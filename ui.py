@@ -5,20 +5,20 @@
 """
 from __future__ import annotations
 
+import ctypes
 import html
-import datetime
 import json
 import os
 import re
 import sys
-from datetime import datetime
+from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence, QFont
+from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
-                               QStackedWidget)
+                               QStackedWidget, QSizeGrip)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
                             FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
                             PrimaryPushButton, ProgressBar, PushButton, ScrollArea,
@@ -813,7 +813,7 @@ class OverviewPage(QWidget):
 
     def set_snapshot(self, snap):
         self.snap = snap
-        today = datetime.date.today().isoformat()
+        today = date.today().isoformat()
         entries = sorted((r for p in snap.projects for r in p.records),
                          key=lambda r: r.date, reverse=True)
         self.recent = entries[:8]
@@ -1311,6 +1311,21 @@ class SettingsPage(QWidget):
                                  "也可以选新目录（推荐 D:\\AgentHub）后初始化全新结构。软件纯本地扫描，不改任何 agent。"))
         lay.addWidget(c1)
 
+        c1b = CardWidget()
+        g1b = QVBoxLayout(c1b)
+        g1b.setContentsMargins(20, 14, 20, 14)
+        g1b.addWidget(StrongBodyLabel("窗口大小（点一下立即生效，边缘拖拽外的一键兜底）"))
+        sizeRow = QHBoxLayout()
+        for label, wd, ht in (("紧凑 1180×760", 1180, 760), ("标准 1400×900", 1400, 900),
+                              ("宽敞 1616×950", 1616, 950)):
+            b = PushButton(label)
+            b.clicked.connect(lambda _, w_=wd, h_=ht: self.win.showNormal() or self.win.resize(w_, h_))
+            sizeRow.addWidget(b)
+        sizeRow.addStretch(1)
+        g1b.addLayout(sizeRow)
+        g1b.addWidget(CaptionLabel("也可以用键盘：Win+←/→ 贴靠半屏，Alt+空格→大小 用方向键精调。"))
+        lay.addWidget(c1b)
+
         c2 = CardWidget()
         g2 = QVBoxLayout(c2)
         g2.setContentsMargins(20, 14, 20, 14)
@@ -1369,6 +1384,8 @@ class SettingsPage(QWidget):
 # ---------------------------------------------------------------- 主窗口
 
 class AgentHubWindow(FluentWindow):
+    """主窗口。边缘缩放：原生 hit-test（BORDER_WIDTH 加宽）+ Qt QSizeGrip 角落手柄双保险。"""
+
     def __init__(self):
         super().__init__()
         self.root = core.get_root()
@@ -1400,8 +1417,22 @@ class AgentHubWindow(FluentWindow):
             self.addSubInterface(w, ic(icon), text)
 
         self._narrow_nav()
+        # 边缘拖拽：qframelesswindow 原生链命中带默认 5 物理像素（高分屏拖不到），加宽兜底；
+        # 另加 Qt QSizeGrip 角落手柄（startSystemResize，不依赖原生 hit-test）
+        self.setResizeEnabled(True)
+        self.BORDER_WIDTH = 14
+        self.setMinimumSize(920, 600)
+        self._grips = [QSizeGrip(self), QSizeGrip(self)]
+        for g in self._grips:
+            g.setFixedSize(24, 24)
+            g.setStyleSheet("background: transparent;")
+            g.raise_()
         self.setWindowTitle("AgentHub")
         self.resize(1180, 760)
+        geo = core.load_config().get("win_geometry", "")
+        if geo:
+            from PySide6.QtCore import QByteArray
+            self.restoreGeometry(QByteArray.fromBase64(geo.encode()))
         f5 = QShortcut(QKeySequence("F5"), self)
         f5.activated.connect(self.refresh)
         cf = QShortcut(QKeySequence("Ctrl+F"), self)
@@ -1411,8 +1442,15 @@ class AgentHubWindow(FluentWindow):
         if not self.root:
             self.switchTo(self.settings_page)
 
+    def resizeEvent(self, e):
+        if getattr(self, "_grips", None):
+            self._grips[0].move(self.width() - 24, self.height() - 24)  # 右下
+            self._grips[1].move(0, self.height() - 24)                  # 左下
+        super().resizeEvent(e)
+
     def _narrow_nav(self):
-        """导航栏默认收起为窄图标条；展开宽度也压窄（qfw 1.11 实测 API）。"""
+        """导航栏按上次退出时的显示模式恢复（qfw 有 COMPACT/MENU/EXPAND 三态，
+        用户点过汉堡展开后即使悬浮展开也应恢复为展开）。"""
         nav = self.navigationInterface
         try:
             nav.setCollapsible(True)
@@ -1423,11 +1461,36 @@ class AgentHubWindow(FluentWindow):
         except Exception:
             pass
         panel = getattr(nav, "panel", None)
-        if panel is not None and hasattr(panel, "collapse"):
-            try:
-                panel.collapse()
-            except Exception:
-                pass
+        if panel is None or not hasattr(panel, "collapse"):
+            return
+        if core.load_config().get("nav_collapsed", True):
+            QTimer.singleShot(0, panel.collapse)  # 窗口显示后执行，初始化前调用无效
+        else:
+            QTimer.singleShot(0, panel.expand)
+
+    def _nav_collapsed_now(self):
+        """用户视角的收起状态：仅 COMPACT 算收起；MENU（悬浮展开）/EXPAND 都算展开。"""
+        panel = getattr(self.navigationInterface, "panel", None)
+        mode = getattr(panel, "displayMode", None)
+        return getattr(mode, "name", "COMPACT") == "COMPACT"
+
+    def closeEvent(self, e):
+        """退出前：等后台线程结束（防 QThread 运行中被销毁的偶发报错），再记住状态。"""
+        for lst in (self._workers, getattr(self.hub_page, "_workers", []),
+                    getattr(self.search_page, "_workers", [])):
+            for t in list(lst):
+                try:
+                    t.wait(2000)
+                except Exception:
+                    pass
+        try:
+            cfg = core.load_config()
+            cfg["win_geometry"] = bytes(self.saveGeometry().toBase64()).decode()
+            cfg["nav_collapsed"] = self._nav_collapsed_now()
+            core.save_config(cfg)
+        except Exception:
+            pass
+        super().closeEvent(e)
 
     def goto_search(self):
         self.switchTo(self.search_page)
