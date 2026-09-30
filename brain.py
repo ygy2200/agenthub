@@ -98,6 +98,17 @@ CREATE TABLE IF NOT EXISTS sessions (
     agent TEXT PRIMARY KEY,
     project TEXT DEFAULT "", note TEXT DEFAULT "", ts TEXT DEFAULT ""
 );
+CREATE TABLE IF NOT EXISTS agents (
+    name TEXT PRIMARY KEY,
+    home TEXT DEFAULT "",
+    kind TEXT DEFAULT "auto",
+    note TEXT DEFAULT "",
+    first_seen TEXT DEFAULT "",
+    last_seen TEXT DEFAULT "",
+    last_project TEXT DEFAULT "",
+    heartbeats INTEGER DEFAULT 0,
+    records INTEGER DEFAULT 0
+);
 CREATE TABLE IF NOT EXISTS files (
     project TEXT, path TEXT, name TEXT, grp TEXT,
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
@@ -108,6 +119,30 @@ CREATE TABLE IF NOT EXISTS files (
 
 def _now() -> str:
     return datetime.datetime.now().isoformat(timespec="seconds")
+
+
+# user=GUI 本机操作、unknown/migrated=历史数据来源，不算 agent 身份
+_NON_AGENT = {"", "user", "unknown", "migrated"}
+
+
+def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, record: bool = False) -> None:
+    """agent 注册制：所有写动作顺带登记身份（轻量 upsert，见 agents 表）。"""
+    if not agent or agent.strip() in _NON_AGENT:
+        return
+    agent = agent.strip()
+    now = _now()
+    conn.execute("INSERT INTO agents(name,first_seen,last_seen,last_project) VALUES(?,?,?,?) "
+                 "ON CONFLICT(name) DO NOTHING", (agent, now, now, project or ""))
+    sets, args = ["last_seen=?"], [now]
+    if project:
+        sets.append("last_project=?")
+        args.append(project)
+    if beat:
+        sets.append("heartbeats=heartbeats+1")
+    if record:
+        sets.append("records=records+1")
+    args.append(agent)
+    conn.execute(f"UPDATE agents SET {','.join(sets)} WHERE name=?", args)
 
 
 def init_db(root: str) -> str:
@@ -121,6 +156,7 @@ def init_db(root: str) -> str:
         _migrate_records(root)
         _migrate_memory(root)
         _migrate_jsonl(root)
+        _backfill_agents(root)
         return ""
     except sqlite3.Error as e:
         return f"大脑数据库初始化失败：{e}"
@@ -264,12 +300,27 @@ def _meta_get(root: str, key: str) -> str:
         return row["value"] if row else ""
 
 
+def _backfill_agents(root: str) -> None:
+    """历史 records 的 agent 回填注册表（meta 标记防重跑，幂等）。"""
+    with db_conn(root) as conn:
+        if conn.execute("SELECT value FROM meta WHERE key='agents_backfill'").fetchone():
+            return
+        for r in conn.execute(
+                "SELECT agent, COUNT(*) AS n, MIN(date) AS d1, MIN(created) AS d2 "
+                "FROM records WHERE agent NOT IN ('','user','unknown','migrated') GROUP BY agent"):
+            first = r["d1"] or r["d2"] or ""
+            conn.execute("INSERT OR IGNORE INTO agents(name,first_seen,records) VALUES(?,?,?)",
+                         (r["agent"], first, r["n"]))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('agents_backfill','1')")
+
+
 # ---------------------------------------------------------------- 工作记录
 
 def add_record(root: str, project: str, agent: str, date: str, title: str, content: str) -> int:
     """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记）。"""
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
+        _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
             "INSERT INTO records(project,agent,date,title,content,source,created) VALUES(?,?,?,?,?,'hub',?)",
             (project, agent, date, title, content, _now()))
@@ -318,6 +369,7 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
     if kind not in KINDS:
         kind = "note"
     with db_conn(root) as conn:
+        _upsert_agent(conn, agent, project)
         cur = conn.execute(
             "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated) "
             "VALUES(?,?,?,?,?,?,?,?)",
@@ -483,6 +535,7 @@ def error_add(root: str, agent: str, title: str, detail: str = "",
     if not title or not title.strip():
         return "title 必填"
     with db_conn(root) as conn:
+        _upsert_agent(conn, agent, project)
         conn.execute("INSERT INTO errors(ts,agent,project,title,detail,undo,status) VALUES(?,?,?,?,?,?,'open')",
                      (_now(), agent or "unknown", project, title.strip()[:200], (detail or "")[:4000], undo))
     return ""
@@ -533,6 +586,7 @@ def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") ->
                          (s["agent"], s["project"], s["note"], s["ts"]))
         conn.execute("INSERT INTO sessions(agent,project,note,ts) VALUES(?,?,?,?)",
                      (agent.strip(), project or "", note or "", now.isoformat(timespec="seconds")))
+        _upsert_agent(conn, agent, project, beat=True)
     active = [s for s in fresh
               if project and s.get("project") == project
               and _ts_age(s.get("ts", ""), now) < SESSION_ACTIVE]
@@ -555,6 +609,16 @@ def active_sessions(root: str) -> list:
             if _ts_age(d.get("ts", ""), now) < SESSION_TTL:
                 out.append(d)
         return sorted(out, key=lambda s: s.get("ts", ""), reverse=True)
+
+
+def list_agents(root: str) -> list:
+    """注册 agent 全表 + 在线状态（sessions 存活者打 live 标），按最近活跃排序。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute("SELECT * FROM agents ORDER BY last_seen DESC")]
+    online = {s["agent"] for s in active_sessions(root)}
+    for r in rows:
+        r["online"] = r["name"] in online
+    return rows
 
 
 # ---------------------------------------------------------------- 备份

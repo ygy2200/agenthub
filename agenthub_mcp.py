@@ -232,6 +232,17 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines.append(f"- {server_name}  配置于 {'、'.join(agents_)}")
         return "\n".join(lines)
 
+    if name == "hub_list_agents":
+        rows = brain.list_agents(root)
+        if not rows:
+            return "注册表为空（agent 首次心跳/写记录时自动登记）"
+        lines = ["注册 agent（在线 = 心跳存活）："]
+        for r in rows:
+            mark = "[在线]" if r["online"] else "[离线]"
+            lines.append(f"- {r['name']}  {mark}  记录{r['records']} · 心跳{r['heartbeats']} · "
+                         f"最近项目:{r['last_project'] or '无'} · 最近活跃:{r['last_seen'] or '无'}")
+        return "\n".join(lines)
+
     if name == "hub_get_progress":
         try:
             limit = int(arguments.get("limit", 30))
@@ -311,6 +322,8 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "可选，过滤 agent 名"}}}},
     {"name": "hub_list_mcps", "description": "列出本机各 agent 已配置的 MCP 服务器",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_list_agents", "description": "列出注册 agent 身份表（在线状态/累计记录/心跳次数/最近活跃）",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
 ]
@@ -360,14 +373,21 @@ def handle_message(msg: dict, root: str) -> dict | None:
             "error": {"code": -32601, "message": f"method not found: {method}"}}
 
 
-def serve(root: str) -> int:
-    """stdio 主循环。EOF/键盘中断退出。"""
+def serve(root: str, fixed: bool = False) -> int:
+    """stdio 主循环。EOF/键盘中断退出。
+    fixed=False 时每条请求重读 config 的 root：根目录迁移后旧进程自动跟随，
+    杜绝"进程启动时缓存旧路径、静默读写幽灵旧库"（2026-09-30 搬家实测踩坑）。"""
     log = lambda s: print(f"[agenthub-mcp] {s}", file=sys.stderr)  # noqa: E731
-    log(f"启动，根目录：{root}")
+    log(f"启动，根目录：{root}" + ("（固定）" if fixed else "（动态跟随 config）"))
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
             continue
+        if not fixed:
+            live = core.get_root()
+            if live and live != root:
+                root = live
+                log(f"根目录已切换：{root}")
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError as e:
@@ -386,8 +406,9 @@ def serve(root: str) -> int:
 
 
 def main():
-    root = sys.argv[1] if len(sys.argv) > 1 else core.get_root()
-    sys.exit(serve(root))
+    fixed = len(sys.argv) > 1  # 命令行显式指定根目录 = 固定模式（向后兼容）
+    root = sys.argv[1] if fixed else core.get_root()
+    sys.exit(serve(root, fixed))
 
 
 if __name__ == "__main__":

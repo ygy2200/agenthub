@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -318,6 +319,52 @@ def install_skill(identifier: str, target_dir: str) -> str:
     if n == 0:
         return "该技能目录下没有可下载文件"
     return f"已安装到 {dest}（{n} 个文件）"
+
+
+# 技能市场的实时源仓库（GitHub API 拉取 skills/ 子目录，一目录一技能）
+REMOTE_SKILL_REPOS = ["anthropics/skills"]
+
+
+def fetch_remote_skills() -> list:
+    """GitHub 实时拉取技能索引，返回与 load_local_market 同构的列表（desc 留待点选预览）。"""
+    out, seen = [], set()
+    for repo in REMOTE_SKILL_REPOS:
+        try:
+            listing = json.loads(
+                _urlopen(f"https://api.github.com/repos/{repo}/contents/skills").decode("utf-8"))
+        except Exception as e:  # noqa: BLE001
+            raise RuntimeError(f"{repo}: {type(e).__name__}: {e}") from e
+        if not isinstance(listing, list):
+            continue
+        for item in listing:
+            if item.get("type") != "dir":
+                continue
+            name = item.get("name", "")
+            if name in seen or name.startswith((".", "_")):
+                continue
+            seen.add(name)
+            out.append({"name": name, "desc": "（点选预览详情）", "repo": repo,
+                        "identifier": f"{repo}/skills/{name}"})
+    return out
+
+
+def fetch_skill_desc(identifier: str) -> str:
+    """拉取单个技能 SKILL.md 的 frontmatter description（市场预览用）。"""
+    parts = identifier.split("/")
+    if len(parts) < 4:
+        return ""
+    repo, subpath = f"{parts[0]}/{parts[1]}", "/".join(parts[2:])
+    for branch in ("main", "master"):
+        try:
+            text = _urlopen(f"https://raw.githubusercontent.com/{repo}/{branch}/{subpath}/SKILL.md",
+                            timeout=10).decode("utf-8", "replace")
+            break
+        except Exception:  # noqa: BLE001
+            text = ""
+    if not text:
+        return ""
+    m = re.search(r"^description:\s*(.+)$", text, re.M)
+    return m.group(1).strip()[:300] if m else ""
 
 
 def detect_agents(extra: dict | None = None) -> list:

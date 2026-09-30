@@ -68,8 +68,8 @@ def t_protocol(root):
     assert {"hub_list_projects", "hub_log_work", "hub_memory_read", "hub_memory_write",
             "hub_get_progress", "hub_list_skills", "hub_list_mcps", "hub_search",
             "hub_get_project", "hub_create_project", "hub_get_rules", "hub_heartbeat",
-            "hub_report_error", "hub_list_errors", "hub_undo"} <= names, names
-    assert len(names) == 15
+            "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents"} <= names, names
+    assert len(names) == 16
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -406,12 +406,50 @@ def t_bootstrap(tmp):
         assert t["path"].startswith("~/")
 
 
+def t_root_follow(tmp):
+    """回归（2026-09-30 幽灵库事故）：MCP 进程动态跟随 config 的 root——
+    根目录迁移后，旧进程不得继续读写旧库；新写入必须落在新库。"""
+    import contextlib
+    import io
+
+    hub_a, hub_b = fresh_hub(tmp, "root_a"), fresh_hub(tmp, "root_b")
+    core.set_root(str(hub_a))
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "ZCode",
+                                 "content": "迁移前写在旧库"}, str(hub_a))
+    # 模拟配置迁移：config root 切到 B，进程仍从 A 启动
+    core.set_root(str(hub_b))
+    req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                      "params": {"name": "hub_log_work",
+                                 "arguments": {"project": "测试-项目", "agent": "ZCode",
+                                               "content": "迁移后写新库"}}}, ensure_ascii=False)
+
+    class FakeIn:
+        def __init__(self, lines):
+            self._lines = lines
+
+        def __iter__(self):
+            return iter(self._lines)
+
+    old_in = sys.stdin
+    sys.stdin = FakeIn([req])
+    try:
+        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+            m.serve(str(hub_a), fixed=False)
+    finally:
+        sys.stdin = old_in
+    assert any("迁移后写新库" in r["content"]
+               for r in brain.list_records(str(hub_b), "测试-项目")), "新库未收到写入"
+    assert all("迁移后写新库" not in r["content"]
+               for r in brain.list_records(str(hub_a), "测试-项目")), "旧库被幽灵进程误写"
+    core.set_root(str(hub_a))  # 还原，避免影响后续用例
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
-    case("MCP协议（握手/15工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/16工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
@@ -421,6 +459,7 @@ def main():
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
+    case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))
     case("一键接入（两种布局/备份/移除/坏json/幂等）", lambda: t_mcp_access(tmp))
     print()
     if FAILED:

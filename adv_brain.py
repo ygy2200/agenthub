@@ -245,6 +245,44 @@ def t_backup_brain(tmp):
     assert "不存在" in brain.backup_brain(str(Path(tmp) / "无2"))
 
 
+def t_agents_registry(tmp):
+    """agent 注册制：写动作自动登记/计数/在线标记/保留名过滤/回填幂等/并发登记。"""
+    root = str(Path(tmp) / "hub")
+    brain.add_record(root, "注册测试-项目", "注册Robot", "2026-09-30", "t1", "c1")
+    brain.add_record(root, "其他项目", "注册Robot", "2026-09-30", "t2", "c2")
+    brain.add_memory(root, "注册测试记忆", agent="注册Robot", project="注册测试-项目")
+    brain.error_add(root, "注册Robot", "注册测试错误", project="其他项目")
+    err, _act = brain.heartbeat_touch(root, "注册Robot", "注册测试-项目", note="在线测试")
+    assert err == ""
+    rows = {r["name"]: r for r in brain.list_agents(root)}
+    a = rows["注册Robot"]
+    assert a["records"] == 2, a
+    assert a["heartbeats"] == 1, a
+    assert a["last_project"] == "注册测试-项目", a
+    assert a["online"] is True and a["first_seen"] and a["last_seen"], a
+    # 保留名/空名不登记为 agent 身份
+    for name in ("user", "unknown", "migrated", "  "):
+        brain.add_record(root, "注册测试-项目", name, "2026-09-30", "x", "c")
+        brain.add_memory(root, "y", agent=name)
+    assert all(r["name"] not in ("user", "unknown", "migrated")
+               for r in brain.list_agents(root))
+    # init_db 重跑幂等：注册表不增不减
+    n_before = len(brain.list_agents(root))
+    assert brain.init_db(root) == ""
+    assert len(brain.list_agents(root)) == n_before
+    # 8 线程并发心跳登记不炸不丢
+    import threading
+
+    def w(i):
+        brain.heartbeat_touch(root, f"并发Agent{i}", "注册测试-项目")
+
+    ts = [threading.Thread(target=w, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    got = {r["name"] for r in brain.list_agents(root) if r["name"].startswith("并发Agent")}
+    assert got == {f"并发Agent{i}" for i in range(8)}, got
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -271,6 +309,7 @@ def main():
     case("记录写入+栈式软删撤销（不误删迁移/他人）", lambda: t_records_and_undo(tmp))
     case("错误登记流转+操作流水", lambda: t_errors_and_journal(tmp))
     case("心跳（冲突预警/陈旧清理/坏参）", lambda: t_heartbeat(tmp))
+    case("agent注册制（写动作登记/计数/保留名过滤/回填幂等/并发登记）", lambda: t_agents_registry(tmp))
     case("全脑检索+统计（记录/记忆/文件名）", lambda: t_search_all_and_stats(tmp))
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))

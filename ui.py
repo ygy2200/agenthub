@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
-"""AgentHub GUI：项目 / 时间线 / 统计 / 搜索 / 对账 / 设置 六页。
+"""AgentHub GUI：总览 / 项目 / 时间线 / Agent 中心 / 能力市场 / 流水·对账 / 统计 / 搜索 / 接入。
 
-数据全部来自 core.scan 现场扫描，无本地缓存，agent 直写目录后按 F5 即见。
+数据全部来自 core.scan 现场扫描与大脑数据库（brain.db），agent 直写后按 F5 即见。
 """
 from __future__ import annotations
 
@@ -16,14 +16,14 @@ from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit,
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
                             FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
                             PrimaryPushButton, ProgressBar, PushButton, ScrollArea,
-                            SearchLineEdit, StrongBodyLabel, SubtitleLabel, TextBrowser,
-                            TextEdit, TitleLabel, setTheme, Theme)
+                            SearchLineEdit, SegmentedWidget, StrongBodyLabel, SubtitleLabel,
+                            TextBrowser, TextEdit, TitleLabel, setTheme, Theme)
 
 import agentscore
 import brain
@@ -293,7 +293,6 @@ class InboxPickDialog(MessageBoxBase):
 
 class EditAssetDialog(MessageBoxBase):
     """能力中心资产编辑器：记忆 / 规则 / 全局配置等文本文件（保存走自动备份）。"""
-
     def __init__(self, win, path, name):
         super().__init__(win)
         self.titleLabel = SubtitleLabel(f"编辑：{name}")
@@ -973,6 +972,28 @@ class JournalPage(QWidget):
         self.win.refresh()
 
 
+class LedgerPage(QWidget):
+    """流水·对账合并页：原「流水」与「对账」两页功能原样保留，由分段控件承载。"""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        self.seg = SegmentedWidget(self)
+        self.seg.addItem("journal", "错误与流水")
+        self.seg.addItem("audit", "对账中心")
+        self.journal = JournalPage(win)
+        self.audit = AuditPage(win)
+        self.stack = QStackedWidget(self)
+        self.stack.addWidget(self.journal)
+        self.stack.addWidget(self.audit)
+        self.seg.currentItemChanged.connect(
+            lambda key: self.stack.setCurrentIndex({"journal": 0, "audit": 1}.get(key, 0)))
+        self.seg.setCurrentItem("journal")
+        lay.addWidget(self.seg)
+        lay.addWidget(self.stack, 1)
+
+
 class OverviewPage(QWidget):
     """总览首页：打开软件第一眼看到全局——今天谁在干活、有多少待处理、agent 阵容。"""
 
@@ -1021,7 +1042,7 @@ class OverviewPage(QWidget):
         g2 = QVBoxLayout(agentCard)
         g2.setContentsMargins(18, 12, 18, 12)
         g2.setSpacing(6)
-        g2.addWidget(StrongBodyLabel("Agent 阵容（能力中心探测）"))
+        g2.addWidget(StrongBodyLabel("Agent 阵容（Agent 中心探测）"))
         self.agentBox = QVBoxLayout()
         self.agentBox.setSpacing(2)
         g2.addLayout(self.agentBox)
@@ -1036,7 +1057,7 @@ class OverviewPage(QWidget):
         g3.setContentsMargins(18, 12, 18, 12)
         g3.setSpacing(6)
         g3.addWidget(StrongBodyLabel("快捷入口"))
-        for text, target in (("打开时间线", "timeline"), ("打开能力中心", "hub"),
+        for text, target in (("打开时间线", "timeline"), ("打开 Agent 中心", "hub"),
                              ("检查对账问题", "audit"), ("搜索全部记录", "search")):
             b = PushButton(text)
             b.clicked.connect(lambda _, t=target: self.goto(t))
@@ -1095,7 +1116,7 @@ class OverviewPage(QWidget):
                 it.widget().deleteLater()
         for a in agents:
             line = CaptionLabel(f"{'●' if a.detected else '○'} {a.name}：技能 {len(a.skills)} · MCP {len(a.mcps)} · 记忆 {len(a.memories)}")
-            line.setToolTip(a.home or "未检测到，可在能力中心手动添加目录")
+            line.setToolTip(a.home or "未检测到，可在 Agent 中心手动添加目录")
             self.agentBox.addWidget(line)
 
     def set_sessions(self, sessions):
@@ -1111,10 +1132,282 @@ class OverviewPage(QWidget):
                 f"● {s.get('agent')} → {s.get('project') or '未指定'}  {s.get('note') or ''}"))
 
 
-class HubPage(QWidget):
-    """能力中心：聚合电脑上各 agent 的技能 / MCP / 记忆 / 全局配置（只读）。"""
+# 知名 MCP 服务器目录（名称, 简介, 仓库, 标准配置片段；token/key 留占位由用户自填）
+MCP_CATALOG = [
+    ("fetch", "网页抓取：把网页转为 Markdown 供模型阅读", "modelcontextprotocol/servers",
+     '{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}'),
+    ("filesystem", "受控文件系统读写（目录白名单制）", "modelcontextprotocol/servers",
+     '{"mcpServers": {"filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/允许的目录"]}}}'),
+    ("memory", "知识图谱式长期记忆（跨会话保持）", "modelcontextprotocol/servers",
+     '{"mcpServers": {"memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]}}}'),
+    ("github", "GitHub 官方 API：仓库 / PR / Issue 全套", "modelcontextprotocol/servers",
+     '{"mcpServers": {"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], '
+     '"env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "<你的token>"}}}}'),
+    ("playwright", "浏览器自动化：截图 / 点击 / 表单 / 抓取", "microsoft/playwright-mcp",
+     '{"mcpServers": {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}}'),
+    ("brave-search", "Brave 联网搜索", "modelcontextprotocol/servers",
+     '{"mcpServers": {"brave-search": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-brave-search"], '
+     '"env": {"BRAVE_API_KEY": "<你的key>"}}}}'),
+    ("sqlite", "SQLite 数据库直查", "modelcontextprotocol/servers",
+     '{"mcpServers": {"sqlite": {"command": "uvx", "args": ["mcp-server-sqlite", "--db-path", "D:/数据/库名.db"]}}}'),
+    ("sequential-thinking", "结构化分步推理（动态思考链）", "modelcontextprotocol/servers",
+     '{"mcpServers": {"sequential-thinking": {"command": "npx", '
+     '"args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]}}}'),
+    ("tavily", "Tavily 联网搜索与网页抽取", "tavily-ai/tavily-mcp",
+     '{"mcpServers": {"tavily": {"command": "npx", "args": ["-y", "tavily-mcp@latest"], '
+     '"env": {"TAVILY_API_KEY": "<你的key>"}}}}'),
+    ("everything", "官方测试服务器：验证 MCP 接入是否连通", "modelcontextprotocol/servers",
+     '{"mcpServers": {"everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]}}}'),
+]
 
-    VIEWS = ["技能库", "MCP 服务器", "记忆", "全局配置", "技能市场"]
+
+class MarketPage(QWidget):
+    """能力市场：技能双源安装（本地缓存 / 官方实时 + identifier 直装）+ MCP 目录片段复制。"""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        self.agents: list = []
+        self.market_items: list = []
+        self._mcp_entries: list = []
+        self._market_dirs: list = []
+        self._workers = []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        top = QHBoxLayout()
+        top.addWidget(SubtitleLabel("能力市场"))
+        top.addStretch(1)
+        lay.addLayout(top)
+        lay.addWidget(CaptionLabel(
+            "技能：从索引源安装到任意 agent 技能库，或粘贴 identifier 直装任意 GitHub 仓库技能；"
+            "MCP：知名服务器目录，复制配置片段后自行粘贴到对应 agent 的 MCP 配置（本软件不自动写入，密钥不落库）。"))
+
+        self.seg = SegmentedWidget(self)
+        self.seg.addItem("skill", "技能市场")
+        self.seg.addItem("mcp", "MCP 目录")
+        self.seg.currentItemChanged.connect(
+            lambda key: self.stack.setCurrentIndex({"skill": 0, "mcp": 1}.get(key, 0)))
+        self.stack = QStackedWidget(self)
+        lay.addWidget(self.seg)
+        lay.addWidget(self.stack, 1)
+
+        # ---- 技能市场页
+        sk = QWidget()
+        g = QVBoxLayout(sk)
+        g.setContentsMargins(0, 8, 0, 0)
+        g.setSpacing(8)
+        row = QHBoxLayout()
+        row.addWidget(CaptionLabel("来源"))
+        self.srcCombo = ComboBox()
+        self.srcCombo.addItems(["本地缓存索引（anthropics/skills，离线）", "官方实时索引（GitHub，需网络）"])
+        self.srcCombo.setFixedWidth(300)
+        self.srcCombo.currentIndexChanged.connect(self.reload_market)
+        row.addWidget(self.srcCombo)
+        self.filterEdit = SearchLineEdit()
+        self.filterEdit.setPlaceholderText("过滤技能…")
+        self.filterEdit.setFixedWidth(220)
+        self.filterEdit.textChanged.connect(self.fill_market)
+        row.addWidget(self.filterEdit)
+        row.addStretch(1)
+        refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新索引")
+        refreshBtn.clicked.connect(self.reload_market)
+        row.addWidget(refreshBtn)
+        g.addLayout(row)
+
+        row2 = QHBoxLayout()
+        row2.addWidget(CaptionLabel("安装到"))
+        self.marketTargets = ComboBox()
+        self.marketTargets.setFixedWidth(250)
+        row2.addWidget(self.marketTargets)
+        installBtn = PrimaryPushButton(ic("DOWNLOAD", "INFO"), "安装选中技能")
+        installBtn.clicked.connect(self.install_selected)
+        row2.addWidget(installBtn)
+        self.idEdit = LineEdit()
+        self.idEdit.setPlaceholderText("或粘贴 identifier 直装：仓库/路径/技能名")
+        row2.addWidget(self.idEdit, 1)
+        idBtn = PushButton(ic("DOWNLOAD", "INFO"), "直装")
+        idBtn.clicked.connect(self.install_identifier)
+        row2.addWidget(idBtn)
+        g.addLayout(row2)
+
+        self.marketList = ListWidget()
+        g.addWidget(self.marketList, 1)
+        self.stack.addWidget(sk)
+
+        # ---- MCP 目录页
+        mp = QWidget()
+        m = QVBoxLayout(mp)
+        m.setContentsMargins(0, 8, 0, 0)
+        m.setSpacing(8)
+        mrow = QHBoxLayout()
+        self.mcpFilter = SearchLineEdit()
+        self.mcpFilter.setPlaceholderText("过滤 MCP…")
+        self.mcpFilter.setFixedWidth(220)
+        self.mcpFilter.textChanged.connect(self.fill_mcp_catalog)
+        mrow.addWidget(self.mcpFilter)
+        mrow.addStretch(1)
+        copyBtn = PushButton(ic("COPY", "INFO"), "复制配置片段")
+        copyBtn.clicked.connect(self.copy_mcp_config)
+        mrow.addWidget(copyBtn)
+        m.addLayout(mrow)
+        self.mcpList = ListWidget()
+        m.addWidget(self.mcpList, 1)
+        self.mcpPreview = TextBrowser()
+        self.mcpPreview.setMaximumHeight(150)
+        self.mcpPreview.setHtml("<p style='color:#888'>点选上方条目查看配置片段</p>")
+        m.addWidget(self.mcpPreview)
+        self.stack.addWidget(mp)
+
+        self.marketList.itemClicked.connect(self.preview_market)
+        self.mcpList.itemClicked.connect(self.preview_mcp)
+        self.fill_mcp_catalog()
+        QTimer.singleShot(300, self.reload_market)
+
+    # ---- 数据
+    def set_agents(self, agents):
+        """由 Agent 中心探测完成后同步（复用探测结果，不重复扫描）。"""
+        self.agents = agents
+        self._fill_targets()
+
+    def _fill_targets(self):
+        cur = self.marketTargets.currentData()
+        self.marketTargets.clear()
+        self._market_dirs = [
+            ("ZCode 技能库", Path.home() / ".agents" / "skills"),
+            ("Claude 技能库", Path.home() / ".claude" / "skills"),
+        ]
+        for a in self.agents:
+            if a.name == "hermes" and a.home:
+                self._market_dirs.append(("hermes bundled-skills", Path(a.home) / "bundled-skills"))
+        for label, d in self._market_dirs:
+            self.marketTargets.addItem(f"安装到：{label}", str(d))
+        if cur:
+            i = self.marketTargets.findData(cur)
+            if i >= 0:
+                self.marketTargets.setCurrentIndex(i)
+
+    def reload_market(self):
+        self.marketList.clear()
+        self.marketList.addItem("（加载索引中…）")
+        src = self.srcCombo.currentIndex()
+        w = FnWorker(lambda: agentscore.load_local_market() if src == 0
+                     else agentscore.fetch_remote_skills(), self)
+        w.done.connect(self._on_market_loaded)
+        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
+        self._workers.append(w)
+        w.start()
+
+    def _on_market_loaded(self, result):
+        self.marketList.clear()
+        if isinstance(result, Exception):
+            self.marketList.addItem(f"（索引加载失败：{result}）")
+            return
+        self.market_items = result
+        self.fill_market()
+
+    def fill_market(self):
+        kw = self.filterEdit.text().strip().lower()
+        self.marketList.clear()
+        for mitem in self.market_items:
+            if kw and kw not in mitem["name"].lower() and kw not in mitem["desc"].lower():
+                continue
+            self.marketList.addItem(f"{mitem['name']}  ——  {mitem['desc'][:80]}")
+            self.marketList.item(self.marketList.count() - 1).setData(
+                Qt.UserRole, mitem["identifier"])
+        if not self.marketList.count():
+            self.marketList.addItem("（无匹配技能）")
+
+    def fill_mcp_catalog(self):
+        kw = self.mcpFilter.text().strip().lower()
+        self.mcpList.clear()
+        self._mcp_entries = []
+        for entry in MCP_CATALOG:
+            name, desc = entry[0], entry[1]
+            if kw and kw not in name.lower() and kw not in desc.lower():
+                continue
+            self.mcpList.addItem(f"{name}  ——  {desc}")
+            self._mcp_entries.append(entry)
+        if not self.mcpList.count():
+            self.mcpList.addItem("（无匹配）")
+
+    # ---- 交互
+    def preview_market(self, item):
+        row = self.marketList.currentRow()
+        if not (0 <= row < len(self.market_items)):
+            return
+        mitem = self.market_items[row]
+        if mitem["desc"] and mitem["desc"] != "（点选预览详情）":
+            return  # 本地缓存源已带描述
+        item.setText(f"{mitem['name']}  ——  详情加载中…")
+        w = FnWorker(lambda: agentscore.fetch_skill_desc(mitem["identifier"]), self)
+        w.done.connect(lambda d, it=item, mi=mitem: it.setText(
+            f"{mi['name']}  ——  {(str(d) if d and not isinstance(d, Exception) else '（暂无详情）')[:80]}"))
+        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
+        self._workers.append(w)
+        w.start()
+
+    def preview_mcp(self, item):
+        row = self.mcpList.currentRow()
+        if not (0 <= row < len(self._mcp_entries)):
+            return
+        name, desc, repo, cfg = self._mcp_entries[row]
+        self.mcpPreview.setHtml(
+            f"<p><b>{name}</b> — {desc}</p><p style='color:#888'>仓库：{repo}</p>"
+            f"<pre style='background:#f5f5f5;padding:8px'>{html.escape(cfg)}</pre>")
+
+    def copy_mcp_config(self):
+        row = self.mcpList.currentRow()
+        if not (0 <= row < len(self._mcp_entries)):
+            InfoBar.warning("先选择一个 MCP 服务器", "", duration=2000, parent=self.win)
+            return
+        QApplication.clipboard().setText(self._mcp_entries[row][3])
+        InfoBar.success("配置片段已复制", "粘贴到对应 agent 的 MCP 配置文件（本软件不自动写入）",
+                        duration=3000, parent=self.win)
+
+    def install_selected(self):
+        row = self.marketList.currentRow()
+        if row < 0 or row >= len(self.market_items):
+            InfoBar.warning("先在列表中选择一个技能", "", duration=2000, parent=self.win)
+            return
+        mitem = self.market_items[row]
+        self._install(mitem["name"], mitem["identifier"])
+
+    def install_identifier(self):
+        ident = self.idEdit.text().strip().strip("/")
+        if not ident:
+            InfoBar.warning("先粘贴技能 identifier", "", duration=2000, parent=self.win)
+            return
+        if ident.count("/") < 3:
+            InfoBar.warning("格式应为：仓库拥有者/仓库名/路径/技能名", "", duration=3000, parent=self.win)
+            return
+        self._install(ident.split("/")[-1], ident)
+
+    def _install(self, name: str, identifier: str):
+        target = self.marketTargets.currentData()
+        if not target:
+            return
+        InfoBar.info("开始安装", f"{name}（需网络/代理）", duration=2500, parent=self.win)
+        w = FnWorker(lambda: agentscore.install_skill(identifier, target), self)
+        w.done.connect(self._on_installed)
+        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
+        self._workers.append(w)
+        w.start()
+
+    def _on_installed(self, result):
+        text = str(result)
+        if text.startswith("已安装"):
+            InfoBar.success("安装完成", text, duration=4000, parent=self.win)
+            if getattr(self.win, "hub_page", None):
+                self.win.hub_page.rescan()
+        else:
+            InfoBar.error("安装失败", text[:120], duration=6000, parent=self.win)
+
+
+class HubPage(QWidget):
+    """Agent 中心：聚合电脑上各 agent 的技能 / MCP / 记忆 / 全局配置；
+    记忆可增删改，配置文件可编辑（自动备份）；技能安装见「能力市场」页。"""
+
+    VIEWS = ["技能库", "MCP 服务器", "记忆", "全局配置"]
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -1124,7 +1417,7 @@ class HubPage(QWidget):
         lay.setContentsMargins(24, 24, 24, 24)
 
         top = QHBoxLayout()
-        top.addWidget(SubtitleLabel("能力中心"))
+        top.addWidget(SubtitleLabel("Agent 中心"))
         top.addStretch(1)
         addBtn = PushButton(ic("ADD", "INFO"), "添加 agent 目录")
         addBtn.clicked.connect(self.add_agent)
@@ -1133,7 +1426,8 @@ class HubPage(QWidget):
         rescanBtn.clicked.connect(self.rescan)
         top.addWidget(rescanBtn)
         lay.addLayout(top)
-        lay.addWidget(CaptionLabel("自动探测本机 agent 及其技能 / MCP / 记忆 / 全局配置，只读聚合，绝不改动对方配置；"
+        lay.addWidget(CaptionLabel("自动探测本机 agent 及其技能 / MCP / 记忆 / 全局配置；"
+                                   "记忆可增删改，配置文件可编辑保存（自动备份）；MCP 出于安全只读。"
                                    "未列出的 agent 可手动添加根目录。"))
 
         self.cardsRow = QHBoxLayout()
@@ -1159,33 +1453,16 @@ class HubPage(QWidget):
         self.mcpList = ListWidget()
         self.memList = ListWidget()
         self.cfgList = ListWidget()
-        self.marketList = ListWidget()
-        for w in (self.skillList, self.mcpList, self.memList, self.cfgList, self.marketList):
+        for w in (self.skillList, self.mcpList, self.memList, self.cfgList):
             self.stack.addWidget(w)
             w.itemClicked.connect(self.on_preview)
             w.itemDoubleClicked.connect(self.on_open)
+            w.setContextMenuPolicy(Qt.CustomContextMenu)
+            w.customContextMenuRequested.connect(self._ctx_menu)
         self.viewCombo.currentIndexChanged.connect(self.stack.setCurrentIndex)
         lay.addWidget(self.stack, 1)
 
-        marketRow = QHBoxLayout()
-        self.marketTargets = ComboBox()
-        self.marketTargets.setFixedWidth(220)
-        installBtn = PrimaryPushButton(ic("DOWNLOAD", "INFO"), "安装选中技能")
-        installBtn.clicked.connect(self.install_selected)
-        marketRow.addWidget(self.marketTargets)
-        marketRow.addWidget(installBtn)
-        marketRow.addStretch(1)
-        self.marketPage = QWidget()
-        self.marketPage.setLayout(marketRow)
-        self.stack.insertWidget(4, self.marketPage)
-        self.marketList.setParent(None)  # 列表放进市场页上方
-        mk = QVBoxLayout(self.marketPage)
-        mk.insertWidget(0, CaptionLabel("技能来自 anthropics/skills 官方索引（hermes 本地缓存）。"
-                                        "安装即从 GitHub 下载到目标技能库（需网络，走本机 7890 代理或直连）。"))
-        mk.insertWidget(1, self.marketList, 1)
-        self.stack.insertWidget(4, self.marketPage)
-
-        lay.addWidget(CaptionLabel("单击下方预览 · 双击打开所在目录 · MCP 出于安全只显示名称与来源，不显示密钥内容"))
+        lay.addWidget(CaptionLabel("单击预览 · 双击打开所在目录 · 右键更多操作 · MCP 出于安全只显示名称与来源，不显示密钥内容"))
 
         editRow = QHBoxLayout()
         self.editBtn = PushButton(ic("EDIT", "INFO"), "编辑并保存（自动备份）")
@@ -1224,13 +1501,17 @@ class HubPage(QWidget):
             InfoBar.error("探测失败", str(result), duration=4000, parent=self.win)
             return
         self.agents = result
+        try:
+            self._reg = {r["name"].lower(): r for r in brain.list_agents(self.win.root)}
+        except Exception:
+            self._reg = {}
         self.rebuild_cards()
         self.fill_skills()
         self.fill_mcps()
         self.fill_memories()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
-        self.fill_market()
         self.win.overview_page.set_agents(self.agents)
+        self.win.market_page.set_agents(self.agents)
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
 
     def fill_memories(self):
@@ -1265,6 +1546,11 @@ class HubPage(QWidget):
             g.addWidget(CaptionLabel((a.home or "未检测到（可手动添加目录）")[:60]))
             g.addWidget(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
                                      f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
+            reg = getattr(self, "_reg", {}).get(a.name.lower())
+            if reg:
+                g.addWidget(CaptionLabel(
+                    f"{'● 在线' if reg['online'] else '○ 离线'} · 记录 {reg['records']} 条 · "
+                    f"最近活跃 {reg['last_seen'] or '—'}"))
             self.cardsRow.addWidget(card)
         self.cardsRow.addStretch(1)
 
@@ -1398,50 +1684,33 @@ class HubPage(QWidget):
         if path:
             open_location(path, select=False)
 
-    # ---- 技能市场
-    def fill_market(self):
-        self.marketList.clear()
-        self.market_items = agentscore.load_local_market()
-        self.marketTargets.clear()
-        self._market_dirs = [
-            ("ZCode 技能库", Path.home() / ".agents" / "skills"),
-            ("Claude 技能库", Path.home() / ".claude" / "skills"),
-        ]
-        for a in self.agents:
-            if a.name == "hermes" and a.home:
-                self._market_dirs.append(("hermes bundled-skills", Path(a.home) / "bundled-skills"))
-        for label, d in self._market_dirs:
-            self.marketTargets.addItem(f"安装到：{label}", str(d))
-        for m in self.market_items:
-            self.marketList.addItem(f"{m['name']}  ——  {m['desc'][:80]}")
-            self.marketList.item(self.marketList.count() - 1).setData(
-                Qt.UserRole, f"{m['repo']}|{m['identifier']}")
-        if not self.market_items:
-            self.marketList.addItem("（本地市场索引为空）")
-
-    def install_selected(self):
-        row = self.marketList.currentRow()
-        if row < 0 or row >= len(self.market_items):
-            InfoBar.warning("先在列表中选择一个技能", "", duration=2000, parent=self.win)
+    def _ctx_menu(self, pos):
+        lst = self.sender()
+        item = lst.itemAt(pos)
+        if item is None:
             return
-        target = self.marketTargets.currentData()
-        if not target:
-            return
-        m = self.market_items[row]
-        InfoBar.info("开始安装", f"{m['name']} ← {m['repo']}（需网络/代理）", duration=2500, parent=self.win)
-        w = FnWorker(lambda: agentscore.install_skill(m["identifier"], target), self)
-        w.done.connect(self._on_installed)
-        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
-        self._workers.append(w)
-        w.start()
-
-    def _on_installed(self, result):
-        text = str(result)
-        if text.startswith("已安装"):
-            InfoBar.success("安装完成", text, duration=4000, parent=self.win)
-            self.rescan()
-        else:
-            InfoBar.error("安装失败", text[:120], duration=6000, parent=self.win)
+        lst.setCurrentItem(item)
+        data = item.data(Qt.UserRole)
+        menu = QMenu(self)
+        act_open = menu.addAction("打开所在目录")
+        act_edit = act_del = None
+        if isinstance(data, str) and data.startswith("mem:"):
+            act_edit = menu.addAction("编辑这条记忆")
+            act_del = menu.addAction("删除这条记忆")
+        elif (isinstance(data, str) and data and self.stack.currentIndex() != 1
+              and Path(data).is_file()):
+            act_edit = menu.addAction("编辑文件（自动备份）")
+        act_copy = menu.addAction("复制路径")
+        chosen = menu.exec(QCursor.pos())
+        if chosen is act_open:
+            self.on_open(item)
+        elif chosen is act_edit:
+            self.edit_current()
+        elif chosen is act_del:
+            self.delete_memory()
+        elif chosen is act_copy and data:
+            QApplication.clipboard().setText(str(data))
+            InfoBar.success("已复制", "", duration=1200, parent=self.win)
 
     def add_agent(self):
         from PySide6.QtWidgets import QFileDialog
@@ -1618,7 +1887,8 @@ class HelpPage(QWidget):
     <li><b>流水</b>：错误登记（agent 出错自动/主动上报，可标记已修、看回滚方式）+ 操作流水（每次写操作一条，记录类可一键撤销）。</li>
     <li><b>统计</b>：项目数、记录数、各 agent 工作量、月度活跃。</li>
     <li><b>搜索</b>：全文+文件名搜索，Ctrl+F 直达。</li>
-    <li><b>能力中心</b>：各 agent 的技能库 / MCP / 记忆 / 全局配置聚合；「技能市场」可从 anthropics/skills 安装新技能；记忆支持软件内编辑与历史备份还原（自动备份）。</li>
+    <li><b>Agent 中心</b>：各 agent 的技能库 / MCP / 记忆 / 全局配置聚合，含注册档案（在线状态/累计记录）；记忆可增删改、配置可编辑（自动备份）。</li>
+    <li><b>能力市场</b>：技能双源安装（本地缓存 / GitHub 官方实时 + identifier 直装）；MCP 目录提供知名服务器标准配置片段，复制后自行粘贴到 agent 的 MCP 配置（不自动写入）。</li>
     <li><b>接入</b>：一键写 MCP 配置 + 注入开工引导到 agent 全局指令文件（均自动备份、可移除）；hermes 等复制配置片段手动粘贴。</li>
     <li><b>对账</b>：揪出 agent 前缀平行目录、重复项目、野目录，杜绝记录分裂。</li>
     </ul>
@@ -1626,7 +1896,7 @@ class HelpPage(QWidget):
     <p>1. 到「接入」页对某个 agent 点「一键接入」+「注入引导」（ZCode / Claude Code / Codex / DSH 支持）；<br>
     2. 重启对应 agent——它每次开工就会自动读进度和记忆、干完活自动写记录、出错自动登记，无需口头提醒。</p>
     <h2>公用记忆是什么</h2>
-    <p>能力中心 → 记忆 → 第一条「共享记忆」。所有已接入的 agent 都能读写（MCP 工具 hub_memory_read / hub_memory_write）。
+    <p>Agent 中心 → 记忆 → 第一条「共享记忆」。所有已接入的 agent 都能读写（MCP 工具 hub_memory_read / hub_memory_write）。
     适合存放：机器环境事实、你的偏好、跨 agent 的项目进展。任何 agent 学到的东西，其他 agent 下次开工先读它。</p>
     <h2>常见问题</h2>
     <ul>
@@ -1789,9 +2059,11 @@ class AgentHubWindow(FluentWindow):
         self.timeline_page = TimelinePage(self)
         self.stats_page = StatsPage(self)
         self.search_page = SearchPage(self)
-        self.audit_page = AuditPage(self)
-        self.journal_page = JournalPage(self)
+        self.ledger_page = LedgerPage(self)
+        self.audit_page = self.ledger_page.audit      # 原对账页别名，apply() 链路不变
+        self.journal_page = self.ledger_page.journal  # 原流水页别名，reload 链路不变
         self.hub_page = HubPage(self)
+        self.market_page = MarketPage(self)
         self.connect_page = ConnectPage(self)
         self.help_page = HelpPage(self)
         self.settings_page = SettingsPage(self)
@@ -1800,12 +2072,12 @@ class AgentHubWindow(FluentWindow):
             (self.overview_page, "HOME", "总览"),
             (self.project_page, "FOLDER", "项目"),
             (self.timeline_page, "HISTORY", "时间线"),
-            (self.journal_page, "DICTIONARY", "流水"),
+            (self.hub_page, "PEOPLE", "Agent 中心"),
+            (self.market_page, "SHOP", "能力市场"),
+            (self.ledger_page, "DICTIONARY", "流水·对账"),
             (self.stats_page, "TILES", "统计"),
             (self.search_page, "SEARCH", "搜索"),
-            (self.hub_page, "LIBRARY", "能力中心"),
             (self.connect_page, "LINK", "接入"),
-            (self.audit_page, "FILTER", "对账"),
             (self.help_page, "INFO", "帮助"),
             (self.settings_page, "SETTING", "设置"),
         ):
@@ -1882,6 +2154,7 @@ class AgentHubWindow(FluentWindow):
     def closeEvent(self, e):
         """退出前：等后台线程结束（防 QThread 运行中被销毁的偶发报错），备份大脑，再记住状态。"""
         for lst in (self._workers, getattr(self.hub_page, "_workers", []),
+                    getattr(self.market_page, "_workers", []),
                     getattr(self.search_page, "_workers", [])):
             for t in list(lst):
                 try:

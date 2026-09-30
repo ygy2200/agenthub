@@ -103,9 +103,23 @@ def main():
         check("md代码块", "<pre>" in h)
         check("md转义", "<script>" not in md_to_html("<script>alert(1)</script>"))
         check("记录含正文content", any(len(r.get("content", "")) > 0 for r in w.timeline_page.all_entries))
-        # 能力中心页冒烟
-        check("能力中心页存在且已切导航", w.hub_page is not None)
+        # Agent 中心页冒烟
+        check("Agent中心页存在且已切导航", w.hub_page is not None)
         w.hub_page.viewCombo.setCurrentIndex(1)  # MCP 视图切换不崩
+        check("hub视图=4项(无市场)", w.hub_page.viewCombo.count() == 4)
+        # 能力市场页冒烟（分段切换/源切换/MCP目录过滤）
+        check("能力市场页存在", w.market_page is not None)
+        w.market_page.seg.setCurrentItem("mcp")
+        check("MCP目录填充", w.market_page.mcpList.count() >= 5)
+        w.market_page.mcpFilter.setText("playwright")
+        check("MCP目录过滤", w.market_page.mcpList.count() <= 2)
+        w.market_page.mcpFilter.setText("")
+        w.market_page.seg.setCurrentItem("skill")
+        w.market_page.reload_market()  # 本地缓存源加载不崩
+        # 流水·对账合并页冒烟（分段切换）
+        w.ledger_page.seg.setCurrentItem("audit")
+        check("对账问题>=3（前缀/野目录/缺记录）", len(w.audit_page.issues) >= 3)
+        w.ledger_page.seg.setCurrentItem("journal")
         # 流水页冒烟（v2：journal/errors 读 brain.db）
         w.journal_page.reload()
         check("流水页填充不崩", w.journal_page.jList.count() >= 0 and w.journal_page.errList.count() >= 0)
