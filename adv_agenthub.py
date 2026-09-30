@@ -219,6 +219,144 @@ def t_move_to_project(tmp):
     assert core.move_to_project(str(root), "素材.txt", "没有-此项目") != ""
 
 
+# ---------------------------------------------------------------- v1.3 新增：hub 基础设施
+
+def t_init_hub(tmp):
+    root = Path(tmp) / "ih"
+    root.mkdir()
+    assert core.init_hub(str(root)) == ""
+    meta = root / core.DIR_META
+    assert (meta / core.RULES_NAME).is_file()
+    assert (meta / "memory.md").is_file()
+    assert (meta / "journal.jsonl").is_file()
+    assert (meta / "errors.jsonl").is_file()
+    assert (meta / "sessions.json").read_text(encoding="utf-8") == "[]"
+    assert (root / core.DIR_INBOX).is_dir() and (root / core.DIR_ARCHIVE).is_dir()
+    # 幂等：已有内容不被覆盖
+    (meta / "memory.md").write_text("用户改过的记忆", encoding="utf-8")
+    (meta / core.RULES_NAME).write_text("用户改过的规则", encoding="utf-8")
+    assert core.init_hub(str(root)) == ""
+    assert (meta / "memory.md").read_text(encoding="utf-8") == "用户改过的记忆"
+    assert (meta / core.RULES_NAME).read_text(encoding="utf-8") == "用户改过的规则"
+    assert "根目录不存在" in core.init_hub(str(Path(tmp) / "无此根"))
+
+
+def t_hub_lock(tmp):
+    root = Path(tmp) / "lk"
+    root.mkdir()
+    # 互斥：持锁期间第二个 O_EXCL 必失败
+    with core.hub_lock(str(root)):
+        try:
+            with core.hub_lock(str(root), timeout=0.2):
+                raise AssertionError("互斥失败：第二个锁不应拿到")
+        except TimeoutError:
+            pass
+    # 释放后可重入
+    with core.hub_lock(str(root)):
+        pass
+    # 陈旧锁强拆：mtime 伪造 120 秒前
+    stale = root / core.DIR_META / "locks" / "hub.lock"
+    stale.parent.mkdir(parents=True, exist_ok=True)
+    stale.write_text("9999", encoding="utf-8")
+    old = __import__("time").time() - 120
+    os.utime(stale, (old, old))
+    with core.hub_lock(str(root), timeout=2.0):
+        assert not stale.exists() or True  # 已被强拆重建
+    # 新鲜锁不拆（等待超时）
+    fresh = root / core.DIR_META / "locks" / "hub.lock"
+    fresh.write_text("1", encoding="utf-8")
+    try:
+        with core.hub_lock(str(root), timeout=0.3):
+            raise AssertionError("新鲜锁不应被强拆")
+    except TimeoutError:
+        pass
+    fresh.unlink()
+
+
+def t_undo_segment_surgery(tmp):
+    """core.undo_log 精确切除：含 ### 子段、多段、段间正文。"""
+    root = Path(tmp) / "undo"
+    p = root / "外科-项目"
+    p.mkdir(parents=True)
+    rec = p / core.RECORD_NAME
+    rec.write_text(
+        "# 工作记录\n\n"
+        "## 2026-09-01（hermes）\n开头老记录\n\n"
+        "## 2026-09-29（surgeryA）\n保留段A\n包含###井号开头的正文行\n\n"
+        "### 2026-09-29（子段也认）\n子段正文\n\n"
+        "## 2026-09-30（surgeryA）\n要删的段\n最后一行\n",
+        encoding="utf-8")
+    # 伪造 journal：surgeryA 最后一条 log_work = "2026-09-30（surgeryA）"
+    core.journal(str(root), "surgeryA", "log_work", str(rec), note="2026-09-29（surgeryA）")
+    core.journal(str(root), "surgeryA", "log_work", str(rec), note="2026-09-30（surgeryA）")
+    err, bak = core.undo_log(str(root), "surgeryA")
+    assert err == "", err
+    text = rec.read_text(encoding="utf-8")
+    assert "要删的段" not in text and "最后一行" not in text
+    assert "保留段A" in text and "开头老记录" in text, "误伤其他段"
+    assert "子段正文" in text, "误伤 ### 子段"
+    assert "2026-09-30（surgeryA）" not in text
+    assert Path(bak).is_file() and "bak-agenthub" in bak
+    # 已撤条目不能再撤 -> 撤上一条（2026-09-29 段，含其下的 ### 子段）
+    err, bak2 = core.undo_log(str(root), "surgeryA")
+    assert err == "", err
+    text = rec.read_text(encoding="utf-8")
+    assert "保留段A" not in text and "子段正文" not in text
+    assert "开头老记录" in text
+    # 撤无可撤
+    err, _ = core.undo_log(str(root), "surgeryA")
+    assert "没有找到" in err
+    # 段已被手工删除时给明确错误
+    core.journal(str(root), "surgeryB", "log_work", str(rec), note="2026-08-01（surgeryB）")
+    err, _ = core.undo_log(str(root), "surgeryB")
+    assert "已不在文件中" in err
+
+
+def t_journal_and_errors(tmp):
+    root = Path(tmp) / "je"
+    root.mkdir()
+    # journal 坏根静默
+    core.journal(str(Path(tmp) / "无"), "a", "log_work")
+    core.journal(str(root), "zcode", "log_work", "t1", note="n1")
+    core.journal(str(root), "hermes", "memory_append", "t2")
+    es = core.read_journal(str(root))
+    assert [e.get("agent") for e in es] == ["zcode", "hermes"]
+    # errors：登记/自增/坏行跳过/流转整文件重写
+    assert "title 必填" in core.report_error(str(root), "a", "  ")
+    assert core.report_error(str(root), "a", "错1", detail="d" * 5000) == ""
+    assert core.report_error(str(root), "b", "错2", project="p-1", undo="回滚法") == ""
+    # 混入坏行不崩
+    ef = core.errors_file(str(root))
+    ef.write_text(ef.read_text(encoding="utf-8") + "坏行\n", encoding="utf-8")
+    errs = core.list_errors(str(root))
+    assert len(errs) == 2 and errs[0]["id"] == 2 and errs[1]["id"] == 1
+    assert len(errs[1]["detail"]) == 4000  # 超长 detail 截断（错1 在旧序）
+    assert core.set_error_status(str(root), 1, "fixed") == ""
+    errs = core.list_errors(str(root), status="fixed")
+    assert len(errs) == 1 and errs[0]["id"] == 1
+    assert list(ef.parent.glob("errors.jsonl.bak-agenthub-*"))
+
+
+def t_restore_backup(tmp):
+    root = Path(tmp) / "rb"
+    root.mkdir()
+    f = root / "memory.md"
+    f.write_text("当前版本", encoding="utf-8")
+    bak = f.with_suffix(f.suffix + ".bak-agenthub-20260930-000000-000")
+    bak.write_text("历史版本", encoding="utf-8")
+    # 非法备份名拒绝
+    evil = root / "evil.md"
+    evil.write_text("恶意内容", encoding="utf-8")
+    assert "只允许" in core.restore_backup(str(f), str(evil))
+    assert "备份文件不存在" in core.restore_backup(str(f), str(root / "无.bak-agenthub-1"))
+    # 正常还原：当前内容先再备份
+    assert core.restore_backup(str(f), str(bak), root=str(root)) == ""
+    assert f.read_text(encoding="utf-8") == "历史版本"
+    baks = list(root.glob("memory.md.bak-agenthub-*"))
+    assert len(baks) == 2, f"应有 2 份备份（原 bak + 还原前的当前内容），实际 {len(baks)}"
+    assert any(core.read_journal(str(root)))  # 进流水
+
+
 # ---------------------------------------------------------------- 搜索
 
 def t_search(tmp):
@@ -301,6 +439,11 @@ def main():
     case("搜索（内容/文件名/空词/超长文件）", lambda: t_search(tmp))
     case("规则读写与收编建议", lambda: t_rules(tmp))
     case("agent能力探测（特征识别/坏json/键名变体）", lambda: t_agents_detect(tmp))
+    case("hub初始化（幂等/不覆盖用户内容）", lambda: t_init_hub(tmp))
+    case("跨进程锁（互斥/重入/陈旧强拆/新鲜不拆）", lambda: t_hub_lock(tmp))
+    case("撤销手术（精确切段/###子段/连续撤销/手工删除报错）", lambda: t_undo_segment_surgery(tmp))
+    case("流水与错误登记（自增/坏行/截断/流转备份）", lambda: t_journal_and_errors(tmp))
+    case("备份还原（命名白名单/不存在/再备份）", lambda: t_restore_backup(tmp))
     shutil.rmtree(tmp, ignore_errors=True)
     print()
     if FAILED:

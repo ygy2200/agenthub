@@ -20,7 +20,7 @@ import agentscore  # noqa: E402
 import core  # noqa: E402
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "1.1.0"}
+SERVER_INFO = {"name": "agenthub", "version": "1.3.0"}
 
 
 # ---------------------------------------------------------------- 工具实现（纯函数，供测试直接调用）
@@ -29,8 +29,15 @@ def memory_path(root: str) -> Path:
     return core.memory_file(root)
 
 
+def _conflict_warn(active: list) -> str:
+    if not active:
+        return ""
+    others = "、".join(f"{s.get('agent')}（{s.get('note') or '工作中'}，{s.get('ts', '')}）" for s in active)
+    return f"\n⚠ 撞车预警：同项目还有其他活跃会话：{others}，注意分工避让"
+
+
 def call_tool(name: str, arguments: dict, root: str) -> str:
-    """执行一个工具，返回文本结果。抛异常时由协议层转为 isError。"""
+    """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
         return f"错误：AgentHub 根目录不存在：{root}"
 
@@ -59,19 +66,34 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
 
     if name == "hub_log_work":
         pname = str(arguments.get("project", "")).strip()
-        agent = str(arguments.get("agent", "unknown")).strip()
+        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
         content = str(arguments.get("content", "")).strip()
         date = str(arguments.get("date") or datetime.date.today().isoformat())
         if not pname or not content:
             return "错误：project 与 content 必填"
         proj_dir = Path(root) / pname
         if not proj_dir.is_dir():
-            return f"错误：项目目录不存在：{pname}（先让用户在 AgentHub 新建，或用规范名）"
+            return (f"错误：项目目录不存在：{pname}（新项目先调 hub_create_project，"
+                    f"或用 hub_list_projects 核对现有项目名）")
         rec = proj_dir / core.RECORD_NAME
-        entry = f"\n## {date}（{agent}）\n{content}\n"
-        with open(rec, "a", encoding="utf-8") as f:
-            f.write(entry)
-        return f"已记录到 {rec}（追加 {len(content)} 字符）"
+        entry = f"{date}（{agent}）"
+        with core.hub_lock(root):
+            with open(rec, "a", encoding="utf-8") as f:
+                f.write(f"\n## {entry}\n{content}\n")
+        core.journal(root, agent, "log_work", str(rec), note=entry)
+        err, active = core.heartbeat(root, agent, pname)
+        warn = _conflict_warn(active)
+        return f"已记录到 {rec}（追加 {len(content)} 字符）{warn}"
+
+    if name == "hub_create_project":
+        pname = str(arguments.get("project", "")).strip()
+        agent = str(arguments.get("agent", "unknown")).strip()
+        err = core.create_project(root, pname)
+        if err:
+            return f"错误：{err}"
+        core.journal(root, agent or "unknown", "create_project",
+                     str(Path(root) / pname))
+        return f"项目已创建：{pname}（含 input/output 与工作记录模板）"
 
     if name == "hub_search":
         kw = str(arguments.get("keyword", "")).strip()
@@ -79,6 +101,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         if not hits:
             return f"无结果：{kw}"
         return "\n".join(f"- [{h.project}] {Path(h.path).name}:{h.line_no}  {h.line[:120]}" for h in hits)
+
+    if name == "hub_get_rules":
+        return core.load_rules(root)
 
     if name == "hub_memory_read":
         f = memory_path(root)
@@ -89,14 +114,65 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if name == "hub_memory_write":
         content = str(arguments.get("content", "")).strip()
         mode = str(arguments.get("mode", "append"))
+        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
         if not content:
             return "错误：content 必填"
+        if mode not in ("append", "overwrite"):
+            return "错误：mode 只能是 append 或 overwrite"
         f = memory_path(root)
-        f.parent.mkdir(parents=True, exist_ok=True)
-        stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-        with open(f, "a", encoding="utf-8") as fh:
-            fh.write(f"\n[{stamp}] {content}\n" if mode == "append" else content + "\n")
+        with core.hub_lock(root):
+            if mode == "overwrite":
+                err = core.write_text_backed(str(f), content + "\n", root=root, agent=agent,
+                                             action="memory_overwrite")
+                if err:
+                    return f"错误：{err}"
+            else:
+                f.parent.mkdir(parents=True, exist_ok=True)
+                stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
+                with open(f, "a", encoding="utf-8") as fh:
+                    fh.write(f"\n[{stamp}] {content}\n")
+        core.journal(root, agent, f"memory_{mode}", str(f))
         return f"已写入公用记忆（{mode}），当前所有 agent 可读"
+
+    if name == "hub_heartbeat":
+        agent = str(arguments.get("agent", "")).strip()
+        project = str(arguments.get("project", "")).strip()
+        note = str(arguments.get("note", "")).strip()
+        err, active = core.heartbeat(root, agent, project, note)
+        if err:
+            return f"错误：{err}"
+        return ("心跳已更新" + _conflict_warn(active)) if active else "心跳已更新（同项目无其他活跃会话）"
+
+    if name == "hub_report_error":
+        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
+        title = str(arguments.get("title", "")).strip()
+        detail = str(arguments.get("detail", "")).strip()
+        project = str(arguments.get("project", "")).strip()
+        undo = str(arguments.get("undo", "")).strip()
+        err = core.report_error(root, agent, title, detail, project, undo)
+        return f"错误已登记，其他 agent 与用户可在 AgentHub 流水页看到" if not err else f"错误：{err}"
+
+    if name == "hub_list_errors":
+        status = str(arguments.get("status", "")).strip()
+        errs = core.list_errors(root, status if status in ("open", "fixed") else "")
+        if not errs:
+            return "（无错误登记）"
+        lines = [f"共 {len(errs)} 条错误登记（新在前）："]
+        for e in errs[:30]:
+            lines.append(f"- #{e.get('id')} [{e.get('status')}] {e.get('ts', '')} {e.get('agent')}·"
+                         f"{e.get('project') or '无项目'}：{e.get('title')}")
+            if e.get("undo"):
+                lines.append(f"  回滚方式：{e['undo']}")
+        return "\n".join(lines)
+
+    if name == "hub_undo":
+        agent = str(arguments.get("agent", "")).strip()
+        if not agent:
+            return "错误：agent 必填（只允许撤销自己的记录）"
+        err, bak = core.undo_log(root, agent)
+        if err:
+            return f"错误：{err}"
+        return f"已撤销该 agent 最近一条 hub 记录（原文备份：{bak}）"
 
     if name == "hub_list_skills":
         want = str(arguments.get("agent", "")).strip().lower()
@@ -146,7 +222,12 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_get_project", "description": "查看某项目的路径、文件与最近工作记录",
      "inputSchema": {"type": "object", "properties": {"project": {"type": "string", "description": "项目目录名"}}, "required": ["project"]}},
-    {"name": "hub_log_work", "description": "向项目工作记录.md 追加一条工作记录（所有 agent 应在完成任务后调用）",
+    {"name": "hub_create_project", "description": "按规范新建项目目录（「对象-问题」命名，含 input/output 与工作记录模板）",
+     "inputSchema": {"type": "object",
+                     "properties": {"project": {"type": "string", "description": "项目目录名，须含连字符"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["project"]}},
+    {"name": "hub_log_work", "description": "向项目工作记录.md 追加一条工作记录（所有 agent 应在完成任务后调用；走此工具的记录可撤销、进操作流水）",
      "inputSchema": {"type": "object",
                      "properties": {"project": {"type": "string"}, "agent": {"type": "string", "description": "你的 agent 名，如 ZCode/hermes"},
                                     "content": {"type": "string", "description": "做了什么/验证结果/如何回滚"},
@@ -154,12 +235,36 @@ TOOLS = [
                      "required": ["project", "agent", "content"]}},
     {"name": "hub_search", "description": "跨项目全文搜索工作记录与文件名",
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}},
+    {"name": "hub_get_rules", "description": "读取团队协作规范（目录命名/记录格式/铁律）",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_memory_read", "description": "读取公用大脑记忆（所有 agent 共享的知识：环境事实/用户偏好/项目进展）",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "hub_memory_write", "description": "写入公用大脑记忆，供其他 agent 读取（append 追加带时间戳，overwrite 谨慎用）",
+    {"name": "hub_memory_write", "description": "写入公用大脑记忆，供其他 agent 读取（append 追加带时间戳，overwrite 会先自动备份再覆写）",
      "inputSchema": {"type": "object",
-                     "properties": {"content": {"type": "string"}, "mode": {"type": "string", "enum": ["append", "overwrite"]}},
+                     "properties": {"content": {"type": "string"},
+                                    "mode": {"type": "string", "enum": ["append", "overwrite"]},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["content"]}},
+    {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃时会收到撞车预警，长任务开工前先调用",
+     "inputSchema": {"type": "object",
+                     "properties": {"agent": {"type": "string", "description": "你的 agent 名"},
+                                    "project": {"type": "string", "description": "正在工作的项目名"},
+                                    "note": {"type": "string", "description": "一句话说明在做什么"}},
+                     "required": ["agent"]}},
+    {"name": "hub_report_error", "description": "登记错误/踩坑（含回滚方式），用户与其他 agent 可在流水页查询。出错时主动调用",
+     "inputSchema": {"type": "object",
+                     "properties": {"title": {"type": "string", "description": "一句话错误摘要"},
+                                    "detail": {"type": "string", "description": "现象/原因/过程"},
+                                    "project": {"type": "string", "description": "相关项目名，可空"},
+                                    "undo": {"type": "string", "description": "如何回滚/撤销"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["title"]}},
+    {"name": "hub_list_errors", "description": "查询错误登记（可按 status=open/fixed 过滤），排查历史问题用",
+     "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["open", "fixed"]}}}},
+    {"name": "hub_undo", "description": "撤销你（agent）最近一条经 hub_log_work 写入的记录段（原文自动备份，操作进流水）",
+     "inputSchema": {"type": "object",
+                     "properties": {"agent": {"type": "string", "description": "你的 agent 名（只能撤自己的）"}},
+                     "required": ["agent"]}},
     {"name": "hub_list_skills", "description": "列出本机各 agent 的技能库（能力对齐：看别的 agent 会什么）",
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "可选，过滤 agent 名"}}}},
     {"name": "hub_list_mcps", "description": "列出本机各 agent 已配置的 MCP 服务器",
@@ -196,9 +301,16 @@ def handle_message(msg: dict, root: str) -> dict | None:
             text = call_tool(tname, args, root)
             return {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": text}], "isError": False}}
-        except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连
+        except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落盘错误登记
+            text = f"工具执行失败：{type(e).__name__}: {e}"
+            try:
+                core.report_error(root, str(args.get("agent") or "mcp-server"),
+                                  f"MCP 工具 {tname} 执行异常", text,
+                                  project=str(args.get("project") or ""))
+            except Exception:  # noqa: BLE001 登记失败不影响协议响应
+                pass
             return {"jsonrpc": "2.0", "id": mid,
-                    "result": {"content": [{"type": "text", "text": f"工具执行失败：{type(e).__name__}: {e}"}],
+                    "result": {"content": [{"type": "text", "text": text}],
                                "isError": True}}
     if is_notification:
         return None

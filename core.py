@@ -1,8 +1,10 @@
 # -*- coding: utf-8 -*-
-"""AgentHub 核心数据层：扫描、工作记录解析、对账、新建项目、搜索。
+"""AgentHub 核心数据层：扫描、工作记录解析、对账、新建项目、搜索、公用大脑。
 
-纯逻辑无 GUI 依赖，可独立测试。目录是唯一真理，本层只读为主，
-仅 create_project / move_to_project / save_rules 会写盘。
+纯逻辑无 GUI 依赖，可独立测试。目录是唯一真理。写盘入口收口：
+create_project / move_to_project / save_rules / write_text_backed /
+init_hub / journal / heartbeat / report_error / undo_log / bootstrap 注入，
+全部经 hub_lock 跨进程加锁并落操作流水。
 """
 from __future__ import annotations
 
@@ -11,6 +13,7 @@ import json
 import os
 import re
 import shutil
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
@@ -455,26 +458,453 @@ def memory_file(root: str) -> Path:
     return Path(root) / DIR_META / "memory.md"
 
 
-def write_text_backed(path: str, text: str) -> str:
-    """备份原文件后写新内容（记忆/全局配置编辑用）。返回错误或 ""。"""
+def write_text_backed(path: str, text: str, root: str = "", agent: str = "user",
+                      action: str = "edit") -> str:
+    """备份原文件后写新内容（记忆/全局配置编辑用）。文件不存在时直接创建。
+    传 root 则落操作流水。返回错误或 ""。"""
     p = Path(path)
-    if not p.is_file():
-        return "文件不存在"
+    bak = ""
     try:
-        _backup(p)
+        if p.is_file():
+            bak = _backup(p)
+        p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
     except OSError as e:
         return f"写入失败：{e}"
+    if root:
+        journal(root, agent, action, path, bak)
+    return ""
+
+
+# ---------------------------------------------------------------- hub 基础设施：锁 / 流水 / 心跳 / 错误 / 撤销
+
+HUB_LOCK = "hub"           # 全部写操作共用的锁名（写频率低，一把锁最简单且无死锁）
+SESSION_TTL = 1800         # 会话心跳陈旧阈值（秒）
+SESSION_ACTIVE = 300       # 同项目"正在工作"判定窗口（秒）
+
+
+def _hub_path(root: str, name: str) -> Path:
+    return Path(root) / DIR_META / name
+
+
+def journal_file(root: str) -> Path:
+    return _hub_path(root, "journal.jsonl")
+
+
+def errors_file(root: str) -> Path:
+    return _hub_path(root, "errors.jsonl")
+
+
+def sessions_file(root: str) -> Path:
+    return _hub_path(root, "sessions.json")
+
+
+class hub_lock:
+    """跨进程文件锁（_hub/locks/<name>.lock，O_CREAT|O_EXCL）。
+    等待 timeout 秒；持锁进程死掉留下的陈旧锁（>stale 秒）强拆。"""
+
+    def __init__(self, root: str, name: str = HUB_LOCK, timeout: float = 10.0, stale: float = 60.0):
+        self.root, self.name, self.timeout, self.stale = root, name, timeout, stale
+        self.fd = -1
+        self.path = Path(root) / DIR_META / "locks" / f"{name}.lock"
+
+    def __enter__(self):
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        deadline = time.monotonic() + self.timeout
+        while True:
+            try:
+                self.fd = os.open(self.path, os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+                os.write(self.fd, str(os.getpid()).encode())
+                return self
+            except FileExistsError:
+                try:
+                    age = time.time() - self.path.stat().st_mtime
+                    if age > self.stale:
+                        self.path.unlink()  # 陈旧锁（持锁进程已死）强拆
+                        continue
+                except OSError:
+                    pass  # 锁刚好被释放/被别人拆了，重试
+                if time.monotonic() > deadline:
+                    raise TimeoutError(f"获取 hub 锁超时：{self.name}（有其他 agent 正在写）")
+                time.sleep(0.05)
+            except OSError as e:
+                raise TimeoutError(f"创建锁失败：{e}")
+
+    def __exit__(self, *exc):
+        if self.fd >= 0:
+            os.close(self.fd)
+            try:
+                self.path.unlink()
+            except OSError:
+                pass
+        return False
+
+
+def journal(root: str, agent: str, action: str, target: str = "",
+            backup: str = "", note: str = "") -> None:
+    """追加一条操作流水到 _hub/journal.jsonl（可撤销操作的依据）。失败不阻断主操作。"""
+    if not root or not os.path.isdir(root):
+        return
+    rec = {"ts": datetime.datetime.now().isoformat(timespec="seconds"), "agent": agent,
+           "action": action, "target": target, "backup": backup, "note": note}
+    try:
+        with hub_lock(root):
+            f = journal_file(root)
+            f.parent.mkdir(parents=True, exist_ok=True)
+            with open(f, "a", encoding="utf-8") as fh:
+                fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001 流水是旁路，绝不影响主操作
+        pass
+
+
+def read_journal(root: str, limit: int = 200) -> list:
+    """读操作流水（最新在后）。坏行跳过。"""
+    try:
+        lines = read_text(journal_file(root)).splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in lines[-limit:]:
+        try:
+            d = json.loads(ln)
+            if isinstance(d, dict):
+                out.append(d)
+        except Exception:  # noqa: BLE001
+            continue
+    return out
+
+
+def _parse_ts(s: str):
+    try:
+        return datetime.datetime.fromisoformat(s)
+    except (ValueError, TypeError):
+        return None
+
+
+def heartbeat(root: str, agent: str, project: str = "", note: str = "") -> tuple:
+    """更新会话心跳。返回 (错误或"", 同项目其他活跃会话列表)。坏 sessions.json 自愈。"""
+    if not agent or not agent.strip():
+        return "agent 必填", []
+    now = datetime.datetime.now()
+    me = {"agent": agent.strip(), "project": project or "", "note": note or "",
+          "ts": now.isoformat(timespec="seconds")}
+    f = sessions_file(root)
+    try:
+        with hub_lock(root):
+            f.parent.mkdir(parents=True, exist_ok=True)
+            try:
+                data = json.loads(read_text(f) or "[]")
+                if not isinstance(data, list):
+                    raise ValueError("not a list")
+            except Exception:  # noqa: BLE001 坏文件：备份后重建
+                if f.exists():
+                    try:
+                        _backup(f)
+                    except OSError:
+                        pass
+                data = []
+            others = []
+            for s in data:
+                if not isinstance(s, dict) or s.get("agent") == me["agent"]:
+                    continue
+                ts = _parse_ts(s.get("ts", ""))
+                if ts and (now - ts).total_seconds() < SESSION_TTL:
+                    others.append(s)
+            f.write_text(json.dumps(others + [me], ensure_ascii=False, indent=1), encoding="utf-8")
+    except (OSError, TimeoutError) as e:
+        return f"心跳写入失败：{e}", []
+    active = [s for s in others
+              if project and s.get("project") == project
+              and _parse_ts(s.get("ts", ""))
+              and (now - _parse_ts(s["ts"])).total_seconds() < SESSION_ACTIVE]
+    return "", active
+
+
+def active_sessions(root: str) -> list:
+    """当前活跃会话（GUI 总览用），最新在前。"""
+    try:
+        data = json.loads(read_text(sessions_file(root)) or "[]")
+    except Exception:  # noqa: BLE001
+        return []
+    if not isinstance(data, list):
+        return []
+    now = datetime.datetime.now()
+    out = []
+    for s in data:
+        if not isinstance(s, dict):
+            continue
+        ts = _parse_ts(s.get("ts", ""))
+        if ts and (now - ts).total_seconds() < SESSION_TTL:
+            out.append(s)
+    return out
+
+
+def report_error(root: str, agent: str, title: str, detail: str = "",
+                 project: str = "", undo: str = "") -> str:
+    """登记错误到 _hub/errors.jsonl（自增 id）。返回错误或 ""。"""
+    if not root or not os.path.isdir(root):
+        return "根目录不存在"
+    if not title or not title.strip():
+        return "title 必填"
+    with hub_lock(root):
+        f = errors_file(root)
+        f.parent.mkdir(parents=True, exist_ok=True)
+        max_id = 0
+        if f.exists():
+            for ln in read_text(f).splitlines():
+                try:
+                    max_id = max(max_id, int(json.loads(ln).get("id", 0)))
+                except Exception:  # noqa: BLE001
+                    continue
+        rec = {"id": max_id + 1, "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+               "agent": agent or "unknown", "project": project or "",
+               "title": title.strip()[:200], "detail": (detail or "")[:4000],
+               "undo": undo or "", "status": "open"}
+        with open(f, "a", encoding="utf-8") as fh:
+            fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    return ""
+
+
+def list_errors(root: str, status: str = "") -> list:
+    """读错误登记（新在前）。status 传 "open"/"fixed" 过滤。"""
+    try:
+        lines = read_text(errors_file(root)).splitlines()
+    except OSError:
+        return []
+    out = []
+    for ln in reversed(lines):
+        try:
+            d = json.loads(ln)
+        except Exception:  # noqa: BLE001
+            continue
+        if isinstance(d, dict) and (not status or d.get("status") == status):
+            out.append(d)
+    return out
+
+
+def set_error_status(root: str, error_id: int, status: str) -> str:
+    """流转错误状态（open/fixed）。整文件读改写，先备份。返回错误或 ""。"""
+    if status not in ("open", "fixed"):
+        return "status 只能是 open/fixed"
+    f = errors_file(root)
+    if not f.is_file():
+        return "错误登记文件不存在"
+    lines = read_text(f).splitlines()
+    found = False
+    out = []
+    for ln in lines:
+        try:
+            d = json.loads(ln)
+        except Exception:  # noqa: BLE001
+            out.append(ln)
+            continue
+        if isinstance(d, dict) and d.get("id") == error_id:
+            d["status"] = status
+            out.append(json.dumps(d, ensure_ascii=False))
+            found = True
+        else:
+            out.append(ln)
+    if not found:
+        return f"未找到 id={error_id} 的错误"
+    bak = _backup(f)
+    try:
+        f.write_text("\n".join(out) + "\n", encoding="utf-8")
+    except OSError as e:
+        return f"写入失败：{e}"
+    journal(root, "user", "error_status", str(f), bak, note=f"id={error_id} → {status}")
+    return ""
+
+
+def undo_log(root: str, agent: str) -> tuple:
+    """撤销该 agent 最后一条经 hub_log_work 追加的工作记录段。
+    定位依据 = journal 中该 agent 最近一条未被撤销的 log_work（note=段头）。
+    返回 (错误或"", 备份路径)。"""
+    if not root or not os.path.isdir(root):
+        return "根目录不存在", ""
+    entries = read_journal(root, limit=1000)
+    undone = {e.get("note") for e in entries if e.get("action") == "undo_log_work"}
+    target = None
+    for e in reversed(entries):
+        if e.get("agent") != agent or e.get("action") != "log_work":
+            continue
+        if e.get("note") in undone:
+            continue
+        target = e
+        break
+    if not target:
+        return f"没有找到 {agent} 可撤销的 hub 记录", ""
+    rec_path = Path(target.get("target", ""))
+    entry = target.get("note", "")
+    if not rec_path.is_file() or not entry:
+        return "记录文件不存在或流水条目不完整", ""
+    with hub_lock(root):
+        lines = read_text(rec_path).splitlines()
+        start = None
+        for i, ln in enumerate(lines):
+            if ln.strip() == f"## {entry}" or ln.strip() == f"### {entry}":
+                start = i
+                break
+        if start is None:
+            return f"记录段「{entry}」已不在文件中（可能被手工编辑）", ""
+        # 边界只认 ## 级段头：log_work 写入的 content 可能自带 ### 小节，须一并删除
+        end = len(lines)
+        for j in range(start + 1, len(lines)):
+            if re.match(r"^##\s+", lines[j]):
+                end = j
+                break
+        bak = _backup(rec_path)
+        kept = lines[:start] + lines[end:]
+        rec_path.write_text("\n".join(kept).rstrip("\n") + "\n", encoding="utf-8")
+    journal(root, agent, "undo_log_work", str(rec_path), bak, note=entry)
+    return "", bak
+
+
+def restore_backup(path: str, backup: str, root: str = "") -> str:
+    """把 *.bak-agenthub-* 备份还原为正式文件（当前内容先再备份一次）。"""
+    p, b = Path(path), Path(backup)
+    if not b.is_file():
+        return "备份文件不存在"
+    if "bak-agenthub" not in b.name:
+        return "只允许还原 agenthub 生成的备份"
+    bak_now = _backup(p) if p.is_file() else ""
+    try:
+        shutil.copy2(b, p)
+    except OSError as e:
+        return f"还原失败：{e}"
+    if root:
+        journal(root, "user", "restore", path, bak_now, note=f"← {b.name}")
+    return ""
+
+
+# ---------------------------------------------------------------- hub 初始化
+
+HUB_MEMORY_TEMPLATE = """# 公用大脑共享记忆
+
+所有已接入 agent 共读写的记忆区（MCP 工具 hub_memory_read / hub_memory_write）。
+适合存放：机器环境事实、用户偏好、跨 agent 的项目进展、踩坑记录。
+append 追加带时间戳；整段修正用 GUI 能力中心编辑（自动备份）。
+"""
+
+
+def init_hub(root: str) -> str:
+    """初始化 _hub 与保留目录（幂等）：rules.md / memory.md / journal / errors / sessions。
+    返回错误或 ""。"""
+    if not root or not os.path.isdir(root):
+        return "根目录不存在"
+    try:
+        for d in (DIR_INBOX, DIR_ARCHIVE, DIR_META):
+            (Path(root) / d).mkdir(parents=True, exist_ok=True)
+        rf = rules_file(root)
+        if not rf.exists():
+            rf.write_text(DEFAULT_RULES, encoding="utf-8")
+        mf = memory_file(root)
+        if not mf.exists():
+            mf.write_text(HUB_MEMORY_TEMPLATE, encoding="utf-8")
+        for f in (journal_file(root), errors_file(root)):
+            if not f.exists():
+                f.touch()
+        sf = sessions_file(root)
+        if not sf.exists():
+            sf.write_text("[]", encoding="utf-8")
+    except OSError as e:
+        return f"初始化失败：{e}"
+    return ""
+
+
+# ---------------------------------------------------------------- 引导注入（agent 全局指令文件）
+
+BOOTSTRAP_BEGIN = "<!-- agenthub:begin -->"
+BOOTSTRAP_END = "<!-- agenthub:end -->"
+
+# 引导注入目标：各 agent 的全局指令文件（不存在则创建）
+BOOTSTRAP_TARGETS = [
+    {"agent": "ZCode", "path": "~/AGENTS.md"},
+    {"agent": "Claude Code", "path": "~/.claude/CLAUDE.md"},
+    {"agent": "Codex", "path": "~/.codex/AGENTS.md"},
+    {"agent": "DSH", "path": "~/.dsh/AGENTS.md"},
+]
+
+
+def bootstrap_text(root: str) -> str:
+    return f"""{BOOTSTRAP_BEGIN}
+## AgentHub 公用大脑（自动接入，请勿删除本标记块）
+
+你已接入 AgentHub MCP（工具前缀 hub_），数据根目录：{root}
+- 开工先对齐进度：hub_get_progress(limit=15)；相关背景先查 hub_memory_read；跨项目找线索用 hub_search
+- 干完活记录：hub_log_work(project, agent, content)，content 含 目的/做了什么/验证结果/如何回滚——
+  这就是全局规范「工作记录」要求的动作，MCP 可用时必须走这里，不可用才直写文件
+- 新项目先 hub_create_project(name)，命名「对象-问题」结构；不确定项目名先 hub_list_projects
+- 团队规范：hub_get_rules；有跨会话价值的知识：hub_memory_write(append)
+- 出错/受阻/踩坑：hub_report_error(title, detail, undo) 登记，undo 写回滚方式，方便任何人查询和撤销
+- 长任务开工先 hub_heartbeat(agent, project)：同项目有其他 agent 在干时会收到预警，防止撞车
+{BOOTSTRAP_END}"""
+
+
+def _strip_bootstrap(text: str) -> str:
+    b, e = text.find(BOOTSTRAP_BEGIN), text.find(BOOTSTRAP_END)
+    if b < 0 or e < 0 or e < b:
+        return text
+    return text[:b] + text[e + len(BOOTSTRAP_END):]
+
+
+def bootstrap_status(path: str) -> bool:
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    return p.is_file() and BOOTSTRAP_BEGIN in read_text(p)
+
+
+def inject_bootstrap(path: str, root: str, agent: str = "user") -> str:
+    """把引导块写入 agent 全局指令文件（幂等：先去旧块再注入，写前备份）。
+    返回错误或 ""。"""
+    if not root:
+        return "根目录未设置"
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        old = read_text(p) if p.is_file() else ""
+        body = _strip_bootstrap(old).rstrip("\n")
+        text = (body + "\n\n" + bootstrap_text(root) + "\n") if body.strip() \
+            else bootstrap_text(root) + "\n"
+        bak = _backup(p) if p.is_file() else ""
+        p.write_text(text, encoding="utf-8")
+    except OSError as e:
+        return f"写入失败：{e}"
+    journal(root, agent, "bootstrap_inject", str(p), bak)
+    return ""
+
+
+def remove_bootstrap(path: str, root: str, agent: str = "user") -> str:
+    """从 agent 全局指令文件移除引导块（写前备份）。返回错误或 ""。"""
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    if not p.is_file():
+        return "文件不存在"
+    old = read_text(p)
+    if BOOTSTRAP_BEGIN not in old:
+        return "未注入"
+    try:
+        bak = _backup(p)
+        p.write_text(_strip_bootstrap(old).rstrip("\n") + "\n", encoding="utf-8")
+    except OSError as e:
+        return f"写入失败：{e}"
+    journal(root, agent, "bootstrap_remove", str(p), bak)
     return ""
 
 
 # ---------------------------------------------------------------- agent MCP 配置读写（一键接入）
 
-# 各 agent 的 MCP 配置文件位置与 mcpServers 字典的键路径（存在才接入）
+# 各 agent 的 MCP 配置文件位置与 mcpServers 字典的键路径（存在才接入）。
+# boot = 该 agent 的引导注入目标（全局指令文件，inject_bootstrap 写入）。
 MCP_TARGETS = [
-    {"agent": "ZCode", "path": "~/.zcode/cli/config.json", "layout": "zcode"},
-    {"agent": "Claude Code", "path": "~/.claude.json", "layout": "standard"},
+    {"agent": "ZCode", "path": "~/.zcode/cli/config.json", "layout": "zcode", "boot": "~/AGENTS.md"},
+    {"agent": "Claude Code", "path": "~/.claude.json", "layout": "standard", "boot": "~/.claude/CLAUDE.md"},
 ]
+
+# 引导-only：暂不支持自动写 MCP 配置、但可注入引导规则的 agent
+BOOTSTRAP_ONLY = [
+    {"agent": "Codex", "path": "~/.codex/AGENTS.md"},
+    {"agent": "DSH", "path": "~/.dsh/AGENTS.md"},
+]
+
+BOOTSTRAP_TARGETS = [{"agent": t["agent"], "path": t["boot"]} for t in MCP_TARGETS] + BOOTSTRAP_ONLY
 
 MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py")

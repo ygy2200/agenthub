@@ -47,21 +47,33 @@ def build_hub(root: Path):
     (root / core.DIR_INBOX).mkdir()
 
 
+def fresh_hub(tmp, name) -> Path:
+    """独立 hub：隔离共享状态（错误自增 id / 心跳残留），保证用例可单跑复现。"""
+    root = Path(tmp) / name
+    build_hub(root)
+    return root
+
+
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
+    assert r["serverInfo"]["version"] == "1.3.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
     assert {"hub_list_projects", "hub_log_work", "hub_memory_read", "hub_memory_write",
             "hub_get_progress", "hub_list_skills", "hub_list_mcps", "hub_search",
-            "hub_get_project"} <= names
+            "hub_get_project", "hub_create_project", "hub_get_rules", "hub_heartbeat",
+            "hub_report_error", "hub_list_errors", "hub_undo"} <= names, names
+    assert len(names) == 15
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
-    # 工具抛异常 -> isError 而非崩溃（limit 传非法值触发 int() 异常）
+    # 工具抛异常 -> isError 而非崩溃（limit 传非法值触发 int() 异常），且自动落盘错误登记
     r = m.handle_message(rpc("tools/call", {"name": "hub_get_progress", "arguments": {"limit": "abc"}}, 2), str(root))
     assert r["result"]["isError"] is True, r
+    errs = core.list_errors(str(root))
+    assert any("hub_get_progress" in e.get("title", "") for e in errs), "工具异常未自动登记错误"
     # ping
     assert "result" in m.handle_message(rpc("ping"), str(root))
 
@@ -166,13 +178,245 @@ def t_mcp_access(tmp):
     assert core.install_mcp_entry(str(f4), "standard", py, srv, root) == ""
 
 
+# ---------------------------------------------------------------- v1.3 新增对抗用例
+
+def t_memory_overwrite(tmp):
+    root = str(Path(tmp) / "hub")
+    out = m.call_tool("hub_memory_write", {"content": "旧记忆第一条"}, root)
+    assert "append" in out
+    out = m.call_tool("hub_memory_write", {"content": "覆写后的全新记忆", "mode": "overwrite",
+                                           "agent": "zcode"}, root)
+    assert "overwrite" in out
+    mem = m.call_tool("hub_memory_read", {}, root)
+    assert "覆写后的全新记忆" in mem, mem
+    assert "旧记忆第一条" not in mem, "overwrite 没有清空旧内容！"
+    # overwrite 产生备份（write_text_backed 路径）
+    assert list((Path(root) / core.DIR_META).glob("memory.md.bak-agenthub-*")), "overwrite 未备份"
+    # 非法 mode
+    out = m.call_tool("hub_memory_write", {"content": "x", "mode": "drop"}, root)
+    assert "append 或 overwrite" in out
+    # 空 content
+    out = m.call_tool("hub_memory_write", {"content": "  "}, root)
+    assert "必填" in out
+    # journal 有埋点
+    jl = core.read_journal(root)
+    assert any(e.get("action") == "memory_overwrite" for e in jl)
+
+
+def t_concurrent_log_work(tmp):
+    root = Path(tmp) / "hub"
+    root_s = str(root)
+    p = root / "并发-记录"
+    p.mkdir()
+    (p / core.RECORD_NAME).write_text("# 工作记录\n", encoding="utf-8")
+    errs = []
+
+    def worker(i):
+        out = m.call_tool("hub_log_work", {"project": "并发-记录", "agent": f"并发{i}",
+                                           "content": f"第{i}号并发记录内容", "date": "2026-09-30"}, root_s)
+        if "已记录" not in out:
+            errs.append(out)
+
+    import threading
+    ts = [threading.Thread(target=worker, args=(i,)) for i in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    assert not errs, errs
+    rec = (p / core.RECORD_NAME).read_text(encoding="utf-8")
+    for i in range(8):
+        assert f"（并发{i}）" in rec, f"并发第{i}条丢失"
+        assert f"第{i}号并发记录内容" in rec, f"并发第{i}条内容交错丢失"
+    # journal 每行合法 JSON
+    jl = core.read_journal(root_s, limit=1000)
+    log_entries = [e for e in jl if e.get("action") == "log_work" and e.get("agent", "").startswith("并发")]
+    assert len(log_entries) == 8, f"journal 应有 8 条并发记录，实际 {len(log_entries)}"
+
+
+def t_heartbeat_conflict(root):
+    root = str(root)
+    out = m.call_tool("hub_heartbeat", {"agent": "alpha", "project": "测试-项目", "note": "改UI"}, root)
+    assert "无其他活跃会话" in out
+    # 第二个 agent 同项目 -> 收到撞车预警
+    out = m.call_tool("hub_heartbeat", {"agent": "beta", "project": "测试-项目", "note": "改驱动"}, root)
+    assert "撞车预警" in out and "alpha" in out, out
+    # log_work 返回值也带预警（alpha/beta 心跳都还活跃且同项目）
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "alpha",
+                                       "content": "alpha 的活干完了"}, root)
+    assert "撞车预警" in out, out
+    # 不同项目不预警
+    out = m.call_tool("hub_heartbeat", {"agent": "beta", "project": "别的-项目"}, root)
+    assert "无其他活跃会话" in out
+    # 陈旧清理：把 alpha 的 ts 手改到 1 小时前 -> beta 再心跳时 alpha 被清理
+    sf = Path(root) / core.DIR_META / "sessions.json"
+    data = json.loads(sf.read_text(encoding="utf-8"))
+    for s in data:
+        if s.get("agent") == "alpha":
+            s["ts"] = "2026-09-30T08:00:00"
+    sf.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+    out = m.call_tool("hub_heartbeat", {"agent": "beta", "project": "测试-项目"}, root)
+    assert "alpha" not in out, "陈旧会话未被清理"
+    data = json.loads(sf.read_text(encoding="utf-8"))
+    assert all(s.get("agent") != "alpha" for s in data)
+    # 坏 json 自愈：备份后重建
+    sf.write_text("{坏掉的json", encoding="utf-8")
+    out = m.call_tool("hub_heartbeat", {"agent": "gamma", "project": "x-y"}, root)
+    assert "心跳已更新" in out
+    json.loads(sf.read_text(encoding="utf-8"))  # 重建为合法 json
+    # agent 必填
+    out = m.call_tool("hub_heartbeat", {"agent": "  "}, root)
+    assert "必填" in out
+
+
+def t_errors_flow(root):
+    root = str(root)
+    out = m.call_tool("hub_report_error", {"agent": "deepseek", "title": "删错文件",
+                                           "detail": "把 output/a.png 删了", "project": "测试-项目",
+                                           "undo": "从回收站还原"}, root)
+    assert "已登记" in out
+    out = m.call_tool("hub_list_errors", {}, root)
+    assert "#1" in out and "删错文件" in out and "从回收站还原" in out
+    assert "[open]" in out
+    # 状态流转
+    assert core.set_error_status(root, 1, "fixed") == ""
+    out = m.call_tool("hub_list_errors", {"status": "fixed"}, root)
+    assert "删错文件" in out
+    out = m.call_tool("hub_list_errors", {"status": "open"}, root)
+    assert "删错文件" not in out
+    # 非法 status / 不存在 id
+    assert "open/fixed" in core.set_error_status(root, 1, "bad")
+    assert "未找到" in core.set_error_status(root, 99, "fixed")
+    # 自增 id
+    m.call_tool("hub_report_error", {"agent": "x", "title": "第二件错事"}, root)
+    errs = core.list_errors(root)
+    assert errs[0]["id"] == 2
+    # title 必填
+    out = m.call_tool("hub_report_error", {"agent": "x", "title": " "}, root)
+    assert "必填" in out
+
+
+def t_undo_log(root):
+    root_s = str(root)
+    rec = Path(root_s) / "测试-项目" / core.RECORD_NAME
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "undoA",
+                                       "content": "undoA 第一件事", "date": "2026-09-29"}, root_s)
+    assert "已记录" in out, out
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "undoA",
+                                       "content": "undoA 第二件事写错了", "date": "2026-09-30"}, root_s)
+    assert "已记录" in out, out
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "undoB",
+                                       "content": "undoB 的事不能被误伤", "date": "2026-09-30"}, root_s)
+    assert "已记录" in out, out
+    # 撤 undoA 最新一条
+    out = m.call_tool("hub_undo", {"agent": "undoA"}, root_s)
+    assert "已撤销" in out, out
+    text = rec.read_text(encoding="utf-8")
+    assert "第二件事写错了" not in text, "目标段未切除"
+    assert "undoA 第一件事" in text, "误伤更早的段"
+    assert "undoB 的事不能被误伤" in text, "误伤他人段"
+    assert "初始化记录" in text, "误伤文件原有内容"
+    # 重复撤销 = 栈式继续撤上一条（09-29 段），他人段与原文不动
+    out = m.call_tool("hub_undo", {"agent": "undoA"}, root_s)
+    assert "已撤销" in out, out
+    text = rec.read_text(encoding="utf-8")
+    assert "undoA 第一件事" not in text
+    assert "undoB 的事不能被误伤" in text and "初始化记录" in text
+    # 撤无可撤
+    out = m.call_tool("hub_undo", {"agent": "undoA"}, root_s)
+    assert "没有找到" in out, out
+    # 无记录的 agent
+    out = m.call_tool("hub_undo", {"agent": "没干活的"}, root_s)
+    assert "没有找到" in out, out
+    # agent 必填
+    out = m.call_tool("hub_undo", {"agent": ""}, root_s)
+    assert "必填" in out
+    # 撤销操作进流水，且原文有备份
+    jl = core.read_journal(root_s, limit=1000)
+    assert len([e for e in jl if e.get("action") == "undo_log_work"]) == 2
+    assert list(rec.parent.glob("工作记录.md.bak-agenthub-*"))
+
+
+def t_new_tools(tmp):
+    root_s = str(Path(tmp) / "hub")
+    # get_rules：未初始化时回退内置规则
+    out = m.call_tool("hub_get_rules", {}, root_s)
+    assert "对象-问题" in out
+    # 初始化后读文件内容
+    (Path(root_s) / core.DIR_META).mkdir(exist_ok=True)
+    (Path(root_s) / core.DIR_META / core.RULES_NAME).write_text("自定义规则v1", encoding="utf-8")
+    assert m.call_tool("hub_get_rules", {}, root_s) == "自定义规则v1"
+    # create_project 成功 + journal 埋点
+    out = m.call_tool("hub_create_project", {"project": "新工具新建-项目", "agent": "zcode"}, root_s)
+    assert "已创建" in out
+    assert (Path(root_s) / "新工具新建-项目" / "input").is_dir()
+    assert any(e.get("action") == "create_project" for e in core.read_journal(root_s))
+    # 注入拒绝：穿越 / 保留名 / 无连字符
+    out = m.call_tool("hub_create_project", {"project": "../逃逸"}, root_s)
+    assert "错误" in out
+    assert not (Path(root_s).parent / "逃逸").exists()
+    out = m.call_tool("hub_create_project", {"project": "CON"}, root_s)
+    assert "保留名" in out
+    out = m.call_tool("hub_create_project", {"project": "没有连字符"}, root_s)
+    assert "连字符" in out
+    # 重复创建幂等
+    out = m.call_tool("hub_create_project", {"project": "新工具新建-项目"}, root_s)
+    assert "已创建" in out
+
+
+def t_bootstrap(tmp):
+    root = str(Path(tmp) / "hub")
+    tgt = Path(tmp) / "boot" / "AGENTS.md"
+    tgt.parent.mkdir(parents=True)
+    original = "# 我的全局规则\n\n保持原样。\n"
+    tgt.write_text(original, encoding="utf-8")
+    # 注入
+    assert core.inject_bootstrap(str(tgt), root) == ""
+    text = tgt.read_text(encoding="utf-8")
+    assert "我的全局规则" in text, "原有内容丢失"
+    assert core.BOOTSTRAP_BEGIN in text and core.BOOTSTRAP_END in text
+    assert "hub_log_work" in text and root in text
+    assert core.bootstrap_status(str(tgt))
+    # 幂等：再注入只有一块，且原有内容仍不重复
+    assert core.inject_bootstrap(str(tgt), root) == ""
+    text2 = tgt.read_text(encoding="utf-8")
+    assert text2.count(core.BOOTSTRAP_BEGIN) == 1, "幂等失败：出现多块"
+    assert text2.count("我的全局规则") == 1
+    # 更新 root 路径后注入反映新路径
+    assert core.inject_bootstrap(str(tgt), "D:/新根") == ""
+    assert "D:/新根" in tgt.read_text(encoding="utf-8")
+    # 移除 -> 恢复为"原文 + 移除块后的干净版本"
+    assert core.remove_bootstrap(str(tgt), root) == ""
+    text3 = tgt.read_text(encoding="utf-8")
+    assert core.BOOTSTRAP_BEGIN not in text3
+    assert "我的全局规则" in text3
+    assert not core.bootstrap_status(str(tgt))
+    # 备份存在
+    assert list(tgt.parent.glob("AGENTS.md.bak-agenthub-*"))
+    # 未注入时移除
+    assert "未注入" in core.remove_bootstrap(str(tgt), root)
+    # 文件不存在自动创建（纯引导）
+    tgt2 = Path(tmp) / "boot2" / "deep" / "AGENTS.md"
+    assert core.inject_bootstrap(str(tgt2), root) == ""
+    assert core.bootstrap_status(str(tgt2))
+    # 四家目标定义完整
+    assert {t["agent"] for t in core.BOOTSTRAP_TARGETS} == {"ZCode", "Claude Code", "Codex", "DSH"}
+    for t in core.BOOTSTRAP_TARGETS:
+        assert t["path"].startswith("~/")
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
-    case("MCP协议（握手/通知/未知方法/工具异常/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/15工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
+    case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
+    case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
+    case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
+    case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))
+    case("撤销（只切自己最新段/误伤检查/栈式撤销）", lambda: t_undo_log(fresh_hub(tmp, "undo")))
+    case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
+    case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("一键接入（两种布局/备份/移除/坏json/幂等）", lambda: t_mcp_access(tmp))
     print()

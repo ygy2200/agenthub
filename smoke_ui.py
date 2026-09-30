@@ -103,6 +103,21 @@ def main():
         # 能力中心页冒烟
         check("能力中心页存在且已切导航", w.hub_page is not None)
         w.hub_page.viewCombo.setCurrentIndex(1)  # MCP 视图切换不崩
+        # 流水页冒烟（v1.3）：读 journal/errors 不崩、列表已填充
+        w.journal_page.reload()
+        check("流水页填充不崩", w.journal_page.jList.count() >= 0 and w.journal_page.errList.count() >= 0)
+        # 流水页撤销按钮路径（无 log_work 时点击只弹提示，不崩）
+        w.journal_page.undo_selected()
+        # 记忆历史下拉填充（v1.3）
+        w.hub_page.fill_baks(str(tmp / core.DIR_META / "memory.md"))
+        check("记忆历史下拉可用", hasattr(w.hub_page, "bak_items"))
+        # EditAssetDialog 冒烟（v1.3 修复的 NameError）
+        from ui import EditAssetDialog
+        dlg = EditAssetDialog(w, str(tmp / "红色沙漠-存档备份" / core.RECORD_NAME), "工作记录.md")
+        check("编辑对话框加载内容", "第二次记录" in dlg.text())
+        # 总览活跃会话冒烟
+        w.overview_page.set_sessions([])
+        check("总览活跃会话空态", w.overview_page.sessionBox.count() >= 1)
         w.close()
         app.quit()
 

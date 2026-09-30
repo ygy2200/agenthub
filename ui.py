@@ -287,6 +287,26 @@ class InboxPickDialog(MessageBoxBase):
         return [i.text() for i in self.listw.selectedItems()]
 
 
+class EditAssetDialog(MessageBoxBase):
+    """能力中心资产编辑器：记忆 / 规则 / 全局配置等文本文件（保存走自动备份）。"""
+
+    def __init__(self, win, path, name):
+        super().__init__(win)
+        self.titleLabel = SubtitleLabel(f"编辑：{name}")
+        self.edit = TextEdit()
+        p = Path(path)
+        self.edit.setPlainText(core.read_text(p) if p.is_file() else "")
+        self.edit.setMinimumSize(820, 460)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.edit)
+        self.yesButton.setText("保存")
+        self.cancelButton.setText("取消")
+        self.widget.setMinimumWidth(860)
+
+    def text(self):
+        return self.edit.toPlainText()
+
+
 # ---------------------------------------------------------------- 页面
 
 class ProjectPage(QWidget):
@@ -737,6 +757,145 @@ class AuditPage(QWidget):
             InfoBar.success("已复制建议名", "", duration=1500, parent=self.win)
 
 
+class JournalPage(QWidget):
+    """流水页：错误登记（谁错了、怎么回滚、处理状态）+ 全部写操作流水（可撤销）。
+    错误来源：MCP 工具执行异常自动落盘 + agent 主动 hub_report_error。"""
+
+    ACTION_CN = {
+        "log_work": "写工作记录", "undo_log_work": "撤销记录", "create_project": "新建项目",
+        "memory_append": "写记忆", "memory_overwrite": "覆写记忆", "memory_edit": "编辑记忆",
+        "edit": "编辑文件", "restore": "还原备份", "error_status": "流转错误状态",
+        "bootstrap_inject": "注入引导", "bootstrap_remove": "移除引导",
+        "mcp_connect": "接入MCP", "mcp_remove": "移除接入",
+    }
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        self.errors: list = []
+        self.journal: list = []
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+
+        top = QHBoxLayout()
+        top.addWidget(SubtitleLabel("流水 · 错误与操作"))
+        top.addStretch(1)
+        refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新")
+        refreshBtn.clicked.connect(self.reload)
+        top.addWidget(refreshBtn)
+        lay.addLayout(top)
+        lay.addWidget(CaptionLabel("agent 执行出错（自动/主动上报）在这里可查可流转；"
+                                   "每一次写操作（记录/记忆/接入/引导/还原）都有流水，记录类可撤销。"))
+
+        errCard = CardWidget()
+        g1 = QVBoxLayout(errCard)
+        g1.setContentsMargins(18, 12, 18, 12)
+        g1.setSpacing(6)
+        g1.addWidget(StrongBodyLabel("错误登记（open=待处理 · fixed=已处理）"))
+        self.errList = ListWidget()
+        self.errList.setMinimumHeight(150)
+        g1.addWidget(self.errList, 1)
+        errRow = QHBoxLayout()
+        self.fixBtn = PushButton("标记已修")
+        self.reopenBtn = PushButton("重新打开")
+        self.openProjBtn = PushButton(ic("FOLDER", "INFO"), "打开相关项目")
+        for b in (self.fixBtn, self.reopenBtn, self.openProjBtn):
+            errRow.addWidget(b)
+        errRow.addStretch(1)
+        g1.addLayout(errRow)
+        lay.addWidget(errCard, 2)
+
+        jCard = CardWidget()
+        g2 = QVBoxLayout(jCard)
+        g2.setContentsMargins(18, 12, 18, 12)
+        g2.setSpacing(6)
+        g2.addWidget(StrongBodyLabel("操作流水（最新在上，最近 200 条）"))
+        self.jList = ListWidget()
+        g2.addWidget(self.jList, 1)
+        jRow = QHBoxLayout()
+        self.undoBtn = PushButton(ic("REPEAT", "INFO"), "撤销选中的工作记录")
+        self.undoBtn.setToolTip("仅限各 agent 经 hub_log_work 写入的最新一条；原文会先自动备份")
+        jRow.addWidget(self.undoBtn)
+        jRow.addStretch(1)
+        g2.addLayout(jRow)
+        lay.addWidget(jCard, 3)
+
+        self.fixBtn.clicked.connect(lambda: self.set_status("fixed"))
+        self.reopenBtn.clicked.connect(lambda: self.set_status("open"))
+        self.openProjBtn.clicked.connect(self.open_project)
+        self.undoBtn.clicked.connect(self.undo_selected)
+
+    def reload(self):
+        if not self.win.root:
+            return
+        self.errors = core.list_errors(self.win.root)
+        self.errList.clear()
+        for e in self.errors:
+            self.errList.addItem(
+                f"#{e.get('id')} [{e.get('status')}] {e.get('ts', '')}  {e.get('agent')}"
+                f" · {e.get('project') or '无项目'}：{e.get('title')}"
+                + (f"  ｜回滚：{e['undo'][:60]}" if e.get("undo") else ""))
+        if not self.errors:
+            self.errList.addItem("（无错误登记）")
+        self.journal = core.read_journal(self.win.root, limit=200)
+        self.jList.clear()
+        for e in reversed(self.journal):
+            act = self.ACTION_CN.get(e.get("action"), e.get("action", ""))
+            tgt = Path(e.get("target", "") or "").name
+            self.jList.addItem(f"{e.get('ts', '')}  [{e.get('agent')}]  {act}  {tgt}"
+                               + (f"  {str(e.get('note'))[:70]}" if e.get("note") else ""))
+        if not self.journal:
+            self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
+
+    def set_status(self, status):
+        row = self.errList.currentRow()
+        if row < 0 or row >= len(self.errors):
+            InfoBar.warning("先选择一条错误登记", "", duration=2000, parent=self.win)
+            return
+        e = self.errors[row]
+        err = core.set_error_status(self.win.root, e.get("id"), status)
+        if err:
+            InfoBar.error("操作失败", err, duration=4000, parent=self.win)
+        else:
+            InfoBar.success("已更新", f"#{e.get('id')} → {status}", duration=2000, parent=self.win)
+        self.reload()
+
+    def open_project(self):
+        row = self.errList.currentRow()
+        if row < 0 or row >= len(self.errors):
+            return
+        p = self.errors[row].get("project", "")
+        d = Path(self.win.root) / p if p else None
+        if d and d.is_dir():
+            os.startfile(str(d))  # noqa: S606
+
+    def undo_selected(self):
+        row = self.jList.currentRow()
+        if row < 0 or row >= len(self.journal):
+            InfoBar.warning("先选择一条操作流水", "", duration=2000, parent=self.win)
+            return
+        e = self.journal[len(self.journal) - 1 - row]  # 列表最新在上，映射回原序
+        if e.get("action") != "log_work":
+            InfoBar.warning("只能撤销「写工作记录」类型的操作", "", duration=2500, parent=self.win)
+            return
+        agent = e.get("agent", "")
+        undone = {x.get("note") for x in self.journal if x.get("action") == "undo_log_work"}
+        latest = next((x for x in reversed(self.journal)
+                       if x.get("agent") == agent and x.get("action") == "log_work"
+                       and x.get("note") not in undone), None)
+        if latest is None or latest.get("ts") != e.get("ts") or latest.get("note") != e.get("note"):
+            InfoBar.warning("只能撤销该 agent 的最新一条记录",
+                            "先撤后面那条，再回来撤这条", duration=3000, parent=self.win)
+            return
+        err, bak = core.undo_log(self.win.root, agent)
+        if err:
+            InfoBar.error("撤销失败", err, duration=4000, parent=self.win)
+        else:
+            InfoBar.success("已撤销（原文已备份）", bak, duration=3000, parent=self.win)
+        self.reload()
+        self.win.refresh()
+
+
 class OverviewPage(QWidget):
     """总览首页：打开软件第一眼看到全局——今天谁在干活、有多少待处理、agent 阵容。"""
 
@@ -789,6 +948,10 @@ class OverviewPage(QWidget):
         self.agentBox = QVBoxLayout()
         self.agentBox.setSpacing(2)
         g2.addLayout(self.agentBox)
+        g2.addWidget(StrongBodyLabel("当前活跃会话（hub_heartbeat 上报）"))
+        self.sessionBox = QVBoxLayout()
+        self.sessionBox.setSpacing(2)
+        g2.addLayout(self.sessionBox)
         g2.addStretch(1)
         rightCol.addWidget(agentCard, 2)
         quickCard = CardWidget()
@@ -857,6 +1020,18 @@ class OverviewPage(QWidget):
             line = CaptionLabel(f"{'●' if a.detected else '○'} {a.name}：技能 {len(a.skills)} · MCP {len(a.mcps)} · 记忆 {len(a.memories)}")
             line.setToolTip(a.home or "未检测到，可在能力中心手动添加目录")
             self.agentBox.addWidget(line)
+
+    def set_sessions(self, sessions):
+        while self.sessionBox.count():
+            it = self.sessionBox.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        if not sessions:
+            self.sessionBox.addWidget(CaptionLabel("（暂无——agent 开工调 hub_heartbeat 后显示）"))
+            return
+        for s in sessions[:6]:
+            self.sessionBox.addWidget(CaptionLabel(
+                f"● {s.get('agent')} → {s.get('project') or '未指定'}  {s.get('note') or ''}"))
 
 
 class HubPage(QWidget):
@@ -941,6 +1116,14 @@ class HubPage(QWidget):
         self.editBtn.clicked.connect(self.edit_current)
         editRow.addWidget(self.editBtn)
         editRow.addStretch(1)
+        editRow.addWidget(CaptionLabel("历史备份"))
+        self.bakCombo = ComboBox()
+        self.bakCombo.setFixedWidth(320)
+        editRow.addWidget(self.bakCombo)
+        self.restoreBtn = PushButton(ic("SYNC", "INFO"), "还原选中备份")
+        self.restoreBtn.setEnabled(False)
+        self.restoreBtn.clicked.connect(self.restore_memory)
+        editRow.addWidget(self.restoreBtn)
         lay.addLayout(editRow)
 
         self.preview = TextBrowser()
@@ -1038,6 +1221,7 @@ class HubPage(QWidget):
         path = item.data(Qt.UserRole)
         self.cur_path = path
         self.cur_editable = False
+        self.fill_baks(path)
         if not path:
             self.preview.setHtml("<p style='color:#888'>无内容</p>")
             return
@@ -1063,11 +1247,37 @@ class HubPage(QWidget):
             return
         dlg = EditAssetDialog(self.win, self.cur_path, Path(self.cur_path).name)
         if dlg.exec():
-            err = core.write_text_backed(self.cur_path, dlg.text())
+            err = core.write_text_backed(self.cur_path, dlg.text(), root=self.win.root,
+                                         agent="user",
+                                         action="memory_edit" if self.stack.currentIndex() == 2 else "edit")
             if err:
                 InfoBar.error("保存失败", err, duration=4000, parent=self.win)
             else:
                 InfoBar.success("已保存（原文件已备份）", "", duration=2500, parent=self.win)
+
+    def fill_baks(self, path):
+        """列出当前选中资产的 agenthub 备份（仅记忆视图开放还原）。"""
+        self.bakCombo.clear()
+        self.bak_items = []
+        if path and self.stack.currentIndex() == 2:
+            p = Path(path)
+            if p.parent.is_dir():
+                for b in sorted(p.parent.glob(p.name + ".bak-agenthub-*"), reverse=True):
+                    self.bak_items.append(b)
+                    self.bakCombo.addItem(b.name)
+        self.restoreBtn.setEnabled(bool(self.bak_items))
+
+    def restore_memory(self):
+        idx = self.bakCombo.currentIndex()
+        if idx < 0 or idx >= len(self.bak_items) or not self.cur_path:
+            return
+        bak = self.bak_items[idx]
+        err = core.restore_backup(self.cur_path, str(bak), root=self.win.root)
+        if err:
+            InfoBar.error("还原失败", err, duration=4000, parent=self.win)
+        else:
+            InfoBar.success("已还原（当前内容先已再备份）", bak.name, duration=3000, parent=self.win)
+            self.fill_baks(self.cur_path)
 
     def on_open(self, item):
         path = item.data(Qt.UserRole)
@@ -1148,73 +1358,92 @@ class ConnectPage(QWidget):
         top.addWidget(refreshBtn)
         lay.addLayout(top)
         lay.addWidget(CaptionLabel(
-            "AgentHub 通过标准 MCP 协议向所有 agent 提供 9 个工具：项目登记 / 写工作记录 / 全文搜索 / "
-            "公用记忆读写 / 技能清单 / MCP 清单 / 进度对齐。接入后，你的 agent 指令里直接说"
-            "「把这次工作记录到 AgentHub」即可自动归档；每个 agent 也能看到其他 agent 的能力和进度。"))
+            "AgentHub 通过标准 MCP 协议向所有 agent 提供 15 个工具：项目登记/新建、工作记录（可撤销）、"
+            "全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、技能/MCP 清单、进度对齐。"
+            "「一键接入」写入 MCP 配置，「注入引导」把开工规则写进 agent 的全局指令文件——"
+            "两步都做，agent 才会在每次会话自然使用公用大脑，无需口头提醒。"))
 
         self.rows = QVBoxLayout()
         lay.addLayout(self.rows)
-        lay.addWidget(StrongBodyLabel("手动接入（hermes 等未自动探测到配置文件的 agent）"))
+        lay.addWidget(StrongBodyLabel("手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）"))
         self.snippet = TextBrowser()
         self.snippet.setMaximumHeight(180)
         lay.addWidget(self.snippet)
         copyBtn = PushButton(ic("COPY", "INFO"), "复制配置片段")
         copyBtn.clicked.connect(self.copy_snippet)
         lay.addWidget(copyBtn, 0, Qt.AlignRight)
-        lay.addWidget(CaptionLabel("接入会自动备份原配置文件为 *.bak-agenthub-时间戳，可随时移除接入还原。"))
+        lay.addWidget(CaptionLabel("所有写入（接入/引导）均先自动备份原文件为 *.bak-agenthub-时间戳，"
+                                   "可随时移除还原；操作全部进「流水」页可查。"))
         lay.addStretch(1)
         self.pyLabel = CaptionLabel("")
         lay.addWidget(self.pyLabel)
         QTimer.singleShot(400, self.refresh_status)
 
-    def _targets(self):
-        out = []
+    def _rows_data(self):
         py, server = core.deploy_server()
+        rows = []
         for t in core.MCP_TARGETS:
-            p = Path(os.path.expandvars(os.path.expanduser(t["path"])))
             data = core.read_mcp_config(t["path"])
-            connected = False
+            servers = {}
             if isinstance(data, dict):
                 servers = (data.get("mcp", {}).get("servers") if t["layout"] == "zcode"
                            else data.get("mcpServers")) or {}
-                connected = isinstance(servers, dict) and "agenthub" in servers
-            out.append((t["agent"], t["path"], t["layout"], connected))
-        return py, server, out
+            rows.append({"agent": t["agent"], "path": t["path"], "layout": t["layout"],
+                         "mcp": isinstance(servers, dict) and "agenthub" in servers,
+                         "boot_path": t["boot"]})
+        for b in core.BOOTSTRAP_ONLY:
+            rows.append({"agent": b["agent"], "path": "", "layout": "", "mcp": None,
+                         "boot_path": b["path"]})
+        return py, server, rows
 
     def refresh_status(self):
         while self.rows.count():
             it = self.rows.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
-        py, server, targets = self._targets()
+        py, server, rows = self._rows_data()
         if not py:
             self.pyLabel.setText("⚠ 未找到可用的 python.exe，无法自动接入（MCP server 需要 python 运行）")
         elif not server:
             self.pyLabel.setText("⚠ MCP server 部署失败")
         else:
             self.pyLabel.setText(f"服务端就绪：{server}")
-        for agent, path, layout, connected in targets:
+        for r in rows:
             card = CardWidget()
             g = QHBoxLayout(card)
             g.setContentsMargins(18, 10, 18, 10)
             col = QVBoxLayout()
-            col.addWidget(StrongBodyLabel(f"{agent}  {'✓ 已接入公用大脑' if connected else '○ 未接入'}"))
-            col.addWidget(CaptionLabel(f"配置文件：{path}"))
+            mcp_txt = "—（用下方配置片段手动接入）" if r["mcp"] is None else \
+                ("✓ 已接入公用大脑" if r["mcp"] else "○ 未接入")
+            boot_on = core.bootstrap_status(r["boot_path"])
+            col.addWidget(StrongBodyLabel(r["agent"]))
+            col.addWidget(CaptionLabel(f"MCP：{mcp_txt}      引导规则：{'✓ 已注入' if boot_on else '○ 未注入'}"))
+            if r["path"]:
+                col.addWidget(CaptionLabel(f"配置文件：{r['path']}"))
+            col.addWidget(CaptionLabel(f"引导写入：{r['boot_path']}"))
             g.addLayout(col, 1)
-            if connected:
-                rm = PushButton(ic("CLOSE", "INFO"), "移除接入")
-                rm.clicked.connect(lambda _, p=path, l=layout: self.do_remove(p, l))
-                g.addWidget(rm)
+            if r["mcp"] is not None:
+                if r["mcp"]:
+                    rm = PushButton(ic("CLOSE", "INFO"), "移除接入")
+                    rm.clicked.connect(lambda _, p=r["path"], l=r["layout"]: self.do_remove(p, l))
+                    g.addWidget(rm)
+                else:
+                    btn = PrimaryPushButton(ic("LINK", "INFO"), "一键接入")
+                    btn.setEnabled(bool(py and server))
+                    btn.clicked.connect(lambda _, p=r["path"], l=r["layout"]: self.do_connect(p, l))
+                    g.addWidget(btn)
+            if boot_on:
+                rb = PushButton("移除引导")
+                rb.clicked.connect(lambda _, p=r["boot_path"]: self.do_boot_remove(p))
+                g.addWidget(rb)
             else:
-                ok = bool(py and server)
-                btn = PrimaryPushButton(ic("LINK", "INFO"), "一键接入")
-                btn.setEnabled(ok)
-                btn.clicked.connect(lambda _, p=path, l=layout: self.do_connect(p, l))
-                g.addWidget(btn)
+                ib = PrimaryPushButton(ic("EDIT", "INFO"), "注入引导")
+                ib.clicked.connect(lambda _, p=r["boot_path"]: self.do_boot_inject(p))
+                g.addWidget(ib)
             self.rows.addWidget(card)
 
     def do_connect(self, path, layout):
-        py, server, _ = self._targets()
+        py, server, _ = self._rows_data()
         if not py or not server:
             InfoBar.error("无法接入", "python 或服务端未就绪", duration=3000, parent=self.win)
             return
@@ -1222,16 +1451,33 @@ class ConnectPage(QWidget):
         if err:
             InfoBar.error("接入失败", err, duration=5000, parent=self.win)
         else:
+            core.journal(self.win.root, "user", "mcp_connect", path)
             InfoBar.success("已接入", f"{path}（原文件已备份）", duration=3000, parent=self.win)
         self.refresh_status()
 
     def do_remove(self, path, layout):
         err = core.remove_mcp_entry(path, layout)
+        if not err:
+            core.journal(self.win.root, "user", "mcp_remove", path)
         InfoBar.success("已移除" if not err else "移除失败", err, duration=3000, parent=self.win)
         self.refresh_status()
 
+    def do_boot_inject(self, path):
+        err = core.inject_bootstrap(path, self.win.root)
+        if err:
+            InfoBar.error("注入失败", err, duration=5000, parent=self.win)
+        else:
+            InfoBar.success("引导已注入", f"{path}（原文件已备份，重启该 agent 生效）",
+                            duration=3000, parent=self.win)
+        self.refresh_status()
+
+    def do_boot_remove(self, path):
+        err = core.remove_bootstrap(path, self.win.root)
+        InfoBar.success("引导已移除" if not err else "移除失败", err, duration=3000, parent=self.win)
+        self.refresh_status()
+
     def _snippet_text(self):
-        py, server, _ = self._targets()
+        py, server, _ = self._rows_data()
         entry = {"agenthub": {"command": py or "D:/python311/python.exe",
                               "args": [server or r"C:\\Users\\y\\.agenthub\\mcp_server\\agenthub_mcp.py",
                                        self.win.root or "D:/AgentHub"]}}
@@ -1248,31 +1494,33 @@ class HelpPage(QWidget):
     CONTENT = """
     <h2>AgentHub 是什么</h2>
     <p>你电脑上所有 AI agent 的<b>公用大脑</b>和统一工作台：项目记录、投入产出文件、
-    工作记录、技能、MCP、记忆，全部在一个地方；agent 通过 MCP 协议接入后共享同一个记忆和进度。</p>
+    工作记录、技能、MCP、记忆，全部在一个地方；agent 通过 MCP 协议接入后共享同一个记忆和进度，
+    错误可查、操作可撤销、同项目干活有撞车预警。</p>
     <h2>各页面怎么用</h2>
     <ul>
-    <li><b>总览</b>：今天谁在干活、待处理数量、agent 阵容，一眼全局。</li>
+    <li><b>总览</b>：今天谁在干活、待处理数量、agent 阵容与当前活跃会话，一眼全局。</li>
     <li><b>项目</b>：左侧列表（最近活动优先），右侧看工作记录全文和文件总览；新建项目强制「对象-问题」命名；从 00_Inbox 分拣投入文件。</li>
     <li><b>时间线</b>：所有 agent 的工作记录按时间倒序，可按 agent/项目过滤，点击条目看完整操作步骤。</li>
+    <li><b>流水</b>：错误登记（agent 出错自动/主动上报，可标记已修、看回滚方式）+ 操作流水（每次写操作一条，记录类可一键撤销）。</li>
     <li><b>统计</b>：项目数、记录数、各 agent 工作量、月度活跃。</li>
     <li><b>搜索</b>：全文+文件名搜索，Ctrl+F 直达。</li>
-    <li><b>能力中心</b>：各 agent 的技能库 / MCP / 记忆 / 全局配置聚合；「技能市场」可从 anthropics/skills 安装新技能；记忆支持软件内编辑（自动备份）。</li>
-    <li><b>接入中心</b>：一键把 ZCode / Claude Code 等接入公用大脑（自动备份原配置）；hermes 等复制配置片段手动粘贴。</li>
+    <li><b>能力中心</b>：各 agent 的技能库 / MCP / 记忆 / 全局配置聚合；「技能市场」可从 anthropics/skills 安装新技能；记忆支持软件内编辑与历史备份还原（自动备份）。</li>
+    <li><b>接入</b>：一键写 MCP 配置 + 注入开工引导到 agent 全局指令文件（均自动备份、可移除）；hermes 等复制配置片段手动粘贴。</li>
     <li><b>对账</b>：揪出 agent 前缀平行目录、重复项目、野目录，杜绝记录分裂。</li>
     </ul>
-    <h2>agent 怎么接入公用大脑（三步）</h2>
-    <p>1. 到「接入中心」点「一键接入」（ZCode / Claude Code 支持自动写入）；<br>
-    2. 重启对应 agent；<br>
-    3. 对它说「把这次工作记录到 AgentHub」或「读一下公用记忆」——它就能用 hub_* 全部工具了。</p>
+    <h2>agent 怎么接入公用大脑（两步）</h2>
+    <p>1. 到「接入」页对某个 agent 点「一键接入」+「注入引导」（ZCode / Claude Code / Codex / DSH 支持）；<br>
+    2. 重启对应 agent——它每次开工就会自动读进度和记忆、干完活自动写记录、出错自动登记，无需口头提醒。</p>
     <h2>公用记忆是什么</h2>
     <p>能力中心 → 记忆 → 第一条「共享记忆」。所有已接入的 agent 都能读写（MCP 工具 hub_memory_read / hub_memory_write）。
     适合存放：机器环境事实、你的偏好、跨 agent 的项目进展。任何 agent 学到的东西，其他 agent 下次开工先读它。</p>
     <h2>常见问题</h2>
     <ul>
-    <li><b>数据在哪？</b>根目录（默认桌面 zcode项目记录）就是唯一真理，软件随时可删可重装。</li>
-    <li><b>会改我的 agent 配置吗？</b>只有你在接入中心主动点「接入」才会写，且每次写前自动备份。</li>
+    <li><b>数据在哪？</b>根目录（默认桌面 zcode项目记录）就是唯一真理，软件随时可删可重装；_hub 下是共享记忆/规则/流水/错误登记。</li>
+    <li><b>会改我的 agent 配置吗？</b>只有你在接入页主动点「接入/注入引导」才会写，且每次写前自动备份、可一键移除、操作进流水。</li>
     <li><b>MCP 配置里的密钥会被展示吗？</b>不会，界面只显示服务器名称和来源。</li>
-    <li><b>为什么我的项目记录没显示 agent 名？</b>识别优先级：记录段头括号 → 目录前缀 → 缺省 ZCode；也可以让 agent 接入后自动带名。</li>
+    <li><b>agent 记错了怎么撤？</b>「流水」页选中该条记录点撤销（只撤各 agent 最新一条，原文先备份）。</li>
+    <li><b>两个 agent 撞车怎么办？</b>agent 开工调 hub_heartbeat，同项目有别人活跃时会收到预警；总览页也能看到谁在干活。</li>
     </ul>
     """
 
@@ -1361,14 +1609,12 @@ class SettingsPage(QWidget):
         if not self.win.root:
             InfoBar.warning("先选择根目录", "", duration=2000, parent=self.win)
             return
-        try:
-            for d in (core.DIR_INBOX, core.DIR_PROJECTS, core.DIR_ARCHIVE, core.DIR_META):
-                (Path(self.win.root) / d).mkdir(exist_ok=True)
-            core.save_rules(self.win.root, core.load_rules(self.win.root))
-        except OSError as e:
-            InfoBar.error("初始化失败", str(e), duration=4000, parent=self.win)
+        err = core.init_hub(self.win.root)
+        if err:
+            InfoBar.error("初始化失败", err, duration=4000, parent=self.win)
             return
-        InfoBar.success("已初始化", "00_Inbox / projects / 99_Archive / _hub", duration=2500, parent=self.win)
+        InfoBar.success("已初始化", "00_Inbox / 99_Archive / _hub（规则·共享记忆·操作流水·错误登记）",
+                        duration=3000, parent=self.win)
         self.win.refresh()
 
     def save_rules(self):
@@ -1396,6 +1642,7 @@ class AgentHubWindow(FluentWindow):
         self.stats_page = StatsPage(self)
         self.search_page = SearchPage(self)
         self.audit_page = AuditPage(self)
+        self.journal_page = JournalPage(self)
         self.hub_page = HubPage(self)
         self.connect_page = ConnectPage(self)
         self.help_page = HelpPage(self)
@@ -1405,6 +1652,7 @@ class AgentHubWindow(FluentWindow):
             (self.overview_page, "HOME", "总览"),
             (self.project_page, "FOLDER", "项目"),
             (self.timeline_page, "HISTORY", "时间线"),
+            (self.journal_page, "DICTIONARY", "流水"),
             (self.stats_page, "TILES", "统计"),
             (self.search_page, "SEARCH", "搜索"),
             (self.hub_page, "LIBRARY", "能力中心"),
@@ -1514,11 +1762,19 @@ class AgentHubWindow(FluentWindow):
     def apply(self, snap):
         if snap.error and not snap.projects:
             InfoBar.error("扫描失败", snap.error, duration=4000, parent=self)
+        if self.root and not (Path(self.root) / core.DIR_META).is_dir() \
+                and not getattr(self, "_hub_warned", False):
+            self._hub_warned = True
+            InfoBar.warning("公用大脑未初始化",
+                            "到「设置」页点「初始化目录结构」——启用共享记忆、操作流水、错误登记",
+                            duration=6000, parent=self)
         self.project_page.set_snapshot(snap)
         self.timeline_page.set_snapshot(snap)
         self.stats_page.set_snapshot(snap)
         self.audit_page.set_snapshot(snap)
         self.overview_page.set_snapshot(snap)
+        self.overview_page.set_sessions(core.active_sessions(self.root) if self.root else [])
+        self.journal_page.reload()
 
 
 def run_gui():
