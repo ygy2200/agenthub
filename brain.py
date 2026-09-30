@@ -129,30 +129,53 @@ def init_db(root: str) -> str:
 # ---------------------------------------------------------------- 迁移（幂等增量）
 
 def _migrate_records(root: str) -> int:
-    """扫描全部项目目录的 工作记录.md，导入缺失记录；所有非保留目录登记进 projects。
-    返回本次导入条数。"""
+    """扫描全部项目目录导入记录；所有非保留目录登记进 projects。返回本次导入条数。
+
+    对齐 core.scan 的记录提取语义：
+    - 有 工作记录.md 用之；否则用目录下最新 md/txt 顶上，整篇无段头按 "[主文档]" 一条
+    - 段头/段内解析不出日期时用文档 mtime 兜底（fallback_date）
+    幂等：先清掉 date 为空的旧迁移记录（早期版本未传 fallback_date 的缺日期数据），
+    再按 (project,date,agent,title,content) 去重增量导入，可安全重复跑。
+    去重键含 content：同一项目里存在段头完全相同的多条段（如同名 "## 日期（agent）"），
+    只按段头去重会吞掉第二条的内容。"""
     n = 0
     with db_conn(root) as conn:
-        known = {(r["project"], r["date"], r["agent"], r["title"])
-                 for r in conn.execute("SELECT project,date,agent,title FROM records")}
+        conn.execute("DELETE FROM records WHERE source LIKE 'migrated:%' AND date=''")
+        known = {(r["project"], r["date"], r["agent"], r["title"], (r["content"] or "")[:256])
+                 for r in conn.execute("SELECT project,date,agent,title,content FROM records")}
         for entry in os.scandir(root):
             if not entry.is_dir() or entry.name in core.RESERVED:
                 continue
             conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)",
                          (entry.name, _now()))
-            rec = Path(entry.path) / core.RECORD_NAME
-            if not rec.is_file():
-                continue
+            p = Path(entry.path)
+            src = p / core.RECORD_NAME
+            if not src.is_file():
+                try:
+                    cands = [f for f in p.iterdir()
+                             if f.is_file() and f.suffix.lower() in core.SEARCH_EXTS]
+                except OSError:
+                    cands = []
+                if not cands:
+                    continue
+                src = max(cands, key=lambda f: f.stat().st_mtime)
             pm = core.AGENT_PREFIX_RE.match(entry.name)
             fallback = pm.group(1).lower() if pm else "zcode"
-            for r in core.parse_record(core.read_text(rec), fallback_agent=fallback):
-                key = (entry.name, r.date, r.agent, r.title)
+            entries = core.parse_record(core.read_text(src), fallback_agent=fallback,
+                                        fallback_date=core._mtime_date(src))
+            if not entries and src.name != core.RECORD_NAME:  # 主文档整篇无段头 → 文件级一条
+                entries = [core.RecordEntry(date=core._mtime_date(src), agent=fallback,
+                                            agent_raw="", title=f"[主文档] {src.name}", line_no=0,
+                                            body=core.read_text(src)[:4000])]
+            for r in entries:
+                key = (entry.name, r.date, r.agent, r.title, (r.body or "")[:256])
                 if key in known:
                     continue
                 conn.execute(
                     "INSERT INTO records(project,agent,date,title,content,source,created) "
                     "VALUES(?,?,?,?,?,?,?)",
-                    (entry.name, r.agent, r.date, r.title, r.body, f"migrated:{rec.name}:{r.line_no}", _now()))
+                    (entry.name, r.agent, r.date, r.title, r.body,
+                     f"migrated:{src.name}:{r.line_no}", _now()))
                 known.add(key)
                 n += 1
     return n
