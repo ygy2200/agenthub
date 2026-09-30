@@ -17,11 +17,15 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import agentscore  # noqa: E402
+import brain  # noqa: E402
 import core  # noqa: E402
 
+# 流水落库（brain.db）；文件版仅作兜底
+core.JOURNAL_SINK = brain.journal_add
+
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "1.3.1"}
-MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆文件
+SERVER_INFO = {"name": "agenthub", "version": "2.0.0"}
+MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
 # ---------------------------------------------------------------- 工具实现（纯函数，供测试直接调用）
@@ -52,26 +56,24 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         return f"错误：AgentHub 根目录不存在：{root}"
 
     if name == "hub_list_projects":
-        snap = core.scan(root)
-        lines = [f"共 {len(snap.projects)} 个项目（按最近活动排序，前 50）："]
-        for p in snap.projects[:50]:
-            n_rec = len(p.records)
-            lines.append(f"- {p.name}  最近活动:{p.last_active or '无'}  记录:{n_rec}条  路径:{p.path}")
+        rows = brain.list_projects(root)
+        lines = [f"共 {len(rows)} 个项目（按最近活动排序，前 50）："]
+        for p in rows:
+            lines.append(f"- {p['name']}  最近活动:{p['last_active'] or '无'}  记录:{p['n_records']}条")
         return "\n".join(lines)
 
     if name == "hub_get_project":
         pname = str(arguments.get("project", "")).strip()
-        snap = core.scan(root)
-        proj = next((p for p in snap.projects if p.name == pname), None)
+        proj = brain.get_project(root, pname)
         if not proj:
-            close = [p.name for p in snap.projects if pname.lower() in p.name.lower()][:8]
+            close = [p["name"] for p in brain.list_projects(root, 200) if pname.lower() in p["name"].lower()][:8]
             return f"项目不存在：{pname}。相近项目：{'、'.join(close) if close else '无'}"
-        out = [f"项目：{proj.name}", f"路径：{proj.path}", f"最近活动：{proj.last_active or '无'}",
-               f"文件：{'、'.join(rp for _, rp, _ in proj.files[:20]) or '无'}", "", "最近记录："]
-        for r in proj.records[-5:]:
-            out.append(f"[{r.date or '无日期'}|{r.agent}] {r.title}")
-            if r.body:
-                out.append("  " + r.body[:300].replace("\n", "\n  "))
+        out = [f"项目：{proj['name']}", f"归属:{proj['agent'] or '未知'}  最近活动：{proj['last_active'] or '无'}",
+               "", "最近记录："]
+        for r in proj["records"]:
+            out.append(f"[{r['date'] or '无日期'}|{r['agent']}] {r['title']}")
+            if r["content"]:
+                out.append("  " + r["content"][:300].replace("\n", "\n  "))
         return "\n".join(out)
 
     if name == "hub_log_work":
@@ -81,24 +83,16 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         err = _check_content(content, "content")
         if err:
             return err
+        if not pname:
+            return "错误：project 必填"
         # date 畸形兜底：从参数里提取 YYYY-MM-DD，取不到用今天
         dm = core.DATE_RE.search(str(arguments.get("date") or ""))
         date = dm.group(1) if dm else datetime.date.today().isoformat()
-        if not pname:
-            return "错误：project 必填"
-        proj_dir = Path(root) / pname
-        if not proj_dir.is_dir():
-            return (f"错误：项目目录不存在：{pname}（新项目先调 hub_create_project，"
-                    f"或用 hub_list_projects 核对现有项目名）")
-        rec = proj_dir / core.RECORD_NAME
-        entry = f"{date}（{agent}）"
-        with core.hub_lock(root):
-            with open(rec, "a", encoding="utf-8") as f:
-                f.write(f"\n## {entry}\n{content}\n")
-        core.journal(root, agent, "log_work", str(rec), note=entry)
-        err, active = core.heartbeat(root, agent, pname)
+        rec_id = brain.add_record(root, pname, agent, date, f"{date}（{agent}）", content)
+        core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
+        herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
-        return f"已记录到 {rec}（追加 {len(content)} 字符）{warn}"
+        return f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}"
 
     if name == "hub_create_project":
         pname = str(arguments.get("project", "")).strip()
@@ -106,55 +100,77 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         err = core.create_project(root, pname)
         if err:
             return f"错误：{err}"
-        core.journal(root, agent or "unknown", "create_project",
-                     str(Path(root) / pname))
-        return f"项目已创建：{pname}（含 input/output 与工作记录模板）"
+        with brain.db_conn(root) as conn:
+            conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (pname, brain._now()))
+        core.journal(root, agent or "unknown", "create_project", pname)
+        return f"项目已创建：{pname}（含 input/output 目录，记录存大脑数据库）"
 
     if name == "hub_search":
         kw = str(arguments.get("keyword", "")).strip()
-        hits = core.search(root, kw, max_hits=20)
-        if not hits:
+        res = brain.search_all(root, kw)
+        lines = []
+        for r in res["records"]:
+            lines.append(f"[记录] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:80]}")
+        for m in res["memories"]:
+            lines.append(f"[记忆#{m['id']}] {brain.KIND_CN.get(m['kind'], m['kind'])}：{m['content'][:100]}")
+        for f in res["files"]:
+            lines.append(f"[文件] {f['project']}\\{f['name']}")
+        if not lines:
             return f"无结果：{kw}"
-        return "\n".join(f"- [{h.project}] {Path(h.path).name}:{h.line_no}  {h.line[:120]}" for h in hits)
+        return "\n".join(lines[:40])
 
     if name == "hub_get_rules":
         return core.load_rules(root)
 
     if name == "hub_memory_read":
-        f = memory_path(root)
-        if not f.is_file():
-            return "（公用记忆为空。这是所有 agent 共享的记忆区，可写入项目进展、环境事实、用户偏好等）"
-        return core.read_text(f)
+        query = str(arguments.get("query", "")).strip()
+        kind = str(arguments.get("kind", "")).strip()
+        try:
+            limit = int(arguments.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        rows = brain.search_memories(root, query, kind, limit)
+        total = len(brain.search_memories(root, "", "", 1000))
+        if not rows:
+            return f"（大脑记忆无命中。当前共 {total} 条记忆；写入用 hub_memory_write）"
+        head = f"大脑记忆（共 {total} 条" + (f"，命中 {len(rows)} 条" if query or kind else "") + "）"
+        lines = [head]
+        for m in rows:
+            flag = "★" if m["pinned"] else "·"
+            tags = f" #{m['tags']}" if m["tags"] else ""
+            lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]{tags} {m['content'][:160]}")
+        lines.append("（hub_memory_write 写入；read 带 query/kind/limit 参数可检索）")
+        return "\n".join(lines)
 
     if name == "hub_memory_write":
         content = str(arguments.get("content", "")).strip()
         mode = str(arguments.get("mode", "append"))
+        kind = str(arguments.get("kind", "note")).strip()
+        tags = str(arguments.get("tags", "")).strip()
+        project = str(arguments.get("project", "")).strip()
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
+        pinned = bool(arguments.get("pinned", False))
         err = _check_content(content, "content")
         if err:
             return err
-        if mode not in ("append", "overwrite"):
-            return "错误：mode 只能是 append 或 overwrite"
-        f = memory_path(root)
-        with core.hub_lock(root):
-            if mode == "overwrite":
-                err = core.write_text_backed(str(f), content + "\n", root=root, agent=agent,
-                                             action="memory_overwrite")
-                if err:
-                    return f"错误：{err}"
-            else:
-                f.parent.mkdir(parents=True, exist_ok=True)
-                stamp = datetime.datetime.now().strftime("%Y-%m-%d %H:%M")
-                with open(f, "a", encoding="utf-8") as fh:
-                    fh.write(f"\n[{stamp}] {content}\n")
-        core.journal(root, agent, f"memory_{mode}", str(f))
-        return f"已写入公用记忆（{mode}），当前所有 agent 可读"
+        if mode not in ("append", "overwrite", "new"):
+            return "错误：mode 只能是 append/new 或 overwrite"
+        if mode == "overwrite":
+            # overwrite 语义：按内容精确匹配更新旧条目（v1 文本时代遗留接口），否则当新条目
+            rows = brain.search_memories(root, content[:80], "", 1)
+            if rows and rows[0]["content"] == content:
+                brain.edit_memory(root, rows[0]["id"], content=content, kind=kind if kind in brain.KINDS else "")
+                core.journal(root, agent, "memory_overwrite", f"brain:memories#{rows[0]['id']}")
+                return f"已更新大脑记忆 #{rows[0]['id']}"
+        mid = brain.add_memory(root, content, kind, tags, project, agent, pinned)
+        core.journal(root, agent, "memory_append", f"brain:memories#{mid}", note=kind)
+        return f"已写入大脑记忆 #{mid}（{brain.KIND_CN.get(kind, kind)}），所有 agent 可读可检索"
 
     if name == "hub_heartbeat":
         agent = str(arguments.get("agent", "")).strip()
         project = str(arguments.get("project", "")).strip()
         note = str(arguments.get("note", "")).strip()
-        err, active = core.heartbeat(root, agent, project, note)
+        err, active = brain.heartbeat_touch(root, agent, project, note)
         if err:
             return f"错误：{err}"
         return ("心跳已更新" + _conflict_warn(active)) if active else "心跳已更新（同项目无其他活跃会话）"
@@ -165,19 +181,19 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         detail = str(arguments.get("detail", "")).strip()
         project = str(arguments.get("project", "")).strip()
         undo = str(arguments.get("undo", "")).strip()
-        err = core.report_error(root, agent, title, detail, project, undo)
-        return f"错误已登记，其他 agent 与用户可在 AgentHub 流水页看到" if not err else f"错误：{err}"
+        err = brain.error_add(root, agent, title, detail, project, undo)
+        return "错误已登记进大脑，用户与其他 agent 可在流水页/查询工具看到" if not err else f"错误：{err}"
 
     if name == "hub_list_errors":
         status = str(arguments.get("status", "")).strip()
-        errs = core.list_errors(root, status if status in ("open", "fixed") else "")
+        errs = brain.error_list(root, status if status in ("open", "fixed") else "")
         if not errs:
             return "（无错误登记）"
         lines = [f"共 {len(errs)} 条错误登记（新在前）："]
         for e in errs[:30]:
-            lines.append(f"- #{e.get('id')} [{e.get('status')}] {e.get('ts', '')} {e.get('agent')}·"
-                         f"{e.get('project') or '无项目'}：{e.get('title')}")
-            if e.get("undo"):
+            lines.append(f"- #{e['id']} [{e['status']}] {e['ts']} {e['agent']}·"
+                         f"{e['project'] or '无项目'}：{e['title']}")
+            if e["undo"]:
                 lines.append(f"  回滚方式：{e['undo']}")
         return "\n".join(lines)
 
@@ -185,10 +201,11 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         agent = str(arguments.get("agent", "")).strip()
         if not agent:
             return "错误：agent 必填（只允许撤销自己的记录）"
-        err, bak = core.undo_log(root, agent)
+        err, info = brain.undo_last_record(root, agent)
         if err:
             return f"错误：{err}"
-        return f"已撤销该 agent 最近一条 hub 记录（原文备份：{bak}）"
+        core.journal(root, agent, "undo_log_work", "brain:records", note=info)
+        return f"已撤销该 agent 最近一条 hub 记录（软删，可在流水追溯）：{info}"
 
     if name == "hub_list_skills":
         want = str(arguments.get("agent", "")).strip().lower()
@@ -221,17 +238,15 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         except (TypeError, ValueError):
             limit = 30
         limit = max(1, min(limit, 200))
-        snap = core.scan(root)
-        entries = sorted((r for p in snap.projects for r in p.records),
-                         key=lambda r: (r.date, r.project), reverse=True)[:limit]
+        entries = brain.get_progress(root, limit)
         by_agent: dict = {}
         for r in entries:
-            by_agent.setdefault(r.agent or "其他", []).append(r)
+            by_agent.setdefault(r["agent"] or "其他", []).append(r)
         lines = ["各 agent 最近工作（对齐进度用）："]
         for a, rs in sorted(by_agent.items()):
             lines.append(f"[{a}]")
             for r in rs[:10]:
-                lines.append(f"  {r.date} {r.project}：{r.title[:60]}")
+                lines.append(f"  {r['date']} {r['project']}：{r['title'][:60]}")
         return "\n".join(lines)
 
     return f"未知工具：{name}"
@@ -257,13 +272,20 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}},
     {"name": "hub_get_rules", "description": "读取团队协作规范（目录命名/记录格式/铁律）",
      "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "hub_memory_read", "description": "读取公用大脑记忆（所有 agent 共享的知识：环境事实/用户偏好/项目进展）",
-     "inputSchema": {"type": "object", "properties": {}}},
-    {"name": "hub_memory_write", "description": "写入公用大脑记忆，供其他 agent 读取（append 追加带时间戳，overwrite 会先自动备份再覆写）",
+    {"name": "hub_memory_read", "description": "读取大脑记忆库（结构化：环境事实/用户偏好/踩坑经验/项目进展/随手记）。带 query 可关键词检索，kind 按类型过滤",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string", "description": "关键词检索，缺省返回置顶+最近概览"},
+                                    "kind": {"type": "string", "enum": ["fact", "preference", "lesson", "project", "note"]},
+                                    "limit": {"type": "integer"}}}},
+    {"name": "hub_memory_write", "description": "写入一条大脑记忆，供所有 agent 检索。kind 建议明确：环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project",
      "inputSchema": {"type": "object",
                      "properties": {"content": {"type": "string"},
-                                    "mode": {"type": "string", "enum": ["append", "overwrite"]},
-                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                                    "kind": {"type": "string", "enum": ["fact", "preference", "lesson", "project", "note"], "description": "记忆类型，缺省 note"},
+                                    "tags": {"type": "string", "description": "标签，逗号分隔"},
+                                    "project": {"type": "string", "description": "相关项目，可空"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"},
+                                    "pinned": {"type": "boolean", "description": "置顶（每次读记忆优先展示）"},
+                                    "mode": {"type": "string", "enum": ["append", "overwrite"], "description": "append 新增（默认）；overwrite 按内容匹配更新"}},
                      "required": ["content"]}},
     {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃时会收到撞车预警，长任务开工前先调用",
      "inputSchema": {"type": "object",
@@ -321,12 +343,12 @@ def handle_message(msg: dict, root: str) -> dict | None:
             text = call_tool(tname, args, root)
             return {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": text}], "isError": False}}
-        except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落盘错误登记
+        except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落库错误登记
             text = f"工具执行失败：{type(e).__name__}: {e}"
             try:
-                core.report_error(root, str(args.get("agent") or "mcp-server"),
-                                  f"MCP 工具 {tname} 执行异常", text,
-                                  project=str(args.get("project") or ""))
+                brain.error_add(root, str(args.get("agent") or "mcp-server"),
+                                f"MCP 工具 {tname} 执行异常", text,
+                                project=str(args.get("project") or ""))
             except Exception:  # noqa: BLE001 登记失败不影响协议响应
                 pass
             return {"jsonrpc": "2.0", "id": mid,

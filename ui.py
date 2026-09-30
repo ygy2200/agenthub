@@ -26,6 +26,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, Fluen
                             TextEdit, TitleLabel, setTheme, Theme)
 
 import agentscore
+import brain
 import core
 
 
@@ -146,14 +147,17 @@ class ScanWorker(QThread):
 
 
 class SearchWorker(QThread):
-    done = Signal(list)
+    done = Signal(object)
 
     def __init__(self, root, keyword, parent=None):
         super().__init__(parent)
         self.root, self.keyword = root, keyword
 
     def run(self):
-        self.done.emit(core.search(self.root, self.keyword))
+        try:
+            self.done.emit(brain.search_all(self.root, self.keyword))
+        except Exception as e:  # noqa: BLE001
+            self.done.emit(e)
 
 
 class FnWorker(QThread):
@@ -194,23 +198,23 @@ class ClickBodyLabel(BodyLabel):
 
 
 class RecordDetailDialog(MessageBoxBase):
-    """时间线记录详情：标题 + 元信息 + 段正文渲染。"""
+    """时间线记录详情：标题 + 元信息 + 段正文渲染（接收 DB records 行 dict）。"""
 
-    def __init__(self, win, r):
+    def __init__(self, win, r: dict):
         super().__init__(win)
-        self.titleLabel = SubtitleLabel(r.title[:60])
+        self.titleLabel = SubtitleLabel((r.get("title") or "(无标题)")[:60])
         meta = QHBoxLayout()
-        meta.addWidget(badge(r.agent, r.agent_raw))
-        meta.addWidget(CaptionLabel(f"{r.date or '日期未标注'} · {r.project} · {r.line_no} 行起"))
+        meta.addWidget(badge(r.get("agent", ""), ""))
+        meta.addWidget(CaptionLabel(f"{r.get('date') or '日期未标注'} · {r.get('project', '')} · 记录#{r.get('id', '?')}"))
         meta.addStretch(1)
         self.browser = TextBrowser()
-        self.browser.setHtml(md_to_html(r.body or r.title))
+        self.browser.setHtml(md_to_html(r.get("content") or r.get("title") or ""))
         self.browser.setMinimumSize(860, 480)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addLayout(meta)
         self.viewLayout.addWidget(self.browser)
         openBtn = PushButton(ic("FOLDER", "INFO"), "打开项目目录")
-        openBtn.clicked.connect(lambda: open_location(str(Path(win.root) / r.project), select=False))
+        openBtn.clicked.connect(lambda: open_location(str(Path(win.root) / r.get("project", "")), select=False))
         self.viewLayout.addWidget(openBtn, 0, Qt.AlignRight)
         self.yesButton.setText("关闭")
         self.cancelButton.hide()
@@ -307,6 +311,55 @@ class EditAssetDialog(MessageBoxBase):
         return self.edit.toPlainText()
 
 
+class MemoryEditDialog(MessageBoxBase):
+    """大脑记忆编辑器：内容 + 类型 + 标签 + 置顶（编辑已有条目传 m，新建传 None）。"""
+
+    def __init__(self, win, m: dict | None):
+        super().__init__(win)
+        self.titleLabel = SubtitleLabel("编辑记忆" if m else "新建记忆")
+        self.edit = TextEdit()
+        self.edit.setPlainText((m or {}).get("content", ""))
+        self.edit.setMinimumSize(720, 360)
+        row = QHBoxLayout()
+        row.addWidget(CaptionLabel("类型"))
+        self.kindCombo = ComboBox()
+        for k, cn in brain.KIND_CN.items():
+            self.kindCombo.addItem(f"{cn}（{k}）", k)
+        if m:
+            idx = self.kindCombo.findData(m.get("kind", "note"))
+            self.kindCombo.setCurrentIndex(idx if idx >= 0 else 4)
+        else:
+            self.kindCombo.setCurrentIndex(4)  # 默认 note
+        row.addWidget(self.kindCombo)
+        row.addWidget(CaptionLabel("标签（逗号分隔）"))
+        self.tagsEdit = LineEdit()
+        self.tagsEdit.setText((m or {}).get("tags", ""))
+        row.addWidget(self.tagsEdit, 1)
+        self.pinBox = None
+        from qfluentwidgets import CheckBox
+        self.pinBox = CheckBox("置顶（优先展示）")
+        self.pinBox.setChecked(bool((m or {}).get("pinned", False)))
+        row.addWidget(self.pinBox)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.edit)
+        self.viewLayout.addLayout(row)
+        self.yesButton.setText("保存")
+        self.cancelButton.setText("取消")
+        self.widget.setMinimumWidth(780)
+
+    def content(self):
+        return self.edit.toPlainText()
+
+    def kind(self):
+        return self.kindCombo.currentData() or "note"
+
+    def tags(self):
+        return self.tagsEdit.text().strip()
+
+    def pinned(self):
+        return bool(self.pinBox and self.pinBox.isChecked())
+
+
 # ---------------------------------------------------------------- 页面
 
 class ProjectPage(QWidget):
@@ -373,8 +426,12 @@ class ProjectPage(QWidget):
     # ---- 数据
     def set_snapshot(self, snap):
         self.snap = snap
+        try:
+            self.db_projects = brain.list_projects(self.win.root, 200)
+        except Exception:
+            self.db_projects = []
         selected = self.current
-        names = [p.name for p in snap.projects]
+        names = [p["name"] for p in self.db_projects]
         self.rebuild_list()
         if selected in names:
             self.listw.setCurrentRow(names.index(selected))
@@ -385,36 +442,43 @@ class ProjectPage(QWidget):
         kw = self.filterEdit.text().strip().lower()
         self.listw.blockSignals(True)
         self.listw.clear()
-        if self.snap:
-            for p in self.snap.projects:
-                if kw in p.name.lower():
-                    self.listw.addItem(p.name)
+        for p in getattr(self, "db_projects", []):
+            if kw in p["name"].lower():
+                n = p.get("n_records", 0)
+                self.listw.addItem(f"{p['name']}   ({n}条)")
         self.listw.blockSignals(False)
         if self.listw.count():
             self.listw.setCurrentRow(0)
 
     def on_select(self, row):
-        if not self.snap or row < 0 or row >= self.listw.count():
+        if row < 0 or row >= self.listw.count():
             return
-        name = self.listw.item(row).text()
-        proj = next((p for p in self.snap.projects if p.name == name), None)
+        name = self.listw.item(row).text().rsplit("   (", 1)[0]
+        proj_scan = next((p for p in self.snap.projects if p.name == name), None) if self.snap else None
         self.current = name
-        if not proj:
-            return
-        self.nameLabel.setText(proj.name)
-        self.pathLabel.setText(proj.path)
-        self.issueLabel.setText("⚠ " + "；".join(proj.issues) if proj.issues else "")
-        if proj.doc_path:
-            md = core.read_text(Path(proj.doc_path))
+        self.nameLabel.setText(name)
+        self.pathLabel.setText(str(Path(self.win.root) / name))
+        issues = proj_scan.issues if proj_scan else []
+        self.issueLabel.setText("⚠ " + "；".join(issues) if issues else "")
+        # 工作记录正文：大脑数据库
+        try:
+            recs = brain.list_records(self.win.root, project=name, limit=500)
+        except Exception:
+            recs = []
+        if recs:
+            md = "\n\n".join(f"## {r['title']}\n{r['content']}" for r in reversed(recs))
             self.browser.setHtml(md_to_html(md))
+        elif proj_scan and proj_scan.doc_path:
+            self.browser.setHtml(md_to_html(core.read_text(Path(proj_scan.doc_path))))
         else:
-            self.browser.setHtml("<p style='color:#888'>无 工作记录.md，也无可用 md/txt 主文档</p>")
+            self.browser.setHtml("<p style='color:#888'>大脑中无此项目记录，目录中也无可用主文档</p>")
         self.fileList.clear()
-        for group, rp, fp in proj.files:
-            self.fileList.addItem(f"[{group}]  {rp}")
-            self.fileList.item(self.fileList.count() - 1).setData(Qt.UserRole, fp)
-        if not proj.files:
-            self.fileList.addItem("（空目录）")
+        if proj_scan:
+            for group, rp, fp in proj_scan.files:
+                self.fileList.addItem(f"[{group}]  {rp}")
+                self.fileList.item(self.fileList.count() - 1).setData(Qt.UserRole, fp)
+            if not proj_scan.files:
+                self.fileList.addItem("（空目录）")
 
     def open_file_loc(self, item):
         fp = item.data(Qt.UserRole)
@@ -506,17 +570,19 @@ class TimelinePage(QWidget):
         self.agentFilter.currentIndexChanged.connect(self.rebuild)
         self.projFilter.currentIndexChanged.connect(self.rebuild)
 
-    def set_snapshot(self, snap):
-        self.projects = snap.projects
-        entries = []
-        for p in snap.projects:
-            entries.extend(p.records)
-        entries.sort(key=lambda r: r.date, reverse=True)
+    def set_records(self, rows: list):
+        """时间线数据源 = 大脑数据库 records 表（dict 行）。"""
+        self.projects = sorted({r["project"] for r in rows})
+        entries = rows
         self.all_entries = entries
 
-        # 过滤器填充（保持当前选择）
-        agents = ["全部"] + [AGENT_CN.get(a, a) for a in sorted(snap.agent_counts.keys())]
-        projs = ["全部"] + [p.name for p in snap.projects]
+        # 过滤器填充（保持当前选择）；项目列表取全量（无记录项目也可过滤）
+        agents = ["全部"] + [AGENT_CN.get(a, a) for a in sorted({r.get("agent", "") for r in rows} - {""})]
+        try:
+            all_projects = [p["name"] for p in brain.list_projects(self.win.root, 200)]
+        except Exception:
+            all_projects = self.projects
+        projs = ["全部"] + all_projects
         for combo, items in ((self.agentFilter, agents), (self.projFilter, projs)):
             combo.blockSignals(True)
             cur = combo.currentText()
@@ -534,9 +600,9 @@ class TimelinePage(QWidget):
         out = self.all_entries
         if a and a != "全部":
             want = {v: k for k, v in AGENT_CN.items()}.get(a, a.lower())
-            out = [r for r in out if r.agent == want]
+            out = [r for r in out if r.get("agent", "") == want]
         if pj and pj != "全部":
-            out = [r for r in out if r.project == pj]
+            out = [r for r in out if r.get("project", "") == pj]
         return out
 
     def rebuild(self):
@@ -550,7 +616,7 @@ class TimelinePage(QWidget):
         cur_date = None
         card_lay = None
         for r in shown:
-            d = r.date or "日期未标注"
+            d = r.get("date") or "日期未标注"
             if d != cur_date:
                 cur_date = d
                 card = CardWidget()
@@ -560,15 +626,15 @@ class TimelinePage(QWidget):
                 card_lay.addWidget(StrongBodyLabel(d))
                 self.box.addWidget(card)
             row = QHBoxLayout()
-            row.addWidget(badge(r.agent, r.agent_raw))
-            title = ClickBodyLabel(r.title[:80])
-            title.setToolTip(f"{r.project} · {r.title}\n点击查看完整记录")
+            row.addWidget(badge(r.get("agent", ""), ""))
+            title = ClickBodyLabel((r.get("title") or "(无标题)")[:80])
+            title.setToolTip(f"{r.get('project', '')} · {r.get('title', '')}\n点击查看完整记录")
             title.setCursor(Qt.PointingHandCursor)
             title.clicked.connect(lambda _, rr=r: self.show_detail(rr))
-            proj_btn = PushButton(r.project[:18])
+            proj_btn = PushButton(r.get("project", "")[:18])
             proj_btn.setFixedHeight(26)
-            proj_btn.setToolTip(r.project)
-            proj_btn.clicked.connect(lambda _, n=r.project: self.jump(n))
+            proj_btn.setToolTip(r.get("project", ""))
+            proj_btn.clicked.connect(lambda _, n=r.get("project", ""): self.jump(n))
             row.addWidget(title, 1)
             row.addWidget(proj_btn)
             card_lay.addLayout(row)
@@ -624,10 +690,11 @@ class StatsPage(QWidget):
             lay.addWidget(gb)
         lay.addStretch(1)
 
-    def set_snapshot(self, snap):
-        self.cardProj.value.setText(str(len(snap.projects)))
-        self.cardRec.value.setText(str(snap.total_records))
-        self.cardIssue.value.setText(str(len(snap.issues)))
+    def set_db(self, s: dict):
+        """统计页数据源 = 大脑数据库。"""
+        self.cardProj.value.setText(str(s.get("projects", 0)))
+        self.cardRec.value.setText(str(s.get("records", 0)))
+        self.cardIssue.value.setText(str(s.get("errors_open", 0)))
 
         def clear(box):
             while box.count():
@@ -636,8 +703,8 @@ class StatsPage(QWidget):
                     it.widget().deleteLater()
 
         clear(self.agentBox)
-        total = max(1, snap.total_records)
-        for agent, n in sorted(snap.agent_counts.items(), key=lambda x: -x[1]):
+        total = max(1, s.get("records", 0))
+        for agent, n in sorted(s.get("agent_counts", {}).items(), key=lambda x: -x[1]):
             row = QHBoxLayout()
             row.addWidget(badge(agent, agent))
             bar = ProgressBar()
@@ -645,11 +712,11 @@ class StatsPage(QWidget):
             row.addWidget(bar, 1)
             row.addWidget(BodyLabel(str(n)))
             self.agentBox.addLayout(row)
-        if not snap.agent_counts:
+        if not s.get("agent_counts"):
             self.agentBox.addWidget(CaptionLabel("暂无数据"))
 
         clear(self.monthBox)
-        months = sorted(snap.monthly_counts.items())[-6:]
+        months = sorted(s.get("monthly_counts", {}).items())[-6:]
         mx = max((v for _, v in months), default=1)
         for m, n in months:
             row = QHBoxLayout()
@@ -670,7 +737,7 @@ class SearchPage(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
         self.edit = SearchLineEdit()
-        self.edit.setPlaceholderText("搜索工作记录 / 文件名，回车执行…")
+        self.edit.setPlaceholderText("全脑检索：工作记录 / 记忆 / 文件名，回车执行…")
         self.edit.setClearButtonEnabled(True)
         lay.addWidget(self.edit)
         self.result = ListWidget()
@@ -697,20 +764,38 @@ class SearchPage(QWidget):
         self._workers.append(w)
         w.start()
 
-    def on_done(self, hits):
-        self.hits = hits
+    def on_done(self, res):
+        """全脑检索结果：records / memories / files 三段合并展示。"""
         self.result.clear()
-        for h in hits:
-            self.result.addItem(f"{h.line}   —— {Path(h.path).name}:{h.line_no}")
+        self.preview.setHtml("")
+        if isinstance(res, Exception):
+            self.result.addItem(f"搜索失败：{res}")
+            return
+        hits = []
+        for r in res.get("records", []):
+            self.result.addItem(f"[记录] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:80]}")
+            hits.append(("record", r))
+        for m in res.get("memories", []):
+            self.result.addItem(f"[记忆#{m['id']}] {brain.KIND_CN.get(m['kind'], m['kind'])}：{m['content'][:100]}")
+            hits.append(("memory", m))
+        for f in res.get("files", []):
+            self.result.addItem(f"[文件] {f['project']}\\{f['name']}")
+            hits.append(("file", f))
+        self.hits = hits
         if not hits:
             self.result.addItem("无结果")
 
     def show_hit(self, row):
         if row < 0 or row >= len(self.hits):
             return
-        h = self.hits[row]
-        md = core.read_text(Path(h.path))
-        self.preview.setHtml(md_to_html(md, limit=100 * 1024))
+        kind, h = self.hits[row]
+        if kind == "record":
+            self.preview.setHtml(md_to_html(f"## {h['title']}\n{h['content']}"))
+        elif kind == "memory":
+            self.preview.setHtml(md_to_html(f"**{brain.KIND_CN.get(h['kind'], h['kind'])}**"
+                                            f"{(' #' + h['tags']) if h['tags'] else ''}\n\n{h['content']}"))
+        else:
+            self.preview.setHtml(f"<p>{html.escape(h['path'])}</p>")
 
 
 class AuditPage(QWidget):
@@ -828,22 +913,23 @@ class JournalPage(QWidget):
     def reload(self):
         if not self.win.root:
             return
-        self.errors = core.list_errors(self.win.root)
+        self.errors = brain.error_list(self.win.root)
         self.errList.clear()
         for e in self.errors:
             self.errList.addItem(
-                f"#{e.get('id')} [{e.get('status')}] {e.get('ts', '')}  {e.get('agent')}"
-                f" · {e.get('project') or '无项目'}：{e.get('title')}"
-                + (f"  ｜回滚：{e['undo'][:60]}" if e.get("undo") else ""))
+                f"#{e['id']} [{e['status']}] {e['ts']}  {e['agent']}"
+                f" · {e['project'] or '无项目'}：{e['title']}"
+                + (f"  ｜回滚：{e['undo'][:60]}" if e["undo"] else ""))
         if not self.errors:
             self.errList.addItem("（无错误登记）")
-        self.journal = core.read_journal(self.win.root, limit=200)
+        self.journal = brain.journal_list(self.win.root, 200)
         self.jList.clear()
-        for e in reversed(self.journal):
-            act = self.ACTION_CN.get(e.get("action"), e.get("action", ""))
-            tgt = Path(e.get("target", "") or "").name
-            self.jList.addItem(f"{e.get('ts', '')}  [{e.get('agent')}]  {act}  {tgt}"
-                               + (f"  {str(e.get('note'))[:70]}" if e.get("note") else ""))
+        for e in self.journal:
+            act = self.ACTION_CN.get(e["action"], e["action"])
+            tgt = str(e["target"] or "")
+            tgt = Path(tgt).name if "/" in tgt or "\\" in tgt else tgt
+            self.jList.addItem(f"{e['ts']}  [{e['agent']}]  {act}  {tgt}"
+                               + (f"  {str(e['note'])[:70]}" if e["note"] else ""))
         if not self.journal:
             self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
 
@@ -853,11 +939,11 @@ class JournalPage(QWidget):
             InfoBar.warning("先选择一条错误登记", "", duration=2000, parent=self.win)
             return
         e = self.errors[row]
-        err = core.set_error_status(self.win.root, e.get("id"), status)
+        err = brain.error_set_status(self.win.root, e["id"], status)
         if err:
             InfoBar.error("操作失败", err, duration=4000, parent=self.win)
         else:
-            InfoBar.success("已更新", f"#{e.get('id')} → {status}", duration=2000, parent=self.win)
+            InfoBar.success("已更新", f"#{e['id']} → {status}", duration=2000, parent=self.win)
         self.reload()
 
     def open_project(self):
@@ -874,24 +960,15 @@ class JournalPage(QWidget):
         if row < 0 or row >= len(self.journal):
             InfoBar.warning("先选择一条操作流水", "", duration=2000, parent=self.win)
             return
-        e = self.journal[len(self.journal) - 1 - row]  # 列表最新在上，映射回原序
-        if e.get("action") != "log_work":
+        e = self.journal[row]
+        if e["action"] != "log_work":
             InfoBar.warning("只能撤销「写工作记录」类型的操作", "", duration=2500, parent=self.win)
             return
-        agent = e.get("agent", "")
-        undone = {x.get("note") for x in self.journal if x.get("action") == "undo_log_work"}
-        latest = next((x for x in reversed(self.journal)
-                       if x.get("agent") == agent and x.get("action") == "log_work"
-                       and x.get("note") not in undone), None)
-        if latest is None or latest.get("ts") != e.get("ts") or latest.get("note") != e.get("note"):
-            InfoBar.warning("只能撤销该 agent 的最新一条记录",
-                            "先撤后面那条，再回来撤这条", duration=3000, parent=self.win)
-            return
-        err, bak = core.undo_log(self.win.root, agent)
+        err, info = brain.undo_last_record(self.win.root, e["agent"])
         if err:
             InfoBar.error("撤销失败", err, duration=4000, parent=self.win)
         else:
-            InfoBar.success("已撤销（原文已备份）", bak, duration=3000, parent=self.win)
+            InfoBar.success("已撤销（软删，流水可追溯）", info, duration=3000, parent=self.win)
         self.reload()
         self.win.refresh()
 
@@ -976,33 +1053,33 @@ class OverviewPage(QWidget):
 
     def set_snapshot(self, snap):
         self.snap = snap
-        today = date.today().isoformat()
-        entries = sorted((r for p in snap.projects for r in p.records),
-                         key=lambda r: r.date, reverse=True)
-        self.recent = entries[:8]
-        self.cardProj.value.setText(str(len(snap.projects)))
-        self.cardRec.value.setText(str(snap.total_records))
-        self.cardToday.value.setText(str(sum(1 for r in entries if r.date == today)))
         self.cardTodo.value.setText(str(len(snap.issues) + len(snap.inbox)))
+
+    def set_db(self, s: dict, recent: list):
+        """大脑数据库统计与最近记录（总览的数字/动态改读 brain.db）。"""
+        self.cardProj.value.setText(str(s.get("projects", 0)))
+        self.cardRec.value.setText(str(s.get("records", 0)))
+        self.cardToday.value.setText(str(s.get("today", 0)))
 
         # 问候语
         h = datetime.now().hour
         greet = "早上好" if h < 12 else ("下午好" if h < 18 else "晚上好")
-        self.hello.setText(f"{greet}，{today}")
+        self.hello.setText(f"{greet}，{date.today().isoformat()}")
 
         while self.recentBox.count():
             it = self.recentBox.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
+        self.recent = recent
         for r in self.recent:
             row = QHBoxLayout()
-            row.addWidget(badge(r.agent, r.agent_raw))
-            t = ClickBodyLabel(r.title[:52])
+            row.addWidget(badge(r.get("agent", ""), ""))
+            t = ClickBodyLabel((r.get("title") or "(无标题)")[:52])
             t.setCursor(Qt.PointingHandCursor)
             t.clicked.connect(lambda _, rr=r: RecordDetailDialog(self.win, rr).exec())
             row.addWidget(t, 1)
-            pn = CaptionLabel(r.project[:14])
-            pn.setToolTip(r.project)
+            pn = CaptionLabel(r.get("project", "")[:14])
+            pn.setToolTip(r.get("project", ""))
             row.addWidget(pn)
             wrap = QWidget()
             wrap.setLayout(row)
@@ -1116,14 +1193,12 @@ class HubPage(QWidget):
         self.editBtn.clicked.connect(self.edit_current)
         editRow.addWidget(self.editBtn)
         editRow.addStretch(1)
-        editRow.addWidget(CaptionLabel("历史备份"))
-        self.bakCombo = ComboBox()
-        self.bakCombo.setFixedWidth(320)
-        editRow.addWidget(self.bakCombo)
-        self.restoreBtn = PushButton(ic("SYNC", "INFO"), "还原选中备份")
-        self.restoreBtn.setEnabled(False)
-        self.restoreBtn.clicked.connect(self.restore_memory)
-        editRow.addWidget(self.restoreBtn)
+        newMemBtn = PushButton(ic("ADD", "INFO"), "新建记忆")
+        newMemBtn.clicked.connect(self.new_memory)
+        editRow.addWidget(newMemBtn)
+        delMemBtn = PushButton(ic("DELETE", "INFO"), "删除选中记忆")
+        delMemBtn.clicked.connect(self.delete_memory)
+        editRow.addWidget(delMemBtn)
         lay.addLayout(editRow)
 
         self.preview = TextBrowser()
@@ -1152,15 +1227,29 @@ class HubPage(QWidget):
         self.rebuild_cards()
         self.fill_skills()
         self.fill_mcps()
-        mem_pairs = [(a.name, m) for a in self.agents for m in a.memories]
-        pub = agentscore.AssetFile(agent="公用大脑", path=str(core.memory_file(self.win.root)),
-                                   label="共享记忆 ★ 所有已接入 agent 共读写", mtime=0)
-        mem_pairs.insert(0, ("公用大脑", pub))
-        self.fill_assets(self.memList, mem_pairs)
+        self.fill_memories()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
         self.fill_market()
         self.win.overview_page.set_agents(self.agents)
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
+
+    def fill_memories(self):
+        """大脑记忆视图：SQLite memories 表（条目 data = mem:<id>）。"""
+        self.memList.clear()
+        self._mem_rows = []
+        try:
+            self._mem_rows = brain.search_memories(self.win.root, "", "", 500)
+        except Exception:
+            pass
+        for m in self._mem_rows:
+            flag = "★" if m["pinned"] else "·"
+            tags = f" #{m['tags']}" if m["tags"] else ""
+            src = f" @{m['agent']}" if m["agent"] and m["agent"] != "migrated" else ""
+            self.memList.addItem(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]{tags}{src}  {m['content'][:90]}")
+            self.memList.item(self.memList.count() - 1).setData(Qt.UserRole, f"mem:{m['id']}")
+        if not self._mem_rows:
+            self.memList.addItem("（大脑记忆为空——用下方「新建记忆」或让 agent 调 hub_memory_write）")
+            self.memList.item(0).setData(Qt.UserRole, "")
 
     def rebuild_cards(self):
         while self.cardsRow.count():
@@ -1221,9 +1310,18 @@ class HubPage(QWidget):
         path = item.data(Qt.UserRole)
         self.cur_path = path
         self.cur_editable = False
-        self.fill_baks(path)
         if not path:
             self.preview.setHtml("<p style='color:#888'>无内容</p>")
+            return
+        # 大脑记忆条目（data = mem:<id>）
+        if isinstance(path, str) and path.startswith("mem:"):
+            self.editBtn.setEnabled(True)
+            self.editBtn.setText("编辑这条记忆")
+            m = next((x for x in self._mem_rows if x["id"] == int(path[4:])), None)
+            if m:
+                meta = f"类型 {brain.KIND_CN.get(m['kind'], m['kind'])} · 置顶{'是' if m['pinned'] else '否'}" \
+                       f" · 标签 {m['tags'] or '无'} · {m['created']}"
+                self.preview.setHtml(f"<p style='color:#888'>{meta}</p>" + md_to_html(m["content"]))
             return
         p = Path(path)
         if self.stack.currentIndex() == 1:  # MCP：只显示来源，不读内容（防密钥外泄到界面日志）
@@ -1238,46 +1336,62 @@ class HubPage(QWidget):
         if p.is_file():
             self.preview.setHtml(md_to_html(core.read_text(p, limit=200 * 1024)))
         else:
-            self.preview.setHtml("<p style='color:#888'>(文件尚不存在，编辑保存后创建——公用记忆适合存放"
-                                 "所有 agent 需要知道的环境事实、用户偏好、项目进展)</p>")
-            self.cur_editable = self.stack.currentIndex() == 2
+            self.preview.setHtml("<p style='color:#888'>(文件尚不存在，编辑保存后创建)</p>")
+            self.cur_editable = False
 
     def edit_current(self):
-        if not self.cur_path or not self.cur_editable:
+        if not self.cur_path:
+            return
+        if isinstance(self.cur_path, str) and self.cur_path.startswith("mem:"):
+            mid = int(self.cur_path[4:])
+            m = next((x for x in self._mem_rows if x["id"] == mid), None)
+            if not m:
+                return
+            dlg = MemoryEditDialog(self.win, m)
+            if dlg.exec():
+                err = brain.edit_memory(root=self.win.root, mid=mid, content=dlg.content(),
+                                        kind=dlg.kind(), tags=dlg.tags(), pinned=dlg.pinned())
+                if err:
+                    InfoBar.error("保存失败", err, duration=4000, parent=self.win)
+                else:
+                    core.journal(self.win.root, "user", "memory_edit", f"brain:memories#{mid}")
+                    InfoBar.success("记忆已更新", "", duration=2000, parent=self.win)
+                    self.fill_memories()
+            return
+        if not self.cur_editable:
             return
         dlg = EditAssetDialog(self.win, self.cur_path, Path(self.cur_path).name)
         if dlg.exec():
-            err = core.write_text_backed(self.cur_path, dlg.text(), root=self.win.root,
-                                         agent="user",
-                                         action="memory_edit" if self.stack.currentIndex() == 2 else "edit")
+            err = core.write_text_backed(self.cur_path, dlg.text(), root=self.win.root, agent="user")
             if err:
                 InfoBar.error("保存失败", err, duration=4000, parent=self.win)
             else:
                 InfoBar.success("已保存（原文件已备份）", "", duration=2500, parent=self.win)
 
-    def fill_baks(self, path):
-        """列出当前选中资产的 agenthub 备份（仅记忆视图开放还原）。"""
-        self.bakCombo.clear()
-        self.bak_items = []
-        if path and self.stack.currentIndex() == 2:
-            p = Path(path)
-            if p.parent.is_dir():
-                for b in sorted(p.parent.glob(p.name + ".bak-agenthub-*"), reverse=True):
-                    self.bak_items.append(b)
-                    self.bakCombo.addItem(b.name)
-        self.restoreBtn.setEnabled(bool(self.bak_items))
-
-    def restore_memory(self):
-        idx = self.bakCombo.currentIndex()
-        if idx < 0 or idx >= len(self.bak_items) or not self.cur_path:
+    def new_memory(self):
+        if not self.win.root:
+            InfoBar.warning("先在设置页选择根目录", "", duration=2500, parent=self.win)
             return
-        bak = self.bak_items[idx]
-        err = core.restore_backup(self.cur_path, str(bak), root=self.win.root)
+        dlg = MemoryEditDialog(self.win, None)
+        if dlg.exec():
+            mid = brain.add_memory(self.win.root, dlg.content().strip(), dlg.kind(),
+                                   dlg.tags(), agent="user", pinned=dlg.pinned())
+            core.journal(self.win.root, "user", "memory_append", f"brain:memories#{mid}", note=dlg.kind())
+            InfoBar.success("已写入大脑记忆", f"#{mid}", duration=2500, parent=self.win)
+            self.fill_memories()
+
+    def delete_memory(self):
+        if not self.cur_path or not (isinstance(self.cur_path, str) and self.cur_path.startswith("mem:")):
+            InfoBar.warning("先在列表中选择一条记忆", "", duration=2500, parent=self.win)
+            return
+        mid = int(self.cur_path[4:])
+        err = brain.delete_memory(self.win.root, mid)
         if err:
-            InfoBar.error("还原失败", err, duration=4000, parent=self.win)
+            InfoBar.error("删除失败", err, duration=4000, parent=self.win)
         else:
-            InfoBar.success("已还原（当前内容先已再备份）", bak.name, duration=3000, parent=self.win)
-            self.fill_baks(self.cur_path)
+            core.journal(self.win.root, "user", "memory_delete", f"brain:memories#{mid}")
+            InfoBar.success("已删除（软删，可整库追溯）", "", duration=2500, parent=self.win)
+            self.fill_memories()
 
     def on_open(self, item):
         path = item.data(Qt.UserRole)
@@ -1562,7 +1676,22 @@ class SettingsPage(QWidget):
         c1b = CardWidget()
         g1b = QVBoxLayout(c1b)
         g1b.setContentsMargins(20, 14, 20, 14)
-        g1b.addWidget(StrongBodyLabel("窗口大小（点一下立即生效，边缘拖拽外的一键兜底）"))
+        g1b.addWidget(StrongBodyLabel("大脑数据库（_hub\\brain.db —— 记忆/记录/流水的唯一真理）"))
+        dbRow = QHBoxLayout()
+        self.backupBtn = PrimaryPushButton(ic("SAVE", "INFO"), "立即备份大脑")
+        self.backupBtn.clicked.connect(self.backup_now)
+        dbRow.addWidget(self.backupBtn)
+        self.dbLabel = CaptionLabel("")
+        dbRow.addWidget(self.dbLabel, 1)
+        g1b.addLayout(dbRow)
+        g1b.addWidget(CaptionLabel("每次退出软件自动备份（保留 30 份，在 _hub\\brain-backups\\）；"
+                                   "历史 md/jsonl 已增量迁移入库并保留为只读存档。"))
+        lay.addWidget(c1b)
+
+        c1c = CardWidget()
+        g1c = QVBoxLayout(c1c)
+        g1c.setContentsMargins(20, 14, 20, 14)
+        g1c.addWidget(StrongBodyLabel("窗口大小（点一下立即生效，边缘拖拽外的一键兜底）"))
         sizeRow = QHBoxLayout()
         for label, wd, ht in (("紧凑 1180×760", 1180, 760), ("标准 1400×900", 1400, 900),
                               ("宽敞 1616×950", 1616, 950)):
@@ -1570,9 +1699,9 @@ class SettingsPage(QWidget):
             b.clicked.connect(lambda _, w_=wd, h_=ht: self.win.showNormal() or self.win.resize(w_, h_))
             sizeRow.addWidget(b)
         sizeRow.addStretch(1)
-        g1b.addLayout(sizeRow)
-        g1b.addWidget(CaptionLabel("也可以用键盘：Win+←/→ 贴靠半屏，Alt+空格→大小 用方向键精调。"))
-        lay.addWidget(c1b)
+        g1c.addLayout(sizeRow)
+        g1c.addWidget(CaptionLabel("也可以用键盘：Win+←/→ 贴靠半屏，Alt+空格→大小 用方向键精调。"))
+        lay.addWidget(c1c)
 
         c2 = CardWidget()
         g2 = QVBoxLayout(c2)
@@ -1605,6 +1734,17 @@ class SettingsPage(QWidget):
         if d:
             self.win.set_root(d)
 
+    def backup_now(self):
+        if not self.win.root:
+            InfoBar.warning("先选择根目录", "", duration=2000, parent=self.win)
+            return
+        err = brain.backup_brain(self.win.root)
+        if err.startswith("_") or "失败" in err:
+            InfoBar.error("备份失败", err, duration=4000, parent=self.win)
+        else:
+            self.dbLabel.setText(f"上次备份：{err}")
+            InfoBar.success("大脑已备份", err, duration=3000, parent=self.win)
+
     def init_struct(self):
         if not self.win.root:
             InfoBar.warning("先选择根目录", "", duration=2000, parent=self.win)
@@ -1635,6 +1775,14 @@ class AgentHubWindow(FluentWindow):
     def __init__(self):
         super().__init__()
         self.root = core.get_root()
+        core.JOURNAL_SINK = brain.journal_add  # 流水落库
+        self._workers = []
+        if self.root and os.path.isdir(self.root):
+            # 建表 + 历史 md/jsonl 增量迁移（幂等），后台跑防卡启动
+            w = FnWorker(lambda: brain.init_db(self.root), self)
+            w.done.connect(self._on_db_ready)
+            self._workers.append(w)
+            w.start()
 
         self.overview_page = OverviewPage(self)
         self.project_page = ProjectPage(self)
@@ -1685,10 +1833,19 @@ class AgentHubWindow(FluentWindow):
         f5.activated.connect(self.refresh)
         cf = QShortcut(QKeySequence("Ctrl+F"), self)
         cf.activated.connect(self.goto_search)
-        self._workers = []  # 持住运行中的 QThread 引用，防 GC 销毁运行中线程导致进程崩溃
+        self._workers = getattr(self, "_workers", [])  # 迁移线程已在 __init__ 挂入
         QTimer.singleShot(200, self.refresh)
         if not self.root:
             self.switchTo(self.settings_page)
+
+    def _on_db_ready(self, result):
+        """大脑库就绪（含历史迁移结果）。"""
+        if isinstance(result, Exception):
+            InfoBar.error("大脑数据库初始化失败", str(result), duration=6000, parent=self)
+            return
+        if result:
+            InfoBar.warning("大脑建库告警", str(result), duration=6000, parent=self)
+        self.refresh()  # 迁移完成后重刷，各页补上 DB 数据
 
     def resizeEvent(self, e):
         if getattr(self, "_grips", None):
@@ -1723,7 +1880,7 @@ class AgentHubWindow(FluentWindow):
         return getattr(mode, "name", "COMPACT") == "COMPACT"
 
     def closeEvent(self, e):
-        """退出前：等后台线程结束（防 QThread 运行中被销毁的偶发报错），再记住状态。"""
+        """退出前：等后台线程结束（防 QThread 运行中被销毁的偶发报错），备份大脑，再记住状态。"""
         for lst in (self._workers, getattr(self.hub_page, "_workers", []),
                     getattr(self.search_page, "_workers", [])):
             for t in list(lst):
@@ -1731,6 +1888,11 @@ class AgentHubWindow(FluentWindow):
                     t.wait(2000)
                 except Exception:
                     pass
+        if self.root and os.path.isdir(self.root):
+            try:
+                brain.backup_brain(self.root)  # 退出自动备份大脑（轮转保留30份）
+            except Exception:
+                pass
         try:
             cfg = core.load_config()
             cfg["win_geometry"] = bytes(self.saveGeometry().toBase64()).decode()
@@ -1747,6 +1909,10 @@ class AgentHubWindow(FluentWindow):
     def set_root(self, d):
         self.root = d
         core.set_root(d)
+        core.init_hub(d)
+        err = brain.init_db(d)
+        if err:
+            InfoBar.error("大脑建库失败", err, duration=5000, parent=self)
         self.settings_page.reload()
         self.refresh()
 
@@ -1768,12 +1934,32 @@ class AgentHubWindow(FluentWindow):
             InfoBar.warning("公用大脑未初始化",
                             "到「设置」页点「初始化目录结构」——启用共享记忆、操作流水、错误登记",
                             duration=6000, parent=self)
+        # 文件索引刷进大脑（供全脑检索按文件名命中）
+        rows = []
+        for p in snap.projects:
+            for group, rp, fp in p.files:
+                try:
+                    st = os.stat(fp)
+                    rows.append((p.name, fp, Path(fp).name, group, st.st_size, st.st_mtime))
+                except OSError:
+                    continue
+        try:
+            brain.update_files_index(self.root, rows)
+        except Exception:
+            pass
         self.project_page.set_snapshot(snap)
-        self.timeline_page.set_snapshot(snap)
-        self.stats_page.set_snapshot(snap)
+        try:
+            self.timeline_page.set_records(brain.list_records(self.root, limit=2000))
+            self.stats_page.set_db(brain.stats(self.root))
+        except Exception:
+            pass
         self.audit_page.set_snapshot(snap)
         self.overview_page.set_snapshot(snap)
-        self.overview_page.set_sessions(core.active_sessions(self.root) if self.root else [])
+        try:
+            self.overview_page.set_db(brain.stats(self.root), brain.list_records(self.root, limit=8))
+            self.overview_page.set_sessions(brain.active_sessions(self.root))
+        except Exception:
+            self.overview_page.set_sessions([])
         self.journal_page.reload()
 
 

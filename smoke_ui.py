@@ -13,6 +13,7 @@ from pathlib import Path
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+import brain  # noqa: E402
 import core  # noqa: E402
 from ui import AgentHubWindow, SearchWorker, md_to_html  # noqa: E402
 
@@ -52,6 +53,7 @@ def main():
     w = AgentHubWindow()
     w.show()
     w.root = str(tmp)  # 不走 set_root，避免污染用户真实配置 ~/.agenthub/config.json
+    brain.init_db(str(tmp))  # 建库 + 把假目录数据迁移进大脑
     w.refresh()
 
     def safe(fn):
@@ -91,33 +93,39 @@ def main():
         sw.start()
 
     @safe
-    def step2(hits):
-        check("搜索线程返回结果", len(hits) >= 1)
+    def step2(res):
+        check("全脑检索返回结果", isinstance(res, dict) and
+              (res.get("records") or res.get("files")), str(res)[:80])
         h = md_to_html("| a | b |\n|---|---|\n| 1 | 2 |\n\n- x\n- y\n\n**粗体**\n```\ncode\n```")
         check("md表格", "<table" in h)
         check("md列表", "<ul>" in h)
         check("md粗体", "<b>" in h)
         check("md代码块", "<pre>" in h)
         check("md转义", "<script>" not in md_to_html("<script>alert(1)</script>"))
-        check("记录含正文body", any(len(r.body) > 0 for p in w.project_page.snap.projects for r in p.records))
+        check("记录含正文content", any(len(r.get("content", "")) > 0 for r in w.timeline_page.all_entries))
         # 能力中心页冒烟
         check("能力中心页存在且已切导航", w.hub_page is not None)
         w.hub_page.viewCombo.setCurrentIndex(1)  # MCP 视图切换不崩
-        # 流水页冒烟（v1.3）：读 journal/errors 不崩、列表已填充
+        # 流水页冒烟（v2：journal/errors 读 brain.db）
         w.journal_page.reload()
         check("流水页填充不崩", w.journal_page.jList.count() >= 0 and w.journal_page.errList.count() >= 0)
-        # 流水页撤销按钮路径（无 log_work 时点击只弹提示，不崩）
-        w.journal_page.undo_selected()
-        # 记忆历史下拉填充（v1.3）
-        w.hub_page.fill_baks(str(tmp / core.DIR_META / "memory.md"))
-        check("记忆历史下拉可用", hasattr(w.hub_page, "bak_items"))
-        # EditAssetDialog 冒烟（v1.3 修复的 NameError）
+        w.journal_page.undo_selected()  # 无 log_work 时点击只弹提示，不崩
+        # 大脑记忆视图冒烟（v2：memories 表 CRUD）
+        w.hub_page.fill_memories()
+        check("记忆视图可填充", hasattr(w.hub_page, "_mem_rows"))
+        mid = brain.add_memory(str(tmp), "冒烟测试记忆条目", "fact", "测试", agent="smoke")
+        check("记忆写入DB", mid >= 1)
+        check("记忆检索", any("冒烟测试记忆条目" in m["content"]
+                              for m in brain.search_memories(str(tmp), "冒烟")))
+        w.hub_page.fill_memories()
+        # EditAssetDialog 冒烟
         from ui import EditAssetDialog
         dlg = EditAssetDialog(w, str(tmp / "红色沙漠-存档备份" / core.RECORD_NAME), "工作记录.md")
         check("编辑对话框加载内容", "第二次记录" in dlg.text())
         # 总览活跃会话冒烟
         w.overview_page.set_sessions([])
         check("总览活跃会话空态", w.overview_page.sessionBox.count() >= 1)
+        brain.delete_memory(str(tmp), mid)
         w.close()
         app.quit()
 
