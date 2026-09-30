@@ -283,6 +283,53 @@ def t_agents_registry(tmp):
     assert got == {f"并发Agent{i}" for i in range(8)}, got
 
 
+def t_plasticity(tmp):
+    """反射弧+反馈回路+可塑性：记忆推送排序/唤起计数/检索日志/项目状态迁移幂等。"""
+    import datetime
+    import sqlite3
+
+    root = str(Path(tmp) / "hub")
+    les_id = brain.add_memory(root, "项目专属教训", kind="lesson", project="可塑项目", agent="X")
+    pin_id = brain.add_memory(root, "全局置顶事实", kind="fact", agent="X", pinned=True)
+    brain.add_memory(root, "无关项目记忆", kind="note", project="别的项目", agent="X")
+    rows = brain.recall_for(root, "可塑项目")
+    by_id = {r["id"]: r for r in rows}
+    # 项目匹配 + 全部置顶记忆都被唤起；置顶排最前
+    assert les_id in by_id and pin_id in by_id, sorted(by_id)
+    assert rows[0]["pinned"] == 1, rows[0]
+    assert all("无关项目记忆" not in r["content"] for r in rows)
+    assert by_id[les_id]["use_count"] == 1 and by_id[les_id]["last_hit"], by_id[les_id]
+    again = brain.recall_for(root, "可塑项目")
+    by_id2 = {r["id"]: r for r in again}
+    assert by_id2[les_id]["use_count"] == by_id[les_id]["use_count"] + 1, by_id2[les_id]
+    assert by_id2[pin_id]["use_count"] == by_id[pin_id]["use_count"] + 1, by_id2[pin_id]
+    assert all(r["last_hit"] for r in by_id2.values())
+    # 检索日志落库 + stats 计数
+    brain.log_search(root, "hub_search", "测试词", 3, agent="X")
+    brain.log_search(root, "hub_memory_read", "", 0)
+    st = brain.stats(root)
+    assert st["searches_total"] == 2 and st["searches_today"] == 2, st
+    assert st["projects_stalled"] >= 0
+    # 极端参数：hits 负数/超长 query 不崩
+    brain.log_search(root, "hub_search", "x" * 5000, -99)
+    # 项目活跃刷新 + stalled 回填（幂等重跑）
+    today = datetime.date.today().isoformat()
+    brain.add_record(root, "可塑项目", "X", today, "t", "c")
+    con = sqlite3.connect(str(Path(root) / "_hub" / "brain.db"))
+    p = con.execute("SELECT status, updated FROM projects WHERE name='可塑项目'").fetchone()
+    assert p[0] == "active" and p[1] == today, p
+    old = (datetime.date.today() - datetime.timedelta(days=91)).isoformat()
+    brain.add_record(root, "古董项目", "X", old, "t", "c")
+    con.execute("UPDATE projects SET updated=?, status='active' WHERE name='古董项目'", (old,))
+    con.commit()
+    con.close()
+    assert brain.init_db(root) == ""
+    con = sqlite3.connect(str(Path(root) / "_hub" / "brain.db"))
+    s = con.execute("SELECT status FROM projects WHERE name='古董项目'").fetchone()[0]
+    con.close()
+    assert s == "stalled", s
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -310,6 +357,7 @@ def main():
     case("错误登记流转+操作流水", lambda: t_errors_and_journal(tmp))
     case("心跳（冲突预警/陈旧清理/坏参）", lambda: t_heartbeat(tmp))
     case("agent注册制（写动作登记/计数/保留名过滤/回填幂等/并发登记）", lambda: t_agents_registry(tmp))
+    case("反射弧+可塑性（记忆推送/唤起计数/检索日志/项目stalled迁移）", lambda: t_plasticity(tmp))
     case("全脑检索+统计（记录/记忆/文件名）", lambda: t_search_all_and_stats(tmp))
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))

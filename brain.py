@@ -26,6 +26,7 @@ KIND_CN = {"fact": "环境事实", "preference": "用户偏好", "lesson": "踩�
            "project": "项目进展", "note": "随手记"}
 SESSION_TTL = 1800     # 会话心跳陈旧阈值（秒）
 SESSION_ACTIVE = 300   # 同项目"正在工作"判定窗口（秒）
+STALL_DAYS = 90        # 项目停滞判定：超过该天数无记录即 stalled
 MAX_CONTENT = 128 * 1024
 
 
@@ -58,7 +59,9 @@ CREATE TABLE IF NOT EXISTS projects (
     name TEXT PRIMARY KEY,
     agent TEXT DEFAULT "",
     note TEXT DEFAULT "",
-    created TEXT DEFAULT ""
+    created TEXT DEFAULT "",
+    status TEXT DEFAULT "active",
+    updated TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS records (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -83,7 +86,9 @@ CREATE TABLE IF NOT EXISTS memories (
     pinned INTEGER DEFAULT 0,
     status TEXT DEFAULT "active",
     created TEXT DEFAULT "",
-    updated TEXT DEFAULT ""
+    updated TEXT DEFAULT "",
+    use_count INTEGER DEFAULT 0,
+    last_hit TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,6 +98,11 @@ CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, project TEXT, title TEXT, detail TEXT,
     undo TEXT, status TEXT DEFAULT "open"
+);
+CREATE TABLE IF NOT EXISTS searches (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT, agent TEXT DEFAULT "", tool TEXT DEFAULT "",
+    query TEXT DEFAULT "", hits INTEGER DEFAULT 0
 );
 CREATE TABLE IF NOT EXISTS sessions (
     agent TEXT PRIMARY KEY,
@@ -157,6 +167,7 @@ def init_db(root: str) -> str:
         _migrate_memory(root)
         _migrate_jsonl(root)
         _backfill_agents(root)
+        _migrate_columns(root)
         return ""
     except sqlite3.Error as e:
         return f"大脑数据库初始化失败：{e}"
@@ -314,16 +325,44 @@ def _backfill_agents(root: str) -> None:
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('agents_backfill','1')")
 
 
+def _migrate_columns(root: str) -> None:
+    """老库增量补列（幂等）：memories 用进废退、projects 生命周期；projects.updated 按 records 回填，
+    超过 STALL_DAYS 无活动标 stalled。"""
+    with db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+        if "use_count" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN use_count INTEGER DEFAULT 0")
+        if "last_hit" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN last_hit TEXT DEFAULT ''")
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+        if "status" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
+        if "updated" not in cols:
+            conn.execute("ALTER TABLE projects ADD COLUMN updated TEXT DEFAULT ''")
+        # ALTER 后刷新列集合，保证首次迁移即执行回填
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
+        if "updated" in cols:
+            conn.execute(
+                "UPDATE projects SET updated=(SELECT MAX(r.date) FROM records r "
+                "WHERE r.project=projects.name AND r.status='active') "
+                "WHERE updated='' OR updated IS NULL")
+            conn.execute(
+                "UPDATE projects SET status='stalled' WHERE status='active' AND updated!='' "
+                "AND julianday('now')-julianday(updated) > ?", (STALL_DAYS,))
+
+
 # ---------------------------------------------------------------- 工作记录
 
 def add_record(root: str, project: str, agent: str, date: str, title: str, content: str) -> int:
-    """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记）。"""
+    """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。"""
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
         _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
             "INSERT INTO records(project,agent,date,title,content,source,created) VALUES(?,?,?,?,?,'hub',?)",
             (project, agent, date, title, content, _now()))
+        conn.execute("UPDATE projects SET updated=?, status='active' "
+                     "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
         return cur.lastrowid
 
 
@@ -375,6 +414,33 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
             "VALUES(?,?,?,?,?,?,?,?)",
             (kind, content, tags.strip(), project, agent, 1 if pinned else 0, _now(), _now()))
         return cur.lastrowid
+
+
+def recall_for(root: str, project: str, limit: int = 5) -> list:
+    """开工记忆推送（反射弧）：该项目相关记忆 + 置顶记忆，按置顶/命中次数/最新排序。
+    命中即记一次唤起（use_count+1）——记忆用进废退的反馈来源。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM memories WHERE status='active' AND (project=? OR pinned=1) "
+            "ORDER BY pinned DESC, use_count DESC, id DESC LIMIT ?",
+            (project or "", max(1, min(limit, 20))))]
+        now = _now()
+        for r in rows:
+            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
+                         (now, r["id"]))
+            r["use_count"] = (r["use_count"] or 0) + 1  # 返回值反映本次唤起后的计数
+            r["last_hit"] = now
+        return rows
+
+
+def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> None:
+    """检索日志（反馈回路）：谁/何时/用什么工具/查什么/命中几条。失败不影响检索本身。"""
+    try:
+        with db_conn(root) as conn:
+            conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                         (_now(), agent or "", tool, (query or "")[:200], max(0, int(hits or 0))))
+    except sqlite3.Error:
+        pass
 
 
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20) -> list:
@@ -433,7 +499,7 @@ def delete_memory(root: str, mid: int) -> str:
 def list_projects(root: str, limit: int = 50) -> list:
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT p.name, p.agent, p.created,"
+            "SELECT p.name, p.agent, p.created, p.status,"
             " (SELECT MAX(date) FROM records r WHERE r.project=p.name AND r.status='active') AS last_active,"
             " (SELECT COUNT(*) FROM records r WHERE r.project=p.name AND r.status='active') AS n_records"
             " FROM projects p ORDER BY last_active DESC, p.name LIMIT ?",
@@ -509,6 +575,9 @@ def stats(root: str) -> dict:
                 "memories": one("SELECT COUNT(*) FROM memories WHERE status='active'"),
                 "today": one("SELECT COUNT(*) FROM records WHERE status='active' AND date=?", (today,)),
                 "errors_open": one("SELECT COUNT(*) FROM errors WHERE status='open'"),
+                "searches_today": one("SELECT COUNT(*) FROM searches WHERE substr(ts,1,10)=?", (today,)),
+                "searches_total": one("SELECT COUNT(*) FROM searches"),
+                "projects_stalled": one("SELECT COUNT(*) FROM projects WHERE status='stalled'"),
                 "agent_counts": agent_counts, "monthly_counts": monthly}
 
 

@@ -59,7 +59,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         rows = brain.list_projects(root)
         lines = [f"共 {len(rows)} 个项目（按最近活动排序，前 50）："]
         for p in rows:
-            lines.append(f"- {p['name']}  最近活动:{p['last_active'] or '无'}  记录:{p['n_records']}条")
+            mark = "  [停滞]" if p.get("status") == "stalled" else ""
+            lines.append(f"- {p['name']}  最近活动:{p['last_active'] or '无'}  记录:{p['n_records']}条{mark}")
         return "\n".join(lines)
 
     if name == "hub_get_project":
@@ -108,6 +109,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if name == "hub_search":
         kw = str(arguments.get("keyword", "")).strip()
         res = brain.search_all(root, kw)
+        brain.log_search(root, "hub_search", kw,
+                         len(res["records"]) + len(res["memories"]) + len(res["files"]))
         lines = []
         for r in res["records"]:
             lines.append(f"[记录] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:80]}")
@@ -130,6 +133,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         except (TypeError, ValueError):
             limit = 20
         rows = brain.search_memories(root, query, kind, limit)
+        brain.log_search(root, "hub_memory_read", query or (f"kind:{kind}" if kind else ""), len(rows))
         total = len(brain.search_memories(root, "", "", 1000))
         if not rows:
             return f"（大脑记忆无命中。当前共 {total} 条记忆；写入用 hub_memory_write）"
@@ -173,7 +177,24 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         err, active = brain.heartbeat_touch(root, agent, project, note)
         if err:
             return f"错误：{err}"
-        return ("心跳已更新" + _conflict_warn(active)) if active else "心跳已更新（同项目无其他活跃会话）"
+        out = ("心跳已更新" + _conflict_warn(active)) if active else "心跳已更新（同项目无其他活跃会话）"
+        # 大脑推送（反射弧）：开工即唤起该项目相关+置顶记忆，不靠 agent 自觉查询
+        try:
+            recall = brain.recall_for(root, project)
+        except Exception as e:  # noqa: BLE001
+            recall = []
+            try:
+                brain.error_add(root, "system", "记忆推送失败（heartbeat）",
+                                f"{type(e).__name__}: {e}", project)
+            except Exception:  # noqa: BLE001
+                pass
+        if recall:
+            lines = [out, "", f"[大脑推送] 开工先读（{project or '全局'}相关/置顶记忆，共 {len(recall)} 条）："]
+            for m in recall:
+                flag = "★" if m["pinned"] else "·"
+                lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}")
+            out = "\n".join(lines)
+        return out
 
     if name == "hub_report_error":
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
