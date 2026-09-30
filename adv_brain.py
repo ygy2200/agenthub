@@ -294,9 +294,10 @@ def t_plasticity(tmp):
     brain.add_memory(root, "无关项目记忆", kind="note", project="别的项目", agent="X")
     rows = brain.recall_for(root, "可塑项目")
     by_id = {r["id"]: r for r in rows}
-    # 项目匹配 + 全部置顶记忆都被唤起；置顶排最前
+    # 项目相关优先于置顶（即使置顶膨胀也不挤掉项目教训）；置顶限 3 条
     assert les_id in by_id and pin_id in by_id, sorted(by_id)
-    assert rows[0]["pinned"] == 1, rows[0]
+    assert rows[0]["id"] == les_id, rows[0]
+    assert sum(1 for r in rows if r["pinned"] == 1) <= 3, [r["id"] for r in rows]
     assert all("无关项目记忆" not in r["content"] for r in rows)
     assert by_id[les_id]["use_count"] == 1 and by_id[les_id]["last_hit"], by_id[les_id]
     again = brain.recall_for(root, "可塑项目")
@@ -304,6 +305,11 @@ def t_plasticity(tmp):
     assert by_id2[les_id]["use_count"] == by_id[les_id]["use_count"] + 1, by_id2[les_id]
     assert by_id2[pin_id]["use_count"] == by_id[pin_id]["use_count"] + 1, by_id2[pin_id]
     assert all(r["last_hit"] for r in by_id2.values())
+    # 免推窗口：同 agent+project 窗口内不重推；换 agent / 换项目不受影响
+    brain.heartbeat_touch(root, "推送Robot", "可塑项目")
+    assert brain.should_push(root, "推送Robot", "可塑项目") is False
+    assert brain.should_push(root, "另一个人", "可塑项目") is True
+    assert brain.should_push(root, "推送Robot", "其他项目") is True
     # 检索日志落库 + stats 计数
     brain.log_search(root, "hub_search", "测试词", 3, agent="X")
     brain.log_search(root, "hub_memory_read", "", 0)

@@ -416,14 +416,34 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
         return cur.lastrowid
 
 
-def recall_for(root: str, project: str, limit: int = 5) -> list:
-    """开工记忆推送（反射弧）：该项目相关记忆 + 置顶记忆，按置顶/命中次数/最新排序。
-    命中即记一次唤起（use_count+1）——记忆用进废退的反馈来源。"""
+PUSH_LIMIT_PROJECT = 3   # 记忆推送：项目相关最多条数（项目教训优先于全局置顶）
+PUSH_LIMIT_PINNED = 3    # 记忆推送：全局置顶最多条数（防置顶膨胀推高每次心跳成本）
+PUSH_CHAR_CAP = 600      # 记忆推送：输出总字数封顶
+PUSH_THROTTLE_MIN = 10   # 同 agent+project 重复心跳的免推窗口（分钟）——推送内容还在会话上下文里
+
+
+def recall_for(root: str, project: str) -> list:
+    """开工记忆推送（反射弧）：项目相关记忆优先、置顶垫后（限流），按命中次数/最新排序。
+    命中即记一次唤起（use_count+1）——只对实际推送出去的条目计数（用进废退）。"""
     with db_conn(root) as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM memories WHERE status='active' AND (project=? OR pinned=1) "
-            "ORDER BY pinned DESC, use_count DESC, id DESC LIMIT ?",
-            (project or "", max(1, min(limit, 20))))]
+        proj = [dict(r) for r in conn.execute(
+            "SELECT * FROM memories WHERE status='active' AND project=? "
+            "ORDER BY use_count DESC, id DESC LIMIT ?",
+            (project or "", PUSH_LIMIT_PROJECT))]
+        pins = [dict(r) for r in conn.execute(
+            "SELECT * FROM memories WHERE status='active' AND pinned=1 "
+            "AND (project='' OR project IS NULL OR project!=?) "
+            "ORDER BY use_count DESC, id DESC LIMIT ?",
+            (project or "", PUSH_LIMIT_PINNED))]
+        rows, seen, total = [], set(), 0
+        for r in proj + pins:  # 项目相关在前
+            if r["id"] in seen:
+                continue
+            if total >= PUSH_CHAR_CAP:
+                break
+            seen.add(r["id"])
+            total += len(r["content"])
+            rows.append(r)
         now = _now()
         for r in rows:
             conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
@@ -431,6 +451,19 @@ def recall_for(root: str, project: str, limit: int = 5) -> list:
             r["use_count"] = (r["use_count"] or 0) + 1  # 返回值反映本次唤起后的计数
             r["last_hit"] = now
         return rows
+
+
+def should_push(root: str, agent: str, project: str) -> bool:
+    """同一 agent+project 在免推窗口内的重复心跳不再推送（上下文里已有，重推纯冗余）。"""
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT ts, project FROM sessions WHERE agent=?", (agent,)).fetchone()
+    if not row or row["project"] != (project or ""):
+        return True
+    try:
+        age = (datetime.datetime.now() - datetime.datetime.fromisoformat(row["ts"])).total_seconds()
+    except (ValueError, TypeError):
+        return True
+    return age >= PUSH_THROTTLE_MIN * 60
 
 
 def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> None:

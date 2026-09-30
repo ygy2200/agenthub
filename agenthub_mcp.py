@@ -174,26 +174,30 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         agent = str(arguments.get("agent", "")).strip()
         project = str(arguments.get("project", "")).strip()
         note = str(arguments.get("note", "")).strip()
+        # 免推判定须在心跳写入前读旧会话（heartbeat_touch 会重建 sessions）
+        push = brain.should_push(root, agent, project)
         err, active = brain.heartbeat_touch(root, agent, project, note)
         if err:
             return f"错误：{err}"
         out = ("心跳已更新" + _conflict_warn(active)) if active else "心跳已更新（同项目无其他活跃会话）"
-        # 大脑推送（反射弧）：开工即唤起该项目相关+置顶记忆，不靠 agent 自觉查询
-        try:
-            recall = brain.recall_for(root, project)
-        except Exception as e:  # noqa: BLE001
-            recall = []
+        # 大脑推送（反射弧）：开工即唤起该项目相关+置顶记忆，不靠 agent 自觉查询；
+        # 免推窗口内的重复心跳不重推（内容还在会话上下文里），推送异常降级登记错误不打断心跳
+        if push:
             try:
-                brain.error_add(root, "system", "记忆推送失败（heartbeat）",
-                                f"{type(e).__name__}: {e}", project)
-            except Exception:  # noqa: BLE001
-                pass
-        if recall:
-            lines = [out, "", f"[大脑推送] 开工先读（{project or '全局'}相关/置顶记忆，共 {len(recall)} 条）："]
-            for m in recall:
-                flag = "★" if m["pinned"] else "·"
-                lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}")
-            out = "\n".join(lines)
+                recall = brain.recall_for(root, project)
+            except Exception as e:  # noqa: BLE001
+                recall = []
+                try:
+                    brain.error_add(root, "system", "记忆推送失败（heartbeat）",
+                                    f"{type(e).__name__}: {e}", project)
+                except Exception:  # noqa: BLE001
+                    pass
+            if recall:
+                lines = [out, "", f"[大脑推送] 开工先读（{project or '全局'}相关/置顶记忆，共 {len(recall)} 条）："]
+                for m in recall:
+                    flag = "★" if m["pinned"] else "·"
+                    lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}")
+                out = "\n".join(lines)
         return out
 
     if name == "hub_report_error":
