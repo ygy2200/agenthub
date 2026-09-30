@@ -230,9 +230,9 @@ def _scan_generic_root(agent: str, root: Path) -> AgentInfo:
             info.skills = _collect_skills(agent, [str(d)], {0: 2})
             break
     for f in list(root.glob("*.json"))[:10]:
-        if _parse_mcp_json(f):
-            info.mcps = [McpServer(name=n, agents=[agent], config_path=str(f))
-                         for n in _parse_mcp_json(f)]
+        parsed = _parse_mcp_json(f)
+        if parsed:
+            info.mcps = [McpServer(name=n, agents=[agent], config_path=str(f)) for n in parsed]
             break
     for sub in ("memory", "memories"):
         d = root / sub

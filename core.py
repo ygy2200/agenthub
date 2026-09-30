@@ -461,7 +461,7 @@ def memory_file(root: str) -> Path:
 def write_text_backed(path: str, text: str, root: str = "", agent: str = "user",
                       action: str = "edit") -> str:
     """备份原文件后写新内容（记忆/全局配置编辑用）。文件不存在时直接创建。
-    传 root 则落操作流水。返回错误或 ""。"""
+    写入失败自动还原备份，原文件不丢。传 root 则落操作流水。返回错误或 ""。"""
     p = Path(path)
     bak = ""
     try:
@@ -470,6 +470,11 @@ def write_text_backed(path: str, text: str, root: str = "", agent: str = "user",
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
     except OSError as e:
+        if bak:  # 写失败：把刚 rename 走的原文件还原回来
+            try:
+                shutil.copy2(bak, p)
+            except OSError:
+                pass
         return f"写入失败：{e}"
     if root:
         journal(root, agent, action, path, bak)
@@ -540,6 +545,20 @@ class hub_lock:
         return False
 
 
+LOG_ROTATE = 1024 * 1024  # 流水/错误登记超过 1MB 归档轮转
+
+
+def _rotate_if_large(f: Path) -> None:
+    """超过 LOG_ROTATE 时把当前文件归档（改名带时间戳），新内容从空文件开始。
+    归档文件保留在 _hub/ 下可人工查阅，读取接口只认固定名。"""
+    try:
+        if f.is_file() and f.stat().st_size > LOG_ROTATE:
+            stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
+            f.rename(f.with_name(f"{f.stem}-{stamp}{f.suffix}"))
+    except OSError:
+        pass
+
+
 def journal(root: str, agent: str, action: str, target: str = "",
             backup: str = "", note: str = "") -> None:
     """追加一条操作流水到 _hub/journal.jsonl（可撤销操作的依据）。失败不阻断主操作。"""
@@ -551,6 +570,7 @@ def journal(root: str, agent: str, action: str, target: str = "",
         with hub_lock(root):
             f = journal_file(root)
             f.parent.mkdir(parents=True, exist_ok=True)
+            _rotate_if_large(f)
             with open(f, "a", encoding="utf-8") as fh:
                 fh.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001 流水是旁路，绝不影响主操作
@@ -641,7 +661,7 @@ def active_sessions(root: str) -> list:
 
 def report_error(root: str, agent: str, title: str, detail: str = "",
                  project: str = "", undo: str = "") -> str:
-    """登记错误到 _hub/errors.jsonl（自增 id）。返回错误或 ""。"""
+    """登记错误到 _hub/errors.jsonl（自增 id，超 1MB 自动归档）。返回错误或 ""。"""
     if not root or not os.path.isdir(root):
         return "根目录不存在"
     if not title or not title.strip():
@@ -649,6 +669,7 @@ def report_error(root: str, agent: str, title: str, detail: str = "",
     with hub_lock(root):
         f = errors_file(root)
         f.parent.mkdir(parents=True, exist_ok=True)
+        _rotate_if_large(f)
         max_id = 0
         if f.exists():
             for ln in read_text(f).splitlines():
@@ -853,11 +874,12 @@ def bootstrap_status(path: str) -> bool:
 
 
 def inject_bootstrap(path: str, root: str, agent: str = "user") -> str:
-    """把引导块写入 agent 全局指令文件（幂等：先去旧块再注入，写前备份）。
+    """把引导块写入 agent 全局指令文件（幂等：先去旧块再注入，写前备份、写失败还原）。
     返回错误或 ""。"""
     if not root:
         return "根目录未设置"
     p = Path(os.path.expandvars(os.path.expanduser(path)))
+    bak = ""
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         old = read_text(p) if p.is_file() else ""
@@ -867,23 +889,34 @@ def inject_bootstrap(path: str, root: str, agent: str = "user") -> str:
         bak = _backup(p) if p.is_file() else ""
         p.write_text(text, encoding="utf-8")
     except OSError as e:
+        if bak:
+            try:
+                shutil.copy2(bak, p)
+            except OSError:
+                pass
         return f"写入失败：{e}"
     journal(root, agent, "bootstrap_inject", str(p), bak)
     return ""
 
 
 def remove_bootstrap(path: str, root: str, agent: str = "user") -> str:
-    """从 agent 全局指令文件移除引导块（写前备份）。返回错误或 ""。"""
+    """从 agent 全局指令文件移除引导块（写前备份、写失败还原）。返回错误或 ""。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     if not p.is_file():
         return "文件不存在"
     old = read_text(p)
     if BOOTSTRAP_BEGIN not in old:
         return "未注入"
+    bak = ""
     try:
         bak = _backup(p)
         p.write_text(_strip_bootstrap(old).rstrip("\n") + "\n", encoding="utf-8")
     except OSError as e:
+        if bak:
+            try:
+                shutil.copy2(bak, p)
+            except OSError:
+                pass
         return f"写入失败：{e}"
     journal(root, agent, "bootstrap_remove", str(p), bak)
     return ""
@@ -972,11 +1005,26 @@ def _backup(p: Path) -> str:
         bak = p.with_suffix(p.suffix + f".bak-agenthub-{stamp}({n})")
         n += 1
     p.rename(bak)
+    _prune_backups(p)
     return str(bak)
 
 
+BACKUP_KEEP = 30  # 每个文件的备份保留上限（只清 agenthub 自己生成的备份）
+
+
+def _prune_backups(p: Path, keep: int = BACKUP_KEEP) -> None:
+    """同前缀备份超过 keep 份时删最旧，防止编辑/覆写高频时备份无限堆积。
+    按文件名内时间戳字典序排新旧（同秒高频覆写时 mtime 精度不可靠）。"""
+    try:
+        baks = sorted(p.parent.glob(p.name + ".bak-agenthub-*"))
+        for old in baks[:-keep] if len(baks) > keep else []:
+            old.unlink()
+    except OSError:
+        pass
+
+
 def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, root: str) -> str:
-    """把 agenthub server 写入 agent 的 MCP 配置（先备份）。返回错误或 ""。"""
+    """把 agenthub server 写入 agent 的 MCP 配置（先备份，写失败自动还原）。返回错误或 ""。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     data = read_mcp_config(path)
     if data is None:
@@ -986,17 +1034,21 @@ def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, r
         return "配置文件存在但不是合法 json，拒绝自动写入（请手工处理）"
     servers = _ensure_servers_dict(data, layout)
     servers["agenthub"] = _mcp_entry(python_exe, server_py, root)
-    if p.is_file():
-        _backup(p)
+    bak = _backup(p) if p.is_file() else ""
     try:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as e:
+        if bak:
+            try:
+                shutil.copy2(bak, p)
+            except OSError:
+                pass
         return f"写入失败：{e}"
     return ""
 
 
 def remove_mcp_entry(path: str, layout: str) -> str:
-    """从 agent 的 MCP 配置移除 agenthub 条目（先备份）。返回错误或 ""。"""
+    """从 agent 的 MCP 配置移除 agenthub 条目（先备份，写失败自动还原）。返回错误或 ""。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     data = read_mcp_config(path)
     if data is None:
@@ -1005,11 +1057,15 @@ def remove_mcp_entry(path: str, layout: str) -> str:
     if "agenthub" not in servers:
         return "未接入"
     del servers["agenthub"]
-    if p.is_file():
-        _backup(p)
+    bak = _backup(p) if p.is_file() else ""
     try:
         p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
     except OSError as e:
+        if bak:
+            try:
+                shutil.copy2(bak, p)
+            except OSError:
+                pass
         return f"写入失败：{e}"
     return ""
 

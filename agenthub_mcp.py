@@ -20,7 +20,8 @@ import agentscore  # noqa: E402
 import core  # noqa: E402
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "1.3.0"}
+SERVER_INFO = {"name": "agenthub", "version": "1.3.1"}
+MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆文件
 
 
 # ---------------------------------------------------------------- 工具实现（纯函数，供测试直接调用）
@@ -34,6 +35,15 @@ def _conflict_warn(active: list) -> str:
         return ""
     others = "、".join(f"{s.get('agent')}（{s.get('note') or '工作中'}，{s.get('ts', '')}）" for s in active)
     return f"\n⚠ 撞车预警：同项目还有其他活跃会话：{others}，注意分工避让"
+
+
+def _check_content(content: str, what: str) -> str:
+    """内容校验，通过返回 ""，否则返回错误文本。"""
+    if not content:
+        return f"错误：{what}必填"
+    if len(content) > MAX_CONTENT:
+        return f"错误：{what}超长（{len(content)} > {MAX_CONTENT} 字符），请精简后分条写入"
+    return ""
 
 
 def call_tool(name: str, arguments: dict, root: str) -> str:
@@ -68,9 +78,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         pname = str(arguments.get("project", "")).strip()
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
         content = str(arguments.get("content", "")).strip()
-        date = str(arguments.get("date") or datetime.date.today().isoformat())
-        if not pname or not content:
-            return "错误：project 与 content 必填"
+        err = _check_content(content, "content")
+        if err:
+            return err
+        # date 畸形兜底：从参数里提取 YYYY-MM-DD，取不到用今天
+        dm = core.DATE_RE.search(str(arguments.get("date") or ""))
+        date = dm.group(1) if dm else datetime.date.today().isoformat()
+        if not pname:
+            return "错误：project 必填"
         proj_dir = Path(root) / pname
         if not proj_dir.is_dir():
             return (f"错误：项目目录不存在：{pname}（新项目先调 hub_create_project，"
@@ -115,8 +130,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         content = str(arguments.get("content", "")).strip()
         mode = str(arguments.get("mode", "append"))
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
-        if not content:
-            return "错误：content 必填"
+        err = _check_content(content, "content")
+        if err:
+            return err
         if mode not in ("append", "overwrite"):
             return "错误：mode 只能是 append 或 overwrite"
         f = memory_path(root)
@@ -200,7 +216,11 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         return "\n".join(lines)
 
     if name == "hub_get_progress":
-        limit = int(arguments.get("limit", 30))
+        try:
+            limit = int(arguments.get("limit", 30))
+        except (TypeError, ValueError):
+            limit = 30
+        limit = max(1, min(limit, 200))
         snap = core.scan(root)
         entries = sorted((r for p in snap.projects for r in p.records),
                          key=lambda r: (r.date, r.project), reverse=True)[:limit]

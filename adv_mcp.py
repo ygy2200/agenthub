@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import subprocess
@@ -57,7 +58,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "1.3.0"
+    assert r["serverInfo"]["version"] == "1.3.1"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -69,11 +70,17 @@ def t_protocol(root):
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
-    # 工具抛异常 -> isError 而非崩溃（limit 传非法值触发 int() 异常），且自动落盘错误登记
+    # limit 非法值容错（v1.3.1：不再抛异常，返回正常结果）
     r = m.handle_message(rpc("tools/call", {"name": "hub_get_progress", "arguments": {"limit": "abc"}}, 2), str(root))
-    assert r["result"]["isError"] is True, r
+    assert r["result"]["isError"] is False, r
+    # 工具抛异常 -> isError 且自动落盘错误登记（mock 掉 call_tool 模拟任意异常）
+    from unittest import mock
+    with mock.patch.object(m, "call_tool", side_effect=RuntimeError("模拟崩溃")):
+        r = m.handle_message(rpc("tools/call", {"name": "hub_x", "arguments": {"agent": "zcode"}}, 3), str(root))
+    assert r["result"]["isError"] is True and "模拟崩溃" in r["result"]["content"][0]["text"]
     errs = core.list_errors(str(root))
-    assert any("hub_get_progress" in e.get("title", "") for e in errs), "工具异常未自动登记错误"
+    assert any("hub_x" in e.get("title", "") and e.get("agent") == "zcode" for e in errs), \
+        "工具异常未自动登记错误"
     # ping
     assert "result" in m.handle_message(rpc("ping"), str(root))
 
@@ -337,6 +344,23 @@ def t_undo_log(root):
 
 def t_new_tools(tmp):
     root_s = str(Path(tmp) / "hub")
+    # 参数健壮化（v1.3.1）：content 超长拒绝、date 畸形兜底、limit 容错
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "x",
+                                       "content": "y" * (m.MAX_CONTENT + 1)}, root_s)
+    assert "超长" in out, out
+    out = m.call_tool("hub_memory_write", {"content": "z" * (m.MAX_CONTENT + 1)}, root_s)
+    assert "超长" in out, out
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "x",
+                                       "content": "date畸形", "date": "明天下午"}, root_s)
+    assert "已记录" in out, out
+    today = datetime.date.today().isoformat()
+    assert f"## {today}（x）" in (Path(root_s) / "测试-项目" / core.RECORD_NAME).read_text(encoding="utf-8")
+    out = m.call_tool("hub_get_progress", {"limit": "abc"}, root_s)
+    assert "各 agent 最近工作" in out
+    out = m.call_tool("hub_get_progress", {"limit": 99999}, root_s)
+    assert "各 agent 最近工作" in out
+    out = m.call_tool("hub_log_work", {"project": "", "agent": "x", "content": "y"}, root_s)
+    assert "project 必填" in out
     # get_rules：未初始化时回退内置规则
     out = m.call_tool("hub_get_rules", {}, root_s)
     assert "对象-问题" in out

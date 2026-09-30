@@ -6,6 +6,7 @@ Inbox 越权分拣、超长文件、根目录缺失。全绿输出 ALL PASS。
 """
 from __future__ import annotations
 
+import json
 import os
 import shutil
 import sys
@@ -357,6 +358,77 @@ def t_restore_backup(tmp):
     assert any(core.read_journal(str(root)))  # 进流水
 
 
+# ---------------------------------------------------------------- v1.3.1 优化回归
+
+def t_backup_prune(tmp):
+    """备份保留策略：超过上限删最旧，且只清 agenthub 自产备份。"""
+    root = Path(tmp) / "bp"
+    root.mkdir()
+    f = root / "memory.md"
+    f.write_text("v0", encoding="utf-8")
+    for i in range(35):  # 手工造 35 份"旧"备份
+        (root / f"memory.md.bak-agenthub-20260901-0000{i:02d}-000").write_text(f"v{i}", encoding="utf-8")
+    keep_file = root / "memory.md.bak-agenthub-20260901-99999-000"
+    keep_file.write_text("最新备份", encoding="utf-8")
+    (root / "别的文件.txt").write_text("与备份无关", encoding="utf-8")
+    bak = core._backup(f)  # rename v0 → 触发裁剪
+    assert Path(bak).read_text(encoding="utf-8") == "v0"
+    baks = sorted(root.glob("memory.md.bak-agenthub-*"))
+    assert len(baks) == core.BACKUP_KEEP, f"应保留 {core.BACKUP_KEEP} 份，实际 {len(baks)}"
+    assert keep_file in baks, "最新备份不应被裁剪"
+    assert (root / "别的文件.txt").is_file(), "误删了非备份文件"
+
+
+def t_write_fail_restore(tmp):
+    """写盘失败（权限/磁盘满模拟）时自动还原备份，原文件不丢。"""
+    from unittest import mock
+    root = Path(tmp) / "wf"
+    root.mkdir()
+    f = root / "memory.md"
+    original = " precious 原内容"
+    f.write_text(original, encoding="utf-8")
+    with mock.patch.object(Path, "write_text", side_effect=OSError(13, "denied")):
+        err = core.write_text_backed(str(f), "新内容")
+    assert err, "写失败应返回错误"
+    assert f.read_text(encoding="utf-8") == original, "原文件丢失！"
+    # MCP 配置写入失败同样还原
+    cfg = root / "config.json"
+    cfg.write_text('{"mcpServers": {"github": {"url": "u"}}}', encoding="utf-8")
+    with mock.patch.object(Path, "write_text", side_effect=OSError(13, "denied")):
+        err = core.install_mcp_entry(str(cfg), "standard", "py", "srv", "root")
+    assert err
+    d = json.loads(cfg.read_text(encoding="utf-8"))
+    assert "agenthub" not in d["mcpServers"] and "github" in d["mcpServers"], "写失败后配置丢失"
+    # 引导注入失败还原
+    boot = root / "AGENTS.md"
+    boot.write_text("# 原规则", encoding="utf-8")
+    with mock.patch.object(Path, "write_text", side_effect=OSError(13, "denied")):
+        err = core.inject_bootstrap(str(boot), str(root))
+    assert err
+    assert boot.read_text(encoding="utf-8") == "# 原规则", "引导注入失败后原文件丢失"
+    # 不存在文件的写失败：无备份可还原也不崩
+    nf = root / "新建.md"
+    with mock.patch.object(Path, "write_text", side_effect=OSError(13, "denied")):
+        err = core.write_text_backed(str(nf), "x")
+    assert err and not nf.exists()
+
+
+def t_journal_rotate(tmp):
+    root = Path(tmp) / "jr"
+    root.mkdir()
+    jf = core.journal_file(str(root))
+    jf.parent.mkdir(parents=True)
+    jf.write_text("x" * (core.LOG_ROTATE + 100), encoding="utf-8")  # 超 1MB
+    core.journal(str(root), "zcode", "log_work", "t", note="轮转后第一条")
+    archives = list(jf.parent.glob("journal-*.jsonl"))
+    assert len(archives) == 1, "未归档"
+    assert archives[0].stat().st_size > core.LOG_ROTATE
+    cur = jf.read_text(encoding="utf-8")
+    assert len(cur) < 500 and "轮转后第一条" in cur
+    es = core.read_journal(str(root))
+    assert len(es) == 1 and es[0]["note"] == "轮转后第一条"
+
+
 # ---------------------------------------------------------------- 搜索
 
 def t_search(tmp):
@@ -444,6 +516,9 @@ def main():
     case("撤销手术（精确切段/###子段/连续撤销/手工删除报错）", lambda: t_undo_segment_surgery(tmp))
     case("流水与错误登记（自增/坏行/截断/流转备份）", lambda: t_journal_and_errors(tmp))
     case("备份还原（命名白名单/不存在/再备份）", lambda: t_restore_backup(tmp))
+    case("备份保留策略（超限裁剪/不误删）", lambda: t_backup_prune(tmp))
+    case("写失败自动还原（记忆/配置/引导/新文件）", lambda: t_write_fail_restore(tmp))
+    case("流水1MB轮转（归档/重读）", lambda: t_journal_rotate(tmp))
     shutil.rmtree(tmp, ignore_errors=True)
     print()
     if FAILED:
