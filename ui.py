@@ -37,7 +37,7 @@ def ic(name, fallback="INFO"):
 
 AGENT_BADGE_COLOR = {
     "zcode": "#0078d4", "hermes": "#8764b8", "deepseek": "#0a7ea4",
-    "claude": "#c76a42", "codex": "#4a6b8a", "其他": "#666666",
+    "claude": "#c76a42", "codex": "#4a6b8a", "dsh": "#00a67e", "其他": "#666666",
 }
 ISSUE_KIND_CN = {"prefix": "平行前缀目录", "wild": "野目录", "duplicate": "重复项目组", "no_record": "缺工作记录"}
 
@@ -224,11 +224,13 @@ class RecordDetailDialog(MessageBoxBase):
 # ---------------------------------------------------------------- 小组件
 
 def badge(agent: str, raw: str) -> QLabel:
+    # 未知 agent 显示自己的名字（中性色），"未标注"仅限 agent 字段真空——
+    # 否则新接入的 agent 一律显示"未标注"（2026-10-01 dsh 实测踩坑）
     text = {"zcode": "ZCode", "hermes": "hermes", "deepseek": "deepseek",
-            "claude": "claude", "codex": "codex"}.get(agent, raw or "未标注")
+            "claude": "claude", "codex": "codex", "dsh": "DSH"}.get(agent, raw or agent or "未标注")
     lb = QLabel(text)
     lb.setStyleSheet(
-        f"color:white;background:{AGENT_BADGE_COLOR.get(agent, '#666666')};"
+        f"color:white;background:{AGENT_BADGE_COLOR.get(agent, '#8a8a8a')};"
         "border-radius:8px;padding:1px 8px;font-size:11px;")
     lb.setFixedHeight(20)
     return lb
