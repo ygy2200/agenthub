@@ -21,9 +21,9 @@ from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMe
                                QStackedWidget, QSizeGrip)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
                             FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
-                            PrimaryPushButton, ProgressBar, PushButton, ScrollArea,
-                            SearchLineEdit, SegmentedWidget, StrongBodyLabel, SubtitleLabel,
-                            TextBrowser, TextEdit, TitleLabel, setTheme, Theme)
+                            NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
+                            ScrollArea, SearchLineEdit, SegmentedWidget, StrongBodyLabel,
+                            SubtitleLabel, TextBrowser, TextEdit, TitleLabel, setTheme, Theme)
 
 import agentscore
 import brain
@@ -2068,21 +2068,37 @@ class AgentHubWindow(FluentWindow):
         self.help_page = HelpPage(self)
         self.settings_page = SettingsPage(self)
 
+        # Fluent 导航规范：主区只放"地方"，按语义分组（工作区/数据），配置与帮助类沉底，
+        # 避免 11 项平铺扫视困难（2026-10-01 参照官方示例与 MS NavigationView 指南重整）
+        self.overview_page.setObjectName("总览")
+        self.addSubInterface(self.overview_page, ic("HOME"), "总览")
+
+        self.navigationInterface.addItemHeader("工作区")
         for w, icon, text in (
-            (self.overview_page, "HOME", "总览"),
             (self.project_page, "FOLDER", "项目"),
             (self.timeline_page, "HISTORY", "时间线"),
             (self.hub_page, "PEOPLE", "Agent 中心"),
-            (self.market_page, "SHOP", "能力市场"),
+            (self.market_page, "BOOK_SHELF", "能力市场"),
+        ):
+            w.setObjectName(text)
+            self.addSubInterface(w, ic(icon), text)
+
+        self.navigationInterface.addItemHeader("数据")
+        for w, icon, text in (
             (self.ledger_page, "DICTIONARY", "流水·对账"),
             (self.stats_page, "TILES", "统计"),
             (self.search_page, "SEARCH", "搜索"),
+        ):
+            w.setObjectName(text)
+            self.addSubInterface(w, ic(icon), text)
+
+        for w, icon, text in (
             (self.connect_page, "LINK", "接入"),
             (self.help_page, "INFO", "帮助"),
             (self.settings_page, "SETTING", "设置"),
         ):
             w.setObjectName(text)
-            self.addSubInterface(w, ic(icon), text)
+            self.addSubInterface(w, ic(icon), text, NavigationItemPosition.BOTTOM)
 
         self._narrow_nav()
         # 边缘拖拽：qframelesswindow 原生链命中带默认 5 物理像素（高分屏拖不到），加宽兜底；
