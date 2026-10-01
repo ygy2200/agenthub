@@ -413,35 +413,41 @@ def t_root_follow(tmp):
     import io
 
     hub_a, hub_b = fresh_hub(tmp, "root_a"), fresh_hub(tmp, "root_b")
-    core.set_root(str(hub_a))
-    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "ZCode",
-                                 "content": "迁移前写在旧库"}, str(hub_a))
-    # 模拟配置迁移：config root 切到 B，进程仍从 A 启动
-    core.set_root(str(hub_b))
-    req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
-                      "params": {"name": "hub_log_work",
-                                 "arguments": {"project": "测试-项目", "agent": "ZCode",
-                                               "content": "迁移后写新库"}}}, ensure_ascii=False)
-
-    class FakeIn:
-        def __init__(self, lines):
-            self._lines = lines
-
-        def __iter__(self):
-            return iter(self._lines)
-
-    old_in = sys.stdin
-    sys.stdin = FakeIn([req])
+    # smoke_ui 的既定约定：测试不得把用户真实 config.json 留在测试路径上（2026-09-30 踩坑：
+    # 本用例曾把真实 root 污染成临时目录，导致下一会话全部 hub 工具报根目录不存在）
+    saved_root = core.load_config().get("root", "")
     try:
-        with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-            m.serve(str(hub_a), fixed=False)
+        core.set_root(str(hub_a))
+        m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "ZCode",
+                                     "content": "迁移前写在旧库"}, str(hub_a))
+        # 模拟配置迁移：config root 切到 B，进程仍从 A 启动
+        core.set_root(str(hub_b))
+        req = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                          "params": {"name": "hub_log_work",
+                                     "arguments": {"project": "测试-项目", "agent": "ZCode",
+                                                   "content": "迁移后写新库"}}}, ensure_ascii=False)
+
+        class FakeIn:
+            def __init__(self, lines):
+                self._lines = lines
+
+            def __iter__(self):
+                return iter(self._lines)
+
+        old_in = sys.stdin
+        sys.stdin = FakeIn([req])
+        try:
+            with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
+                m.serve(str(hub_a), fixed=False)
+        finally:
+            sys.stdin = old_in
+        assert any("迁移后写新库" in r["content"]
+                   for r in brain.list_records(str(hub_b), "测试-项目")), "新库未收到写入"
+        assert all("迁移后写新库" not in r["content"]
+                   for r in brain.list_records(str(hub_a), "测试-项目")), "旧库被幽灵进程误写"
     finally:
-        sys.stdin = old_in
-    assert any("迁移后写新库" in r["content"]
-               for r in brain.list_records(str(hub_b), "测试-项目")), "新库未收到写入"
-    assert all("迁移后写新库" not in r["content"]
-               for r in brain.list_records(str(hub_a), "测试-项目")), "旧库被幽灵进程误写"
-    core.set_root(str(hub_a))  # 还原，避免影响后续用例
+        if saved_root:
+            core.set_root(saved_root)  # 恢复用户真实配置
 
 
 def main():

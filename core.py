@@ -21,7 +21,9 @@ DIR_INBOX = "00_Inbox"
 DIR_PROJECTS = "projects"
 DIR_ARCHIVE = "99_Archive"
 DIR_META = "_hub"
-RESERVED = {DIR_INBOX, DIR_PROJECTS, DIR_ARCHIVE, DIR_META}
+# "_archive"：v2.0 迁移 D 盘时建立的历史目录归档层（98 个 hermes-/deepseek- 前缀目录），
+# 不作为项目参与扫描/登记（2026-10-01 复盘发现曾被登记为空项目）
+RESERVED = {DIR_INBOX, DIR_PROJECTS, DIR_ARCHIVE, DIR_META, "_archive"}
 RECORD_NAME = "工作记录.md"
 RULES_NAME = "rules.md"
 CONFIG_DIR = Path.home() / ".agenthub"
