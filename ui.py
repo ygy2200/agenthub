@@ -676,7 +676,9 @@ class StatsPage(QWidget):
         self.cardProj = NumberCard("项目总数")
         self.cardRec = NumberCard("工作记录条数")
         self.cardIssue = NumberCard("对账问题数")
-        for c in (self.cardProj, self.cardRec, self.cardIssue):
+        self.cardStalled = NumberCard("停滞项目（90天）")
+        self.cardSearch = NumberCard("检索（今日/累计）")
+        for c in (self.cardProj, self.cardRec, self.cardIssue, self.cardStalled, self.cardSearch):
             row.addWidget(c)
         lay.addLayout(row)
 
@@ -696,6 +698,8 @@ class StatsPage(QWidget):
         self.cardProj.value.setText(str(s.get("projects", 0)))
         self.cardRec.value.setText(str(s.get("records", 0)))
         self.cardIssue.value.setText(str(s.get("errors_open", 0)))
+        self.cardStalled.value.setText(str(s.get("projects_stalled", 0)))
+        self.cardSearch.value.setText(f"{s.get('searches_today', 0)} / {s.get('searches_total', 0)}")
 
         def clear(box):
             while box.count():
@@ -1025,6 +1029,11 @@ class OverviewPage(QWidget):
         for c in (self.cardProj, self.cardRec, self.cardToday, self.cardTodo):
             row.addWidget(c)
         lay.addLayout(row)
+        # 数字卡点击直达对应页（CardWidget 自带 clicked）
+        self.cardProj.clicked.connect(lambda: self.win.switchTo(self.win.project_page))
+        self.cardRec.clicked.connect(lambda: self.win.switchTo(self.win.timeline_page))
+        self.cardToday.clicked.connect(lambda: self.win.switchTo(self.win.timeline_page))
+        self.cardTodo.clicked.connect(self.goto_todo)
 
         cols = QHBoxLayout()
         # 左：最近 agent 动态
@@ -1074,6 +1083,11 @@ class OverviewPage(QWidget):
                 "audit": self.win.audit_page, "search": self.win.search_page}[key]
         self.win.switchTo(page)
 
+    def goto_todo(self):
+        """待处理卡直达对账分段（2026-10-01 审计补充：数字卡可点击）。"""
+        self.win.ledger_page.seg.setCurrentItem("audit")
+        self.win.switchTo(self.win.ledger_page)
+
     def set_snapshot(self, snap):
         self.snap = snap
         self.cardTodo.value.setText(str(len(snap.issues) + len(snap.inbox)))
@@ -1116,6 +1130,10 @@ class OverviewPage(QWidget):
             it = self.agentBox.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
+        if not agents:
+            self.agentBox.addWidget(CaptionLabel(
+                "（探测中，或未检测到 agent——去「Agent 中心」点「重新探测」，或手动添加 agent 目录）"))
+            return
         for a in agents:
             line = CaptionLabel(f"{'●' if a.detected else '○'} {a.name}：技能 {len(a.skills)} · MCP {len(a.mcps)} · 记忆 {len(a.memories)}")
             line.setToolTip(a.home or "未检测到，可在 Agent 中心手动添加目录")
@@ -1448,6 +1466,12 @@ class HubPage(QWidget):
         self.skillFilter.setFixedWidth(260)
         self.skillFilter.textChanged.connect(self.fill_skills)
         viewRow.addWidget(self.skillFilter)
+        self.memFilter = SearchLineEdit()
+        self.memFilter.setPlaceholderText("过滤记忆（内容/标签）…")
+        self.memFilter.setFixedWidth(260)
+        self.memFilter.textChanged.connect(self.fill_memories)
+        viewRow.addWidget(self.memFilter)
+        self.memFilter.hide()  # 仅记忆视图显示
         lay.addLayout(viewRow)
 
         self.stack = QStackedWidget()
@@ -1461,7 +1485,7 @@ class HubPage(QWidget):
             w.itemDoubleClicked.connect(self.on_open)
             w.setContextMenuPolicy(Qt.CustomContextMenu)
             w.customContextMenuRequested.connect(self._ctx_menu)
-        self.viewCombo.currentIndexChanged.connect(self.stack.setCurrentIndex)
+        self.viewCombo.currentIndexChanged.connect(self._on_view_changed)
         lay.addWidget(self.stack, 1)
 
         lay.addWidget(CaptionLabel("单击预览 · 双击打开所在目录 · 右键更多操作 · MCP 出于安全只显示名称与来源，不显示密钥内容"))
@@ -1489,6 +1513,12 @@ class HubPage(QWidget):
         QTimer.singleShot(300, self.rescan)
 
     # ---- 数据
+    def _on_view_changed(self, idx):
+        """视图切换：stack 翻页 + 过滤框按视图显隐（技能/记忆各有过滤框）。"""
+        self.stack.setCurrentIndex(idx)
+        self.skillFilter.setVisible(idx == 0)
+        self.memFilter.setVisible(idx == 2)
+
     def rescan(self):
         extra = core.load_config().get("extra_agents", {})
         w = FnWorker(lambda: agentscore.detect_agents(extra), self)
@@ -1517,14 +1547,17 @@ class HubPage(QWidget):
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
 
     def fill_memories(self):
-        """大脑记忆视图：SQLite memories 表（条目 data = mem:<id>）。"""
+        """大脑记忆视图：SQLite memories 表（条目 data = mem:<id>），支持内容/标签过滤。"""
         self.memList.clear()
         self._mem_rows = []
+        kw = self.memFilter.text().strip().lower() if hasattr(self, "memFilter") else ""
         try:
             self._mem_rows = brain.search_memories(self.win.root, "", "", 500)
         except Exception:
             pass
         for m in self._mem_rows:
+            if kw and kw not in m["content"].lower() and kw not in (m["tags"] or "").lower():
+                continue
             flag = "★" if m["pinned"] else "·"
             tags = f" #{m['tags']}" if m["tags"] else ""
             src = f" @{m['agent']}" if m["agent"] and m["agent"] != "migrated" else ""
@@ -1532,6 +1565,9 @@ class HubPage(QWidget):
             self.memList.item(self.memList.count() - 1).setData(Qt.UserRole, f"mem:{m['id']}")
         if not self._mem_rows:
             self.memList.addItem("（大脑记忆为空——用下方「新建记忆」或让 agent 调 hub_memory_write）")
+            self.memList.item(0).setData(Qt.UserRole, "")
+        elif not self.memList.count():
+            self.memList.addItem("（无匹配记忆）")
             self.memList.item(0).setData(Qt.UserRole, "")
 
     def rebuild_cards(self):
