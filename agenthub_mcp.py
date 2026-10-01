@@ -16,6 +16,18 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+# stdio 一律按 UTF-8 处理（2026-09-30 dsh 修，复盘时从部署版回流）：
+# Windows 上 Python 子进程的 stdin/stdout 默认跟随系统 ANSI 代码页（实测 stdin.encoding == 'gbk'），
+# 而 MCP 客户端按 UTF-8 发帧，中文参数会被解码成孤立代理字符，报
+# "UnicodeEncodeError: surrogates not allowed"。三流都钉死 UTF-8，
+# 客户端就不再需要设 PYTHONIOENCODING。重配失败（如被测试框架替换成非标准流）不致命，忽略即可。
+for _stream in (sys.stdin, sys.stdout, sys.stderr):
+    try:
+        _stream.reconfigure(encoding="utf-8", errors="replace")
+    except (AttributeError, ValueError, OSError):
+        pass
+
 import agentscore  # noqa: E402
 import brain  # noqa: E402
 import core  # noqa: E402
