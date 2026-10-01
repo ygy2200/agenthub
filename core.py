@@ -117,6 +117,17 @@ def get_root() -> str:
 
 
 def set_root(root: str) -> None:
+    """写入根目录。仅对真实全局配置启用 Temp 守卫——测试/审计代码误调 set_root 会把
+    全局 config 污染成临时目录并随 rmtree 失效，致所有 agent 的 hub 工具瘫痪
+    （2026-09-30 t_root_follow、2026-10-01 ui_audit 连续两次踩坑后的机制性防御）。
+    测试 monkeypatch CONFIG_FILE 指向临时配置后守卫自动解除，测试数据合法可写。"""
+    is_global_cfg = Path(CONFIG_FILE).resolve() == (CONFIG_DIR / "config.json").resolve()
+    if is_global_cfg:
+        norm = os.path.normpath(os.path.expandvars(os.path.expanduser(root))).lower()
+        temp_dir = os.path.normpath(os.environ.get("TEMP", r"C:\Users\Default\AppData\Local\Temp")).lower()
+        if norm.startswith(temp_dir) or "\\temp\\" in norm or "/temp/" in norm:
+            raise ValueError(
+                f"拒绝把 Temp 测试路径写入全局配置：{root}（测试请 monkeypatch CONFIG_FILE）")
     cfg = load_config()
     cfg["root"] = root
     save_config(cfg)

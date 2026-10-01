@@ -52,8 +52,9 @@ def main():
     w = ui.AgentHubWindow()
     w.show()
     app.processEvents()
+    # 审计纪律（两次 config 污染事故的教训）：绝不调 core.set_root——
+    # 页面数据链路只读 w.root，无需写全局 config；Temp 路径即使误写也会被守卫拒绝
     w.root = str(root)
-    core.set_root(str(root))
     w.refresh()
     app.processEvents()
 
