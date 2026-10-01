@@ -2134,7 +2134,7 @@ class AgentHubWindow(FluentWindow):
         except Exception:
             pass
         try:
-            nav.setExpandWidth(96)
+            nav.setExpandWidth(170)  # v2.1 导航更名后（Agent 中心/流水·对账）96px 截断文字
         except Exception:
             pass
         panel = getattr(nav, "panel", None)
