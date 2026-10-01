@@ -341,7 +341,7 @@ def t_mcp_access(tmp):
     assert core.install_mcp_entry(str(f), "zcode", py, srv, root) == ""
     d = json.loads(f.read_text(encoding="utf-8"))
     assert d["other"] == 1 and "github" in d["mcp"]["servers"]
-    assert d["mcp"]["servers"]["agenthub"]["args"] == [srv, root]
+    assert d["mcp"]["servers"]["agenthub"]["args"] == [srv]  # v2.2.1 动态模式不传 root
     assert list(f.parent.glob("*.bak-agenthub-*"))
     assert core.remove_mcp_entry(str(f), "zcode") == ""
     d = json.loads(f.read_text(encoding="utf-8"))

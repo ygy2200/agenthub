@@ -62,6 +62,19 @@ def _check_content(content: str, what: str) -> str:
     return ""
 
 
+def _guess_agent(root: str) -> str:
+    """从活跃会话推断检索者身份：单会话时可靠；多会话取最近心跳者并加 ? 标注不确定。"""
+    try:
+        rows = brain.active_sessions(root)
+        if len(rows) == 1:
+            return rows[0]["agent"]
+        if rows:
+            return rows[0]["agent"] + "?"
+    except Exception:  # noqa: BLE001
+        pass
+    return ""
+
+
 def call_tool(name: str, arguments: dict, root: str) -> str:
     """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
@@ -122,7 +135,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         kw = str(arguments.get("keyword", "")).strip()
         res = brain.search_all(root, kw)
         brain.log_search(root, "hub_search", kw,
-                         len(res["records"]) + len(res["memories"]) + len(res["files"]))
+                         len(res["records"]) + len(res["memories"]) + len(res["files"]),
+                         agent=_guess_agent(root))
         lines = []
         for r in res["records"]:
             lines.append(f"[记录] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:80]}")
@@ -145,7 +159,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         except (TypeError, ValueError):
             limit = 20
         rows = brain.search_memories(root, query, kind, limit)
-        brain.log_search(root, "hub_memory_read", query or (f"kind:{kind}" if kind else ""), len(rows))
+        brain.log_search(root, "hub_memory_read", query or (f"kind:{kind}" if kind else ""), len(rows),
+                         agent=_guess_agent(root))
         total = len(brain.search_memories(root, "", "", 1000))
         if not rows:
             return f"（大脑记忆无命中。当前共 {total} 条记忆；写入用 hub_memory_write）"

@@ -622,6 +622,9 @@ def bootstrap_text(root: str) -> str:
   这就是全局规范「工作记录」要求的动作，记录直接进大脑数据库，不要再手写工作记录.md 文件
 - 有跨会话价值的知识立即沉淀：hub_memory_write(content, kind, tags)——
   环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project；重要条目加 pinned: true
+- 修正旧记忆别删：写一条新记忆并在开头标注「取代记忆#N」+错在哪，由全员共同裁决旧条目（免疫协议）
+- 检索带具体关键词：hub_memory_read/hub_search 的 query 写「项目名/组件名/错误类型」，
+  不要空查或只查一个泛词——问得越准，大脑答得越准
 - 新项目先 hub_create_project(name)，命名「对象-问题」结构；不确定项目名先 hub_list_projects
 - 团队规范：hub_get_rules
 - 出错/受阻/踩坑：hub_report_error(title, detail, undo) 登记，undo 写回滚方式，方便任何人查询和撤销
@@ -734,8 +737,10 @@ def deploy_server() -> tuple:
     return find_python(), str(MCP_SERVER_DIR / "agenthub_mcp.py")
 
 
-def _mcp_entry(python_exe: str, server_py: str, root: str) -> dict:
-    return {"command": python_exe, "args": [server_py, root]}
+def _mcp_entry(python_exe: str, server_py: str, root: str = "") -> dict:
+    """接入条目不传 root：v2.2.1 起 server 每请求动态跟随 config（传 argv 反而锁死 fixed 模式，
+    根目录迁移后旧接入会指向失效路径——2026-10-01 复盘发现 claude/zcode 旧接入即此问题）。"""
+    return {"command": python_exe, "args": [server_py]}
 
 
 def _ensure_servers_dict(data: dict, layout: str) -> dict:
