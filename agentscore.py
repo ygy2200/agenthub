@@ -51,6 +51,24 @@ PROBES = [
         "mcp_globs": [],
         "mcp_globs_rel": [],
     },
+    {
+        # DSH = DeepSeek Harness 桌面版（2026-09-30 dsh 接入大脑时补探测，复盘时从部署版回流）。
+        # 技能走两级：~/.dsh/skills 是 DSH 自己的用户级根（用户/市场装到这里），
+        # ~/.agents/skills 与 ~/.claude/skills 是跨 agent 共享根（DSH 也在扫，
+        # 所以这里列出来是为了让 Agent 中心如实反映"DSH 实际能用的技能"）。
+        # MCP 配置不在单一 json 里，而是 profile 的 cordis.patch.yml（行 id 形如
+        # mcp-<serverName>，由 @deepseek-ai/dsh-mcp-client 承载）。
+        "name": "DSH",
+        "home": "~/.dsh",
+        "skills": ["~/.dsh/skills", "~/.agents/skills", "~/.claude/skills"],
+        "memories": [],
+        "memories_rel": [],
+        "configs": ["~/.dsh/.credentials.yaml"],
+        "configs_rel": ["profiles/desktop/cordis.patch.yml"],
+        "mcp": [],
+        "mcp_globs": [],
+        "mcp_globs_rel": ["profiles/desktop/cordis.patch.yml"],
+    },
 ]
 
 
