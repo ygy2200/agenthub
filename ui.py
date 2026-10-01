@@ -542,7 +542,7 @@ class TimelinePage(QWidget):
         self.win = win
         self.all_entries: list = []
         self.projects: list = []
-        self.render_limit = 80  # 懒加载：首屏渲染条数
+        self.render_limit = 80  # 懒加载：每批渲染条数
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 0)
         top = QHBoxLayout()
@@ -594,8 +594,7 @@ class TimelinePage(QWidget):
             idx = combo.findText(cur)
             combo.setCurrentIndex(idx if idx >= 0 else 0)
             combo.blockSignals(False)
-        self.render_limit = 80  # 新快照重置懒加载
-        self.rebuild()
+        self.rebuild()  # 新快照：全清重渲（rendered/_last_date 重置）
 
     def _filtered(self):
         a = self.agentFilter.currentText()
@@ -608,25 +607,47 @@ class TimelinePage(QWidget):
             out = [r for r in out if r.get("project", "") == pj]
         return out
 
-    def rebuild(self):
+    def _clear_layout(self, lay):
+        """递归清理子布局：只 deleteLater widget 项会让装在子布局里的按钮泄漏残留
+        （2026-10-01 时间线"加载更多"按钮堆叠 bug 根因）。"""
+        while lay.count():
+            it = lay.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+            elif it.layout():
+                self._clear_layout(it.layout())
+                it.layout().deleteLater()
+
+    def _clear_box(self):
         while self.box.count():
             item = self.box.takeAt(0)
             if item.widget():
                 item.widget().deleteLater()
+            elif item.layout():
+                self._clear_layout(item.layout())
+                item.layout().deleteLater()
+
+    def rebuild(self):
+        self._clear_box()
+        self.rendered = 0
+        self._last_date = None
+        self._cur_card_lay = None
+        self._append_batch()
+
+    def _append_batch(self):
+        """增量渲染下一批（load_more 不整页重建：不闪屏、不丢滚动位置）。
+        _cur_card_lay 跨批次保存最后一张日期卡——批次首条与上批末条同日时继续入同卡。"""
         entries = self._filtered()
-        # 懒加载：一次只渲染一屏多一点的条目，避免大量控件卡主线程
-        shown = entries[:self.render_limit]
-        cur_date = None
-        card_lay = None
-        for r in shown:
+        batch = entries[self.rendered:self.rendered + self.render_limit]
+        for r in batch:
             d = r.get("date") or "日期未标注"
-            if d != cur_date:
-                cur_date = d
+            if d != self._last_date or self._cur_card_lay is None:
+                self._last_date = d
                 card = CardWidget()
-                card_lay = QVBoxLayout(card)
-                card_lay.setContentsMargins(18, 12, 18, 12)
-                card_lay.setSpacing(6)
-                card_lay.addWidget(StrongBodyLabel(d))
+                self._cur_card_lay = QVBoxLayout(card)
+                self._cur_card_lay.setContentsMargins(18, 12, 18, 12)
+                self._cur_card_lay.setSpacing(6)
+                self._cur_card_lay.addWidget(StrongBodyLabel(d))
                 self.box.addWidget(card)
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
@@ -640,24 +661,29 @@ class TimelinePage(QWidget):
             proj_btn.clicked.connect(lambda _, n=r.get("project", ""): self.jump(n))
             row.addWidget(title, 1)
             row.addWidget(proj_btn)
-            card_lay.addLayout(row)
-        if not shown:
+            self._cur_card_lay.addLayout(row)
+        self.rendered += len(batch)
+        if not entries:
             tip = BodyLabel("暂无符合条件的记录")
             tip.setAlignment(Qt.AlignCenter)
             self.box.addWidget(tip)
-        elif len(entries) > len(shown):
-            more = PushButton(f"加载更多（还有 {len(entries) - len(shown)} 条）")
+            return
+        # 尾部：加载更多按钮 + 统计说明（直接放 box，居中对齐，增量时先移除旧尾部）
+        for tw in getattr(self, "_tail", []):
+            tw.setParent(None)
+            tw.deleteLater()
+        self._tail = []
+        if self.rendered < len(entries):
+            more = PushButton(f"加载更多（还有 {len(entries) - self.rendered} 条）")
             more.clicked.connect(self.load_more)
-            wrap = QHBoxLayout()
-            wrap.addStretch(1)
-            wrap.addWidget(more)
-            wrap.addStretch(1)
-            self.box.addLayout(wrap)
-            self.box.addWidget(CaptionLabel(f"共 {len(entries)} 条，已显示 {len(shown)} 条；用上方过滤器可缩小范围"))
+            self.box.addWidget(more, 0, Qt.AlignHCenter)
+            self._tail.append(more)
+            cap = CaptionLabel(f"共 {len(entries)} 条，已显示 {self.rendered} 条；用上方过滤器可缩小范围")
+            self.box.addWidget(cap, 0, Qt.AlignHCenter)
+            self._tail.append(cap)
 
     def load_more(self):
-        self.render_limit += 80
-        self.rebuild()
+        self._append_batch()
 
     def show_detail(self, r):
         dlg = RecordDetailDialog(self.win, r)
