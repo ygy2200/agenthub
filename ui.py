@@ -533,7 +533,7 @@ class ProjectPage(QWidget):
 
 
 AGENT_CN = {"zcode": "ZCode", "hermes": "hermes", "deepseek": "deepseek",
-            "claude": "claude", "codex": "codex", "其他": "其他"}
+            "claude": "claude", "codex": "codex", "dsh": "DSH", "其他": "其他"}
 
 
 class TimelinePage(QWidget):
@@ -577,8 +577,10 @@ class TimelinePage(QWidget):
         entries = rows
         self.all_entries = entries
 
-        # 过滤器填充（保持当前选择）；项目列表取全量（无记录项目也可过滤）
-        agents = ["全部"] + [AGENT_CN.get(a, a) for a in sorted({r.get("agent", "") for r in rows} - {""})]
+        # 过滤器填充（保持当前选择）；agent 候选统一小写去重（大小写双身份曾致过滤滤光记录）；
+        # 项目列表取全量（无记录项目也可过滤）
+        agents = ["全部"] + [AGENT_CN.get(a, a) for a in
+                             sorted({(r.get("agent") or "").lower() for r in rows} - {""})]
         try:
             all_projects = [p["name"] for p in brain.list_projects(self.win.root, 200)]
         except Exception:
@@ -600,8 +602,8 @@ class TimelinePage(QWidget):
         pj = self.projFilter.currentText()
         out = self.all_entries
         if a and a != "全部":
-            want = {v: k for k, v in AGENT_CN.items()}.get(a, a.lower())
-            out = [r for r in out if r.get("agent", "") == want]
+            # casefold 比较：agent 存值大小写曾混杂（ZCode/zcode），精确 == 会滤光记录
+            out = [r for r in out if (r.get("agent") or "").lower() == a.lower()]
         if pj and pj != "全部":
             out = [r for r in out if r.get("project", "") == pj]
         return out

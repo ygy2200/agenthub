@@ -135,11 +135,17 @@ def _now() -> str:
 _NON_AGENT = {"", "user", "unknown", "migrated"}
 
 
+def _norm_agent(agent: str) -> str:
+    """agent 身份统一小写：ZCode/zcode 双身份曾并存，过滤/统计/徽章处处错位
+    （2026-10-01 时间线过滤滤光记录事故根因）。"""
+    return (agent or "").strip().lower()
+
+
 def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, record: bool = False) -> None:
     """agent 注册制：所有写动作顺带登记身份（轻量 upsert，见 agents 表）。"""
-    if not agent or agent.strip() in _NON_AGENT:
+    agent = _norm_agent(agent)
+    if agent in _NON_AGENT:
         return
-    agent = agent.strip()
     now = _now()
     conn.execute("INSERT INTO agents(name,first_seen,last_seen,last_project) VALUES(?,?,?,?) "
                  "ON CONFLICT(name) DO NOTHING", (agent, now, now, project or ""))
@@ -167,6 +173,7 @@ def init_db(root: str) -> str:
         _migrate_memory(root)
         _migrate_jsonl(root)
         _backfill_agents(root)
+        _normalize_agents(root)
         _migrate_columns(root)
         return ""
     except sqlite3.Error as e:
@@ -325,6 +332,28 @@ def _backfill_agents(root: str) -> None:
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('agents_backfill','1')")
 
 
+def _normalize_agents(root: str) -> None:
+    """历史数据 agent 大小写归一（ZCode/zcode 双身份清理，幂等）。
+    agents 表主键冲突行合并：计数累加、首见/最近取极值。"""
+    with db_conn(root) as conn:
+        for tbl in ("records", "memories", "errors", "journal"):
+            conn.execute(f"UPDATE {tbl} SET agent=lower(agent) "
+                         "WHERE agent IS NOT NULL AND agent!=lower(agent)")
+        for r in [dict(x) for x in conn.execute("SELECT * FROM agents")]:
+            low = (r["name"] or "").strip().lower()
+            if not low or low == r["name"]:
+                continue
+            dup = conn.execute("SELECT name FROM agents WHERE name=?", (low,)).fetchone()
+            if dup:
+                conn.execute("UPDATE agents SET records=records+?, heartbeats=heartbeats+?, "
+                             "first_seen=MIN(first_seen,?), last_seen=MAX(last_seen,?) WHERE name=?",
+                             (r["records"] or 0, r["heartbeats"] or 0,
+                              r["first_seen"] or "", r["last_seen"] or "", low))
+                conn.execute("DELETE FROM agents WHERE name=?", (r["name"],))
+            else:
+                conn.execute("UPDATE agents SET name=? WHERE name=?", (low, r["name"]))
+
+
 def _migrate_columns(root: str) -> None:
     """老库增量补列（幂等）：memories 用进废退、projects 生命周期；projects.updated 按 records 回填，
     超过 STALL_DAYS 无活动标 stalled。"""
@@ -357,6 +386,7 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
     """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。"""
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
+        agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
             "INSERT INTO records(project,agent,date,title,content,source,created) VALUES(?,?,?,?,?,'hub',?)",
@@ -368,6 +398,7 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
 
 def undo_last_record(root: str, agent: str) -> tuple:
     """软删该 agent 最后一条 hub 写入的记录（栈式）。返回 (错误或"", 撤掉的记录摘要)。"""
+    agent = _norm_agent(agent)
     with db_conn(root) as conn:
         row = conn.execute(
             "SELECT id,project,date,title FROM records WHERE agent=? AND source='hub' AND status='active' "
@@ -408,6 +439,7 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
     if kind not in KINDS:
         kind = "note"
     with db_conn(root) as conn:
+        agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
         cur = conn.execute(
             "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated) "
@@ -637,6 +669,7 @@ def error_add(root: str, agent: str, title: str, detail: str = "",
     if not title or not title.strip():
         return "title 必填"
     with db_conn(root) as conn:
+        agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
         conn.execute("INSERT INTO errors(ts,agent,project,title,detail,undo,status) VALUES(?,?,?,?,?,?,'open')",
                      (_now(), agent or "unknown", project, title.strip()[:200], (detail or "")[:4000], undo))
@@ -667,7 +700,8 @@ def error_set_status(root: str, error_id: int, status: str) -> str:
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:
     """更新心跳并重建会话表（清掉陈旧条目），返回 (错误或"", 同项目其他活跃会话)。"""
-    if not agent or not agent.strip():
+    agent = _norm_agent(agent)
+    if not agent:
         return "agent 必填", []
     now = datetime.datetime.now()
     with db_conn(root) as conn:
