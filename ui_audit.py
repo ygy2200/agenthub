@@ -75,13 +75,14 @@ def main():
         else:
             ok("总览", f"项目总数卡={proj_n} 与DB一致")
         if not ov.agentBox.count():
-            # 主动验证空态引导文案（探测异步未回时 agentBox 为空）
+            # 主动验证空态引导文案；探测线程可能竞态完成（空态被真实数据替换），两者皆合法
             ov.set_agents([])
             app.processEvents()
-            if ov.agentBox.count() and "探测" in ov.agentBox.itemAt(0).widget().text():
-                ok("总览", "Agent 阵容空态有引导文案")
+            first_txt = ov.agentBox.itemAt(0).widget().text() if ov.agentBox.count() else ""
+            if first_txt.startswith(("●", "○")) or "探测" in first_txt:
+                ok("总览", "Agent 阵容空态有引导文案（或探测竞态完成显示真实数据）")
             else:
-                note("UX", "总览", "Agent 阵容为空时无引导文案")
+                note("UX", "总览", f"Agent 阵容空态文案异常: {first_txt[:40]}")
             ov.set_agents([])
         else:
             ok("总览", "Agent 阵容有渲染")

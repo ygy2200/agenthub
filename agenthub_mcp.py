@@ -75,6 +75,18 @@ def _guess_agent(root: str) -> str:
     return ""
 
 
+def _auto_title(content: str, date: str, agent: str) -> str:
+    """记录标题自动摘要：取「目的」行或首个非空行，避免标题全部是重复的日期串
+    （2026-10-01 用户实测：dsh 记录标题清一色"2026-10-01（dsh）"，时间线毫无信息量）。"""
+    import re
+    m = re.search(r"目的[】\]:：]\s*(.+)", content)
+    first = (m.group(1) if m else next((ln.strip() for ln in content.splitlines() if ln.strip()), ""))
+    first = first.strip("【】 ").strip()
+    if first:
+        return f"{date}（{agent}）· {first[:48]}{'…' if len(first) > 48 else ''}"
+    return f"{date}（{agent}）"
+
+
 def call_tool(name: str, arguments: dict, root: str) -> str:
     """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
@@ -114,7 +126,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         # date 畸形兜底：从参数里提取 YYYY-MM-DD，取不到用今天
         dm = core.DATE_RE.search(str(arguments.get("date") or ""))
         date = dm.group(1) if dm else datetime.date.today().isoformat()
-        rec_id = brain.add_record(root, pname, agent, date, f"{date}（{agent}）", content)
+        rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content)
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)

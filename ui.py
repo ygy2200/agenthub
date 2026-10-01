@@ -223,6 +223,23 @@ class RecordDetailDialog(MessageBoxBase):
 
 # ---------------------------------------------------------------- 小组件
 
+_BARE_TITLE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}（[^）]*）$")
+
+
+def _display_title(r: dict) -> str:
+    """空洞标题（仅"日期（agent）"，MCP 旧写入与迁移记录皆如此）用 content 首行
+    （目的行优先）替代显示——title 原值是迁移幂等键，只改显示不动库。"""
+    t = (r.get("title") or "").strip()
+    if _BARE_TITLE_RE.match(t) and r.get("content"):
+        m = re.search(r"目的[】\]:：]\s*(.+)", r["content"])
+        first = (m.group(1) if m else
+                 next((ln.strip() for ln in r["content"].splitlines() if ln.strip()), ""))
+        first = first.strip("【】 ").strip()
+        if first:
+            return f"{t} · {first[:56]}{'…' if len(first) > 56 else ''}"
+    return t or "(无标题)"
+
+
 def badge(agent: str, raw: str) -> QLabel:
     # 未知 agent 显示自己的名字（中性色），"未标注"仅限 agent 字段真空——
     # 否则新接入的 agent 一律显示"未标注"（2026-10-01 dsh 实测踩坑）
@@ -651,8 +668,8 @@ class TimelinePage(QWidget):
                 self.box.addWidget(card)
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
-            title = ClickBodyLabel((r.get("title") or "(无标题)")[:80])
-            title.setToolTip(f"{r.get('project', '')} · {r.get('title', '')}\n点击查看完整记录")
+            title = ClickBodyLabel(_display_title(r)[:80])
+            title.setToolTip(f"{r.get('project', '')} · {_display_title(r)}\n点击查看完整记录")
             title.setCursor(Qt.PointingHandCursor)
             title.clicked.connect(lambda _, rr=r: self.show_detail(rr))
             proj_btn = PushButton(r.get("project", "")[:18])
@@ -1139,7 +1156,8 @@ class OverviewPage(QWidget):
         for r in self.recent:
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
-            t = ClickBodyLabel((r.get("title") or "(无标题)")[:52])
+            t = ClickBodyLabel(_display_title(r)[:72])
+            t.setToolTip(_display_title(r))
             t.setCursor(Qt.PointingHandCursor)
             t.clicked.connect(lambda _, rr=r: RecordDetailDialog(self.win, rr).exec())
             row.addWidget(t, 1)
