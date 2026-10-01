@@ -27,7 +27,9 @@ def case(name, fn):
         print(f"  PASS  {name}")
     except AssertionError as e:
         FAILED.append(name)
-        print(f"  FAIL  {name}  ->  {e}")
+        import traceback
+        line = [s.strip() for s in traceback.format_exc().splitlines() if "adv_brain.py" in s]
+        print(f"  FAIL  {name}  ->  {e} @ {line[-1] if line else '?'}")
     except Exception as e:  # noqa: BLE001
         FAILED.append(name)
         print(f"  ERROR {name}  ->  {type(e).__name__}: {e}")
@@ -133,8 +135,8 @@ def t_records_and_undo(tmp):
     assert err == "" and "2026-09-30（undoA）" in info, (err, info)
     rows = brain.list_records(root, "测试-项目")
     assert all("第二件写错" not in r["title"] for r in rows), "软删记录仍可见"
-    assert len([r for r in rows if r["agent"] == "undoA"]) == 1, "误删第一条"
-    assert any(r["agent"] == "undoB" for r in rows), "误删他人"
+    assert len([r for r in rows if r["agent"].lower() == "undoa"]) == 1, "误删第一条"
+    assert any(r["agent"].lower() == "undob" for r in rows), "误删他人"
     assert any("初始化记录正文" in r["content"] for r in rows), "误删迁移记录"
     # 再撤：撤第一条；迁移记录不可撤
     err, info2 = brain.undo_last_record(root, "undoA")
@@ -191,7 +193,9 @@ def t_search_all_and_stats(tmp):
     root = Path(str(Path(tmp) / "hub"))
     rs = str(root)
     brain.add_memory(rs, "FlClash订阅更新会覆盖profile_id", "lesson", "flclash")
-    brain.add_record(rs, "测试-项目", "zcode", "2026-09-30", "2026-09-30（zcode）", "修了FlClash的规则")
+    import datetime
+    _today = datetime.date.today().isoformat()
+    brain.add_record(rs, "测试-项目", "zcode", _today, f"{_today}（zcode）", "修了FlClash的规则")
     brain.update_files_index(rs, [("测试-项目", str(root / "测试-项目" / "a.png"), "a.png", "根目录", 1, 0.0)])
     res = brain.search_all(rs, "flclash")
     assert res["records"] and res["memories"] and not res["files"]
@@ -248,14 +252,14 @@ def t_backup_brain(tmp):
 def t_agents_registry(tmp):
     """agent 注册制：写动作自动登记/计数/在线标记/保留名过滤/回填幂等/并发登记。"""
     root = str(Path(tmp) / "hub")
-    brain.add_record(root, "注册测试-项目", "注册Robot", "2026-09-30", "t1", "c1")
-    brain.add_record(root, "其他项目", "注册Robot", "2026-09-30", "t2", "c2")
-    brain.add_memory(root, "注册测试记忆", agent="注册Robot", project="注册测试-项目")
-    brain.error_add(root, "注册Robot", "注册测试错误", project="其他项目")
-    err, _act = brain.heartbeat_touch(root, "注册Robot", "注册测试-项目", note="在线测试")
+    brain.add_record(root, "注册测试-项目", "注册robot", "2026-09-30", "t1", "c1")
+    brain.add_record(root, "其他项目", "注册robot", "2026-09-30", "t2", "c2")
+    brain.add_memory(root, "注册测试记忆", agent="注册robot", project="注册测试-项目")
+    brain.error_add(root, "注册robot", "注册测试错误", project="其他项目")
+    err, _act = brain.heartbeat_touch(root, "注册robot", "注册测试-项目", note="在线测试")
     assert err == ""
     rows = {r["name"]: r for r in brain.list_agents(root)}
-    a = rows["注册Robot"]
+    a = rows["注册robot"]
     assert a["records"] == 2, a
     assert a["heartbeats"] == 1, a
     assert a["last_project"] == "注册测试-项目", a
@@ -274,13 +278,13 @@ def t_agents_registry(tmp):
     import threading
 
     def w(i):
-        brain.heartbeat_touch(root, f"并发Agent{i}", "注册测试-项目")
+        brain.heartbeat_touch(root, f"并发agent{i}", "注册测试-项目")
 
     ts = [threading.Thread(target=w, args=(i,)) for i in range(8)]
     [t.start() for t in ts]
     [t.join() for t in ts]
-    got = {r["name"] for r in brain.list_agents(root) if r["name"].startswith("并发Agent")}
-    assert got == {f"并发Agent{i}" for i in range(8)}, got
+    got = {r["name"] for r in brain.list_agents(root) if r["name"].startswith("并发agent")}
+    assert got == {f"并发agent{i}" for i in range(8)}, got
 
 
 def t_plasticity(tmp):

@@ -487,6 +487,7 @@ def recall_for(root: str, project: str) -> list:
 
 def should_push(root: str, agent: str, project: str) -> bool:
     """同一 agent+project 在免推窗口内的重复心跳不再推送（上下文里已有，重推纯冗余）。"""
+    agent = _norm_agent(agent)
     with db_conn(root) as conn:
         row = conn.execute("SELECT ts, project FROM sessions WHERE agent=?", (agent,)).fetchone()
     if not row or row["project"] != (project or ""):
