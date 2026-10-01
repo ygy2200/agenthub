@@ -729,6 +729,8 @@ class StatsPage(QWidget):
 
         self.agentBox = QVBoxLayout()
         self.monthBox = QVBoxLayout()
+        self.healthLine = CaptionLabel("")
+        self.healthLine.setWordWrap(True)
         for box, t in ((self.agentBox, "各 agent 记录分布"), (self.monthBox, "近 6 个月活跃")):
             gb = CardWidget()
             g = QVBoxLayout(gb)
@@ -736,6 +738,12 @@ class StatsPage(QWidget):
             g.addWidget(StrongBodyLabel(t))
             g.addLayout(box)
             lay.addWidget(gb)
+        hc = CardWidget()
+        hg = QVBoxLayout(hc)
+        hg.setContentsMargins(20, 14, 20, 14)
+        hg.addWidget(StrongBodyLabel("大脑体检（智能摘要）"))
+        hg.addWidget(self.healthLine)
+        lay.addWidget(hc)
         lay.addStretch(1)
 
     def set_db(self, s: dict):
@@ -745,6 +753,23 @@ class StatsPage(QWidget):
         self.cardIssue.value.setText(str(s.get("errors_open", 0)))
         self.cardStalled.value.setText(str(s.get("projects_stalled", 0)))
         self.cardSearch.value.setText(f"{s.get('searches_today', 0)} / {s.get('searches_total', 0)}")
+        try:
+            h = brain.health_report(self.win.root)
+            dup = f"疑似重复记忆 {h['dup_memory_count']} 组"
+            todo = f"待办线索 {h['todo_count']} 条"
+            tip = []
+            if h['dup_memory_count']:
+                tip.append(dup)
+            if h['todo_count']:
+                tip.append(todo)
+            if h['projects_stalled']:
+                tip.append(f"停滞项目 {h['projects_stalled']} 个")
+            self.healthLine.setText(
+                f"结晶率 {h['crystallization']}%（记忆/记录）· 检索 今日 {h['searches_today']} / 累计 {h['searches_total']} 次"
+                + (" · " + " · ".join(tip) if tip else " · 各项整洁")
+                + "（agent 可调 hub_health 看完整报告）")
+        except Exception:
+            self.healthLine.setText("体检暂不可用")
 
         def clear(box):
             while box.count():

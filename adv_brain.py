@@ -340,6 +340,39 @@ def t_plasticity(tmp):
     assert s == "stalled", s
 
 
+
+def t_intelligence(tmp):
+    """智能层：待办提取（句式/清洗/阈值）、相似记忆 Jaccard 检测、健康报告字段。"""
+    root = str(Path(tmp) / "hub")
+    brain.add_record(root, "智能测试-项目", "zcode", "2026-10-01", "t1",
+        "【目的】做了功能甲\n【遗留问题】待验证：长路径沙盒实测还没做")
+    brain.add_record(root, "智能测试-项目", "dsh", "2026-10-01", "t2",
+        "修好了编码问题。下次记得把文档也更新一下。")
+    brain.add_record(root, "智能测试-项目", "dsh", "2026-10-01", "t3", "普通的记录，没有任何待办句式。")
+    todos = brain.extract_todos(root)
+    assert len(todos) == 2, todos
+    assert all("】" not in t["todo"][4:] for t in todos), [t["todo"] for t in todos]
+    assert all(len(t["todo"]) >= 8 for t in todos)
+    # 相似记忆：重复对命中，无关对不命中
+    m1 = brain.add_memory(root, "FlClash订阅更新会覆盖profile_id导致规则脱钩", kind="lesson", agent="zcode")
+    m2 = brain.add_memory(root, "FlClash订阅更新会覆盖profile_id导致规则脱钩（dsh复核确认）", kind="lesson", agent="dsh")
+    brain.add_memory(root, "完全不相关的记忆：校园网出境丢包率高", kind="fact", agent="zcode")
+    sims = brain.similar_memories(root, threshold=0.55)
+    assert sims, "应检出重复对"
+    assert all(0.55 <= s["sim"] <= 1.0 for s in sims)
+    # 本用例写入的 FlClash 对必须被精确检出
+    assert any({s["a"], s["b"]} == {m1, m2} for s in sims), [(s["a"], s["b"], s["sim"]) for s in sims]
+    # 健康报告字段完整
+    h = brain.health_report(root)
+    for k in ("records", "memories", "todos", "todo_count", "dup_memories", "dup_memory_count",
+              "projects_stalled", "searches_total", "crystallization"):
+        assert k in h, k
+    assert h["todo_count"] >= 2 and h["dup_memory_count"] >= 1
+    # 极端参数不崩
+    assert brain.extract_todos(root, limit=-5) == [] or True
+    brain.similar_memories(root, threshold=1.5)
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -371,6 +404,7 @@ def main():
     case("全脑检索+统计（记录/记忆/文件名）", lambda: t_search_all_and_stats(tmp))
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))
+    case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()

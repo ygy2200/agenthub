@@ -307,6 +307,36 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                          f"最近项目:{r['last_project'] or '无'} · 最近活跃:{r['last_seen'] or '无'}")
         return "\n".join(lines)
 
+    if name == "hub_list_todos":
+        try:
+            limit = int(arguments.get("limit", 20))
+        except (TypeError, ValueError):
+            limit = 20
+        todos = brain.extract_todos(root, limit)
+        if not todos:
+            return "未发现待办/承诺线索（记录里没有 待办|后续|下次|待验证…句式）"
+        lines = [f"待办/承诺线索 {len(todos)} 条（新在前）："]
+        for t in todos:
+            lines.append(f"- [{t['date']} {t['agent']}·{t['project']}] {t['todo'][:80]}")
+        return "\n".join(lines)
+
+    if name == "hub_health":
+        h = brain.health_report(root)
+        lines = ["大脑体检报告：",
+                 f"- 规模：记录 {h['records']} 条 · 记忆 {h['memories']} 条 · 项目 {h['projects']}"
+                 f"（停滞 {h['projects_stalled']}）· 待处理错误 {h['errors_open']}",
+                 f"- 结晶率 {h['crystallization']}%（记忆/记录）· 检索：今日 {h['searches_today']} / 累计 {h['searches_total']} 次",
+                 f"- 待办线索 {h['todo_count']} 条 · 疑似重复记忆 {h['dup_memory_count']} 组"]
+        if h["todos"]:
+            lines.append("待办线索（最近 5 条，全部用 hub_list_todos）：")
+            for t in h["todos"][:5]:
+                lines.append(f"  · [{t['date']} {t['agent']}·{t['project']}] {t['todo'][:60]}")
+        if h["dup_memories"]:
+            lines.append("疑似重复记忆（建议合并或按「取代记忆#N」约定处理）：")
+            for d in h["dup_memories"][:5]:
+                lines.append(f"  · #{d['a']}~#{d['b']} 相似{d['sim']}：{d['content_a'][:44]}")
+        return "\n".join(lines)
+
     if name == "hub_get_progress":
         try:
             limit = int(arguments.get("limit", 30))
@@ -387,6 +417,10 @@ TOOLS = [
     {"name": "hub_list_mcps", "description": "列出本机各 agent 已配置的 MCP 服务器",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_list_agents", "description": "列出注册 agent 身份表（在线状态/累计记录/心跳次数/最近活跃）",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_list_todos", "description": "列出工作记录里的待办/承诺线索（后续/待验证/下一步…句式，元认知）",
+     "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认20"}}}},
+    {"name": "hub_health", "description": "大脑体检报告：规模/结晶率/待办线索/疑似重复记忆/检索活跃度+建议",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},

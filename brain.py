@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -786,3 +787,88 @@ def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:
         return str(dst)
     except (sqlite3.Error, OSError) as e:
         return f"备份失败：{e}"
+
+
+# ---------------------------------------------------------------- 智能层（零依赖本地算法：待办提取 / 相似检测 / 体检报告）
+
+_TODO_RE = re.compile(
+    r"(待办|后续|下次|下一步|TODO|待确认|待验证|待实测|待办事项|需要再|记得|提醒用户|尚未完成|遗留问题|待人工|待续)"
+    r"[：:]?([^\n]{4,120})")
+_WORD_RE = re.compile(r"[a-z0-9]+")
+
+
+def _tokens(text: str) -> set:
+    """中文 bigram + 拉丁词的轻量分词（零依赖），供相似度计算。"""
+    text = re.sub(r"[^\w一-鿿]+", " ", (text or "").lower())
+    toks: set = set()
+    for seg in text.split():
+        if _WORD_RE.fullmatch(seg):
+            toks.add(seg)
+        else:
+            toks.update(seg[i:i + 2] for i in range(len(seg) - 1))
+    return toks
+
+
+def extract_todos(root: str, limit: int = 20) -> list:
+    """元认知：扫描工作记录里的待办/承诺线索（后续/待验证/下一步…句式），
+    返回 [{id, project, date, agent, todo}]——大脑不只记过去，还管欠账。"""
+    out = []
+    with db_conn(root) as conn:
+        rows = conn.execute(
+            "SELECT id, project, date, agent, content FROM records "
+            "WHERE status='active' ORDER BY id DESC LIMIT 400").fetchall()
+    for r in rows:
+        for m in _TODO_RE.finditer(r["content"] or ""):
+            text = m.group(2).strip()
+            while text and text[0] in "】』」)]：:，。；、":
+                text = text[1:].strip()
+            text = text.strip("，。；、")
+            if len(text) >= 4:
+                out.append({"id": r["id"], "project": r["project"], "date": r["date"],
+                            "agent": r["agent"], "todo": f"{m.group(1)}：{text}"})
+            if len(out) >= max(1, min(limit, 100)):
+                return out
+    return out
+
+
+def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
+    """巩固：两两 Jaccard 相似度检测疑似重复/矛盾记忆（bigram 分词，<=500 条时全算）。
+    返回 [{a, b, sim, content_a, content_b}]——高相似且同 kind 的多为重复，同主题异结论的可能是矛盾。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, kind, content FROM memories WHERE status='active' ORDER BY id")]
+    toks = [(r["id"], r["kind"], r["content"], _tokens(r["content"])) for r in rows]
+    out = []
+    for i in range(len(toks)):
+        for j in range(i + 1, len(toks)):
+            ta, tb = toks[i][3], toks[j][3]
+            if not ta or not tb:
+                continue
+            inter = len(ta & tb)
+            sim = inter / len(ta | tb) if ta | tb else 0.0
+            if sim >= threshold:
+                out.append({"a": toks[i][0], "b": toks[j][0], "sim": round(sim, 2),
+                            "content_a": toks[i][2][:80], "content_b": toks[j][2][:80]})
+            if len(out) >= max(1, min(limit, 50)):
+                return out
+    out.sort(key=lambda x: -x["sim"])
+    return out
+
+
+def health_report(root: str) -> dict:
+    """大脑体检：汇总各智能维度 + 数据规模，供 hub_health 工具与 GUI 体检摘要。"""
+    s = stats(root)
+    todos = extract_todos(root, limit=50)
+    sims = similar_memories(root, limit=20)
+    with db_conn(root) as conn:
+        bare_titles = conn.execute(
+            "SELECT COUNT(*) FROM records WHERE status='active' "
+            "AND title GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]（*）'").fetchone()[0]
+    return {"records": s["records"], "memories": s["memories"], "projects": s["projects"],
+            "projects_stalled": s.get("projects_stalled", 0),
+            "errors_open": s.get("errors_open", 0),
+            "searches_today": s.get("searches_today", 0), "searches_total": s.get("searches_total", 0),
+            "todos": todos, "todo_count": len(todos),
+            "dup_memories": sims, "dup_memory_count": len(sims),
+            "bare_titles": bare_titles,
+            "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
