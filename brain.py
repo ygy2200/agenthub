@@ -479,12 +479,14 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
 
 PUSH_LIMIT_PROJECT = 3   # 记忆推送：项目相关最多条数（项目教训优先于全局置顶）
 PUSH_LIMIT_PINNED = 3    # 记忆推送：全局置顶最多条数（防置顶膨胀推高每次心跳成本）
+PUSH_LIMIT_RELATED = 2   # 记忆推送：跨项目语义联想最多条数（联想阈值 0.12）
 PUSH_CHAR_CAP = 600      # 记忆推送：输出总字数封顶
 PUSH_THROTTLE_MIN = 10   # 同 agent+project 重复心跳的免推窗口（分钟）——推送内容还在会话上下文里
 
 
 def recall_for(root: str, project: str) -> list:
-    """开工记忆推送（反射弧）：项目相关记忆优先、置顶垫后（限流），按命中次数/最新排序。
+    """开工记忆推送（反射弧）三层：本项目相关 → 全局置顶 → 跨项目语义联想
+    （该项目最近记录的 bigram 词集与其他项目记忆算 Jaccard，撞到别处踩过的坑自动想起）。
     命中即记一次唤起（use_count+1）——只对实际推送出去的条目计数（用进废退）。"""
     with db_conn(root) as conn:
         proj = [dict(r) for r in conn.execute(
@@ -496,8 +498,30 @@ def recall_for(root: str, project: str) -> list:
             "AND (project='' OR project IS NULL OR project!=?) "
             "ORDER BY use_count DESC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PINNED))]
+        # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他项目记忆
+        related: list = []
+        cur_txt = " ".join(r["content"] for r in conn.execute(
+            "SELECT content FROM (SELECT content FROM records WHERE status='active' AND project=? "
+            "ORDER BY id DESC LIMIT 3)", (project or "",)))
+        cur_toks = _tokens(cur_txt)
+        if len(cur_toks) >= 4:
+            others = [dict(r) for r in conn.execute(
+                "SELECT * FROM memories WHERE status='active' AND project IS NOT NULL "
+                "AND project!='' AND project!=? LIMIT 300", (project or "",))]
+            scored = []
+            for om in others:
+                ot = _tokens(om["content"])
+                if not ot:
+                    continue
+                sim = len(cur_toks & ot) / len(cur_toks | ot)
+                if sim >= 0.12:
+                    scored.append((sim, om))
+            scored.sort(key=lambda x: -x[0])
+            for sim, om in scored[:PUSH_LIMIT_RELATED]:
+                om["related_project"] = om["project"]
+                related.append(om)
         rows, seen, total = [], set(), 0
-        for r in proj + pins:  # 项目相关在前
+        for r in proj + pins + related:  # 项目相关 → 置顶 → 跨项目联想
             if r["id"] in seen:
                 continue
             if total >= PUSH_CHAR_CAP:
@@ -539,18 +563,30 @@ def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> 
 
 
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20) -> list:
-    """检索记忆：置顶优先，其余按 id 倒序（最新）。query 对内容/标签/项目 LIKE。"""
+    """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。"""
+    words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
     q = "SELECT * FROM memories WHERE status='active'"
     args: list = []
-    if query.strip():
-        like = f"%{query.strip()}%"
-        q += " AND (content LIKE ? OR tags LIKE ? OR project LIKE ?)"
-        args += [like, like, like]
-    if kind in KINDS:
-        q += " AND kind=?"
-        args.append(kind)
-    q += " ORDER BY pinned DESC, id DESC LIMIT ?"
-    args.append(max(0, min(limit, 100)))
+    if words:
+        conds, score_sql = [], []
+        for w in words:
+            like = f"%{w}%"
+            conds.append("(content LIKE ? OR tags LIKE ? OR project LIKE ?)")
+            args += [like, like, like]
+            score_sql.append("(CASE WHEN content LIKE ? THEN 2 ELSE 0 END + CASE WHEN tags LIKE ? THEN 1 ELSE 0 END)")
+            args += [like, like]
+        q += " AND (" + " OR ".join(conds) + ")"
+        if kind in KINDS:
+            q += " AND kind=?"
+            args.append(kind)
+        q += " ORDER BY pinned DESC, (" + " + ".join(score_sql) + ") DESC, id DESC LIMIT ?"
+        args.append(max(0, min(limit, 100)))
+    else:
+        if kind in KINDS:
+            q += " AND kind=?"
+            args.append(kind)
+        q += " ORDER BY pinned DESC, id DESC LIMIT ?"
+        args.append(max(0, min(limit, 100)))
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(q, args)]
 
@@ -639,10 +675,14 @@ def search_all(root: str, kw: str, limit: int = 30) -> dict:
 
 
 def search_files(root: str, kw: str, limit: int = 20) -> list:
-    like = f"%{kw}%"
+    words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
+    if not words:
+        return []
+    conds = " OR ".join(["name LIKE ?"] * len(words))
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT project,name,path FROM files WHERE name LIKE ? LIMIT ?", (like, max(1, min(limit, 100))))]
+            f"SELECT project,name,path FROM files WHERE ({conds}) LIMIT ?",
+            [f"%{w}%" for w in words] + [max(1, min(limit, 100))])]
 
 
 def update_files_index(root: str, rows: list) -> None:
@@ -877,9 +917,21 @@ def mark_todo_done(root: str, record_id: int, todo: str, agent: str = "") -> str
     return ""
 
 
+_CONFLICT_WORDS = ("取代", "纠正", "错误", "不对", "实际是", "应为", "真相", "误判", "作废")
+
+
+def _verdict(ca: str, cb: str, kind_same: bool) -> str:
+    """裁决辅助：恰一条含修正词 → 疑似矛盾（一条修正另一条）；同 kind → 疑似重复。"""
+    ca, cb = ca or "", cb or ""
+    wa, wb = any(w in ca for w in _CONFLICT_WORDS), any(w in cb for w in _CONFLICT_WORDS)
+    if wa != wb:
+        return "疑似矛盾（一条修正另一条）"
+    return "疑似重复" if kind_same else "相关"
+
+
 def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
     """巩固：两两 Jaccard 相似度检测疑似重复/矛盾记忆（bigram 分词，<=500 条时全算）。
-    返回 [{a, b, sim, content_a, content_b}]——高相似且同 kind 的多为重复，同主题异结论的可能是矛盾。"""
+    返回 [{a, b, sim, verdict, content_a, content_b}]——verdict 为裁决辅助建议，最终由 agent/用户裁决。"""
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, kind, content FROM memories WHERE status='active' ORDER BY id")]
@@ -894,6 +946,7 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
             sim = inter / len(ta | tb) if ta | tb else 0.0
             if sim >= threshold:
                 out.append({"a": toks[i][0], "b": toks[j][0], "sim": round(sim, 2),
+                            "verdict": _verdict(toks[i][2], toks[j][2], toks[i][1] == toks[j][1]),
                             "content_a": toks[i][2][:80], "content_b": toks[j][2][:80]})
             if len(out) >= max(1, min(limit, 50)):
                 return out

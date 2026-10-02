@@ -390,7 +390,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         if h["dup_memories"]:
             lines.append("疑似重复记忆（建议合并或按「取代记忆#N」约定处理）：")
             for d in h["dup_memories"][:5]:
-                lines.append(f"  · #{d['a']}~#{d['b']} 相似{d['sim']}：{d['content_a'][:44]}")
+                lines.append(f"  · #{d['a']}~#{d['b']} 相似{d['sim']} [{d.get('verdict', '')}]：{d['content_a'][:40]}")
         return "\n".join(lines)
 
     if name == "hub_get_progress":

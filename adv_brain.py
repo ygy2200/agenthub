@@ -428,6 +428,42 @@ def t_env_profile(tmp):
     assert brain.env_list(root, limit=-1) == [] or True
 
 
+
+def t_semantic_recall(tmp):
+    """跨项目语义联想推送 + memories/files 多词评分 + 裁决标注。"""
+    root = str(Path(tmp) / "hub")
+    # 项目 A 踩的坑，项目 B 开工时应被联想推送
+    brain.add_record(root, "项目A-代理调试", "zcode", "2026-10-01", "t1",
+        "FlClash 强杀后死代理残留导致断网，需重启代理恢复")
+    brain.add_memory(root, "FlClash 强杀必留死代理，断网先查代理残留", kind="lesson",
+        project="项目A-代理调试", agent="zcode")
+    brain.add_memory(root, "无关记忆：课表导出格式讨论", kind="note", project="项目C-课表", agent="zcode")
+    # 项目 B 开工（有自己的记录，主题与项目 A 的代理坑相关）
+    brain.add_record(root, "项目B-新界面", "zcode", "2026-10-01", "t2",
+        "新界面开发时发现网络异常，怀疑 FlClash 代理强杀残留影响")
+    rows = brain.recall_for(root, "项目B-新界面")
+    ids = {r["id"] for r in rows}
+    rel = [r for r in rows if r.get("related_project")]
+    assert any("死代理" in r["content"] for r in rel), "跨项目联想未命中 FlClash 教训"
+    # 记忆多词评分：两词全中排前
+    brain.add_memory(root, "FlClash 订阅更新覆盖规则", kind="lesson", agent="zcode")
+    brain.add_memory(root, "FlClash 顺带闲聊", kind="note", agent="zcode")
+    res = brain.search_memories(root, "FlClash 订阅")
+    assert "订阅" in res[0]["content"], res[0]["content"]  # 共享hub多高分行在前，验含词即可
+    # 文件多词 OR
+    from pathlib import Path as _P
+    brain.update_files_index(root, [("评分测试-项目", str(_P("x") / "a.png"), "a.png", "根", 1, 0.0),
+                                    ("评分测试-项目", str(_P("x") / "b.txt"), "b.txt", "根", 1, 0.0)])
+    assert len(brain.search_files(root, "a.png")) == 1
+    assert brain.search_files(root, "  ") == []
+    # 裁决标注：修正词对 → 疑似矛盾
+    brain.add_memory(root, "系统代理端口实际是 7890", kind="fact", agent="zcode")
+    brain.add_memory(root, "系统代理端口是 7891", kind="fact", agent="dsh")
+    sims = brain.similar_memories(root, threshold=0.3, limit=50)
+    pair = next((s for s in sims if ("7890" in s["content_a"]) != ("7890" in s["content_b"])), None)
+    assert pair and "矛盾" in pair["verdict"], [(s["a"], s["sim"], s["verdict"]) for s in sims[:5]]
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -462,6 +498,7 @@ def main():
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
     case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
+    case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()
