@@ -181,14 +181,30 @@ def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, recor
     conn.execute(f"UPDATE agents SET {','.join(sets)} WHERE name=?", args)
 
 
+def ensure_schema(root: str) -> str:
+    """仅建表（毫秒级，不跑文件迁移）：MCP server 启动/根目录切换时调用。
+    防"代码已部署但真实库缺新表"——v2.5.2 的 distill_seen 上轮只在测试库验证过，
+    真实库无任何新进程跑过 init_db，hub_distill 直接 no such table（2026-10-02 实锤）。
+    幂等，返回错误或 ""。根目录不存在时报错（与 init_db 一致，不凭空建目录）。"""
+    if not root or not os.path.isdir(root):
+        return "根目录不存在"
+    try:
+        db_path(root).parent.mkdir(parents=True, exist_ok=True)
+        with db_conn(root) as conn:
+            conn.executescript(SCHEMA)
+        return ""
+    except sqlite3.Error as e:
+        return f"大脑 schema 初始化失败：{e}"
+
+
 def init_db(root: str) -> str:
     """建表 + 增量迁移（幂等，每次启动跑，已有数据不重复导入）。返回错误或 ""。"""
     if not root or not os.path.isdir(root):
         return "根目录不存在"
     try:
-        db_path(root).parent.mkdir(parents=True, exist_ok=True)  # 建库责任的唯一入口
-        with db_conn(root) as conn:
-            conn.executescript(SCHEMA)
+        err = ensure_schema(root)
+        if err:
+            return err
         _migrate_records(root)
         _migrate_memory(root)
         _migrate_jsonl(root)

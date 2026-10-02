@@ -580,6 +580,26 @@ def t_like_escape_and_count(tmp):
 
 
 
+def t_ensure_schema(tmp):
+    """schema 自愈（MCP server 启动建表责任的根修）：缺表补建/幂等/坏根目录容错。"""
+    root = str(Path(tmp) / "hub_schema")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_memory(root, "schema自愈用例记忆", agent="zcode")
+    with brain.db_conn(root) as conn:
+        conn.execute("DROP TABLE distill_seen")
+    err = brain.ensure_schema(root)
+    assert err == "", err
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT COUNT(*) FROM distill_seen").fetchone()[0] == 0  # 表回来了且不丢数据
+        assert conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE content LIKE 'schema自愈%'").fetchone()[0] == 1
+    err2 = brain.ensure_schema(root)  # 幂等重跑
+    assert err2 == ""
+    assert brain.ensure_schema(str(Path(tmp) / "不存在_目录xyz")) != ""  # 拒绝而非凭空建目录
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -600,6 +620,7 @@ def main():
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
     case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
     case("LIKE通配符转义（% _ \\字面匹配/裸通配不全命中）+记忆计数", lambda: t_like_escape_and_count(tmp))
+    case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()

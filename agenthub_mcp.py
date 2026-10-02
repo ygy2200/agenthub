@@ -615,6 +615,9 @@ def serve(root: str, fixed: bool = False) -> int:
     杜绝"进程启动时缓存旧路径、静默读写幽灵旧库"（2026-09-30 搬家实测踩坑）。"""
     log = lambda s: print(f"[agenthub-mcp] {s}", file=sys.stderr)  # noqa: E731
     log(f"启动，根目录：{root}" + ("（固定）" if fixed else "（动态跟随 config）"))
+    err = brain.ensure_schema(root)  # 建表责任前移到 server：代码部署后旧库缺新表也能自愈
+    if err:
+        log(f"schema 初始化失败：{err}")
     for raw in sys.stdin:
         raw = raw.strip()
         if not raw:
@@ -624,6 +627,7 @@ def serve(root: str, fixed: bool = False) -> int:
             if live and live != root:
                 root = live
                 log(f"根目录已切换：{root}")
+                brain.ensure_schema(root)
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError as e:
