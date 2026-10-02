@@ -633,6 +633,8 @@ def bootstrap_text(root: str) -> str:
   这就是全局规范「工作记录」要求的动作，记录直接进大脑数据库，不要再手写工作记录.md 文件
 - 有跨会话价值的知识立即沉淀：hub_memory_write(content, kind, tags)——
   环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project；重要条目加 pinned: true
+- 干完活顺手 hub_distill 看一眼蒸馏候选：有「目的」结论但还没沉淀成记忆的，
+  用自己的判断精炼成一条 hub_memory_write（你刚干完活最懂上下文——日记会膨胀，笔记本只留精华）
 - 修正旧记忆别删：写一条新记忆并在开头标注「取代记忆#N」+错在哪，由全员共同裁决旧条目（免疫协议）
 - 检索带具体关键词：hub_memory_read/hub_search 的 query 写「项目名/组件名/错误类型」，
   不要空查或只查一个泛词——问得越准，大脑答得越准

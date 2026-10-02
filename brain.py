@@ -1075,16 +1075,26 @@ def distill_candidates(root: str, limit: int = 20) -> list:
         gist = m.group(1).strip().strip("【】")
         if len(gist) < 6:
             continue
-        gt = _tokens(gist)
-        if not gt:
-            continue
-        covered = any(
-            (len(gt & mt) / len(gt | mt) if gt | mt else 0) >= 0.3
-            for mt in mem_toks.get(r["project"], []))
-        if covered:
-            continue
-        out.append({"id": r["id"], "project": r["project"], "date": r["date"],
-                    "agent": r["agent"], "gist": gist[:80]})
+        # 复合任务（①②③…/分号）按片段级查重：一条记录可能只蒸馏了一部分，
+        # 候选只展示「尚未被记忆覆盖」的片段（2026-10-02 蒸馏演示实测发现）
+        segs = [s.strip() for s in re.split(r"[①②③④⑤⑥⑦⑧⑨⑩]|；", gist)
+                if len(s.strip()) >= 6] or [gist]
+        project_mems = mem_toks.get(r["project"], [])
+        uncovered = []
+        for seg in segs:
+            st = _tokens(seg)
+            if not st:
+                continue
+            # containment（片段被记忆包含的比例）而非 Jaccard——短片段 vs 长记忆时
+            # Jaccard 被记忆大词集稀释，会误判未覆盖（2026-10-02 蒸馏演示实测）
+            covered = any(
+                (len(st & mt) / len(st) if st else 0) >= 0.3
+                for mt in project_mems)
+            if not covered:
+                uncovered.append(seg.strip())
+        if uncovered:
+            out.append({"id": r["id"], "project": r["project"], "date": r["date"],
+                        "agent": r["agent"], "gist": "；".join(uncovered)[:80]})
         if len(out) >= max(1, min(limit, 50)):
             return out
     return out
