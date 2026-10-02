@@ -320,6 +320,19 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines.append(f"- [{t['date']} {t['agent']}·{t['project']}] {t['todo'][:80]}")
         return "\n".join(lines)
 
+    if name == "hub_todo_done":
+        try:
+            rec_id = int(arguments.get("record_id", 0) or 0)
+        except (TypeError, ValueError):
+            rec_id = 0
+        todo = str(arguments.get("todo", "")).strip()
+        agent = str(arguments.get("agent", "")).strip()
+        err = brain.mark_todo_done(root, rec_id, todo, agent)
+        if err:
+            return f"错误：{err}"
+        core.journal(root, agent or "unknown", "todo_done", f"records#{rec_id}", note=todo[:60])
+        return f"待办已勾销：{todo[:60]}"
+
     if name == "hub_health":
         h = brain.health_report(root)
         lines = ["大脑体检报告：",
@@ -422,6 +435,12 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认20"}}}},
     {"name": "hub_health", "description": "大脑体检报告：规模/结晶率/待办线索/疑似重复记忆/检索活跃度+建议",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_todo_done", "description": "勾销待办线索（处理完的欠账销账，闭环）——传 hub_list_todos 行里的待办串",
+     "inputSchema": {"type": "object",
+                     "properties": {"record_id": {"type": "integer", "description": "记录 id"},
+                                    "todo": {"type": "string", "description": "待办原文"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["todo"]}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
 ]

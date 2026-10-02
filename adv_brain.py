@@ -373,6 +373,43 @@ def t_intelligence(tmp):
     brain.similar_memories(root, threshold=1.5)
 
 
+
+def t_search_score_and_todos(tmp):
+    """检索多词评分排序 + 待办勾销闭环。"""
+    root = str(Path(tmp) / "hub")
+    import datetime
+    _td = datetime.date.today().isoformat()
+    brain.add_record(root, "评分测试-项目", "zcode", _td, "FlClash 规则迁移",
+        "FlClash 规则迁移完成，脱钩问题解决")
+    brain.add_record(root, "评分测试-项目", "dsh", _td, "FlClash 顺带一提",
+        "顺带看了 FlClash 的设置页，与本任务无关的闲笔")
+    brain.add_record(root, "评分测试-项目", "dsh", _td, "无关记录",
+        "这里只讲校园网丢包")
+    # 多词评分：两词都命中的排最前
+    res = brain.search_records(root, "FlClash 规则")
+    # 共享 hub 可能有多条含 FlClash 的记录，但两词全中的必须排最前（评分排序语义）
+    top = [r for r in res if r["score"] == 2]
+    assert any("规则迁移" in r["title"] for r in top), [(r["title"], r["score"]) for r in res[:4]]
+    assert all(res[i]["score"] >= res[i + 1]["score"] for i in range(len(res) - 1)), "评分未降序"
+    # 单词兼容
+    assert len(brain.search_records(root, "FlClash")) >= 2  # 共享hub可能多条
+    assert brain.search_records(root, "   ") == []
+    # 待办闭环：提取 -> 勾销 -> 不再出现
+    brain.add_record(root, "评分测试-项目", "dsh", "2026-10-01", "t4",
+        "【遗留问题】待验证：wigolo 工具名在会话里仍报 unknown")
+    todos = brain.extract_todos(root)
+    assert any("wigolo" in t["todo"] for t in todos)
+    target = next(t for t in todos if "wigolo" in t["todo"])
+    assert brain.mark_todo_done(root, target["id"], target["todo"], "dsh") == ""
+    todos2 = brain.extract_todos(root)
+    assert not any("wigolo" in t["todo"] for t in todos2), "勾销后不应再出现"
+    # 空参数拒绝
+    assert "必填" in brain.mark_todo_done(root, 1, "  ")
+    # 勾销后 health/hub 体检不崩且数据一致
+    h = brain.health_report(root)
+    assert not any("wigolo" in t["todo"] for t in h["todos"])
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -405,6 +442,7 @@ def main():
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
+    case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()

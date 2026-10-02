@@ -120,6 +120,13 @@ CREATE TABLE IF NOT EXISTS agents (
     heartbeats INTEGER DEFAULT 0,
     records INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS todos_done (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id INTEGER,
+    todo TEXT,
+    agent TEXT DEFAULT "",
+    ts TEXT
+);
 CREATE TABLE IF NOT EXISTS files (
     project TEXT, path TEXT, name TEXT, grp TEXT,
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
@@ -426,11 +433,24 @@ def list_records(root: str, project: str = "", agent: str = "", limit: int = 100
 
 
 def search_records(root: str, kw: str, limit: int = 30) -> list:
-    like = f"%{kw}%"
+    """多词评分检索：query 按空白切词，命中词数越多越靠前（同分按日期）。
+    单词行为兼容旧版；评分让"多关键词"查询真正缩小范围而非取并集噪声。"""
+    words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
+    if not words:
+        return []
+    score_sql = " + ".join(
+        f"(CASE WHEN title LIKE ? OR content LIKE ? OR project LIKE ? THEN 1 ELSE 0 END)"
+        for _ in words)
+    args: list = []
+    for w in words:
+        like = f"%{w}%"
+        args += [like, like, like]
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
-            "SELECT * FROM records WHERE status='active' AND (title LIKE ? OR content LIKE ? OR project LIKE ?) "
-            "ORDER BY date DESC, id DESC LIMIT ?", (like, like, like, max(1, min(limit, 100))))]
+            f"SELECT *, ({score_sql}) AS score FROM records WHERE status='active' AND "
+            f"({' OR '.join(['(title LIKE ? OR content LIKE ? OR project LIKE ?)'] * len(words))}) "
+            "ORDER BY score DESC, date DESC, id DESC LIMIT ?",
+            args + args + [max(1, min(limit, 100))])]
 
 
 # ---------------------------------------------------------------- 大脑记忆（核心）
@@ -817,18 +837,36 @@ def extract_todos(root: str, limit: int = 20) -> list:
         rows = conn.execute(
             "SELECT id, project, date, agent, content FROM records "
             "WHERE status='active' ORDER BY id DESC LIMIT 400").fetchall()
+        done = {(d[0], d[1]) for d in conn.execute("SELECT record_id, todo FROM todos_done")}
     for r in rows:
         for m in _TODO_RE.finditer(r["content"] or ""):
             text = m.group(2).strip()
             while text and text[0] in "】』」)]：:，。；、":
                 text = text[1:].strip()
             text = text.strip("，。；、")
-            if len(text) >= 4:
-                out.append({"id": r["id"], "project": r["project"], "date": r["date"],
-                            "agent": r["agent"], "todo": f"{m.group(1)}：{text}"})
+            if len(text) < 4:
+                continue
+            todo_str = f"{m.group(1)}：{text}"
+            # 勾销匹配用前缀包含：调用方可能传提取串原样，也可能从 hub_list_todos 行里截片段
+            if any(rid == r["id"] and (kt[:60] in todo_str or todo_str[:60] in kt)
+                   for rid, kt in done):
+                continue  # 已勾销的待办不再出现（闭环）
+            out.append({"id": r["id"], "project": r["project"], "date": r["date"],
+                        "agent": r["agent"], "todo": todo_str})
             if len(out) >= max(1, min(limit, 100)):
                 return out
     return out
+
+
+def mark_todo_done(root: str, record_id: int, todo: str, agent: str = "") -> str:
+    """勾销待办线索（闭环）：勾销后 extract_todos 不再返回该条。todo 传
+    extract_todos 返回的原文（或 hub_list_todos 行内的待办串）。"""
+    if not todo or not todo.strip():
+        return "todo 必填"
+    with db_conn(root) as conn:
+        conn.execute("INSERT INTO todos_done(record_id,todo,agent,ts) VALUES(?,?,?,?)",
+                     (record_id, todo.strip()[:200], _norm_agent(agent) or "", _now()))
+    return ""
 
 
 def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
