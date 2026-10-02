@@ -120,6 +120,14 @@ CREATE TABLE IF NOT EXISTS agents (
     heartbeats INTEGER DEFAULT 0,
     records INTEGER DEFAULT 0
 );
+CREATE TABLE IF NOT EXISTS env_items (
+    category TEXT,
+    key TEXT,
+    value TEXT,
+    agent TEXT DEFAULT "",
+    updated TEXT,
+    PRIMARY KEY (category, key)
+);
 CREATE TABLE IF NOT EXISTS todos_done (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     record_id INTEGER,
@@ -910,3 +918,84 @@ def health_report(root: str) -> dict:
             "dup_memories": sims, "dup_memory_count": len(sims),
             "bare_titles": bare_titles,
             "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
+
+
+# ---------------------------------------------------------------- 环境档案（本机设置的结构化登记）
+
+def env_set(root: str, category: str, key: str, value: str, agent: str = "") -> str:
+    """登记/更新一条本机环境配置（UPSERT）。category：系统/网络/工具/路径/配置…"""
+    if not category.strip() or not key.strip():
+        return "category 与 key 必填"
+    with db_conn(root) as conn:
+        conn.execute(
+            "INSERT INTO env_items(category,key,value,agent,updated) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(category,key) DO UPDATE SET value=excluded.value, "
+            "agent=excluded.agent, updated=excluded.updated",
+            (category.strip()[:40], key.strip()[:120], (value or "")[:2000],
+             _norm_agent(agent), _now()))
+    return ""
+
+
+def env_list(root: str, category: str = "", kw: str = "", limit: int = 200) -> list:
+    q = "SELECT * FROM env_items WHERE 1=1"
+    args: list = []
+    if category.strip():
+        q += " AND category=?"
+        args.append(category.strip())
+    if kw.strip():
+        q += " AND (key LIKE ? OR value LIKE ? OR category LIKE ?)"
+        args += [f"%{kw.strip()}%"] * 3
+    q += " ORDER BY category, key LIMIT ?"
+    args.append(max(1, min(limit, 500)))
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(q, args)]
+
+
+def env_scan(root: str, agent: str = "") -> int:
+    """自动采集本机基础配置快照写入环境档案（幂等 UPSERT，仅标准库）。返回写入条数。"""
+    import platform
+    import shutil
+    import sys
+    import winreg
+    items: list = []
+    items.append(("系统", "主机名", platform.node()))
+    items.append(("系统", "操作系统", f"{platform.system()} {platform.release()} ({platform.version()})"))
+    items.append(("工具", "Python", f"{sys.executable} ({sys.version.split()[0]})"))
+    git = shutil.which("git")
+    if git:
+        try:
+            import subprocess
+            gv = subprocess.run([git, "--version"], capture_output=True, timeout=5)
+            items.append(("工具", "Git", f"{git} ({gv.stdout.decode('utf-8', 'replace').strip().split()[-1]})"))
+        except Exception:  # noqa: BLE001
+            items.append(("工具", "Git", git))
+    ff = shutil.which("ffmpeg")
+    if ff:
+        items.append(("工具", "FFmpeg", ff))
+    if (Path.home() / ".agenthub" / "bin" / "es.exe").is_file():
+        items.append(("工具", "Everything(ES)", str(Path.home() / ".agenthub" / "bin" / "es.exe")))
+    try:
+        k = winreg.OpenKey(winreg.HKEY_CURRENT_USER,
+                           r"Software\Microsoft\Windows\CurrentVersion\Internet Settings")
+        try:
+            proxy = winreg.QueryValueEx(k, "ProxyServer")[0]
+            enable = winreg.QueryValueEx(k, "ProxyEnable")[0]
+        except OSError:
+            proxy, enable = "", 0
+        items.append(("网络", "系统代理", proxy if enable else "未启用"))
+    except OSError:
+        items.append(("网络", "系统代理", "读取失败"))
+    envp = os.environ.get("HTTP_PROXY") or os.environ.get("http_proxy")
+    items.append(("网络", "环境变量代理", envp or "未设置"))
+    for drv in ("C:", "D:", "E:", "F:"):
+        try:
+            import shutil as _sh
+            total, _u, free = _sh.disk_usage(drv + chr(92))
+            items.append(("磁盘", f"{drv} 剩余", f"{free // 2**30}G / 总 {total // 2**30}G"))
+        except OSError:
+            pass
+    n = 0
+    for cat, k2, v in items:
+        if not env_set(root, cat, k2, v, agent):
+            n += 1
+    return n

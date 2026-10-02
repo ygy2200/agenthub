@@ -106,7 +106,7 @@ def main():
         # Agent 中心页冒烟
         check("Agent中心页存在且已切导航", w.hub_page is not None)
         w.hub_page.viewCombo.setCurrentIndex(1)  # MCP 视图切换不崩
-        check("hub视图=4项(无市场)", w.hub_page.viewCombo.count() == 4)
+        check("hub视图=5项(含环境档案)", w.hub_page.viewCombo.count() == 5)
         # 能力市场页冒烟（分段切换/源切换/MCP目录过滤）
         check("能力市场页存在", w.market_page is not None)
         w.market_page.seg.setCurrentItem("mcp")

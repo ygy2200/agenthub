@@ -856,6 +856,17 @@ class SearchPage(QWidget):
         for f in res.get("files", []):
             self.result.addItem(f"[文件] {f['project']}\\{f['name']}")
             hits.append(("file", f))
+        # Everything 全盘文件名搜索（es.exe IPC 毫秒级，未运行则提示原因）
+        ev = core.everything_search(self.edit.text().strip(), 20)
+        if ev.get("results"):
+            self.result.addItem("── 全盘文件（Everything）──")
+            hits.append(("section", None))
+            for pth in ev["results"]:
+                self.result.addItem(f"  [全盘] {pth}")
+                hits.append(("evfile", pth))
+        elif "error" in ev:
+            self.result.addItem(f"── 全盘文件：{ev['error']} ──")
+            hits.append(("section", None))
         self.hits = hits
         if not hits:
             self.result.addItem("无结果")
@@ -864,6 +875,12 @@ class SearchPage(QWidget):
         if row < 0 or row >= len(self.hits):
             return
         kind, h = self.hits[row]
+        if kind == "section":
+            self.preview.setHtml("<p style='color:#888'>——</p>")
+            return
+        if kind == "evfile":
+            self.preview.setHtml(md_to_html(f"**全盘文件（Everything 检索）**\n\n`{h}`"))
+            return
         if kind == "record":
             self.preview.setHtml(md_to_html(f"## {h['title']}\n{h['content']}"))
         elif kind == "memory":
@@ -1498,7 +1515,7 @@ class HubPage(QWidget):
     """Agent 中心：聚合电脑上各 agent 的技能 / MCP / 记忆 / 全局配置；
     记忆可增删改，配置文件可编辑（自动备份）；技能安装见「能力市场」页。"""
 
-    VIEWS = ["技能库", "MCP 服务器", "记忆", "全局配置"]
+    VIEWS = ["技能库", "MCP 服务器", "记忆", "全局配置", "环境档案"]
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -1513,6 +1530,9 @@ class HubPage(QWidget):
         addBtn = PushButton(ic("ADD", "INFO"), "添加 agent 目录")
         addBtn.clicked.connect(self.add_agent)
         top.addWidget(addBtn)
+        envBtn = PushButton(ic("IOT", "INFO"), "采集本机配置")
+        envBtn.clicked.connect(self.scan_env)
+        top.addWidget(envBtn)
         rescanBtn = PrimaryPushButton(ic("SYNC", "INFO"), "重新探测")
         rescanBtn.clicked.connect(self.rescan)
         top.addWidget(rescanBtn)
@@ -1542,7 +1562,13 @@ class HubPage(QWidget):
         self.memFilter.setFixedWidth(260)
         self.memFilter.textChanged.connect(self.fill_memories)
         viewRow.addWidget(self.memFilter)
+        self.envFilter = SearchLineEdit()
+        self.envFilter.setPlaceholderText("搜索环境配置…")
+        self.envFilter.setFixedWidth(260)
+        self.envFilter.textChanged.connect(self.fill_env)
+        viewRow.addWidget(self.envFilter)
         self.memFilter.hide()  # 仅记忆视图显示
+        self.envFilter.hide()  # 仅环境档案视图显示
         lay.addLayout(viewRow)
 
         self.stack = QStackedWidget()
@@ -1550,7 +1576,8 @@ class HubPage(QWidget):
         self.mcpList = ListWidget()
         self.memList = ListWidget()
         self.cfgList = ListWidget()
-        for w in (self.skillList, self.mcpList, self.memList, self.cfgList):
+        self.envList = ListWidget()
+        for w in (self.skillList, self.mcpList, self.memList, self.cfgList, self.envList):
             self.stack.addWidget(w)
             w.itemClicked.connect(self.on_preview)
             w.itemDoubleClicked.connect(self.on_open)
@@ -1585,10 +1612,11 @@ class HubPage(QWidget):
 
     # ---- 数据
     def _on_view_changed(self, idx):
-        """视图切换：stack 翻页 + 过滤框按视图显隐（技能/记忆各有过滤框）。"""
+        """视图切换：stack 翻页 + 过滤框按视图显隐（技能/记忆/环境档案各有过滤框）。"""
         self.stack.setCurrentIndex(idx)
         self.skillFilter.setVisible(idx == 0)
         self.memFilter.setVisible(idx == 2)
+        self.envFilter.setVisible(idx == 4)
 
     def rescan(self):
         extra = core.load_config().get("extra_agents", {})
@@ -1640,6 +1668,48 @@ class HubPage(QWidget):
         elif not self.memList.count():
             self.memList.addItem("（无匹配记忆）")
             self.memList.item(0).setData(Qt.UserRole, "")
+
+    def fill_env(self):
+        """环境档案视图：本机配置结构化登记（brain.env_items）。"""
+        self.envList.clear()
+        kw = self.envFilter.text().strip().lower() if hasattr(self, "envFilter") else ""
+        try:
+            rows = brain.env_list(self.win.root, "", kw, 300)
+        except Exception:
+            rows = []
+        for r in rows:
+            self.envList.addItem(f"[{r['category']}] {r['key']} = {r['value'][:70]}")
+            self.envList.item(self.envList.count() - 1).setData(
+                Qt.UserRole, f"env:{r['category']}|{r['key']}")
+        if not rows:
+            self.envList.addItem("（环境档案为空——点上方「采集本机配置」自动建档，或让 agent 调 hub_env_set）")
+            self.envList.item(0).setData(Qt.UserRole, "")
+
+    def scan_env(self):
+        """自动采集本机配置快照写入环境档案（幂等 UPSERT）。"""
+        if not self.win.root:
+            InfoBar.warning("先在设置页选择根目录", "", duration=2500, parent=self.win)
+            return
+        InfoBar.info("采集本机配置中", "标准库只读采集，秒级完成", duration=2000, parent=self.win)
+
+        def _do():
+            n = brain.env_scan(self.win.root, agent="user")
+            core.journal(self.win.root, "user", "env_scan", f"{n} 项")
+            return n
+
+        w2 = FnWorker(_do, self)
+        w2.done.connect(self._on_env_scan)
+        w2.finished.connect(lambda: self._workers.remove(w2) if w2 in self._workers else None)
+        self._workers.append(w2)
+        w2.start()
+
+    def _on_env_scan(self, result):
+        if isinstance(result, Exception):
+            InfoBar.error("采集失败", str(result), duration=4000, parent=self.win)
+            return
+        InfoBar.success("环境档案已更新", f"{result} 项配置已登记", duration=3000, parent=self.win)
+        self.viewCombo.setCurrentIndex(4)
+        self.fill_env()
 
     def rebuild_cards(self):
         while self.cardsRow.count():
@@ -1707,6 +1777,17 @@ class HubPage(QWidget):
         self.cur_editable = False
         if not path:
             self.preview.setHtml("<p style='color:#888'>无内容</p>")
+            return
+        # 环境档案条目（data = env:category|key）
+        if isinstance(path, str) and path.startswith("env:"):
+            self.editBtn.setEnabled(False)
+            self.editBtn.setText("环境配置项（agent 经 hub_env_set 更新）")
+            cat, key = path[4:].split("|", 1)
+            rows = brain.env_list(self.win.root, cat, key, 1)
+            if rows:
+                self.preview.setHtml(md_to_html(
+                    f"**[{rows[0]['category']}] {rows[0]['key']}**\n\n{rows[0]['value']}"
+                    f"\n\n更新于 {rows[0]['updated'][:10]}（{rows[0]['agent'] or '-'} 登记）"))
             return
         # 大脑记忆条目（data = mem:<id>）
         if isinstance(path, str) and path.startswith("mem:"):

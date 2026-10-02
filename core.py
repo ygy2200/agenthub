@@ -901,3 +901,24 @@ DEFAULT_RULES = """# AgentHub 规则（GUI 可编辑，agent 接入后由工具�
 - 覆盖不可逆格式（docx/pdf/ppt）前先备份
 - 删除文件前确认
 """
+
+
+EVERYTHING_ES = Path.home() / ".agenthub" / "bin" / "es.exe"
+
+
+def everything_search(query: str, limit: int = 30) -> dict:
+    """Everything 全盘文件名搜索（es.exe 经 IPC 连运行中的 Everything，毫秒级）。
+    返回 {"results": [绝对路径]} 或 {"error": 原因}。"""
+    import subprocess
+    if not EVERYTHING_ES.is_file():
+        return {"error": "未找到 es.exe（~/.agenthub/bin）——从 voidtools.com/ES 下载放入"}
+    try:
+        r = subprocess.run([str(EVERYTHING_ES), "-n", str(max(1, min(limit, 100))), query],
+                           capture_output=True, timeout=15)
+        out = r.stdout.decode("utf-8", "replace")
+        err = r.stderr.decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return {"error": f"es.exe 调用失败：{e}"}
+    if "IPC window not found" in out or "IPC" in err:
+        return {"error": "Everything 界面进程未运行（服务模式无 IPC 窗口）"}
+    return {"results": [ln.strip() for ln in out.splitlines() if ln.strip()][:limit]}

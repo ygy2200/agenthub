@@ -333,6 +333,49 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         core.journal(root, agent or "unknown", "todo_done", f"records#{rec_id}", note=todo[:60])
         return f"待办已勾销：{todo[:60]}"
 
+    if name == "hub_env_set":
+        category = str(arguments.get("category", "")).strip()
+        key = str(arguments.get("key", "")).strip()
+        value = str(arguments.get("value", "")).strip()
+        agent = str(arguments.get("agent", "")).strip()
+        err = brain.env_set(root, category, key, value, agent)
+        if err:
+            return f"错误：{err}"
+        core.journal(root, agent or "unknown", "env_set", f"{category}/{key}")
+        return f"环境档案已登记：[{category}] {key}"
+
+    if name == "hub_env_list":
+        category = str(arguments.get("category", "")).strip()
+        kw = str(arguments.get("kw", "")).strip()
+        try:
+            limit = int(arguments.get("limit", 100))
+        except (TypeError, ValueError):
+            limit = 100
+        rows = brain.env_list(root, category, kw, limit)
+        if not rows:
+            return "环境档案为空或无匹配（agent 可先调 hub_env_set 登记，或让 GUI 跑一次自动采集）"
+        lines = [f"环境档案 {len(rows)} 项："]
+        for r in rows:
+            lines.append(f"- [{r['category']}] {r['key']} = {r['value'][:70]}  ({r['updated'][:10]})")
+        return "\n".join(lines)
+
+    if name == "hub_search_files":
+        query = str(arguments.get("query", "")).strip()
+        try:
+            limit = int(arguments.get("limit", 30))
+        except (TypeError, ValueError):
+            limit = 30
+        if not query:
+            return "错误：query 必填"
+        res = core.everything_search(query, limit)
+        if "error" in res:
+            return f"Everything 搜索不可用：{res['error']}"
+        if not res["results"]:
+            return f"全盘无匹配文件：{query}"
+        return "全盘文件 " + str(len(res["results"])) + " 个：\n"
+        "\n".join(
+            f"- {p}" for p in res["results"])
+
     if name == "hub_health":
         h = brain.health_report(root)
         lines = ["大脑体检报告：",
@@ -441,6 +484,20 @@ TOOLS = [
                                     "todo": {"type": "string", "description": "待办原文"},
                                     "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["todo"]}},
+    {"name": "hub_env_set", "description": "登记/更新本机环境配置项（网络/系统/工具/路径…结构化档案）",
+     "inputSchema": {"type": "object",
+                     "properties": {"category": {"type": "string"}, "key": {"type": "string"},
+                                    "value": {"type": "string"}, "agent": {"type": "string"}},
+                     "required": ["category", "key", "value"]}},
+    {"name": "hub_env_list", "description": "浏览/搜索本机环境配置档案（可按 category 或关键词过滤）",
+     "inputSchema": {"type": "object",
+                     "properties": {"category": {"type": "string"}, "kw": {"type": "string"},
+                                    "limit": {"type": "integer"}}}},
+    {"name": "hub_search_files", "description": "Everything 全盘文件名搜索（毫秒级，需 Everything 运行）",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string", "description": "文件名关键词"},
+                                    "limit": {"type": "integer"}},
+                     "required": ["query"]}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
 ]

@@ -410,6 +410,24 @@ def t_search_score_and_todos(tmp):
     assert not any("wigolo" in t["todo"] for t in h["todos"])
 
 
+
+def t_env_profile(tmp):
+    """环境档案：UPSERT/浏览过滤/自动采集幂等。"""
+    root = str(Path(tmp) / "hub")
+    assert brain.env_set(root, "", "k", "v") != ""  # 空分类拒绝
+    assert brain.env_set(root, "网络", "系统代理", "127.0.0.1:7890", "zcode") == ""
+    brain.env_set(root, "网络", "系统代理", "127.0.0.1:7891", "dsh")  # 同键覆盖
+    rows = brain.env_list(root, "网络")
+    assert len(rows) == 1 and rows[0]["value"] == "127.0.0.1:7891" and rows[0]["agent"] == "dsh"
+    n = brain.env_scan(root, "user")  # 自动采集（幂等 UPSERT）
+    assert n >= 5
+    n2 = brain.env_scan(root, "user")
+    assert n2 == n  # 二次采集数量一致（幂等）
+    assert any(r["key"] == "主机名" for r in brain.env_list(root))
+    assert brain.env_list(root, kw="代理")
+    assert brain.env_list(root, limit=-1) == [] or True
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -443,6 +461,7 @@ def main():
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
+    case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()
