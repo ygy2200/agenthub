@@ -1052,3 +1052,39 @@ def env_scan(root: str, agent: str = "") -> int:
         if not env_set(root, cat, k2, v, agent):
             n += 1
     return n
+
+
+def distill_candidates(root: str, limit: int = 20) -> list:
+    """记忆蒸馏候选（结晶流水线）：content 含「目的」结论但同项目无相似记忆覆盖的记录。
+    行业头部（mem0/腾讯AgentMemory）用 LLM 蒸馏；本方案零成本规则版——目的行提取 +
+    bigram 相似度查重，候选经 agent/用户确认后 hub_memory_write 沉淀为记忆。"""
+    with db_conn(root) as conn:
+        recs = [dict(r) for r in conn.execute(
+            "SELECT id, project, date, agent, content FROM records "
+            "WHERE status='active' ORDER BY id DESC LIMIT 300")]
+        mems = [dict(r) for r in conn.execute(
+            "SELECT project, content FROM memories WHERE status='active'")]
+    mem_toks: dict = {}
+    for m in mems:
+        mem_toks.setdefault(m["project"], []).append(_tokens(m["content"]))
+    out = []
+    for r in recs:
+        m = re.search(r"目的[】\]:：]\s*(.+)", r["content"] or "")
+        if not m:
+            continue
+        gist = m.group(1).strip().strip("【】")
+        if len(gist) < 6:
+            continue
+        gt = _tokens(gist)
+        if not gt:
+            continue
+        covered = any(
+            (len(gt & mt) / len(gt | mt) if gt | mt else 0) >= 0.3
+            for mt in mem_toks.get(r["project"], []))
+        if covered:
+            continue
+        out.append({"id": r["id"], "project": r["project"], "date": r["date"],
+                    "agent": r["agent"], "gist": gist[:80]})
+        if len(out) >= max(1, min(limit, 50)):
+            return out
+    return out

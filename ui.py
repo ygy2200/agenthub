@@ -764,10 +764,16 @@ class StatsPage(QWidget):
                 tip.append(todo)
             if h['projects_stalled']:
                 tip.append(f"停滞项目 {h['projects_stalled']} 个")
+            try:
+                dc = len(brain.distill_candidates(self.win.root, 5))
+            except Exception:
+                dc = 0
+            if dc:
+                tip.append(f"蒸馏候选 {dc} 条")
             self.healthLine.setText(
                 f"结晶率 {h['crystallization']}%（记忆/记录）· 检索 今日 {h['searches_today']} / 累计 {h['searches_total']} 次"
                 + (" · " + " · ".join(tip) if tip else " · 各项整洁")
-                + "（agent 可调 hub_health 看完整报告）")
+                + "（agent 可调 hub_health / hub_distill 看完整报告）")
         except Exception:
             self.healthLine.setText("体检暂不可用")
 

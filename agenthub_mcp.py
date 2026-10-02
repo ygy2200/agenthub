@@ -376,6 +376,20 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         "\n".join(
             f"- {p}" for p in res["results"])
 
+    if name == "hub_distill":
+        try:
+            limit = int(arguments.get("limit", 15))
+        except (TypeError, ValueError):
+            limit = 15
+        cands = brain.distill_candidates(root, limit)
+        if not cands:
+            return "无蒸馏候选——所有含「目的」结论的记录都已有同项目记忆覆盖（结晶良好）"
+        lines = [f"记忆蒸馏候选 {len(cands)} 条（记录→记忆的结晶流水线；确认价值后用 "
+                 f"hub_memory_write 沉淀，kind 建议 lesson/fact）："]
+        for c in cands:
+            lines.append(f"- #{c['id']} [{c['date']} {c['agent']}·{c['project']}] {c['gist'][:70]}")
+        return "\n".join(lines)
+
     if name == "hub_health":
         h = brain.health_report(root)
         lines = ["大脑体检报告：",
@@ -498,6 +512,9 @@ TOOLS = [
                      "properties": {"query": {"type": "string", "description": "文件名关键词"},
                                     "limit": {"type": "integer"}},
                      "required": ["query"]}},
+    {"name": "hub_distill", "description": "记忆蒸馏候选：content 有「目的」结论但同项目无记忆覆盖的记录（结晶流水线，确认后用 hub_memory_write 沉淀）",
+     "inputSchema": {"type": "object",
+                     "properties": {"limit": {"type": "integer"}}}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
 ]

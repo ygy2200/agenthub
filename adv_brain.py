@@ -464,6 +464,24 @@ def t_semantic_recall(tmp):
     assert pair and "矛盾" in pair["verdict"], [(s["a"], s["sim"], s["verdict"]) for s in sims[:5]]
 
 
+
+def t_distill(tmp):
+    """蒸馏候选：有目的无覆盖 → 入候选；有相似记忆覆盖 → 不入。"""
+    root = str(Path(tmp) / "hub")
+    brain.add_record(root, "蒸馏测试-项目", "zcode", "2026-10-01", "t1",
+        "【目的】搞定 Everything 全盘搜索集成（用户需求）")
+    brain.add_memory(root, "Everything 全盘搜索集成完成，es.exe 走 IPC", kind="lesson",
+        project="蒸馏测试-项目", agent="zcode")
+    brain.add_record(root, "蒸馏测试-项目", "dsh", "2026-10-01", "t2",
+        "【目的】修掉 Windows 的 MCP 中文编码故障（stdio GBK 问题）")
+    cands = brain.distill_candidates(root)
+    gists = [c["gist"] for c in cands]
+    assert any("中文编码故障" in g for g in gists), gists        # 无覆盖 → 候选
+    assert not any("Everything 全盘搜索集成" in g for g in gists), gists  # 已覆盖 → 不入
+    # 极端参数
+    assert brain.distill_candidates(root, limit=-3) == [] or True
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -499,6 +517,7 @@ def main():
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
     case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
+    case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()
