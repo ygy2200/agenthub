@@ -383,9 +383,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             limit = 15
         cands = brain.distill_candidates(root, limit)
         if not cands:
-            return "无蒸馏候选——所有含「目的」结论的记录都已有同项目记忆覆盖（结晶良好）"
+            return "无蒸馏候选——近期含「目的」的记录都已沉淀或展示过（结晶良好）"
+        brain.mark_distill_shown(root, [c["id"] for c in cands])
         lines = [f"记忆蒸馏候选 {len(cands)} 条（记录→记忆的结晶流水线；确认价值后用 "
-                 f"hub_memory_write 沉淀，kind 建议 lesson/fact）："]
+                 f"hub_memory_write 沉淀，kind 建议 lesson/fact；本轮已登记，之后不再重复推送）："]
         for c in cands:
             lines.append(f"- #{c['id']} [{c['date']} {c['agent']}·{c['project']}] {c['gist'][:70]}")
         return "\n".join(lines)

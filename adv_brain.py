@@ -514,6 +514,14 @@ def t_distill(tmp):
     gists = [c["gist"] for c in cands]
     assert any("中文编码故障" in g for g in gists), gists        # 无覆盖 → 候选
     assert not any("Everything 全盘搜索集成" in g for g in gists), gists  # 已覆盖 → 不入
+    # 展示即登记（死候选治理）：空壳目的行与沉淀进记忆的内容文字不重叠，
+    # 纯内容查重永远排除不掉（2026-10-02 实测 #2021/#2022 已蒸馏过仍霸榜）
+    cand = next(c for c in cands if "中文编码故障" in c["gist"])
+    assert brain.mark_distill_shown(root, [cand["id"]]) == 1
+    assert brain.mark_distill_shown(root, [cand["id"]]) == 0, "标记不幂等"
+    assert brain.mark_distill_shown(root, []) == 0
+    assert not any("中文编码故障" in c["gist"]
+                   for c in brain.distill_candidates(root)), "已展示候选被重复推送"
     # 极端参数
     assert brain.distill_candidates(root, limit=-3) == [] or True
 

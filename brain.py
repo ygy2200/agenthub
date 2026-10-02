@@ -135,6 +135,10 @@ CREATE TABLE IF NOT EXISTS todos_done (
     agent TEXT DEFAULT "",
     ts TEXT
 );
+CREATE TABLE IF NOT EXISTS distill_seen (
+    record_id INTEGER PRIMARY KEY,
+    ts TEXT
+);
 CREATE TABLE IF NOT EXISTS files (
     project TEXT, path TEXT, name TEXT, grp TEXT,
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
@@ -1072,13 +1076,15 @@ def env_scan(root: str, agent: str = "") -> int:
 
 
 def distill_candidates(root: str, limit: int = 20) -> list:
-    """记忆蒸馏候选（结晶流水线）：content 含「目的」结论但同项目无相似记忆覆盖的记录。
-    行业头部（mem0/腾讯AgentMemory）用 LLM 蒸馏；本方案零成本规则版——目的行提取 +
-    bigram 相似度查重，候选经 agent/用户确认后 hub_memory_write 沉淀为记忆。"""
+    """记忆蒸馏候选（结晶流水线）：content 含「目的」结论但同项目无相似记忆覆盖、
+    且往轮 hub_distill 未展示过的记录。行业头部（mem0/腾讯AgentMemory）用 LLM 蒸馏；
+    本方案零成本规则版——目的行提取 + bigram 相似度查重，候选经 agent/用户确认后
+    hub_memory_write 沉淀为记忆。只读不标记：登记在 mark_distill_shown（消费侧）。"""
     with db_conn(root) as conn:
         recs = [dict(r) for r in conn.execute(
             "SELECT id, project, date, agent, content FROM records "
-            "WHERE status='active' ORDER BY id DESC LIMIT 300")]
+            "WHERE status='active' AND id NOT IN "
+            "(SELECT record_id FROM distill_seen) ORDER BY id DESC LIMIT 300")]
         mems = [dict(r) for r in conn.execute(
             "SELECT project, content FROM memories WHERE status='active'")]
     mem_toks: dict = {}
@@ -1115,3 +1121,17 @@ def distill_candidates(root: str, limit: int = 20) -> list:
         if len(out) >= max(1, min(limit, 50)):
             return out
     return out
+
+
+def mark_distill_shown(root: str, record_ids: list) -> int:
+    """蒸馏候选展示即登记（hub_distill 消费侧调用；GUI 只读计数不标记）。
+    已展示的记录不再进候选——空壳目的行（如"执行用户指令xx"）与沉淀进记忆的
+    实际内容文字不重叠，纯内容查重永远排除不掉，会反复霸榜（2026-10-02 实测
+    #2021/#2022 已蒸馏过仍每次出现）。幂等，返回本次新登记条数。"""
+    if not record_ids:
+        return 0
+    with db_conn(root) as conn:
+        cur = conn.executemany(
+            "INSERT OR IGNORE INTO distill_seen(record_id, ts) VALUES (?, ?)",
+            [(int(i), _now()) for i in record_ids])
+        return cur.rowcount

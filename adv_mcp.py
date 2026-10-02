@@ -484,12 +484,23 @@ def t_get_record_and_search_files(tmp):
     assert "全盘无匹配文件" in out, out
 
 
+def t_distill_mark(tmp):
+    """hub_distill 展示即登记：同一记录不重复推送（死候选治理，2026-10-02）。"""
+    root_s = str(Path(tmp) / "hub")
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "【目的】验证蒸馏展示标记的回归用例"}, root_s)
+    out1 = m.call_tool("hub_distill", {"limit": 50}, root_s)
+    assert "验证蒸馏展示标记" in out1, out1
+    out2 = m.call_tool("hub_distill", {"limit": 50}, root_s)
+    assert "验证蒸馏展示标记" not in out2, f"已展示候选被重复推送：{out2}"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
-    case("MCP协议（握手/23工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/24工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
@@ -498,6 +509,7 @@ def main():
     case("撤销（只切自己最新段/误伤检查/栈式撤销）", lambda: t_undo_log(fresh_hub(tmp, "undo")))
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
     case("单条全文读取+Everything列表回归（畸形id/死代码bug）", lambda: t_get_record_and_search_files(tmp))
+    case("蒸馏展示即登记（同一记录不重复推送）", lambda: t_distill_mark(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))
