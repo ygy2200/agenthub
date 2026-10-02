@@ -1054,12 +1054,12 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
     return out
 
 
-def similar_lessons_for(root: str, content: str, threshold: float = 0.20, limit: int = 3) -> list:
+def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit: int = 3) -> list:
     """写入时踩坑拦截：新记录 content 的 bigram 词集 vs 库内 lesson/fact 记忆与 open 错误登记，
-    Jaccard ≥ threshold 视为"可能正在重蹈已记录的坑"。阈值 0.20 为真实库实测标定：
-    同源记录-记忆对（真相关）相似度 0.213~0.328，无关对 ≤0.155；记录长记忆短导致并集偏大、
-    相似度天然偏低，拦截宁可多提醒（agent 看一眼自行取舍），漏报代价高于误报。
-    返回 [{id, kind, sim, content}] 按 sim 降序，kind=error 表示 open 错误登记。"""
+    Jaccard ≥ threshold 视为"可能正在重蹈已记录的坑"。阈值 0.15 为真实库实测标定：
+    同源记录-记忆对（真相关）0.21~0.33，异表述同主题（手写重放）0.17~0.19，真无关 ≤0.08；
+    记录长记忆短导致并集偏大、相似度天然偏低，拦截宁可多提醒（agent 看一眼自行取舍），
+    漏报代价高于误报。返回 [{id, kind, sim, content}] 按 sim 降序，kind=error 表示 open 错误登记。"""
     toks = _tokens(content)
     if len(toks) < 4:
         return []
