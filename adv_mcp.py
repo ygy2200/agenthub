@@ -69,8 +69,9 @@ def t_protocol(root):
             "hub_get_progress", "hub_list_skills", "hub_list_mcps", "hub_search",
             "hub_get_project", "hub_create_project", "hub_get_rules", "hub_heartbeat",
             "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
-            "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list", "hub_search_files", "hub_distill"} <= names, names
-    assert len(names) == 23
+            "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
+            "hub_search_files", "hub_distill", "hub_get_record"} <= names, names
+    assert len(names) == 24
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -452,6 +453,37 @@ def t_root_follow(tmp):
         core.CONFIG_FILE = saved_cfg
 
 
+def t_get_record_and_search_files(tmp):
+    """hub_get_record 全文精读（蒸馏配套）+ hub_search_files 列表回归（2026-10-02 死代码 bug）。"""
+    root_s = str(Path(tmp) / "hub")
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "【目的】验证单条读取\n做了什么：全文应含此行"}, root_s)
+    assert "已记入大脑" in out, out
+    rid = max(r["id"] for r in brain.list_records(root_s, project="测试-项目", limit=2000))
+    out = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
+    assert "records#" in out and "全文应含此行" in out and "做了什么" in out, out
+    assert "已撤销" not in out
+    # 软删后读取带状态标注
+    with brain.db_conn(root_s) as conn:
+        conn.execute("UPDATE records SET status='deleted' WHERE id=?", (rid,))
+    out = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
+    assert "records#" in out and "已软删/撤销" in out, out
+    # 畸形 id 容错
+    for bad in (0, -1, "abc", None, 999999):
+        out = m.call_tool("hub_get_record", {"record_id": bad}, root_s)
+        assert "未找到记录" in out, (bad, out)
+    # hub_search_files：死代码 bug 回归——列表必须真的拼进返回值
+    from unittest import mock
+    fake = {"results": ["D:/a/结果1.py", "D:/b/结果2.txt"], "engine": "everything"}
+    with mock.patch.object(core, "everything_search", return_value=fake):
+        out = m.call_tool("hub_search_files", {"query": "结果"}, root_s)
+    assert "D:/a/结果1.py" in out and "D:/b/结果2.txt" in out, f"文件列表丢失：{out}"
+    assert out.count("- D:/") == 2, out
+    with mock.patch.object(core, "everything_search", return_value={"results": [], "engine": "everything"}):
+        out = m.call_tool("hub_search_files", {"query": "空"}, root_s)
+    assert "全盘无匹配文件" in out, out
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -465,6 +497,7 @@ def main():
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))
     case("撤销（只切自己最新段/误伤检查/栈式撤销）", lambda: t_undo_log(fresh_hub(tmp, "undo")))
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
+    case("单条全文读取+Everything列表回归（畸形id/死代码bug）", lambda: t_get_record_and_search_files(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))

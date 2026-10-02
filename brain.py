@@ -859,9 +859,11 @@ def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:
 
 # ---------------------------------------------------------------- 智能层（零依赖本地算法：待办提取 / 相似检测 / 体检报告）
 
+# 引导词必须紧贴冒号才算待办句式：否则「待办勾销闭环：」「两条'待办'系误抓」
+# 这类复合词/引用全部误抓（2026-10-02 实锤），宁可漏自然语句不可滥报
 _TODO_RE = re.compile(
-    r"(待办|后续|下次|下一步|TODO|待确认|待验证|待实测|待办事项|需要再|记得|提醒用户|尚未完成|遗留问题|待人工|待续)"
-    r"[：:]?([^\n]{4,120})")
+    r"(待办事项|待办|后续|下次|下一步|TODO|待确认|待验证|待实测|需要再|记得|提醒用户|尚未完成|遗留问题|待人工|待续)"
+    r"[：:]([^\n]{4,120})")
 _WORD_RE = re.compile(r"[a-z0-9]+")
 
 
@@ -889,7 +891,7 @@ def extract_todos(root: str, limit: int = 20) -> list:
     for r in rows:
         for m in _TODO_RE.finditer(r["content"] or ""):
             text = m.group(2).strip()
-            while text and text[0] in "】』」)]：:，。；、":
+            while text and text[0] in "】』」)]：:，。；、*#>\"'“”‘’":
                 text = text[1:].strip()
             text = text.strip("，。；、")
             if len(text) < 4:
@@ -904,6 +906,21 @@ def extract_todos(root: str, limit: int = 20) -> list:
             if len(out) >= max(1, min(limit, 100)):
                 return out
     return out
+
+
+def get_record(root: str, record_id: int) -> dict:
+    """单条记录全文读取：hub_search/distill 只给 gist，蒸馏与复盘精读需要全文。"""
+    try:
+        rid = int(record_id)
+    except (TypeError, ValueError):
+        return {}
+    if rid <= 0:
+        return {}
+    with db_conn(root) as conn:
+        row = conn.execute(
+            "SELECT id, project, agent, date, title, content, status FROM records WHERE id=?",
+            (rid,)).fetchone()
+    return dict(row) if row else {}
 
 
 def mark_todo_done(root: str, record_id: int, todo: str, agent: str = "") -> str:

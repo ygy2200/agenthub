@@ -347,7 +347,7 @@ def t_intelligence(tmp):
     brain.add_record(root, "智能测试-项目", "zcode", "2026-10-01", "t1",
         "【目的】做了功能甲\n【遗留问题】待验证：长路径沙盒实测还没做")
     brain.add_record(root, "智能测试-项目", "dsh", "2026-10-01", "t2",
-        "修好了编码问题。下次记得把文档也更新一下。")
+        "修好了编码问题。下次：把文档也更新一下。")
     brain.add_record(root, "智能测试-项目", "dsh", "2026-10-01", "t3", "普通的记录，没有任何待办句式。")
     todos = brain.extract_todos(root)
     assert len(todos) == 2, todos
@@ -372,6 +372,42 @@ def t_intelligence(tmp):
     assert brain.extract_todos(root, limit=-5) == [] or True
     brain.similar_memories(root, threshold=1.5)
 
+
+
+def t_todo_extraction_adversarial(tmp):
+    """对抗：待办提取误抓攻击——复合词/引用/功能名/无冒号不算待办，紧贴冒号才算。"""
+    root = str(Path(tmp) / "hub_adv_todo")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_record(root, "误抓攻击-项目", "zcode", "2026-10-02", "攻击样本",
+        "②待办勾销闭环：todos_done 表+mark_todo_done（功能名，非待办）\n"
+        "两条\"待办\"系提取器误抓记录正文，非真实欠账\n"
+        "待办/承诺句式正则提取——元认知功能描述\n"
+        "本功能叫待办事项提取器，负责扫欠账\n"
+        "下次记得把文档也更新一下（无冒号自然语句不算欠账线索）\n"
+        "**待办：**清理部署目录后重打包\n"
+        "TODO：fix the parser crash\n")
+    todos = brain.extract_todos(root)
+    texts = [t["todo"] for t in todos]
+    assert len(todos) == 2, texts
+    assert any("清理部署目录" in x for x in texts), texts
+    assert any("fix the parser" in x for x in texts), texts
+    # 误抓源全部排除
+    assert all("勾销闭环" not in x and "todos_done" not in x for x in texts), texts
+    assert all("提取器" not in x for x in texts), texts
+    assert all("正则提取" not in x for x in texts), texts
+    assert all("文档也更新" not in x for x in texts), texts
+    # markdown/引号残留清理干净
+    assert all(not x.split("：", 1)[1][:1] in "*#>\"'" for x in texts), texts
+    # 单条记录全文读取（蒸馏精读配套）
+    rid = todos[0]["id"]
+    rec = brain.get_record(root, rid)
+    assert rec["content"].startswith("②待办勾销闭环"), rec["title"]
+    assert "TODO：fix the parser" in rec["content"]
+    assert brain.get_record(root, 0) == {}
+    assert brain.get_record(root, -1) == {}
+    assert brain.get_record(root, "abc") == {}
+    assert brain.get_record(root, 999999) == {}
 
 
 def t_search_score_and_todos(tmp):
@@ -514,6 +550,7 @@ def main():
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
+    case("待办提取对抗（复合词/引用/功能名不误抓+单条全文读取）", lambda: t_todo_extraction_adversarial(tmp))
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
     case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))

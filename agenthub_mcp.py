@@ -372,9 +372,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             return f"Everything 搜索不可用：{res['error']}"
         if not res["results"]:
             return f"全盘无匹配文件：{query}"
-        return "全盘文件 " + str(len(res["results"])) + " 个：\n"
-        "\n".join(
-            f"- {p}" for p in res["results"])
+        lines = [f"全盘文件 {len(res['results'])} 个："]
+        lines.extend(f"- {p}" for p in res["results"])
+        return "\n".join(lines)
 
     if name == "hub_distill":
         try:
@@ -389,6 +389,18 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         for c in cands:
             lines.append(f"- #{c['id']} [{c['date']} {c['agent']}·{c['project']}] {c['gist'][:70]}")
         return "\n".join(lines)
+
+    if name == "hub_get_record":
+        try:
+            rid = int(arguments.get("record_id", 0) or 0)
+        except (TypeError, ValueError):
+            rid = 0
+        rec = brain.get_record(root, rid)
+        if not rec:
+            return f"未找到记录 #{rid}"
+        tag = "" if rec["status"] == "active" else f"（status={rec['status']}，已软删/撤销）"
+        return (f"records#{rec['id']} [{rec['date']} {rec['agent']}·{rec['project']}]{tag}\n"
+                f"标题：{rec['title']}\n\n{rec['content']}")
 
     if name == "hub_health":
         h = brain.health_report(root)
@@ -515,6 +527,10 @@ TOOLS = [
     {"name": "hub_distill", "description": "记忆蒸馏候选：content 有「目的」结论但同项目无记忆覆盖的记录（结晶流水线，确认后用 hub_memory_write 沉淀）",
      "inputSchema": {"type": "object",
                      "properties": {"limit": {"type": "integer"}}}},
+    {"name": "hub_get_record", "description": "读取单条工作记录全文（hub_search/hub_distill 只给摘要；蒸馏候选精读、复盘引用原文用）",
+     "inputSchema": {"type": "object",
+                     "properties": {"record_id": {"type": "integer", "description": "记录 id，如 2037"}},
+                     "required": ["record_id"]}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
 ]
