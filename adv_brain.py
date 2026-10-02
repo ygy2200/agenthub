@@ -314,11 +314,11 @@ def t_plasticity(tmp):
     assert brain.should_push(root, "推送Robot", "可塑项目") is False
     assert brain.should_push(root, "另一个人", "可塑项目") is True
     assert brain.should_push(root, "推送Robot", "其他项目") is True
-    # 检索日志落库 + stats 计数
+    # 检索日志落库 + stats 计数（v2.7 起 recall_for 每次推送落一条 recall_push：上面调了 2 次）
     brain.log_search(root, "hub_search", "测试词", 3, agent="X")
     brain.log_search(root, "hub_memory_read", "", 0)
     st = brain.stats(root)
-    assert st["searches_total"] == 2 and st["searches_today"] == 2, st
+    assert st["searches_total"] == 4 and st["searches_today"] == 4, st
     assert st["projects_stalled"] >= 0
     # 极端参数：hits 负数/超长 query 不崩
     brain.log_search(root, "hub_search", "x" * 5000, -99)
@@ -609,6 +609,88 @@ def t_cjk_bigram_retry(tmp):
     assert res["records"] and res["memories"]
 
 
+def t_recall_push_log(tmp):
+    """推送可观测（v2.7）：recall_for 落 searches(tool=recall_push) + 体检新增推送统计键。"""
+    root = str(Path(tmp) / "hub_pushlog")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_record(root, "推送-项目", "zcode", "2026-10-02", "t1", "推送测试记录内容")
+    brain.add_memory(root, "推送测试置顶记忆", kind="lesson", agent="zcode", pinned=True)
+    rows = brain.recall_for(root, "推送-项目", agent="zcode")
+    assert rows, "置顶记忆应被推送"
+    with brain.db_conn(root) as conn:
+        row = conn.execute(
+            "SELECT tool, query, agent, hits FROM searches WHERE tool='recall_push'").fetchone()
+    assert row and row["query"] == "推送-项目" and row["agent"] == "zcode" and row["hits"] == len(rows)
+    h = brain.health_report(root)
+    assert h["recall_push_total"] == 1 and h["push_by_agent"].get("zcode") == 1
+    assert any(m["id"] == rows[0]["id"] for m in h["top_pushed"]), "被推送记忆应进唤起排行"
+    assert "recall_push" in h["tool_breakdown"]
+    assert h["search_by_agent"] == {} or "zcode" not in h["search_by_agent"], "推送不计入主动检索"
+    # 全局心跳（空 project）也落日志，且按 agent 分组
+    brain.recall_for(root, "", agent="dsh")
+    h2 = brain.health_report(root)
+    assert h2["recall_push_total"] == 2 and h2["push_by_agent"].get("dsh") == 1
+
+
+def t_similar_lessons(tmp):
+    """写入时踩坑拦截（v2.7）：新记录 vs lesson/fact/open 错误的 Jaccard 提醒，阈值 0.20 实测标定。"""
+    root = str(Path(tmp) / "hub_lessons")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_memory(root, "更新桌面快捷方式用 heredoc 写 ps1 无 BOM，PowerShell 中文乱码静默新建错名文件",
+                     kind="lesson", agent="zcode")
+    brain.add_memory(root, "环境事实：Python 3.11.9 在 D:\\python311，python3 不可用", kind="fact", agent="zcode")
+    # 再踩同一个坑的记录 → 命中 lesson（模拟 dsh 重蹈 2026-10-01 快捷方式乱码坑）
+    hits = brain.similar_lessons_for(root,
+        "更新桌面快捷方式时用 heredoc 写了 ps1 无 BOM，PowerShell 5.1 中文乱码，快捷方式名字变乱码还误报成功")
+    assert hits and hits[0]["kind"] == "lesson" and hits[0]["sim"] >= 0.20, hits
+    # open 错误登记也拦截（id 负数表示 errors 命名空间）
+    brain.error_add(root, "zcode", "FlClash 强杀后死代理残留必须重启恢复", "现象：断网", "FlClash-规则脱钩修复")
+    hits2 = brain.similar_lessons_for(root, "FlClash 强杀进程后死代理残留导致断网，需要重启恢复网络")
+    assert hits2 and any(h["kind"] == "error" and h["id"] < 0 for h in hits2), hits2
+    # 完全无关不命中；过短内容不触发
+    assert brain.similar_lessons_for(root, "今天午饭吃了食堂的红烧肉和番茄炒蛋非常好吃") == []
+    assert brain.similar_lessons_for(root, "ps1 乱码") == []
+    # limit 封顶
+    for i in range(6):
+        brain.add_memory(root, f"快捷方式坑{i}：乱码静默新建", kind="lesson", agent="zcode")
+    hits3 = brain.similar_lessons_for(root, "桌面快捷方式乱码静默新建文件", threshold=0.01, limit=3)
+    assert 0 < len(hits3) <= 3
+
+
+def t_archive_project(tmp):
+    """项目归档（v2.7）：状态 archived + 目录移入 99_Archive + 错误分支 + add_record 不复活。"""
+    root = Path(tmp) / "hub_archive"
+    root.mkdir(parents=True, exist_ok=True)
+    core.create_project(str(root), "归档测试-项目")
+    brain.init_db(str(root))
+    brain.add_record(str(root), "归档测试-项目", "zcode", "2026-09-01", "t1", "历史记录")
+    # 归档：状态 + 目录移动
+    err = brain.archive_project(str(root), "归档测试-项目", agent="zcode")
+    assert err == "", err
+    with brain.db_conn(str(root)) as conn:
+        st = conn.execute("SELECT status FROM projects WHERE name='归档测试-项目'").fetchone()[0]
+    assert st == "archived"
+    assert (root / "99_Archive" / "归档测试-项目").is_dir()
+    assert not (root / "归档测试-项目").exists()
+    # 归档后写新记录不复活（add_record 的 status!='archived' 守卫）
+    brain.add_record(str(root), "归档测试-项目", "dsh", "2026-10-02", "t2", "归档后误写")
+    with brain.db_conn(str(root)) as conn:
+        st2 = conn.execute("SELECT status FROM projects WHERE name='归档测试-项目'").fetchone()[0]
+    assert st2 == "archived", "归档项目被新记录复活"
+    # 错误分支：不存在 / 重复归档 / 空名
+    assert "未找到" in brain.archive_project(str(root), "不存在的项目xyz")
+    assert "已是归档状态" in brain.archive_project(str(root), "归档测试-项目")
+    assert "必填" in brain.archive_project(str(root), "")
+    # 回滚路径：目录移回 + 状态改回（记录里承诺的可逆性验证）
+    import shutil as _sh
+    _sh.move(str(root / "99_Archive" / "归档测试-项目"), str(root / "归档测试-项目"))
+    with brain.db_conn(str(root)) as conn:
+        conn.execute("UPDATE projects SET status='active' WHERE name='归档测试-项目'")
+    assert (root / "归档测试-项目").is_dir()
+
+
 def t_ensure_schema(tmp):
     """schema 自愈（MCP server 启动建表责任的根修）：缺表补建/幂等/坏根目录容错。"""
     root = str(Path(tmp) / "hub_schema")
@@ -650,6 +732,9 @@ def main():
     case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
     case("LIKE通配符转义（% _ \\字面匹配/裸通配不全命中）+记忆计数", lambda: t_like_escape_and_count(tmp))
     case("检索召回补盲（中文长串bigram重试/有命中不重试/短串不变）", lambda: t_cjk_bigram_retry(tmp))
+    case("推送可观测（recall_push落表/体检top10/agent覆盖分布）", lambda: t_recall_push_log(tmp))
+    case("写入时踩坑拦截（相似lesson/错误登记/无关不命中/limit）", lambda: t_similar_lessons(tmp))
+    case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)

@@ -132,6 +132,10 @@ def main():
         check("记忆检索", any("冒烟测试记忆条目" in m["content"]
                               for m in brain.search_memories(str(tmp), "冒烟")))
         w.hub_page.fill_memories()
+        # 大脑页冒烟（v2.7：唤起排行/使用分布/待办看板/置顶位四卡填充不崩）
+        check("大脑页存在且已挂导航", w.brain_page is not None)
+        w.brain_page.reload()
+        check("大脑页填充不崩", w.brain_page.cardMem.value.text() != "")
         # EditAssetDialog 冒烟
         from ui import EditAssetDialog
         dlg = EditAssetDialog(w, str(tmp / "红色沙漠-存档备份" / core.RECORD_NAME), "工作记录.md")

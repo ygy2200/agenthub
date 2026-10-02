@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.0.0"
+    assert r["serverInfo"]["version"] == "2.7.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -71,7 +71,7 @@ def t_protocol(root):
             "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
             "hub_search_files", "hub_distill", "hub_get_record"} <= names, names
-    assert len(names) == 24
+    assert len(names) == 25
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -538,6 +538,39 @@ def t_memory_read_fallback(tmp):
     assert "无命中" in out4 and "[记录#" not in out4, out4
 
 
+def t_log_work_intercept(tmp):
+    """写入时踩坑拦截（v2.7）：log_work 返回附相似 lesson/open 错误提醒；无关记录不附。"""
+    root = Path(tmp) / "hub_intercept"
+    build_hub(root)
+    root_s = str(root)
+    m.call_tool("hub_memory_write", {"content": "更新桌面快捷方式用 heredoc 写 ps1 无 BOM，PowerShell 中文乱码静默新建错名文件",
+                                     "kind": "lesson", "agent": "zcode"}, root_s)
+    # 再踩同坑的记录 → 返回带拦截提醒 + 记忆#id
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "dsh",
+                                       "content": "【目的】更新桌面快捷方式：heredoc 写 ps1 无 BOM，PowerShell 中文乱码，快捷方式名变乱码还误报成功"}, root_s)
+    assert "已记入大脑" in out, out
+    assert "大脑拦截提醒" in out and "[记忆#" in out, f"相似踩坑未拦截：{out}"
+    # 无关记录 → 无拦截段
+    out2 = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "dsh",
+                                        "content": "【目的】整理课表导出 PDF 的页边距设置"}, root_s)
+    assert "已记入大脑" in out2 and "大脑拦截提醒" not in out2, out2
+
+
+def t_archive_tool(tmp):
+    """hub_archive_project（v2.7）：归档成功（状态+目录）/未找到报错/重复归档报错。"""
+    root = Path(tmp) / "hub_archive_tool"
+    build_hub(root)
+    root_s = str(root)
+    out = m.call_tool("hub_archive_project", {"project": "测试-项目", "agent": "zcode"}, root_s)
+    assert "已归档" in out and "99_Archive" in out, out
+    assert (root / "99_Archive" / "测试-项目").is_dir(), "目录未移入归档区"
+    assert not (root / "测试-项目").exists()
+    out2 = m.call_tool("hub_archive_project", {"project": "测试-项目"}, root_s)
+    assert "已是归档状态" in out2, out2
+    out3 = m.call_tool("hub_archive_project", {"project": "不存在的项目xyz"}, root_s)
+    assert "未找到" in out3, out3
+
+
 def t_distill_mark(tmp):
     """hub_distill 展示即登记：同一记录不重复推送（死候选治理，2026-10-02）。"""
     root_s = str(Path(tmp) / "hub")
@@ -554,7 +587,7 @@ def main():
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
-    case("MCP协议（握手/24工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/25工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
@@ -566,6 +599,8 @@ def main():
     case("蒸馏展示即登记（同一记录不重复推送）", lambda: t_distill_mark(tmp))
     case("检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）", lambda: t_search_output(tmp))
     case("memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）", lambda: t_memory_read_fallback(tmp))
+    case("写入时踩坑拦截（相似lesson提醒/无关不附）", lambda: t_log_work_intercept(tmp))
+    case("项目归档工具（状态+目录/未找到/重复归档）", lambda: t_archive_tool(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))

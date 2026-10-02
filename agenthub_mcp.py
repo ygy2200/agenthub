@@ -36,7 +36,7 @@ import core  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.0.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.7.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -150,7 +150,20 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
-        return f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}"
+        out = f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}"
+        # 写入时踩坑拦截：新记录与库内 lesson/fact 相似 → 当场弹出核对
+        # （"大脑拦住重复踩坑"的落地时机——比开工推送更贴近踩坑瞬间）
+        try:
+            hits = brain.similar_lessons_for(root, content)
+        except Exception:  # noqa: BLE001
+            hits = []
+        if hits:
+            out += f"\n⚠️ 大脑拦截提醒：库内已有 {len(hits)} 条相似踩坑/环境事实，动手前先核对："
+            for hk in hits:
+                tag = (f"错误登记#{-hk['id']}" if hk["id"] < 0 else f"记忆#{hk['id']}")
+                out += (f"\n  [{tag}]（{brain.KIND_CN.get(hk['kind'], hk['kind'])}"
+                        f"·相似度{hk['sim']}）{hk['content']}")
+        return out
 
     if name == "hub_create_project":
         pname = str(arguments.get("project", "")).strip()
@@ -266,7 +279,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         # 免推窗口内的重复心跳不重推（内容还在会话上下文里），推送异常降级登记错误不打断心跳
         if push:
             try:
-                recall = brain.recall_for(root, project)
+                recall = brain.recall_for(root, project, agent=agent)
             except Exception as e:  # noqa: BLE001
                 recall = []
                 try:
@@ -313,6 +326,16 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             return f"错误：{err}"
         core.journal(root, agent, "undo_log_work", "brain:records", note=info)
         return f"已撤销该 agent 最近一条 hub 记录（软删，可在流水追溯）：{info}"
+
+    if name == "hub_archive_project":
+        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
+        pname = str(arguments.get("project", "")).strip()
+        err = brain.archive_project(root, pname, agent)
+        if err:
+            return f"错误：{err}" if err.startswith(("未找到", "project")) else f"警告：{err}"
+        core.journal(root, agent, "archive_project", pname)
+        return (f"项目已归档：{pname}（状态=archived，目录已移入 99_Archive\\；"
+                f"回滚=目录移回 + 状态改回 active）")
 
     if name == "hub_list_skills":
         want = str(arguments.get("agent", "")).strip().lower()
@@ -461,6 +484,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines.append("疑似重复记忆（建议合并或按「取代记忆#N」约定处理）：")
             for d in h["dup_memories"][:5]:
                 lines.append(f"  · #{d['a']}~#{d['b']} 相似{d['sim']} [{d.get('verdict', '')}]：{d['content_a'][:40]}")
+        if h.get("push_by_agent"):
+            cov = "、".join(f"{k} {v}次" for k, v in h["push_by_agent"].items())
+            lines.append(f"- 记忆推送累计 {h.get('recall_push_total', 0)} 次（{cov}）；"
+                         f"主动检索分布 {'、'.join(f'{k} {v}次' for k, v in h.get('search_by_agent', {}).items())}")
+        if h.get("top_pushed"):
+            lines.append("- 唤起最多的记忆 top（推送反射弧记数，验收看工作知识占比）：")
+            for m in h["top_pushed"][:5]:
+                lines.append(f"    #{m['id']}（{m['use_count']}次）[{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:50]}")
         return "\n".join(lines)
 
     if name == "hub_get_progress":
@@ -538,6 +569,11 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"agent": {"type": "string", "description": "你的 agent 名（只能撤自己的）"}},
                      "required": ["agent"]}},
+    {"name": "hub_archive_project", "description": "归档已完结项目（状态改 archived + 目录移入 99_Archive，可逆）。仅限用户明确拍板的项目清理",
+     "inputSchema": {"type": "object",
+                     "properties": {"project": {"type": "string", "description": "项目目录名"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["project"]}},
     {"name": "hub_list_skills", "description": "列出本机各 agent 的技能库（能力对齐：看别的 agent 会什么）",
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "可选，过滤 agent 名"}}}},
     {"name": "hub_list_mcps", "description": "列出本机各 agent 已配置的 MCP 服务器",

@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AgentHub GUI：总览 / 项目 / 时间线 / Agent 中心 / 能力市场 / 流水·对账 / 统计 / 搜索 / 接入。
+"""AgentHub GUI：总览 / 项目 / 时间线 / Agent 中心 / 能力市场 / 大脑 / 流水·对账 / 统计 / 搜索 / 接入。
 
 数据全部来自 core.scan 现场扫描与大脑数据库（brain.db），agent 直写后按 F5 即见。
 """
@@ -709,6 +709,120 @@ class TimelinePage(QWidget):
     def jump(self, name):
         self.win.project_page.select_project(name)
         self.win.switchTo(self.win.project_page)
+
+
+class BrainPage(QWidget):
+    """大脑页（v2.7）：唤起排行 / 使用分布 / 待办看板 / 置顶记忆——
+    把"写多读少"变得可见：use_count、推送与检索计数直接对应大脑验收四条标准。"""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        row = QHBoxLayout()
+        self.cardMem = NumberCard("记忆总数")
+        self.cardCrys = NumberCard("结晶率（记忆/记录）")
+        self.cardPush = NumberCard("记忆推送累计")
+        self.cardTodo = NumberCard("待办线索")
+        for c in (self.cardMem, self.cardCrys, self.cardPush, self.cardTodo):
+            row.addWidget(c)
+        lay.addLayout(row)
+
+        self.topBox = QVBoxLayout()
+        self.useBox = QVBoxLayout()
+        self.todoBox = QVBoxLayout()
+        self.pinBox = QVBoxLayout()
+        for box, t in ((self.topBox, "记忆唤起 top10（开工推送反射弧记数）"),
+                       (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）"),
+                       (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）"),
+                       (self.pinBox, "置顶记忆（置顶位只放工作知识）")):
+            gb = CardWidget()
+            g = QVBoxLayout(gb)
+            g.setContentsMargins(20, 14, 20, 14)
+            g.addWidget(StrongBodyLabel(t))
+            g.addLayout(box)
+            lay.addWidget(gb)
+        lay.addStretch(1)
+
+    def reload(self):
+        root = self.win.root
+        if not root:
+            return
+        try:
+            h = brain.health_report(root)
+        except Exception:
+            return
+        self.cardMem.value.setText(str(h["memories"]))
+        self.cardCrys.value.setText(f"{h['crystallization']}%")
+        self.cardPush.value.setText(str(h.get("recall_push_total", 0)))
+        self.cardTodo.value.setText(str(h["todo_count"]))
+
+        def clear(box):
+            while box.count():
+                it = box.takeAt(0)
+                if it.widget():
+                    it.widget().deleteLater()
+
+        # 唤起排行（验收①：推送 top 应是工作知识而非元信息）
+        clear(self.topBox)
+        tops = h.get("top_pushed", [])
+        for m in tops:
+            self.topBox.addWidget(CaptionLabel(
+                f"#{m['id']} ×{m['use_count']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:66]}"))
+        if not tops:
+            self.topBox.addWidget(CaptionLabel(
+                "还没有记忆被唤起——agent 开工心跳（hub_heartbeat）时自动推送相关记忆，此处累计记数"))
+
+        # 使用分布（验收①：searches 有跨 agent 真实数据）
+        clear(self.useBox)
+        merged: dict = {}
+        for src in (h.get("search_by_agent", {}), h.get("push_by_agent", {})):
+            for k, v in src.items():
+                merged[k] = merged.get(k, 0) + v
+        total = max(1, sum(merged.values()))
+        for k, v in sorted(merged.items(), key=lambda x: -x[1]):
+            r = QHBoxLayout()
+            r.addWidget(badge(k, k))
+            bar = ProgressBar()
+            bar.setValue(round(v / total * 100))
+            r.addWidget(bar, 1)
+            r.addWidget(BodyLabel(str(v)))
+            self.useBox.addLayout(r)
+        if not merged:
+            self.useBox.addWidget(CaptionLabel("暂无检索/推送记录"))
+
+        # 待办看板（验收③：欠账可见 + 勾销闭环）
+        clear(self.todoBox)
+        for t in h["todos"][:8]:
+            r = QHBoxLayout()
+            r.addWidget(BodyLabel(f"[{t['project']}·{t['date'][5:]}·{t['agent']}] {t['todo'][:56]}"), 1)
+            btn = PushButton("勾销")
+            btn.clicked.connect(lambda _, rid=t["id"], tt=t["todo"]: self._done_todo(rid, tt))
+            r.addWidget(btn)
+            self.todoBox.addLayout(r)
+        if not h["todos"]:
+            self.todoBox.addWidget(CaptionLabel("暂无待办（从记录提取：后续/待验证/下一步…句式）"))
+
+        # 置顶记忆（验收④：置顶位工作知识占比）
+        clear(self.pinBox)
+        try:
+            pins = [m for m in brain.search_memories(root, "", "", 100) if m["pinned"]][:8]
+        except Exception:
+            pins = []
+        for m in pins:
+            self.pinBox.addWidget(CaptionLabel(
+                f"★ #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:70]}"))
+        if not pins:
+            self.pinBox.addWidget(CaptionLabel("暂无置顶——agent 写记忆时可带 pinned=true 进置顶位"))
+
+    def _done_todo(self, rid, todo):
+        err = brain.mark_todo_done(self.win.root, rid, todo, agent="gui")
+        if err:
+            InfoBar.error("勾销失败", err, duration=4000, parent=self.win)
+            return
+        InfoBar.success("已勾销", "该待办不再出现（闭环），操作可在流水页追溯", duration=3000, parent=self.win)
+        self.reload()
 
 
 class StatsPage(QWidget):
@@ -2254,6 +2368,7 @@ class AgentHubWindow(FluentWindow):
         self.project_page = ProjectPage(self)
         self.timeline_page = TimelinePage(self)
         self.stats_page = StatsPage(self)
+        self.brain_page = BrainPage(self)
         self.search_page = SearchPage(self)
         self.ledger_page = LedgerPage(self)
         self.audit_page = self.ledger_page.audit      # 原对账页别名，apply() 链路不变
@@ -2281,6 +2396,7 @@ class AgentHubWindow(FluentWindow):
 
         self.navigationInterface.addItemHeader("数据")
         for w, icon, text in (
+            (self.brain_page, "LIBRARY", "大脑"),
             (self.ledger_page, "DICTIONARY", "流水·对账"),
             (self.stats_page, "TILES", "统计"),
             (self.search_page, "SEARCH", "搜索"),
@@ -2436,6 +2552,7 @@ class AgentHubWindow(FluentWindow):
         try:
             self.timeline_page.set_records(brain.list_records(self.root, limit=2000))
             self.stats_page.set_db(brain.stats(self.root))
+            self.brain_page.reload()
         except Exception:
             pass
         self.audit_page.set_snapshot(snap)

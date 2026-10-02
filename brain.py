@@ -24,7 +24,7 @@ BACKUP_DIR = "brain-backups"
 BACKUP_KEEP = 30
 KINDS = ("fact", "preference", "lesson", "project", "note")
 KIND_CN = {"fact": "环境事实", "preference": "用户偏好", "lesson": "踩坑经验",
-           "project": "项目进展", "note": "随手记"}
+           "project": "项目进展", "note": "随手记", "error": "踩坑登记"}
 SESSION_TTL = 1800     # 会话心跳陈旧阈值（秒）
 SESSION_ACTIVE = 300   # 同项目"正在工作"判定窗口（秒）
 STALL_DAYS = 90        # 项目停滞判定：超过该天数无记录即 stalled
@@ -538,7 +538,7 @@ PUSH_CHAR_CAP = 600      # 记忆推送：输出总字数封顶
 PUSH_THROTTLE_MIN = 10   # 同 agent+project 重复心跳的免推窗口（分钟）——推送内容还在会话上下文里
 
 
-def recall_for(root: str, project: str) -> list:
+def recall_for(root: str, project: str, agent: str = "") -> list:
     """开工记忆推送（反射弧）三层：本项目相关 → 全局置顶 → 跨项目语义联想
     （该项目最近记录的 bigram 词集与其他项目记忆算 Jaccard，撞到别处踩过的坑自动想起）。
     命中即记一次唤起（use_count+1）——只对实际推送出去的条目计数（用进废退）。"""
@@ -589,7 +589,9 @@ def recall_for(root: str, project: str) -> list:
                          (now, r["id"]))
             r["use_count"] = (r["use_count"] or 0) + 1  # 返回值反映本次唤起后的计数
             r["last_hit"] = now
-        return rows
+    # 推送落检索日志（tool=recall_push）：推送可观测，"推送 top10 是工作知识"才可验收
+    log_search(root, "recall_push", (project or "")[:200], len(rows), agent=agent)
+    return rows
 
 
 def should_push(root: str, agent: str, project: str) -> bool:
@@ -1052,6 +1054,62 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
     return out
 
 
+def similar_lessons_for(root: str, content: str, threshold: float = 0.20, limit: int = 3) -> list:
+    """写入时踩坑拦截：新记录 content 的 bigram 词集 vs 库内 lesson/fact 记忆与 open 错误登记，
+    Jaccard ≥ threshold 视为"可能正在重蹈已记录的坑"。阈值 0.20 为真实库实测标定：
+    同源记录-记忆对（真相关）相似度 0.213~0.328，无关对 ≤0.155；记录长记忆短导致并集偏大、
+    相似度天然偏低，拦截宁可多提醒（agent 看一眼自行取舍），漏报代价高于误报。
+    返回 [{id, kind, sim, content}] 按 sim 降序，kind=error 表示 open 错误登记。"""
+    toks = _tokens(content)
+    if len(toks) < 4:
+        return []
+    with db_conn(root) as conn:
+        rows = [{"id": r["id"], "kind": r["kind"], "content": r["content"]} for r in conn.execute(
+            "SELECT id, kind, content FROM memories WHERE status='active' AND kind IN ('lesson','fact')")]
+        rows += [{"id": -r["id"], "kind": "error", "content": f"{r['title']} {r['detail']}"}
+                 for r in conn.execute("SELECT id, title, detail FROM errors WHERE status='open'")]
+    out = []
+    for r in rows:
+        ot = _tokens(r["content"])
+        if not ot:
+            continue
+        sim = len(toks & ot) / len(toks | ot)
+        if sim >= threshold:
+            out.append({"id": r["id"], "kind": r["kind"], "sim": round(sim, 2),
+                        "content": r["content"][:80]})
+    out.sort(key=lambda x: -x["sim"])
+    return out[:max(1, min(limit, 5))]
+
+
+def archive_project(root: str, name: str, agent: str = "") -> str:
+    """项目归档（清理决策的落地动作）：状态改 archived（不再计入活跃/stalled）；
+    目录存在则移入 <root>/99_Archive\\（可逆：移回 + 状态改回 active 即恢复）。
+    add_record 对 archived 项目有 status!='archived' 守卫——归档后新记录不会误复活它。"""
+    import shutil
+    name = (name or "").strip()
+    if not name:
+        return "project 必填"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT name, status FROM projects WHERE name=?", (name,)).fetchone()
+        if not row:
+            return f"未找到项目：{name}"
+        if row["status"] == "archived":
+            return f"项目已是归档状态：{name}"
+        conn.execute("UPDATE projects SET status='archived' WHERE name=?", (name,))
+    src = Path(root) / name
+    if src.is_dir():
+        dst_dir = Path(root) / core.DIR_ARCHIVE
+        dst = dst_dir / name
+        try:
+            dst_dir.mkdir(exist_ok=True)
+            if dst.exists():
+                return f"状态已归档，但 99_Archive\\{name} 已存在同名目录，目录未动（请手动处理）"
+            shutil.move(str(src), str(dst))
+        except OSError as e:
+            return f"状态已归档，但目录移动失败（可手动移入 99_Archive）：{e}"
+    return ""
+
+
 def health_report(root: str) -> dict:
     """大脑体检：汇总各智能维度 + 数据规模，供 hub_health 工具与 GUI 体检摘要。"""
     s = stats(root)
@@ -1061,13 +1119,29 @@ def health_report(root: str) -> dict:
         bare_titles = conn.execute(
             "SELECT COUNT(*) FROM records WHERE status='active' "
             "AND title GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]（*）'").fetchone()[0]
+        push_total = conn.execute(
+            "SELECT COUNT(*) FROM searches WHERE tool='recall_push'").fetchone()[0]
+        push_by_agent = {r[0] or "未知": r[1] for r in conn.execute(
+            "SELECT agent, COUNT(*) FROM searches WHERE tool='recall_push' GROUP BY agent ORDER BY 2 DESC")}
+        search_by_agent = {r[0] or "未知": r[1] for r in conn.execute(
+            "SELECT agent, COUNT(*) FROM searches WHERE tool!='recall_push' GROUP BY agent ORDER BY 2 DESC")}
+        tool_breakdown = {r[0]: r[1] for r in conn.execute(
+            "SELECT tool, COUNT(*) FROM searches GROUP BY tool ORDER BY 2 DESC")}
+        top_pushed = [dict(r) for r in conn.execute(
+            "SELECT id, kind, content, use_count, last_hit FROM memories "
+            "WHERE status='active' AND use_count>0 ORDER BY use_count DESC, id DESC LIMIT 10")]
+        archived = conn.execute(
+            "SELECT COUNT(*) FROM projects WHERE status='archived'").fetchone()[0]
     return {"records": s["records"], "memories": s["memories"], "projects": s["projects"],
-            "projects_stalled": s.get("projects_stalled", 0),
+            "projects_stalled": s.get("projects_stalled", 0), "projects_archived": archived,
             "errors_open": s.get("errors_open", 0),
             "searches_today": s.get("searches_today", 0), "searches_total": s.get("searches_total", 0),
             "todos": todos, "todo_count": len(todos),
             "dup_memories": sims, "dup_memory_count": len(sims),
             "bare_titles": bare_titles,
+            "recall_push_total": push_total, "push_by_agent": push_by_agent,
+            "search_by_agent": search_by_agent, "tool_breakdown": tool_breakdown,
+            "top_pushed": top_pushed,
             "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
 
 
