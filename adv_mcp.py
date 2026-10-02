@@ -99,7 +99,7 @@ def t_tools(root):
     out = m.call_tool("hub_get_project", {"project": "不存在的"}, root_s)
     assert "不存在" in out
     out = m.call_tool("hub_search", {"keyword": "初始化"}, root_s)
-    assert "[记录]" in out
+    assert "[记录#" in out and "全脑检索" in out, out
     out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "deepseek",
                                        "content": "对抗测试记录：修了X，验证通过"}, root_s)
     assert "已记入大脑" in out, out
@@ -484,6 +484,33 @@ def t_get_record_and_search_files(tmp):
     assert "全盘无匹配文件" in out, out
 
 
+def t_search_output(tmp):
+    """hub_search 检索顺手度：#id 精读闭环 + 统计头 + 片段 + 零命中建议 + 通配符转义。"""
+    import re
+    root = Path(tmp) / "hub_search_out"
+    build_hub(root)
+    root_s = str(root)
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "【目的】修好 Everything 索引延迟问题，验证通过"}, root_s)
+    out = m.call_tool("hub_search", {"keyword": "Everything 索引"}, root_s)
+    assert "全脑检索" in out and "命中 记录1 · 记忆0 · 文件0" in out, out
+    assert "[记录#" in out, f"记录行缺 #id（精读链路断）：{out}"
+    assert "↳" in out, f"缺命中片段行：{out}"
+    rid = int(re.search(r"\[记录#(\d+)\]", out).group(1))
+    rec = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
+    assert "Everything" in rec, "#id 无法精读，链路闭环失败"
+    # 零命中：给检索建议而非干巴巴"无结果"
+    out0 = m.call_tool("hub_search", {"keyword": "绝不存在的词xyz"}, root_s)
+    assert "无结果" in out0 and "可试" in out0, out0
+    # 通配符按字面匹配：hub 内无字面 %，裸 % 零命中（旧版全库命中返回一串）
+    outw = m.call_tool("hub_search", {"keyword": "%"}, root_s)
+    assert "无结果" in outw, f"裸 % 仍全库命中：{outw[:200]}"
+    # hub_memory_read 头部总数与实际条数一致（COUNT 而非全捞）
+    m.call_tool("hub_memory_write", {"content": "计数测试记忆A", "kind": "fact"}, root_s)
+    outm = m.call_tool("hub_memory_read", {"query": "计数测试"}, root_s)
+    assert re.search(r"共 \d+ 条，命中 1 条", outm), outm
+
+
 def t_distill_mark(tmp):
     """hub_distill 展示即登记：同一记录不重复推送（死候选治理，2026-10-02）。"""
     root_s = str(Path(tmp) / "hub")
@@ -510,6 +537,7 @@ def main():
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
     case("单条全文读取+Everything列表回归（畸形id/死代码bug）", lambda: t_get_record_and_search_files(tmp))
     case("蒸馏展示即登记（同一记录不重复推送）", lambda: t_distill_mark(tmp))
+    case("检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）", lambda: t_search_output(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))

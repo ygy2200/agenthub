@@ -87,6 +87,26 @@ def _auto_title(content: str, date: str, agent: str) -> str:
     return f"{date}（{agent}）"
 
 
+def _snippet(content: str, words: list, width: int = 76) -> str:
+    """命中片段：取首个命中词前后的上下文（无命中给开头），单行化。
+    hub_search 只给标题时判断不了价值，精读前先看片段省一次 hub_get_record。"""
+    text = " ".join((content or "").split())
+    if not text:
+        return ""
+    pos = -1
+    for w in words:
+        pos = text.lower().find(w.lower())
+        if pos >= 0:
+            break
+    if pos < 0:
+        pos = 0
+    start = max(0, pos - 20)
+    frag = text[start:start + width]
+    head = "…" if start > 0 else ""
+    tail = "…" if start + width < len(text) else ""
+    return f"{head}{frag}{tail}"
+
+
 def call_tool(name: str, arguments: dict, root: str) -> str:
     """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
@@ -146,19 +166,27 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if name == "hub_search":
         kw = str(arguments.get("keyword", "")).strip()
         res = brain.search_all(root, kw)
-        brain.log_search(root, "hub_search", kw,
-                         len(res["records"]) + len(res["memories"]) + len(res["files"]),
-                         agent=_guess_agent(root))
-        lines = []
+        n_total = len(res["records"]) + len(res["memories"]) + len(res["files"])
+        brain.log_search(root, "hub_search", kw, n_total, agent=_guess_agent(root))
+        if not n_total:
+            return (f"无结果：{kw}\n"
+                    "（可试：① 拆成更短的词重查（按子串匹配）② hub_list_projects 看项目名 "
+                    "③ hub_memory_read 查记忆 ④ hub_env_list 查环境档案）")
+        words = [w for w in kw.split() if w][:8]
+        lines = [f"全脑检索「{kw}」：命中 记录{len(res['records'])} · 记忆{len(res['memories'])} · "
+                 f"文件{len(res['files'])}（记录行带 #id，精读用 hub_get_record）"]
         for r in res["records"]:
-            lines.append(f"[记录] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:80]}")
-        for m in res["memories"]:
-            lines.append(f"[记忆#{m['id']}] {brain.KIND_CN.get(m['kind'], m['kind'])}：{m['content'][:100]}")
+            lines.append(f"[记录#{r['id']}] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:60]}")
+            snip = _snippet(r["content"], words)
+            if snip:
+                lines.append(f"  ↳ {snip}")
+        for mem in res["memories"]:
+            lines.append(f"[记忆#{mem['id']}] {brain.KIND_CN.get(mem['kind'], mem['kind'])}：{mem['content'][:100]}")
         for f in res["files"]:
             lines.append(f"[文件] {f['project']}\\{f['name']}")
-        if not lines:
-            return f"无结果：{kw}"
-        return "\n".join(lines[:40])
+        if len(lines) > 41:  # 头部 1 行 + 内容 40 行
+            lines = lines[:41] + ["（结果较多仅显示前 40 行，换更具体的关键词可缩小范围）"]
+        return "\n".join(lines)
 
     if name == "hub_get_rules":
         return core.load_rules(root)
@@ -173,7 +201,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         rows = brain.search_memories(root, query, kind, limit)
         brain.log_search(root, "hub_memory_read", query or (f"kind:{kind}" if kind else ""), len(rows),
                          agent=_guess_agent(root))
-        total = len(brain.search_memories(root, "", "", 1000))
+        total = brain.count_memories(root)
         if not rows:
             return f"（大脑记忆无命中。当前共 {total} 条记忆；写入用 hub_memory_write）"
         head = f"大脑记忆（共 {total} 条" + (f"，命中 {len(rows)} 条" if query or kind else "") + "）"
@@ -456,7 +484,7 @@ TOOLS = [
                                     "content": {"type": "string", "description": "做了什么/验证结果/如何回滚"},
                                     "date": {"type": "string", "description": "YYYY-MM-DD，缺省今天"}},
                      "required": ["project", "agent", "content"]}},
-    {"name": "hub_search", "description": "跨项目全文搜索工作记录与文件名",
+    {"name": "hub_search", "description": "跨项目全文搜索工作记录/记忆/文件名（记录行带 #id，判断不了价值先看片段，精读用 hub_get_record）",
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}},
     {"name": "hub_get_rules", "description": "读取团队协作规范（目录命名/记录格式/铁律）",
      "inputSchema": {"type": "object", "properties": {}}},

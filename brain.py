@@ -444,23 +444,30 @@ def list_records(root: str, project: str = "", agent: str = "", limit: int = 100
         return [dict(r) for r in conn.execute(q, args)]
 
 
+def _like_escape(w: str) -> str:
+    """LIKE 通配符转义：查询词里的 % _ 按字面匹配（否则 query='%' 全库命中，"%"
+    在 Windows 通配习惯/SQL 注入探测里都会出现）。配套 SQL 里 ESCAPE '\\'。"""
+    return w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
 def search_records(root: str, kw: str, limit: int = 30) -> list:
     """多词评分检索：query 按空白切词，命中词数越多越靠前（同分按日期）。
     单词行为兼容旧版；评分让"多关键词"查询真正缩小范围而非取并集噪声。"""
     words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
     if not words:
         return []
+    like_cond = "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR project LIKE ? ESCAPE '\\')"
     score_sql = " + ".join(
-        f"(CASE WHEN title LIKE ? OR content LIKE ? OR project LIKE ? THEN 1 ELSE 0 END)"
-        for _ in words)
+        "(CASE WHEN title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' "
+        "OR project LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)" for _ in words)
     args: list = []
     for w in words:
-        like = f"%{w}%"
+        like = f"%{_like_escape(w)}%"
         args += [like, like, like]
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
             f"SELECT *, ({score_sql}) AS score FROM records WHERE status='active' AND "
-            f"({' OR '.join(['(title LIKE ? OR content LIKE ? OR project LIKE ?)'] * len(words))}) "
+            f"({' OR '.join([like_cond] * len(words))}) "
             "ORDER BY score DESC, date DESC, id DESC LIMIT ?",
             args + args + [max(1, min(limit, 100))])]
 
@@ -574,10 +581,12 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20)
     if words:
         conds, score_sql = [], []
         for w in words:
-            like = f"%{w}%"
-            conds.append("(content LIKE ? OR tags LIKE ? OR project LIKE ?)")
+            like = f"%{_like_escape(w)}%"
+            conds.append("(content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' "
+                         "OR project LIKE ? ESCAPE '\\')")
             args += [like, like, like]
-            score_sql.append("(CASE WHEN content LIKE ? THEN 2 ELSE 0 END + CASE WHEN tags LIKE ? THEN 1 ELSE 0 END)")
+            score_sql.append("(CASE WHEN content LIKE ? ESCAPE '\\' THEN 2 ELSE 0 END "
+                             "+ CASE WHEN tags LIKE ? ESCAPE '\\' THEN 1 ELSE 0 END)")
             args += [like, like]
         q += " AND (" + " OR ".join(conds) + ")"
         if kind in KINDS:
@@ -593,6 +602,17 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20)
         args.append(max(0, min(limit, 100)))
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(q, args)]
+
+
+def count_memories(root: str, kind: str = "") -> int:
+    """活跃记忆总数（SQL COUNT；替代"全捞 1000 条到 Python 再 len"的低效计数）。"""
+    q = "SELECT COUNT(*) FROM memories WHERE status='active'"
+    args: list = []
+    if kind in KINDS:
+        q += " AND kind=?"
+        args.append(kind)
+    with db_conn(root) as conn:
+        return conn.execute(q, args).fetchone()[0]
 
 
 def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: str = "",
@@ -682,11 +702,11 @@ def search_files(root: str, kw: str, limit: int = 20) -> list:
     words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
     if not words:
         return []
-    conds = " OR ".join(["name LIKE ?"] * len(words))
+    conds = " OR ".join(["name LIKE ? ESCAPE '\\'"] * len(words))
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
             f"SELECT project,name,path FROM files WHERE ({conds}) LIMIT ?",
-            [f"%{w}%" for w in words] + [max(1, min(limit, 100))])]
+            [f"%{_like_escape(w)}%" for w in words] + [max(1, min(limit, 100))])]
 
 
 def update_files_index(root: str, rows: list) -> None:

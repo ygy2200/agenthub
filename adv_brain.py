@@ -544,6 +544,42 @@ def t_bad_params(tmp):
     assert "不存在" in brain.edit_memory(root, -1, content="x")
 
 
+def t_like_escape_and_count(tmp):
+    """检索 LIKE 通配符转义：% _ \\ 按字面匹配（旧版裸 % 会全库命中）+ count_memories。"""
+    root = str(Path(tmp) / "hub_escape")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_record(root, "转义测试-项目", "zcode", "2026-10-01", "t1",
+        "折扣率 100% 的记录，含下划线变量 max_size 说明")
+    brain.add_record(root, "转义测试-项目", "dsh", "2026-10-01", "t2",
+        "普通记录无通配符")
+    brain.add_memory(root, "记忆里有 50%_off 字面串", kind="note", agent="zcode")
+    # 字面通配符可精确命中
+    assert len(brain.search_records(root, "100%")) == 1
+    assert len(brain.search_records(root, "max_size")) == 1
+    assert len(brain.search_memories(root, "50%_off")) == 1
+    # 裸通配符只命中含字面字符的行，不再全库命中
+    assert len(brain.search_records(root, "%")) == 1
+    assert len(brain.search_records(root, "_")) == 1
+    assert len(brain.search_memories(root, "%")) == 1
+    assert brain.search_all(root, "_%_")["records"] == []
+    # 旧语义下 _ 是单字符通配，"50_off" 会误命中 "50%_off"；转义后不命中
+    assert brain.search_memories(root, "50_off") == []
+    # 反斜杠（Windows 路径）字面匹配
+    brain.add_record(root, "转义测试-项目", "dsh", "2026-10-01", "t3",
+        "路径 D:\\hub\\a.txt 写入验证")
+    assert len(brain.search_records(root, "D:\\hub")) == 1
+    # count_memories 与全量列表一致，软删后不计数，kind 过滤正确
+    assert brain.count_memories(root) == len(brain.search_memories(root, "", "", 100))
+    mid = brain.add_memory(root, "待删记忆", agent="zcode")
+    brain.delete_memory(root, mid)
+    assert brain.count_memories(root) == len(brain.search_memories(root, "", "", 100))
+    assert brain.count_memories(root, "note") == len(
+        [m for m in brain.search_memories(root, "", "", 100) if m["kind"] == "note"])
+    assert brain.count_memories(root, "lesson") == 0
+
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -563,6 +599,7 @@ def main():
     case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
     case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
+    case("LIKE通配符转义（% _ \\字面匹配/裸通配不全命中）+记忆计数", lambda: t_like_escape_and_count(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
     print()
