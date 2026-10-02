@@ -466,12 +466,20 @@ def _like_escape(w: str) -> str:
     return w.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
 
 
-def search_records(root: str, kw: str, limit: int = 30) -> list:
-    """多词评分检索：query 按空白切词，命中词数越多越靠前（同分按日期）。
-    单词行为兼容旧版；评分让"多关键词"查询真正缩小范围而非取并集噪声。"""
-    words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
-    if not words:
-        return []
+_CJK_RE = re.compile(r"[一-鿿]{4,}")
+
+
+def _retry_bigrams(query: str) -> list:
+    """连续中文长串（≥4 字）的相邻 2-gram：中文无空格分词，整串 LIKE 是全或无
+    （"大迭代优化"匹配不到只含"迭代优化"的文本）。仅在首轮 0 命中时作重试词表，
+    不参与正常路径排序。"""
+    out: list = []
+    for seg in _CJK_RE.findall(query or ""):
+        out.extend(seg[i:i + 2] for i in range(len(seg) - 1))
+    return out[:16]
+
+
+def _records_query(root: str, words: list, limit: int) -> list:
     like_cond = "(title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' OR project LIKE ? ESCAPE '\\')"
     score_sql = " + ".join(
         "(CASE WHEN title LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\' "
@@ -486,6 +494,25 @@ def search_records(root: str, kw: str, limit: int = 30) -> list:
             f"({' OR '.join([like_cond] * len(words))}) "
             "ORDER BY score DESC, date DESC, id DESC LIMIT ?",
             args + args + [max(1, min(limit, 100))])]
+
+
+def search_records(root: str, kw: str, limit: int = 30) -> list:
+    """多词评分检索：query 按空白切词，命中词数越多越靠前（同分按日期）。
+    单词行为兼容旧版；评分让"多关键词"查询真正缩小范围而非取并集噪声。
+    0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（见 _retry_bigrams）。"""
+    words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
+    if not words:
+        return []
+    rows = _records_query(root, words, limit)
+    if rows:
+        return rows
+    retry = _retry_bigrams(kw)
+    if not retry:
+        return []
+    rows = _records_query(root, retry, limit)
+    for r in rows:  # 放宽召回标记：真实大库里常见二字组合会命中弱相关，输出层须标注
+        r["_bigram"] = True
+    return rows
 
 
 # ---------------------------------------------------------------- 大脑记忆（核心）
@@ -589,9 +616,7 @@ def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> 
         pass
 
 
-def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20) -> list:
-    """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。"""
-    words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
+def _memories_query(root: str, words: list, kind: str, limit: int) -> list:
     q = "SELECT * FROM memories WHERE status='active'"
     args: list = []
     if words:
@@ -618,6 +643,22 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20)
         args.append(max(0, min(limit, 100)))
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(q, args)]
+
+
+def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20) -> list:
+    """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
+    0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（与 search_records 同因）。"""
+    words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
+    rows = _memories_query(root, words, kind, limit)
+    if rows or not words:
+        return rows
+    retry = _retry_bigrams(query)
+    if not retry:
+        return []
+    rows = _memories_query(root, retry, kind, limit)
+    for r in rows:  # 同 search_records：放宽召回须可识别
+        r["_bigram"] = True
+    return rows
 
 
 def count_memories(root: str, kind: str = "") -> int:

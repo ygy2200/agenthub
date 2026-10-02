@@ -496,6 +496,7 @@ def t_search_output(tmp):
     assert "全脑检索" in out and "命中 记录1 · 记忆0 · 文件0" in out, out
     assert "[记录#" in out, f"记录行缺 #id（精读链路断）：{out}"
     assert "↳" in out, f"缺命中片段行：{out}"
+    assert "放宽召回" not in out, "正常命中误标注重试提示"
     rid = int(re.search(r"\[记录#(\d+)\]", out).group(1))
     rec = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
     assert "Everything" in rec, "#id 无法精读，链路闭环失败"
@@ -509,6 +510,32 @@ def t_search_output(tmp):
     m.call_tool("hub_memory_write", {"content": "计数测试记忆A", "kind": "fact"}, root_s)
     outm = m.call_tool("hub_memory_read", {"query": "计数测试"}, root_s)
     assert re.search(r"共 \d+ 条，命中 1 条", outm), outm
+
+
+def t_memory_read_fallback(tmp):
+    """hub_memory_read 0 命中兜底：自动搜记录给线索（#id 可精读）；
+    有记忆命中时不附兜底行；记录也 0 命中时保持原文案；连续中文长串走 bigram 重试。"""
+    import re
+    root = Path(tmp) / "hub_mem_fallback"
+    build_hub(root)
+    root_s = str(root)
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "【目的】修复着色器编译卡顿问题，验证通过"}, root_s)
+    # 记忆库为空 0 命中，但记录命中（长串走 bigram 重试，"着色器卡顿"≠"着色器编译卡顿"）→ 附线索
+    out = m.call_tool("hub_memory_read", {"query": "着色器卡顿"}, root_s)
+    assert "大脑记忆无命中" in out, out
+    assert "记录里可能有相关线索" in out and "[记录#" in out, out
+    assert "放宽召回" in out, f"长串重试缺弱相关标注：{out}"
+    rid = int(re.search(r"\[记录#(\d+)\]", out).group(1))
+    rec = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
+    assert "着色器" in rec, f"#id 无法精读，兜底链路断：{rec[:120]}"
+    # 有记忆命中时不附兜底行
+    m.call_tool("hub_memory_write", {"content": "着色器经验：先清缓存", "kind": "lesson"}, root_s)
+    out3 = m.call_tool("hub_memory_read", {"query": "着色器"}, root_s)
+    assert "命中 1 条" in out3 and "记录里可能有相关线索" not in out3, out3
+    # 记忆、记录都 0 命中 → 无兜底行
+    out4 = m.call_tool("hub_memory_read", {"query": "绝不存在的xyz"}, root_s)
+    assert "无命中" in out4 and "[记录#" not in out4, out4
 
 
 def t_distill_mark(tmp):
@@ -538,6 +565,7 @@ def main():
     case("单条全文读取+Everything列表回归（畸形id/死代码bug）", lambda: t_get_record_and_search_files(tmp))
     case("蒸馏展示即登记（同一记录不重复推送）", lambda: t_distill_mark(tmp))
     case("检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）", lambda: t_search_output(tmp))
+    case("memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）", lambda: t_memory_read_fallback(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))

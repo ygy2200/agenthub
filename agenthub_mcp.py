@@ -175,6 +175,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         words = [w for w in kw.split() if w][:8]
         lines = [f"全脑检索「{kw}」：命中 记录{len(res['records'])} · 记忆{len(res['memories'])} · "
                  f"文件{len(res['files'])}（记录行带 #id，精读用 hub_get_record）"]
+        if any("_bigram" in r for r in res["records"]) or any("_bigram" in mem for mem in res["memories"]):
+            lines.insert(1, "（连续长串无直接命中，已拆词放宽召回——按相关度排序，弱相关自行取舍）")
         for r in res["records"]:
             lines.append(f"[记录#{r['id']}] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:60]}")
             snip = _snippet(r["content"], words)
@@ -203,8 +205,21 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                          agent=_guess_agent(root))
         total = brain.count_memories(root)
         if not rows:
-            return f"（大脑记忆无命中。当前共 {total} 条记忆；写入用 hub_memory_write）"
+            msg = f"（大脑记忆无命中。当前共 {total} 条记忆；写入用 hub_memory_write）"
+            if query:
+                # 兜底：记忆 37 条只是结晶层，1486 条记录才是知识主体——0 命中不死路，
+                # 自动用同 query 搜记录给线索（search_records 内部含 bigram 重试）
+                recs = brain.search_records(root, query, 3)
+                if recs:
+                    note = "长串已拆词放宽召回，弱相关自行取舍；" if any("_bigram" in r for r in recs) else ""
+                    lines = [msg, f"记忆之外，工作记录里可能有相关线索（{note}hub_get_record #id 精读）："]
+                    lines += [f"[记录#{r['id']}] {r['date']} {r['project']}（{r['agent']}）：{(r['title'] or '')[:60]}"
+                              for r in recs]
+                    return "\n".join(lines)
+            return msg
         head = f"大脑记忆（共 {total} 条" + (f"，命中 {len(rows)} 条" if query or kind else "") + "）"
+        if any("_bigram" in m for m in rows):
+            head += "（长串已拆词放宽召回，弱相关自行取舍）"
         lines = [head]
         for m in rows:
             flag = "★" if m["pinned"] else "·"

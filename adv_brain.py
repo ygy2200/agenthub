@@ -580,6 +580,35 @@ def t_like_escape_and_count(tmp):
 
 
 
+def t_cjk_bigram_retry(tmp):
+    """检索召回补盲：连续中文长串首轮 0 命中时按 2-gram 重试（"大迭代优化"召回含
+    "迭代优化"的记录/记忆）；首轮有命中时不重试（排序不被 bigram 噪声污染）；
+    英文/短串（<4 字）行为不变；真无关的长串仍 0 命中。"""
+    root = str(Path(tmp) / "hub_bigram")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_record(root, "迭代项目", "zcode", "2026-10-02", "t1",
+        "本轮做检索顺手度迭代优化，hub_search 带 #id")
+    brain.add_memory(root, "检索迭代优化的经验：先实测再动手", kind="lesson", agent="zcode")
+    # 连续长串整串 LIKE 0 命中（库里无连续"大迭代优化"）→ bigram 重试召回
+    recs = brain.search_records(root, "大迭代优化")
+    assert recs and "检索顺手度迭代优化" in recs[0]["content"] and recs[0]["score"] >= 1
+    mems = brain.search_memories(root, "大迭代优化")
+    assert mems and "先实测再动手" in mems[0]["content"]
+    # 重试命中行带 _bigram 标记（输出层据此提示放宽召回）；首轮命中行不带
+    assert all(r.get("_bigram") for r in recs) and all(m.get("_bigram") for m in mems)
+    assert "_bigram" not in brain.search_records(root, "hub_search")[0]
+    # 首轮有命中时直接返回，精确行为不变
+    assert len(brain.search_records(root, "hub_search")) == 1
+    # <4 字 CJK 不触发重试，0 命中仍 0；≥4 字但库里真无相关的也 0（不引入噪声）
+    assert brain.search_records(root, "zzz不存在") == []
+    assert brain.search_memories(root, "zzz不存在") == []
+    assert brain.search_records(root, "完全无关的词") == []
+    # search_all 走同一逻辑
+    res = brain.search_all(root, "大迭代优化")
+    assert res["records"] and res["memories"]
+
+
 def t_ensure_schema(tmp):
     """schema 自愈（MCP server 启动建表责任的根修）：缺表补建/幂等/坏根目录容错。"""
     root = str(Path(tmp) / "hub_schema")
@@ -620,6 +649,7 @@ def main():
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
     case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
     case("LIKE通配符转义（% _ \\字面匹配/裸通配不全命中）+记忆计数", lambda: t_like_escape_and_count(tmp))
+    case("检索召回补盲（中文长串bigram重试/有命中不重试/短串不变）", lambda: t_cjk_bigram_retry(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     shutil_rmtree(tmp)
