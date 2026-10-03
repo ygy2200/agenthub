@@ -734,7 +734,15 @@ class BrainPage(QWidget):
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.win = win
-        lay = QVBoxLayout(self)
+        # 内容装入滚动区：唤起/置顶/待办行数随真实数据增长，默认窗口高度装不下时
+        # QVBoxLayout 会把每行强制压扁成重叠细条（"看不清"的最终根因），滚动化后永不压缩
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        body = QWidget()
+        lay = QVBoxLayout(body)
         lay.setContentsMargins(24, 24, 24, 24)
         row = QHBoxLayout()
         self.cardMem = NumberCard("记忆总数")
@@ -761,6 +769,8 @@ class BrainPage(QWidget):
             g.addLayout(box)
             lay.addWidget(gb)
         lay.addStretch(1)
+        self.scroll.setWidget(body)
+        outer.addWidget(self.scroll, 1)
 
     def reload(self):
         root = self.win.root
@@ -770,6 +780,8 @@ class BrainPage(QWidget):
             h = brain.health_report(root)
         except Exception:
             return
+        # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
+        self.scroll.verticalScrollBar().setValue(0)
         self.cardMem.value.setText(str(h["memories"]))
         self.cardCrys.value.setText(f"{h['crystallization']}%")
         self.cardPush.value.setText(str(h.get("recall_push_total", 0)))
