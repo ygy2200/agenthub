@@ -107,6 +107,22 @@ def main():
     check("deploy_diff 自检输出可读", isinstance(r["summary"], str) and "部署" in r["summary"], str(r["summary"]))
     check("deploy_diff detail ≤ 8", len(r["detail"]) <= 8)
 
+    # ---- rglob 预算：超量目录必须停在 300 个（防 target 传大目录全盘遍历卡死）
+    big = tmp / "大目录压测"
+    big.mkdir()
+    for i in range(310):
+        (big / f"m{i:03d}.py").write_text("x = 1\n", encoding="utf-8")
+    r = ops.run_check("py_compile", str(big))
+    check("py_compile 预算 300 停止遍历", "300 个" in r["summary"], str(r["summary"]))
+
+    # ---- deploy_diff 源码缺失分支（部署有、源码无）
+    fake_src = tmp / "假源码目录"
+    fake_src.mkdir()
+    (fake_src / "ui.py").write_text("# stub\n", encoding="utf-8")
+    r = ops.run_check("deploy_diff", str(fake_src))
+    check("deploy_diff 源码缺失分支", not r["ok"]
+          and sum("源码缺失" in d for d in r["detail"]) >= 5, str(r["summary"]))
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))

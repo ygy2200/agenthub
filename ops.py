@@ -50,7 +50,7 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
     if fn:
         r = fn(t)
     elif name == "env":
-        r = _env()
+        r = _env(root)
     elif name == "inbox":
         r = _inbox(root)
     elif name == "stalled":
@@ -80,11 +80,19 @@ def _tail(text: str, lines: int = 4) -> str:
 
 
 def _py_compile(target: Path) -> dict:
-    """ast 语法解析全量 .py：零子进程、不写 __pycache__、模块内完成（<1s）。"""
-    files = sorted(target.rglob("*.py"))
-    files = [f for f in files if not any(part in {"__pycache__", "venv", ".git", ".venv",
-                                                  "node_modules", "site-packages", "build", "dist"}
-                                         for part in f.parts)][:300]
+    """ast 语法解析 .py：零子进程、不写 __pycache__、模块内完成（<1s）。
+    手动迭代到上限即停——rglob 强制全遍历在磁盘根级目录会卡几十秒。"""
+    SKIP = {"__pycache__", "venv", ".git", ".venv", "node_modules", "site-packages", "build", "dist"}
+    files, budget = [], 300
+    try:
+        for f in target.rglob("*.py"):
+            if len(files) >= budget:
+                break
+            if any(part in SKIP for part in f.parts):
+                continue
+            files.append(f)
+    except OSError:
+        pass
     if not files:
         return {"ok": False, "summary": f"{target.name} 下未找到 .py 文件", "detail": []}
     bad = []
@@ -162,7 +170,7 @@ def _deploy_diff(target: Path) -> dict:
             "detail": diffs[:8]}
 
 
-def _env() -> dict:
+def _env(root: str = "") -> dict:
     rows = [f"Python {sys.version.split()[0]} @ {sys.executable}"]
     es = Path.home() / ".agenthub" / "bin" / "es.exe"
     rows.append(f"Everything es.exe：{'有' if es.is_file() else '缺（全盘搜索不可用，voidtools.com/ES）'}")
@@ -172,11 +180,11 @@ def _env() -> dict:
         rows.append("代理 127.0.0.1:7890：在监听")
     except OSError:
         rows.append("代理 127.0.0.1:7890：不通（FlClash 未运行？出网类操作先开代理）")
-    rows += _disk_and_brain()
+    rows += _disk_and_brain(root)
     return {"ok": True, "summary": f"环境 {len(rows)} 项（开工预检，详情见 detail）", "detail": rows[:8]}
 
 
-def _disk_and_brain() -> list:
+def _disk_and_brain(root: str) -> list:
     rows = []
     for d in ("C:\\", "D:\\"):
         try:
@@ -184,23 +192,12 @@ def _disk_and_brain() -> list:
             rows.append(f"{d} 剩余 {u.free // 2 ** 30}GB")
         except OSError:
             rows.append(f"{d} 不可用")
-    if brain_root := _guess_root():
-        db = Path(brain_root) / "_hub" / "brain.db"
+    if root and Path(root).is_dir():
+        db = Path(root) / "_hub" / "brain.db"
         rows.append(f"brain.db：{db.stat().st_size // 1024}KB" if db.is_file() else "brain.db：不存在（未初始化）")
-        baks = sorted((Path(brain_root) / "_hub" / "brain-backups").glob("brain-*.db"))
+        baks = sorted((Path(root) / "_hub" / "brain-backups").glob("brain-*.db"))
         rows.append(f"最新备份：{baks[-1].name}" if baks else "最新备份：无")
     return rows
-
-
-def _guess_root() -> str:
-    """大脑根目录：config.json 的 root 字段（读不了就空，env 检查降级为纯环境项）。"""
-    try:
-        import json
-        cfg = json.loads((Path.home() / ".agenthub" / "config.json").read_text(encoding="utf-8"))
-        r = cfg.get("root", "")
-        return r if r and Path(r).is_dir() else ""
-    except (OSError, ValueError):
-        return ""
 
 
 def _need_root(root: str):
