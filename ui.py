@@ -28,6 +28,7 @@ from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, Fluen
 import agentscore
 import brain
 import core
+import ops
 
 
 def ic(name, fallback="INFO"):
@@ -2639,8 +2640,24 @@ class AgentHubWindow(FluentWindow):
         cf.activated.connect(self.goto_search)
         self._workers = getattr(self, "_workers", [])  # 迁移线程已在 __init__ 挂入
         QTimer.singleShot(200, self.refresh)
+        # 开机自检（大脑自己跑，agent 不参与）：启动 5 分钟后后台跑一次 env 环境预检落流水。
+        # QTimer 挂 self 为 parent——窗口销毁时定时器随之销毁，不会在死对象上触发
+        self._auto_env_timer = QTimer(self)
+        self._auto_env_timer.setSingleShot(True)
+        self._auto_env_timer.timeout.connect(self._auto_env_check)
+        self._auto_env_timer.start(5 * 60 * 1000)
         if not self.root:
             self.switchTo(self.settings_page)
+
+    def _auto_env_check(self):
+        """启动自检：后台跑一次 env 环境预检（run_check 内部落流水），结果静默不弹 UI——
+        环境快照定期入库，异常时 agent 下次跑 env 自然看到。"""
+        if not self.root:
+            return
+        w = FnWorker(lambda: ops.run_check("env", root=self.root), self)
+        w.done.connect(lambda _r: None)
+        self._workers.append(w)
+        w.start()
 
     def _on_db_ready(self, result):
         """大脑库就绪（含历史迁移结果）。"""

@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.8.0"
+    assert r["serverInfo"]["version"] == "2.8.4"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -550,10 +550,18 @@ def t_log_work_intercept(tmp):
                                        "content": "【目的】更新桌面快捷方式：heredoc 写 ps1 无 BOM，PowerShell 中文乱码，快捷方式名变乱码还误报成功"}, root_s)
     assert "已记入大脑" in out, out
     assert "大脑拦截提醒" in out and "[记忆#" in out, f"相似踩坑未拦截：{out}"
-    # 无关记录 → 无拦截段
+    # 落痕（v2.8.4）：journal 记「拦截命中」+ 命中记忆 use_count+1（验收②观测数据）
+    with brain.db_conn(root_s) as conn:
+        jn = conn.execute("SELECT COUNT(*) FROM journal WHERE action LIKE '拦截命中%'").fetchone()[0]
+        uc = conn.execute("SELECT use_count FROM memories WHERE kind='lesson'").fetchone()[0]
+    assert jn == 1 and uc == 1, (jn, uc)
+    # 无关记录 → 无拦截段，也不落痕
     out2 = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "dsh",
                                         "content": "【目的】整理课表导出 PDF 的页边距设置"}, root_s)
     assert "已记入大脑" in out2 and "大脑拦截提醒" not in out2, out2
+    with brain.db_conn(root_s) as conn:
+        jn2 = conn.execute("SELECT COUNT(*) FROM journal WHERE action LIKE '拦截命中%'").fetchone()[0]
+    assert jn2 == 1, jn2
 
 
 def t_archive_tool(tmp):

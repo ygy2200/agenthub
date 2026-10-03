@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.8.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.8.4"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -159,13 +159,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         except Exception:  # noqa: BLE001
             hits = []
         if hits:
+            brain.mark_intercept_hit(root, agent, rec_id, hits)  # 落痕：流水+use_count，验收②有据可查
             out += f"\n⚠️ 大脑拦截提醒：库内已有 {len(hits)} 条相似踩坑/环境事实，动手前先核对："
             for hk in hits:
                 tag = (f"错误登记#{-hk['id']}" if hk["id"] < 0 else f"记忆#{hk['id']}")
                 out += (f"\n  [{tag}]（{brain.KIND_CN.get(hk['kind'], hk['kind'])}"
                         f"·相似度{hk['sim']}）{hk['content']}")
         try:
-            out += ops.wakeups(root, pname)  # 收尾检查建议：项目含代码且今天没跑过 py_compile 时提醒
+            out += ops.wakeups(root, pname)  # 收尾建议：py_compile/git_status/蒸馏候选，当天已办即静默
         except Exception:  # noqa: BLE001
             pass
         return out

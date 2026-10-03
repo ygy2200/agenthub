@@ -540,19 +540,23 @@ PUSH_THROTTLE_MIN = 10   # 同 agent+project 重复心跳的免推窗口（分�
 
 def recall_for(root: str, project: str, agent: str = "") -> list:
     """开工记忆推送（反射弧）三层：本项目相关 → 全局置顶 → 跨项目语义联想
-    （该项目最近记录的 bigram 词集与其他项目记忆算 Jaccard，撞到别处踩过的坑自动想起）。
-    命中即记一次唤起（use_count+1）——只对实际推送出去的条目计数（用进废退）。"""
+    （该项目最近记录的 bigram 词集与其他记忆算 Jaccard，撞到别处踩过的坑自动想起）。
+    命中即记一次唤起（use_count+1）——只对实际推送出去的条目计数（用进废退）。
+    项目层与置顶层同款轮换排序（零唤起优先曝光）：纯 use_count 排序会让头部记忆
+    越推越热、46 条记忆 39 条永远零唤起（2026-10-03 真实库实测的马太固化）。"""
     with db_conn(root) as conn:
         proj = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE status='active' AND project=? "
-            "ORDER BY use_count DESC, id DESC LIMIT ?",
+            "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PROJECT))]
         pins = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE status='active' AND pinned=1 "
             "AND (project='' OR project IS NULL OR project!=?) "
             "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PINNED))]
-        # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他项目记忆
+        # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他记忆。
+        # 全局记忆（project 空）也入联想池——它们不置顶就三层全捞不到（2026-10-03 实测
+        # 10 条全局 lesson/fact 零唤起的结构盲区），语义撞上就该想起
         related: list = []
         cur_txt = " ".join(r["content"] for r in conn.execute(
             "SELECT content FROM (SELECT content FROM records WHERE status='active' AND project=? "
@@ -560,8 +564,8 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
         cur_toks = _tokens(cur_txt)
         if len(cur_toks) >= 4:
             others = [dict(r) for r in conn.execute(
-                "SELECT * FROM memories WHERE status='active' AND project IS NOT NULL "
-                "AND project!='' AND project!=? LIMIT 300", (project or "",))]
+                "SELECT * FROM memories WHERE status='active' "
+                "AND (project IS NULL OR project='' OR project!=?) LIMIT 300", (project or "",))]
             scored = []
             for om in others:
                 ot = _tokens(om["content"])
@@ -1079,6 +1083,31 @@ def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit:
                         "content": r["content"][:80]})
     out.sort(key=lambda x: -x["sim"])
     return out[:max(1, min(limit, 5))]
+
+
+def mark_intercept_hit(root: str, agent: str, rec_id: int, hits: list) -> None:
+    """拦截命中落痕（2026-10-03 回放排查：上线首日 2 条本应命中但零观测——
+    返回给 agent 看一眼就丢，journal 不落、use_count 不计，验收②无法举证）。
+    落两笔：流水记一条"拦截命中" + 命中记忆 use_count+1（错误登记负 id 只记流水）。
+    观测不能打断写入主链路，任何失败静默。"""
+    try:
+        hits = hits or []
+        if not hits:
+            return
+        note = " ".join(
+            (f"错误登记#{-h['id']}" if h["id"] < 0 else f"记忆#{h['id']}") + f"@{h['sim']}"
+            for h in hits)
+        # 直接落 db journal 表（勿走 core.journal——MCP 进程无 SINK 时写文件，wakeups
+        # 的 ran_today/流水页查的都是 db 表，两边必须同源）
+        journal_add(root, agent or "unknown", "拦截命中",
+                    target=f"records#{rec_id}", note=note[:200])
+        with db_conn(root) as conn:
+            for h in hits:
+                if h["id"] > 0:
+                    conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
+                                 (_now(), h["id"]))
+    except Exception:  # noqa: BLE001 — 观测失败任何原因都静默，不能打断 log_work 主链路
+        pass
 
 
 def archive_project(root: str, name: str, agent: str = "") -> str:

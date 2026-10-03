@@ -532,6 +532,46 @@ def t_distill(tmp):
     assert brain.distill_candidates(root, limit=-3) == [] or True
 
 
+def t_recall_blindspots(tmp):
+    """v2.8.4 推送盲区修复：①项目层零唤起优先轮换（破马太固化——纯 use_count DESC
+    会让头部越推越热、46 条 39 条永零唤起）②全局记忆入联想池（不置顶的三层全捞不到）
+    ③拦截命中落痕（journal+use_count，验收②的观测数据）。"""
+    import sqlite3
+
+    root = str(Path(tmp) / "hub_bs")
+    Path(root).mkdir()  # 独立临时 hub：init_db 不建根目录（约定），先手工建
+    assert brain.init_db(root) == ""
+    # ① 项目层轮换：同项目两条记忆，一条 5 次唤起一条零唤起——零唤起优先曝光
+    hot = brain.add_memory(root, "热点记忆甲", kind="lesson", project="轮换项目", agent="X")
+    cold = brain.add_memory(root, "冷门记忆乙", kind="lesson", project="轮换项目", agent="X")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE memories SET use_count=5 WHERE id=?", (hot,))
+    rows = brain.recall_for(root, "轮换项目", agent="rot1")
+    assert rows[0]["id"] == cold, [(r["id"], r["use_count"]) for r in rows]
+    # ② 全局记忆联想：project 空、不置顶的全局 lesson 靠语义命中被想起
+    g = brain.add_memory(root, "GitBash转义反斜杠坑多层转义", kind="lesson", agent="X")
+    brain.add_record(root, "轮换项目", "X", brain._now()[:10], "t",
+                     "踩了 GitBash转义反斜杠坑多层转义：bash 传字面量给 python 变真换行")
+    rows2 = brain.recall_for(root, "轮换项目", agent="rot2")
+    assert any(r["id"] == g for r in rows2), [(r["id"], r["content"][:30]) for r in rows2]
+    # ③ 拦截落痕：命中记忆 use_count+1 + journal 记「拦截命中」；错误登记负 id 只记流水不崩
+    mid = brain.add_memory(root, "部署铁律schema同步坑", kind="lesson", project="轮换项目", agent="X")
+    hits = [{"id": mid, "kind": "lesson", "sim": 0.2, "content": "x"},
+            {"id": -77, "kind": "error", "sim": 0.3, "content": "y"}]
+    brain.mark_intercept_hit(root, "X", 12345, hits)
+    brain.mark_intercept_hit(root, "X", 12346, hits)  # 两次各 +1
+    with brain.db_conn(root) as conn:
+        c = conn.execute("SELECT use_count FROM memories WHERE id=?", (mid,)).fetchone()[0]
+        jn = conn.execute("SELECT COUNT(*) FROM journal WHERE action LIKE '拦截命中%'").fetchone()[0]
+        neg = conn.execute("SELECT COUNT(*) FROM memories WHERE id=-77").fetchone()[0]
+    assert c == 2, c
+    assert jn == 2, jn
+    assert neg == 0  # 错误登记负 id 不写 memories 表
+    # 空 hits / 异常输入静默不崩
+    brain.mark_intercept_hit(root, "X", 1, [])
+    brain.mark_intercept_hit("", "X", 1, hits)
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -740,6 +780,7 @@ def main():
     case("检索召回补盲（中文长串bigram重试/有命中不重试/短串不变）", lambda: t_cjk_bigram_retry(tmp))
     case("推送可观测（recall_push落表/体检top10/agent覆盖分布）", lambda: t_recall_push_log(tmp))
     case("写入时踩坑拦截（相似lesson/错误登记/无关不命中/limit）", lambda: t_similar_lessons(tmp))
+    case("推送盲区修复（轮换排序/全局联想/拦截落痕）", lambda: t_recall_blindspots(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))

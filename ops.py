@@ -280,23 +280,37 @@ def _journal(root: str, name: str, summary: str, target_name: str = "") -> None:
 
 
 def wakeups(root: str, project: str) -> str:
-    """收尾检查建议（hub_log_work 返回附带）：项目目录含 .py 且今天没跑过 py_compile 时提醒。
-    流程化闭环的最后一环——工具存在 + 引导知道 + 写完记录被提醒。失败静默返回空。"""
+    """收尾建议（hub_log_work 返回附带）：按项目状态逐项判断，当天已办即静默——
+    py_compile（含 .py）/ git_status（含 .git）/ 蒸馏候选（有待结晶记录，提醒后落
+    journal"蒸馏提醒"去重）。流程化闭环的最后一环——工具存在 + 引导知道 + 写完被提醒。
+    失败静默返回空。"""
     try:
         if not root or not project:
             return ""
         pdir = Path(root) / project
-        if not pdir.is_dir() or not any(pdir.glob("*.py")):
+        if not pdir.is_dir():
             return ""
         brain = _import_brain()
         today = datetime.datetime.now().isoformat(timespec="seconds")[:10]
-        with brain.db_conn(root) as conn:
-            ran = conn.execute(
-                "SELECT COUNT(*) FROM journal WHERE action LIKE '检查 py_compile%' "
-                "AND target=? AND ts LIKE ?", (project, today + "%")).fetchone()[0]
-        if ran:
+
+        def ran_today(action: str) -> bool:
+            with brain.db_conn(root) as conn:
+                return bool(conn.execute(
+                    "SELECT COUNT(*) FROM journal WHERE action LIKE ? AND target=? AND ts LIKE ?",
+                    (action + "%", project, today + "%")).fetchone()[0])
+
+        tips = []
+        if any(pdir.glob("*.py")) and not ran_today("检查 py_compile"):
+            tips.append(f'hub_ops_run("py_compile", target=r"{pdir}") 语法检查（今天还没跑）')
+        if (pdir / ".git").is_dir() and not ran_today("检查 git_status"):
+            tips.append(f'hub_ops_run("git_status", target=r"{pdir}") 仓库干净度（今天还没跑）')
+        if not ran_today("蒸馏提醒"):
+            n = len(brain.distill_candidates(root))
+            if n:
+                tips.append(f"hub_distill 有 {n} 条蒸馏候选待结晶")
+                brain.journal_add(root, "ops", "蒸馏提醒", target=project, note=f"{n} 条候选")
+        if not tips:
             return ""
-        return (f"\n💡 收尾建议：该项目含代码文件，收尾前可跑 "
-                f"hub_ops_run(\"py_compile\", target=r\"{pdir}\") 做语法检查（今天还没跑过）")
+        return "\n💡 收尾建议：" + "；".join(tips)
     except Exception:  # noqa: BLE001
         return ""

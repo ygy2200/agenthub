@@ -139,6 +139,22 @@ def main():
     check("wakeups 无码项目静默", ops.wakeups(str(tmp), "纯文档项目") == "")
     check("wakeups 未知项目静默", ops.wakeups(str(tmp), "不存在的项目") == "")
 
+    # ---- wakeups 扩展（v2.8.4）：git_status 提醒 + 蒸馏候选提醒 + 当天去重
+    gitproj = tmp / "仓库项目-收尾建议"
+    gitproj.mkdir()
+    (gitproj / ".git").mkdir()  # 假 git 目录——wakeups 只判 .git 存在，不跑 git 命令
+    wg1 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups git项目提醒", "git_status" in wg1, str(wg1)[:100])
+    brain.add_record(str(tmp), "仓库项目-收尾建议", "X", "2026-10-03", "t",
+                     "【目的】验证蒸馏候选提醒进收尾建议且当天去重")
+    wg2 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups 蒸馏候选提醒", "蒸馏候选" in wg2, str(wg2)[:100])
+    wg3 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups 蒸馏提醒当天去重", "蒸馏候选" not in wg3, str(wg3)[:100])
+    ops.run_check("git_status", str(gitproj), str(tmp))  # 跑检查落 journal（假仓库 ok=False 也落痕）
+    wg4 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups 全办完静默", wg4 == "", str(wg4)[:100])
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
