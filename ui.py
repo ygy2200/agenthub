@@ -15,7 +15,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat, QTextCursor
+from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat, QTextCursor, QIcon
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit)
@@ -2629,6 +2629,10 @@ class AgentHubWindow(FluentWindow):
             g.setStyleSheet("background: transparent;")
             g.raise_()
         self.setWindowTitle("AgentHub")
+        # 窗口图标（运行中任务栏+窗口左上角）：打包时经 --add-data 带入 _MEIPASS，源码运行用仓库 assets
+        _icon = os.path.join(getattr(sys, "_MEIPASS", os.path.dirname(os.path.abspath(__file__))), "agenthub.ico")
+        if os.path.isfile(_icon):
+            self.setWindowIcon(QIcon(_icon))
         self.resize(1180, 760)
         geo = core.load_config().get("win_geometry", "")
         if geo:
