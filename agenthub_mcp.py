@@ -31,12 +31,13 @@ for _stream in (sys.stdin, sys.stdout, sys.stderr):
 import agentscore  # noqa: E402
 import brain  # noqa: E402
 import core  # noqa: E402
+import ops  # noqa: E402
 
 # 流水落库（brain.db）；文件版仅作兜底
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.7.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.8.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -494,6 +495,21 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"    #{m['id']}（{m['use_count']}次）[{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:50]}")
         return "\n".join(lines)
 
+    if name == "hub_ops_list":
+        lines = ["大脑内置检查工具箱（把重复验证固化成一条命令，输出按省 token 设计）："]
+        for n, (desc, need_t) in ops.CHECKS.items():
+            lines.append(f"  {n}：{desc}" + ("（需要 target=目录）" if need_t else "（无需 target）"))
+        lines.append("执行：hub_ops_run(name, target)——py_compile/git_status/regression/deploy_diff 必填 target=目录路径")
+        return "\n".join(lines)
+
+    if name == "hub_ops_run":
+        cname = str(arguments.get("name", "")).strip()
+        tgt = str(arguments.get("target", "")).strip()
+        r = ops.run_check(cname, tgt, root)
+        lines = [("✓" if r.get("ok") else "✗") + f" {cname}：{r.get('summary', '')}"]
+        lines += [f"  {d}" for d in r.get("detail", [])[:8]]
+        return "\n".join(lines)
+
     if name == "hub_get_progress":
         try:
             limit = int(arguments.get("limit", 30))
@@ -582,6 +598,14 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_list_todos", "description": "列出工作记录里的待办/承诺线索（后续/待验证/下一步…句式，元认知）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认20"}}}},
+    {"name": "hub_ops_list", "description": "大脑内置检查工具箱清单：把 agent 每次重复做的验证（编译检查/跑回归/部署一致性/git/环境预检）固化成可一键执行的检查项，输出精简省 token",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_ops_run", "description": "执行一项内置检查并返回精简摘要（不返回全量日志）。py_compile/git_status/regression/deploy_diff 必填 target=目录路径；env/brain 无需。regression 会执行 target 下的测试脚本（约1分钟），其余只读",
+     "inputSchema": {"type": "object",
+                     "properties": {"name": {"type": "string", "description": "检查项名（先 hub_ops_list 看清单）",
+                                             "enum": ["py_compile", "git_status", "regression", "deploy_diff", "env", "brain"]},
+                                    "target": {"type": "string", "description": "目标目录绝对路径（按检查项要求）"}},
+                     "required": ["name"]}},
     {"name": "hub_health", "description": "大脑体检报告：规模/结晶率/待办线索/疑似重复记忆/检索活跃度+建议",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_todo_done", "description": "勾销待办线索（处理完的欠账销账，闭环）——传 hub_list_todos 行里的待办串",

@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.7.0"
+    assert r["serverInfo"]["version"] == "2.8.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -71,7 +71,7 @@ def t_protocol(root):
             "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
             "hub_search_files", "hub_distill", "hub_get_record"} <= names, names
-    assert len(names) == 25
+    assert len(names) == 27
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -587,7 +587,7 @@ def main():
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
-    case("MCP协议（握手/25工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/27工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
