@@ -96,6 +96,16 @@ def main():
     def step2(res):
         check("全脑检索返回结果", isinstance(res, dict) and
               (res.get("records") or res.get("files")), str(res)[:80])
+        # 搜索页 v2.7.6 大改回归：过滤/预览/操作按钮显隐
+        w.search_page.on_done(res)  # 同步喂数据，不走线程
+        check("搜索页列表填充", w.search_page.result.count() == len(w.search_page.view_hits) > 0)
+        w.search_page.kindFilter.setCurrentIndex(1)  # 只看记录
+        check("搜索页分类过滤", w.search_page.view_hits and
+              all(k == "record" for k, _ in w.search_page.view_hits))
+        w.search_page.kindFilter.setCurrentIndex(0)
+        w.search_page.result.setCurrentRow(0)  # 选中触发预览+关键词高亮+按钮显隐
+        check("搜索页预览与操作按钮", bool(w.search_page.preview.toPlainText().strip())
+              and w.search_page.btnOpen.isHidden() and not w.search_page.btnJump.isHidden())
         h = md_to_html("| a | b |\n|---|---|\n| 1 | 2 |\n\n- x\n- y\n\n**粗体**\n```\ncode\n```")
         check("md表格", "<table" in h)
         check("md列表", "<ul>" in h)
@@ -107,15 +117,7 @@ def main():
         check("Agent中心页存在且已切导航", w.hub_page is not None)
         w.hub_page.viewCombo.setCurrentIndex(1)  # MCP 视图切换不崩
         check("hub视图=5项(含环境档案)", w.hub_page.viewCombo.count() == 5)
-        # 能力市场页冒烟（分段切换/源切换/MCP目录过滤）
-        check("能力市场页存在", w.market_page is not None)
-        w.market_page.seg.setCurrentItem("mcp")
-        check("MCP目录填充", w.market_page.mcpList.count() >= 5)
-        w.market_page.mcpFilter.setText("playwright")
-        check("MCP目录过滤", w.market_page.mcpList.count() <= 2)
-        w.market_page.mcpFilter.setText("")
-        w.market_page.seg.setCurrentItem("skill")
-        w.market_page.reload_market()  # 本地缓存源加载不崩
+        # 能力市场已砍（v2.7.6：本地源仅16条官方演示技能/远程走GitHub不通/MCP片段与Agent中心重复）
         # 流水·对账合并页冒烟（分段切换）
         w.ledger_page.seg.setCurrentItem("audit")
         check("对账问题>=3（前缀/野目录/缺记录）", len(w.audit_page.issues) >= 3)

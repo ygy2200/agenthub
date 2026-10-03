@@ -15,10 +15,10 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer
-from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor
+from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat, QTextCursor
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
-                               QStackedWidget, QSizeGrip)
+                               QStackedWidget, QSizeGrip, QSplitter, QTextEdit)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
                             FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
                             NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
@@ -977,26 +977,65 @@ class StatsPage(QWidget):
 
 
 class SearchPage(QWidget):
+    KIND_CN = {"record": "记录", "memory": "记忆", "file": "文件", "evfile": "全盘文件"}
+
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
+        top = QHBoxLayout()
         self.edit = SearchLineEdit()
         self.edit.setPlaceholderText("全脑检索：工作记录 / 记忆 / 文件名，回车执行…")
         self.edit.setClearButtonEnabled(True)
-        lay.addWidget(self.edit)
+        top.addWidget(self.edit, 1)
+        self.kindFilter = ComboBox()
+        self.kindFilter.addItems(["全部", "记录", "记忆", "文件", "全盘文件"])
+        self.kindFilter.setFixedWidth(110)
+        self.kindFilter.currentIndexChanged.connect(self.refill)
+        top.addWidget(self.kindFilter)
+        lay.addLayout(top)
+
+        # 左列表右预览可拖分栏：原预览固定 220px 高压在底部，列表只剩几行
+        split = QSplitter(Qt.Horizontal)
         self.result = ListWidget()
-        lay.addWidget(self.result, 1)
+        split.addWidget(self.result)
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(6)
+        act = QHBoxLayout()
+        act.addStretch(1)
+        self.btnOpen = PushButton(ic("LINK", "INFO"), "打开")
+        self.btnOpen.clicked.connect(self.open_current)
+        act.addWidget(self.btnOpen)
+        self.btnLoc = PushButton(ic("FOLDER", "INFO"), "打开所在位置")
+        self.btnLoc.clicked.connect(self.open_location_current)
+        act.addWidget(self.btnLoc)
+        self.btnJump = PushButton(ic("HOME", "INFO"), "跳到项目")
+        self.btnJump.clicked.connect(self.jump_project)
+        act.addWidget(self.btnJump)
+        self.btnCopy = PushButton(ic("COPY", "INFO"), "复制内容")
+        self.btnCopy.clicked.connect(self.copy_current)
+        act.addWidget(self.btnCopy)
+        rv.addLayout(act)
         self.preview = TextBrowser()
-        self.preview.setMaximumHeight(220)
-        lay.addWidget(self.preview)
-        self.hits = []
+        rv.addWidget(self.preview, 1)
+        split.addWidget(right)
+        split.setStretchFactor(0, 5)
+        split.setStretchFactor(1, 4)
+        split.setSizes([520, 420])
+        lay.addWidget(split, 1)
+
+        self.hits = []       # 全量命中（kind, data）
+        self.view_hits = []  # 当前过滤下显示的命中
         self.worker = None
         self._workers = []  # 持住运行中线程引用，防 GC 崩进程
         self.edit.returnPressed.connect(self.run)
         self.result.currentRowChanged.connect(self.show_hit)
+        self.result.itemDoubleClicked.connect(lambda _: self.open_current())
 
+    # ---- 数据
     def run(self):
         kw = self.edit.text().strip()
         if not kw or not self.win.root:
@@ -1011,54 +1050,144 @@ class SearchPage(QWidget):
         w.start()
 
     def on_done(self, res):
-        """全脑检索结果：records / memories / files 三段合并展示。"""
-        self.result.clear()
+        """全脑检索结果：records / memories / files / Everything 四段合并进 hits，再按过滤填充。"""
         self.preview.setHtml("")
         if isinstance(res, Exception):
-            self.result.addItem(f"搜索失败：{res}")
-            return
-        hits = []
-        for r in res.get("records", []):
-            self.result.addItem(f"[记录] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:80]}")
-            hits.append(("record", r))
-        for m in res.get("memories", []):
-            self.result.addItem(f"[记忆#{m['id']}] {brain.KIND_CN.get(m['kind'], m['kind'])}：{m['content'][:100]}")
-            hits.append(("memory", m))
-        for f in res.get("files", []):
-            self.result.addItem(f"[文件] {f['project']}\\{f['name']}")
-            hits.append(("file", f))
-        # Everything 全盘文件名搜索（es.exe IPC 毫秒级，未运行则提示原因）
-        ev = core.everything_search(self.edit.text().strip(), 20)
-        if ev.get("results"):
-            self.result.addItem("── 全盘文件（Everything）──")
-            hits.append(("section", None))
-            for pth in ev["results"]:
-                self.result.addItem(f"  [全盘] {pth}")
-                hits.append(("evfile", pth))
-        elif "error" in ev:
-            self.result.addItem(f"── 全盘文件：{ev['error']} ──")
-            hits.append(("section", None))
-        self.hits = hits
-        if not hits:
-            self.result.addItem("无结果")
-
-    def show_hit(self, row):
-        if row < 0 or row >= len(self.hits):
-            return
-        kind, h = self.hits[row]
-        if kind == "section":
-            self.preview.setHtml("<p style='color:#888'>——</p>")
-            return
-        if kind == "evfile":
-            self.preview.setHtml(md_to_html(f"**全盘文件（Everything 检索）**\n\n`{h}`"))
-            return
-        if kind == "record":
-            self.preview.setHtml(md_to_html(f"## {h['title']}\n{h['content']}"))
-        elif kind == "memory":
-            self.preview.setHtml(md_to_html(f"**{brain.KIND_CN.get(h['kind'], h['kind'])}**"
-                                            f"{(' #' + h['tags']) if h['tags'] else ''}\n\n{h['content']}"))
+            self.hits = [("info", f"搜索失败：{res}")]
         else:
-            self.preview.setHtml(f"<p>{html.escape(h['path'])}</p>")
+            hits = []
+            for r in res.get("records", []):
+                hits.append(("record", r))
+            for m in res.get("memories", []):
+                hits.append(("memory", m))
+            for f in res.get("files", []):
+                hits.append(("file", f))
+            # Everything 全盘文件名搜索（es.exe IPC 毫秒级，未运行则提示原因）
+            ev = core.everything_search(self.edit.text().strip(), 20)
+            for pth in ev.get("results", []):
+                hits.append(("evfile", pth))
+            self.hits = hits
+            if not hits:
+                self.hits = [("info", "无结果")]
+        self.refill()
+
+    def refill(self):
+        """按类型过滤重建列表。全量在 self.hits，显示子集在 self.view_hits。"""
+        kind = self.kindFilter.currentIndex()  # 0全部 1记录 2记忆 3文件 4全盘
+        key = {1: "record", 2: "memory", 3: "file", 4: "evfile"}.get(kind)
+        self.result.clear()
+        self.view_hits = []
+        kw = self.edit.text().strip()
+        for k, h in self.hits:
+            if key and k != key:
+                continue
+            if k == "info":
+                self.result.addItem(h)
+                self.view_hits.append(("info", h))
+            elif k == "record":
+                self.result.addItem(f"[记录] {h['date']} {h['project']}（{h['agent']}）：{h['title'][:80]}")
+            elif k == "memory":
+                self.result.addItem(f"[记忆#{h['id']}] {brain.KIND_CN.get(h['kind'], h['kind'])}：{h['content'][:100]}")
+            elif k == "file":
+                self.result.addItem(f"[文件] {h['project']}\\{h['name']}")
+            else:
+                self.result.addItem(f"[全盘] {h}")
+            self.view_hits.append((k, h))
+        if not self.view_hits and self.hits and self.hits[0][0] != "info":
+            self.result.addItem(f"该分类下无结果（全部 {len(self.hits)} 条）")
+
+    def _current(self):
+        row = self.result.currentRow()
+        if 0 <= row < len(self.view_hits):
+            return self.view_hits[row]
+        return None, None
+
+    # ---- 交互
+    def show_hit(self, row):
+        kind, h = self._current() if row >= 0 else (None, None)
+        self._sync_actions(kind)
+        self.preview.setHtml(self._preview_html(kind, h))
+        self._highlight()
+
+    def _preview_html(self, kind, h):
+        if kind in (None, "info"):
+            return "<p style='color:#888'>点选左侧条目查看详情</p>"
+        if kind == "evfile":
+            return md_to_html(f"**全盘文件（Everything 检索）**\n\n`{h}`")
+        if kind == "record":
+            return md_to_html(f"## {h['title']}\n{h['content']}")
+        if kind == "memory":
+            return md_to_html(f"**{brain.KIND_CN.get(h['kind'], h['kind'])}**"
+                              f"{(' #' + h['tags']) if h['tags'] else ''}\n\n{h['content']}")
+        return md_to_html(f"**文件**（{h['project']}）\n\n`{h['path']}`")
+
+    def _sync_actions(self, kind):
+        """操作按钮按结果类型显隐：能打开的才出现打开按钮，不让按钮灰着占地方。"""
+        self.btnOpen.setVisible(kind in ("file", "evfile"))
+        self.btnLoc.setVisible(kind in ("file", "evfile"))
+        self.btnJump.setVisible(kind == "record")
+        self.btnCopy.setVisible(kind in ("record", "memory"))
+
+    def _highlight(self):
+        """预览正文里高亮关键词（ExtraSelection 运行时叠加，不改 HTML 结构）。"""
+        kw = self.edit.text().strip()
+        sels = []
+        if kw:
+            doc = self.preview.document()
+            fmt = QTextCharFormat()
+            fmt.setBackground(QColor(255, 214, 90))
+            cur = QTextCursor(doc)
+            while True:
+                cur = doc.find(kw, cur)
+                if cur.isNull():
+                    break
+                sel = QTextEdit.ExtraSelection()
+                sel.format = fmt
+                sel.cursor = cur
+                sels.append(sel)
+        self.preview.setExtraSelections(sels)
+
+    def open_current(self):
+        kind, h = self._current()
+        if kind in ("file", "evfile"):
+            p = h["path"] if kind == "file" else h
+            if p and Path(p).exists():
+                os.startfile(p)
+            else:
+                InfoBar.warning("文件不存在", str(p)[:120], duration=3000, parent=self.win)
+        elif kind == "record":
+            self._open_record(h)
+
+    def open_location_current(self):
+        kind, h = self._current()
+        if kind == "file":
+            open_location(h["path"])
+        elif kind == "evfile" and Path(h).exists():
+            open_location(h)
+
+    def _open_record(self, r):
+        """记录落地文件：项目目录下的工作记录.md，没有则打开项目文件夹。"""
+        base = Path(self.win.root) / r["project"]
+        rec = base / core.RECORD_NAME
+        if not self.win.root or not base.exists():
+            InfoBar.warning("项目目录不存在", r["project"], duration=3000, parent=self.win)
+            return
+        os.startfile(rec if rec.is_file() else base)
+
+    def jump_project(self):
+        kind, h = self._current()
+        if kind == "record" and hasattr(self.win, "project_page"):
+            self.win.project_page.select_project(h["project"])
+            self.win.switchTo(self.win.project_page)
+
+    def copy_current(self):
+        kind, h = self._current()
+        if kind == "memory":
+            QApplication.clipboard().setText(h["content"])
+            InfoBar.success("已复制记忆内容", f"#{h['id']}", duration=2000, parent=self.win)
+        elif kind == "record":
+            QApplication.clipboard().setText(h["content"])
+            InfoBar.success("已复制记录正文", h["title"][:60], duration=2000, parent=self.win)
 
 
 class AuditPage(QWidget):
@@ -1813,7 +1942,6 @@ class HubPage(QWidget):
         self.fill_memories()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
         self.win.overview_page.set_agents(self.agents)
-        self.win.market_page.set_agents(self.agents)
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
 
     def fill_memories(self):
@@ -2425,7 +2553,6 @@ class AgentHubWindow(FluentWindow):
         self.audit_page = self.ledger_page.audit      # 原对账页别名，apply() 链路不变
         self.journal_page = self.ledger_page.journal  # 原流水页别名，reload 链路不变
         self.hub_page = HubPage(self)
-        self.market_page = MarketPage(self)
         self.connect_page = ConnectPage(self)
         self.help_page = HelpPage(self)
         self.settings_page = SettingsPage(self)
@@ -2440,7 +2567,6 @@ class AgentHubWindow(FluentWindow):
             (self.project_page, "FOLDER", "项目"),
             (self.timeline_page, "HISTORY", "时间线"),
             (self.hub_page, "PEOPLE", "Agent 中心"),
-            (self.market_page, "BOOK_SHELF", "能力市场"),
         ):
             w.setObjectName(text)
             self.addSubInterface(w, ic(icon), text)
@@ -2533,7 +2659,6 @@ class AgentHubWindow(FluentWindow):
     def closeEvent(self, e):
         """退出前：断后台线程信号（防 wait 超时后回调触碰已关闭的 UI）、等线程结束，备份大脑，再记住状态。"""
         for lst in (self._workers, getattr(self.hub_page, "_workers", []),
-                    getattr(self.market_page, "_workers", []),
                     getattr(self.search_page, "_workers", [])):
             for t in list(lst):
                 try:
