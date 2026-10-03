@@ -550,7 +550,7 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
         pins = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE status='active' AND pinned=1 "
             "AND (project='' OR project IS NULL OR project!=?) "
-            "ORDER BY use_count DESC, id DESC LIMIT ?",
+            "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PINNED))]
         # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他项目记忆
         related: list = []

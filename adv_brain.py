@@ -320,6 +320,12 @@ def t_plasticity(tmp):
     st = brain.stats(root)
     assert st["searches_total"] == 4 and st["searches_today"] == 4, st
     assert st["projects_stalled"] >= 0
+    # 新置顶曝光死锁修复（v2.7.2）：零曝光新置顶优先于已曝光置顶获得推送
+    # （旧排序纯 use_count DESC 时新置顶 use_count=0 永远垫底、永无出头之日）
+    new_pin = brain.add_memory(root, "新置顶（零曝光）", kind="lesson", agent="X", pinned=True)
+    rows3 = brain.recall_for(root, "可塑项目", agent="X")
+    pins3 = [r for r in rows3 if r["pinned"] == 1]
+    assert pins3 and pins3[0]["id"] == new_pin, [(r["id"], r["use_count"]) for r in pins3]
     # 极端参数：hits 负数/超长 query 不崩
     brain.log_search(root, "hub_search", "x" * 5000, -99)
     # 项目活跃刷新 + stalled 回填（幂等重跑）
