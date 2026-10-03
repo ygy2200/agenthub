@@ -10,6 +10,7 @@
 from __future__ import annotations
 
 import ast
+import datetime
 import hashlib
 import os
 import shutil
@@ -59,7 +60,7 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _dup_mem(root)
     else:
         r = _brain(root)
-    _journal(root, name, r.get("summary", ""))
+    _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""))
     return r
 
 
@@ -267,13 +268,35 @@ def _brain(root: str) -> dict:
             "detail": []}
 
 
-def _journal(root: str, name: str, summary: str) -> None:
-    """检查动作落操作流水（可追溯）；失败不影响检查本身。"""
+def _journal(root: str, name: str, summary: str, target_name: str = "") -> None:
+    """检查动作落操作流水（可追溯，target=被检目录名供收尾建议去重）；失败不影响检查本身。"""
     if not root:
         return
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import brain  # noqa: PLC0415
-        brain.journal_add(root, "ops", f"检查 {name}", note=summary[:200])
+        brain = _import_brain()
+        brain.journal_add(root, "ops", f"检查 {name}", target=target_name, note=summary[:200])
     except Exception:  # noqa: BLE001
         pass
+
+
+def wakeups(root: str, project: str) -> str:
+    """收尾检查建议（hub_log_work 返回附带）：项目目录含 .py 且今天没跑过 py_compile 时提醒。
+    流程化闭环的最后一环——工具存在 + 引导知道 + 写完记录被提醒。失败静默返回空。"""
+    try:
+        if not root or not project:
+            return ""
+        pdir = Path(root) / project
+        if not pdir.is_dir() or not any(pdir.glob("*.py")):
+            return ""
+        brain = _import_brain()
+        today = datetime.datetime.now().isoformat(timespec="seconds")[:10]
+        with brain.db_conn(root) as conn:
+            ran = conn.execute(
+                "SELECT COUNT(*) FROM journal WHERE action LIKE '检查 py_compile%' "
+                "AND target=? AND ts LIKE ?", (project, today + "%")).fetchone()[0]
+        if ran:
+            return ""
+        return (f"\n💡 收尾建议：该项目含代码文件，收尾前可跑 "
+                f"hub_ops_run(\"py_compile\", target=r\"{pdir}\") 做语法检查（今天还没跑过）")
+    except Exception:  # noqa: BLE001
+        return ""

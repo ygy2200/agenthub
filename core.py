@@ -642,6 +642,9 @@ def bootstrap_text(root: str) -> str:
 - 团队规范：hub_get_rules
 - 出错/受阻/踩坑：hub_report_error(title, detail, undo) 登记，undo 写回滚方式，方便任何人查询和撤销
 - 长任务开工先 hub_heartbeat(agent, project)：同项目有其他 agent 在干时会收到预警，防止撞车
+- 重复检查别手写：hub_ops_list 有现成检查项（环境预检 env/语法检查 py_compile/回归 regression/
+  部署一致性 deploy_diff/停滞项目 stalled…），hub_ops_run(name, target) 一条命令出精简摘要——
+  开工跑 env，写完代码跑 py_compile，收尾前跑一次，动作自动进流水
 - 写错/写多的记录：hub_undo 可撤销你最近一条
 {BOOTSTRAP_END}"""
 
@@ -902,6 +905,10 @@ DEFAULT_RULES = """# AgentHub 规则（GUI 可编辑，agent 接入后由工具�
 ## 铁律
 - 覆盖不可逆格式（docx/pdf/ppt）前先备份
 - 删除文件前确认
+
+## 检查工具箱
+- 重复验证不手写：hub_ops_list 看清单，hub_ops_run(name, target) 执行（环境预检/语法检查/回归/部署一致性…）
+- 输出已按省 token 设计（一行结论+少量细节），检查动作自动进操作流水
 """
 
 

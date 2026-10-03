@@ -123,6 +123,22 @@ def main():
     check("deploy_diff 源码缺失分支", not r["ok"]
           and sum("源码缺失" in d for d in r["detail"]) >= 5, str(r["summary"]))
 
+    # ---- wakeups 收尾建议闭环
+    codeproj = tmp / "代码项目-收尾建议"
+    codeproj.mkdir()
+    (codeproj / "tool.py").write_text("x = 1\n", encoding="utf-8")
+    brain.init_db(str(tmp))
+    w1 = ops.wakeups(str(tmp), "代码项目-收尾建议")
+    check("wakeups 首次提醒", "py_compile" in w1 and str(codeproj) in w1, str(w1)[:100])
+    ops.run_check("py_compile", str(codeproj), str(tmp))  # 跑检查落 journal（target=项目名）
+    w2 = ops.wakeups(str(tmp), "代码项目-收尾建议")
+    check("wakeups 当天跑过不再提醒", w2 == "", str(w2)[:100])
+    nocode = tmp / "纯文档项目"
+    nocode.mkdir()
+    (nocode / "readme.md").write_text("x", encoding="utf-8")
+    check("wakeups 无码项目静默", ops.wakeups(str(tmp), "纯文档项目") == "")
+    check("wakeups 未知项目静默", ops.wakeups(str(tmp), "不存在的项目") == "")
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))

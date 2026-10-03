@@ -164,6 +164,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 tag = (f"错误登记#{-hk['id']}" if hk["id"] < 0 else f"记忆#{hk['id']}")
                 out += (f"\n  [{tag}]（{brain.KIND_CN.get(hk['kind'], hk['kind'])}"
                         f"·相似度{hk['sim']}）{hk['content']}")
+        try:
+            out += ops.wakeups(root, pname)  # 收尾检查建议：项目含代码且今天没跑过 py_compile 时提醒
+        except Exception:  # noqa: BLE001
+            pass
         return out
 
     if name == "hub_create_project":
