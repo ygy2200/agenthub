@@ -11,7 +11,7 @@ import tempfile
 from pathlib import Path
 
 from PySide6.QtCore import QTimer  # noqa: E402
-from PySide6.QtWidgets import QApplication  # noqa: E402
+from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QPushButton  # noqa: E402
 
 import brain  # noqa: E402
 import core  # noqa: E402
@@ -33,7 +33,7 @@ def build_fake_hub(root: Path):
     (p1 / "output").mkdir(parents=True)
     (p1 / "input" / "截图.png").write_bytes(b"x")
     (p1 / core.RECORD_NAME).write_text(
-        "## 2026-09-26（hermes）\n**目的**：修图标\n\n| 项 | 值 |\n|---|---|\n| A | 1 |\n\n- 列表一\n- 列表二\n",
+        "## 2026-09-26（hermes）\n**目的**：修图标\n下一步：冒烟待办回归验证\n\n| 项 | 值 |\n|---|---|\n| A | 1 |\n\n- 列表一\n- 列表二\n",
         encoding="utf-8")
     p2 = root / "红色沙漠-存档备份"
     p2.mkdir()
@@ -134,8 +134,27 @@ def main():
         w.hub_page.fill_memories()
         # 大脑页冒烟（v2.7：唤起排行/使用分布/待办看板/置顶位四卡填充不崩）
         check("大脑页存在且已挂导航", w.brain_page is not None)
+        brain.log_search(str(tmp), "hub_search", "冒烟检索", 1, agent="zcode")
+        brain.log_search(str(tmp), "hub_memory_read", "冒烟检索2", 0, agent="hermes")
         w.brain_page.reload()
         check("大脑页填充不崩", w.brain_page.cardMem.value.text() != "")
+        # 残留回归（v2.7.3）：使用分布/待办看板塞的是行布局，clear 必须递归拆净——
+        # 造非空数据后连刷两次，进度条（每 agent 一条）与勾销按钮（每待办一个）数量必须不变
+        brain.log_search(str(tmp), "hub_search", "冒烟检索3", 2, agent="dsh")
+        w.brain_page.reload()
+        n1 = (len(w.brain_page.findChildren(QProgressBar)),
+              len(w.brain_page.findChildren(QPushButton)))
+        w.brain_page.reload()
+        n2 = (len(w.brain_page.findChildren(QProgressBar)),
+              len(w.brain_page.findChildren(QPushButton)))
+        check("大脑页重复reload无残留（进度条/按钮数不变）",
+              n1 == n2 and n1[0] >= 3 and n1[1] >= 1, f"{n1} -> {n2}")
+        # 统计页同类残留回归：set_db 两次后标签数不变（agentBox 行布局同 bug 的第二实例）
+        w.stats_page.set_db(brain.stats(str(tmp)))
+        m1 = len(w.stats_page.findChildren(QLabel))
+        w.stats_page.set_db(brain.stats(str(tmp)))
+        m2 = len(w.stats_page.findChildren(QLabel))
+        check("统计页重复set_db无残留", m1 == m2 and m1 > 0, f"{m1} -> {m2}")
         # EditAssetDialog 冒烟
         from ui import EditAssetDialog
         dlg = EditAssetDialog(w, str(tmp / "红色沙漠-存档备份" / core.RECORD_NAME), "工作记录.md")

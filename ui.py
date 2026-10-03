@@ -761,8 +761,13 @@ class BrainPage(QWidget):
         def clear(box):
             while box.count():
                 it = box.takeAt(0)
-                if it.widget():
-                    it.widget().deleteLater()
+                wid = it.widget()
+                if wid:  # 先摘出父级再排队销毁：立即从界面消失，不与新一轮内容重叠
+                    wid.setParent(None)
+                    wid.deleteLater()
+                sub = it.layout()
+                if sub:  # 行布局（徽章+进度条/文本+按钮）也是布局项，不递归拆净子控件会残留叠加
+                    clear(sub)
 
         # 唤起排行（验收①：推送 top 应是工作知识而非元信息）
         clear(self.topBox)
@@ -894,8 +899,13 @@ class StatsPage(QWidget):
         def clear(box):
             while box.count():
                 it = box.takeAt(0)
-                if it.widget():
-                    it.widget().deleteLater()
+                wid = it.widget()
+                if wid:  # 先摘出父级再排队销毁：立即从界面消失，不与新一轮内容重叠
+                    wid.setParent(None)
+                    wid.deleteLater()
+                sub = it.layout()
+                if sub:  # 行布局（徽章+进度条/文本+按钮）也是布局项，不递归拆净子控件会残留叠加
+                    clear(sub)
 
         clear(self.agentBox)
         total = max(1, s.get("records", 0))
@@ -2480,12 +2490,13 @@ class AgentHubWindow(FluentWindow):
         return getattr(mode, "name", "COMPACT") == "COMPACT"
 
     def closeEvent(self, e):
-        """退出前：等后台线程结束（防 QThread 运行中被销毁的偶发报错），备份大脑，再记住状态。"""
+        """退出前：断后台线程信号（防 wait 超时后回调触碰已关闭的 UI）、等线程结束，备份大脑，再记住状态。"""
         for lst in (self._workers, getattr(self.hub_page, "_workers", []),
                     getattr(self.market_page, "_workers", []),
                     getattr(self.search_page, "_workers", [])):
             for t in list(lst):
                 try:
+                    t.blockSignals(True)  # 阻断 done/finished 全部信号：wait 超时后线程回调不再进已关闭的界面
                     t.wait(2000)
                 except Exception:
                     pass
