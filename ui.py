@@ -240,6 +240,22 @@ def _display_title(r: dict) -> str:
     return t or "(无标题)"
 
 
+KIND_BADGE_COLOR = {
+    "lesson": "#c76a42", "fact": "#0078d4", "preference": "#8764b8",
+    "project": "#00a67e", "note": "#666666",
+}
+
+
+def kind_badge(kind: str) -> QLabel:
+    """记忆类型徽章：唤起排行/置顶记忆的正文行用小字灰文本看不清，类型先入彩色徽章分层。"""
+    lb = QLabel(brain.KIND_CN.get(kind, kind))
+    lb.setStyleSheet(
+        f"color:white;background:{KIND_BADGE_COLOR.get(kind, '#8a8a8a')};"
+        "border-radius:8px;padding:1px 8px;font-size:11px;")
+    lb.setFixedHeight(20)
+    return lb
+
+
 def badge(agent: str, raw: str) -> QLabel:
     # 未知 agent 显示自己的名字（中性色），"未标注"仅限 agent 字段真空——
     # 否则新接入的 agent 一律显示"未标注"（2026-10-01 dsh 实测踩坑）
@@ -737,6 +753,7 @@ class BrainPage(QWidget):
                        (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）"),
                        (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）"),
                        (self.pinBox, "置顶记忆（置顶位只放工作知识）")):
+            box.setSpacing(10)  # 行距：无间距时唤起/置顶行挤成一片
             gb = CardWidget()
             g = QVBoxLayout(gb)
             g.setContentsMargins(20, 14, 20, 14)
@@ -773,8 +790,7 @@ class BrainPage(QWidget):
         clear(self.topBox)
         tops = h.get("top_pushed", [])
         for m in tops:
-            self.topBox.addWidget(CaptionLabel(
-                f"#{m['id']} ×{m['use_count']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:66]}"))
+            self.topBox.addWidget(self._mem_row(f"#{m['id']} ×{m['use_count']}", m))
         if not tops:
             self.topBox.addWidget(CaptionLabel(
                 "还没有记忆被唤起——agent 开工心跳（hub_heartbeat）时自动推送相关记忆，此处累计记数"))
@@ -816,10 +832,23 @@ class BrainPage(QWidget):
         except Exception:
             pins = []
         for m in pins:
-            self.pinBox.addWidget(CaptionLabel(
-                f"★ #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:70]}"))
+            self.pinBox.addWidget(self._mem_row(f"★ #{m['id']}", m))
         if not pins:
             self.pinBox.addWidget(CaptionLabel("暂无置顶——agent 写记忆时可带 pinned=true 进置顶位"))
+
+    @staticmethod
+    def _mem_row(head: str, m: dict) -> QWidget:
+        """唤起/置顶行：类型徽章 + 编号·次数 + 正文（正常字号可换行）。
+        原来是单行 CaptionLabel 灰小字且 [:66]/[:70] 截断，是"看不清"的另一半根因。"""
+        w = QWidget()
+        h = QHBoxLayout(w)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(8)
+        h.addWidget(kind_badge(m["kind"]))
+        body = BodyLabel(f"{head}  {m['content'][:100]}")
+        body.setWordWrap(True)
+        h.addWidget(body, 1)
+        return w
 
     def _done_todo(self, rid, todo):
         err = brain.mark_todo_done(self.win.root, rid, todo, agent="gui")

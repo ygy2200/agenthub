@@ -143,11 +143,13 @@ def main():
         brain.log_search(str(tmp), "hub_search", "冒烟检索3", 2, agent="dsh")
         w.brain_page.reload()
         n1 = (len(w.brain_page.findChildren(QProgressBar)),
-              len(w.brain_page.findChildren(QPushButton)))
+              len(w.brain_page.findChildren(QPushButton)),
+              len(w.brain_page.findChildren(QLabel)))
         w.brain_page.reload()
         n2 = (len(w.brain_page.findChildren(QProgressBar)),
-              len(w.brain_page.findChildren(QPushButton)))
-        check("大脑页重复reload无残留（进度条/按钮数不变）",
+              len(w.brain_page.findChildren(QPushButton)),
+              len(w.brain_page.findChildren(QLabel)))
+        check("大脑页重复reload无残留（进度条/按钮/标签数不变）",
               n1 == n2 and n1[0] >= 3 and n1[1] >= 1, f"{n1} -> {n2}")
         # 统计页同类残留回归：set_db 两次后标签数不变（agentBox 行布局同 bug 的第二实例）
         w.stats_page.set_db(brain.stats(str(tmp)))
