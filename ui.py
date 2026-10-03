@@ -2699,8 +2699,8 @@ class AgentHubWindow(FluentWindow):
             pass
         super().closeEvent(e)
         # 退出挂起兜底（qfw item view+QSS 偶发挂起，os._exit 兜底须 exec 返回才生效）：
-        # 走到这里备份/保存已全部完成，若 5 秒后事件循环仍未退出就硬杀，不给用户留"关不掉"
-        QTimer.singleShot(5000, lambda: os._exit(0) if not self.isVisible() else None)
+        # 走到这里备份/保存已全部完成，若 2 秒后事件循环仍未退出就硬杀，不给用户留"关不掉"
+        QTimer.singleShot(2000, lambda: os._exit(0) if not self.isVisible() else None)
 
     def goto_search(self):
         self.switchTo(self.search_page)
