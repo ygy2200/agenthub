@@ -96,8 +96,12 @@ def main():
     def step2(res):
         check("全脑检索返回结果", isinstance(res, dict) and
               (res.get("records") or res.get("files")), str(res)[:80])
-        # 搜索页 v2.7.6 大改回归：过滤/预览/操作按钮显隐
-        w.search_page.on_done(res)  # 同步喂数据，不走线程
+        # 搜索页 v2.7.7 回归：本地查询同步化（回车立即出结果）+ 分类过滤 + 预览/按钮
+        w.search_page.edit.setText("存档")
+        w.search_page.run()  # 同步执行：返回即有结果，不再有"搜索中…"
+        check("搜索页同步出结果", w.search_page.result.count() > 0
+              and "搜索中" not in w.search_page.result.item(0).text())
+        w.search_page.on_done(res)  # 同步喂数据（旧路径兼容），测过滤/预览
         check("搜索页列表填充", w.search_page.result.count() == len(w.search_page.view_hits) > 0)
         w.search_page.kindFilter.setCurrentIndex(1)  # 只看记录
         check("搜索页分类过滤", w.search_page.view_hits and

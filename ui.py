@@ -1027,9 +1027,10 @@ class SearchPage(QWidget):
         split.setSizes([520, 420])
         lay.addWidget(split, 1)
 
-        self.hits = []       # 全量命中（kind, data）
+        self.hits = []       # 本地命中（kind, data）
         self.view_hits = []  # 当前过滤下显示的命中
-        self.worker = None
+        self.ev = {"results": [], "error": ""}  # Everything 全盘段（异步补充）
+        self.ev_for = ""
         self._workers = []  # 持住运行中线程引用，防 GC 崩进程
         self.edit.returnPressed.connect(self.run)
         self.result.currentRowChanged.connect(self.show_hit)
@@ -1040,18 +1041,18 @@ class SearchPage(QWidget):
         kw = self.edit.text().strip()
         if not kw or not self.win.root:
             return
-        self.result.clear()
-        self.preview.setHtml("")
-        self.result.addItem("搜索中…")
-        w = SearchWorker(self.win.root, kw, self)
-        w.done.connect(self.on_done)
-        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
-        self._workers.append(w)
-        w.start()
+        # 本地三查询是毫秒级 SQLite（实测 8/2/1ms），同步跑比 QThread 启动+信号往返更快——
+        # 回车立即出结果，不再有"搜索中…"的顿挫
+        try:
+            res = brain.search_all(self.win.root, kw)
+        except Exception as e:  # noqa: BLE001
+            res = e
+        self.on_done(res)
 
     def on_done(self, res):
-        """全脑检索结果：records / memories / files / Everything 四段合并进 hits，再按过滤填充。"""
+        """本地结果同步填充；Everything 的 es.exe 子进程启动慢，丢后台线程异步追加全盘段。"""
         self.preview.setHtml("")
+        self.ev = {"results": [], "error": ""}
         if isinstance(res, Exception):
             self.hits = [("info", f"搜索失败：{res}")]
         else:
@@ -1062,37 +1063,55 @@ class SearchPage(QWidget):
                 hits.append(("memory", m))
             for f in res.get("files", []):
                 hits.append(("file", f))
-            # Everything 全盘文件名搜索（es.exe IPC 毫秒级，未运行则提示原因）
-            ev = core.everything_search(self.edit.text().strip(), 20)
-            for pth in ev.get("results", []):
-                hits.append(("evfile", pth))
-            self.hits = hits
-            if not hits:
-                self.hits = [("info", "无结果")]
+            self.hits = hits or [("info", "无结果")]
+        self.refill()
+        kw = self.edit.text().strip()
+        self.ev_for = kw
+        w = FnWorker(lambda: core.everything_search(kw, 20), self)
+        w.done.connect(self._on_everything)
+        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
+        self._workers.append(w)
+        w.start()
+
+    def _on_everything(self, ev):
+        if self.edit.text().strip() != self.ev_for:
+            return  # 用户已改搜索词，这轮全盘结果作废
+        self.ev = ev if isinstance(ev, dict) else {"results": [], "error": str(ev)}
         self.refill()
 
     def refill(self):
-        """按类型过滤重建列表。全量在 self.hits，显示子集在 self.view_hits。"""
+        """按类型过滤重建列表。本地在 self.hits，Everything 在 self.ev，显示子集在 self.view_hits。"""
         kind = self.kindFilter.currentIndex()  # 0全部 1记录 2记忆 3文件 4全盘
         key = {1: "record", 2: "memory", 3: "file", 4: "evfile"}.get(kind)
         self.result.clear()
         self.view_hits = []
-        kw = self.edit.text().strip()
+        if key in (None, "evfile"):
+            # Everything 全盘段：es.exe 异步回来才有内容，失败也给一行原因
+            if key == "evfile" and self.ev.get("error"):
+                self.result.addItem(f"（全盘：{self.ev['error']}）")
+                self.view_hits.append(("info", None))
+            for pth in self.ev.get("results", []):
+                self.result.addItem(f"[全盘] {pth}")
+                self.view_hits.append(("evfile", pth))
+            if key is None and self.ev.get("error"):
+                self.result.addItem(f"── 全盘文件：{self.ev['error']} ──")
+                self.view_hits.append(("info", None))
         for k, h in self.hits:
             if key and k != key:
                 continue
             if k == "info":
-                self.result.addItem(h)
-                self.view_hits.append(("info", h))
+                if key is None:  # 失败/无结果提示只在"全部"里出现
+                    self.result.addItem(h)
+                    self.view_hits.append(("info", h))
             elif k == "record":
                 self.result.addItem(f"[记录] {h['date']} {h['project']}（{h['agent']}）：{h['title'][:80]}")
+                self.view_hits.append((k, h))
             elif k == "memory":
                 self.result.addItem(f"[记忆#{h['id']}] {brain.KIND_CN.get(h['kind'], h['kind'])}：{h['content'][:100]}")
+                self.view_hits.append((k, h))
             elif k == "file":
                 self.result.addItem(f"[文件] {h['project']}\\{h['name']}")
-            else:
-                self.result.addItem(f"[全盘] {h}")
-            self.view_hits.append((k, h))
+                self.view_hits.append((k, h))
         if not self.view_hits and self.hits and self.hits[0][0] != "info":
             self.result.addItem(f"该分类下无结果（全部 {len(self.hits)} 条）")
 
