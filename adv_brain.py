@@ -572,6 +572,50 @@ def t_recall_blindspots(tmp):
     brain.mark_intercept_hit("", "X", 1, hits)
 
 
+def t_health_acceptance(tmp):
+    """v2.8.5 体检增强：验收达成度四条数据 + 记忆保鲜（90 天未唤起 lesson/fact）
+    + 蒸馏候选元信息标注（操作记录 vs 工作知识）。"""
+    import datetime
+
+    root = str(Path(tmp) / "hub_acc")
+    Path(root).mkdir()
+    assert brain.init_db(root) == ""
+    # 验收数据：检索 agent 分布 / 拦截命中 / stalled 使用 / 置顶工作知识占比
+    brain.log_search(root, "hub_search", "甲", 1, agent="zcode")
+    brain.log_search(root, "hub_memory_read", "乙", 0, agent="dsh")
+    brain.journal_add(root, "zcode", "拦截命中", target="records#1")
+    brain.journal_add(root, "zcode", "检查 stalled", target="")
+    brain.add_memory(root, "置顶工作知识", kind="lesson", agent="X", pinned=True)
+    brain.add_memory(root, "置顶随手记", kind="note", agent="X", pinned=True)
+    h = brain.health_report(root)
+    acc = h["acceptance"]
+    assert set(acc["cross_agent_searches"]) == {"zcode", "dsh"}, acc
+    assert acc["intercept_hits"] == 1 and acc["stalled_used"] == 1, acc
+    assert (acc["pinned_work"], acc["pinned_total"]) == (1, 2), acc
+    # 保鲜：created 拨回 91 天前 + 零唤起 → 进 stale 清单；新记忆 / 已唤起的不进
+    stale_m = brain.add_memory(root, "陈年环境事实待复核", kind="fact", agent="X")
+    fresh_m = brain.add_memory(root, "新鲜教训", kind="lesson", agent="X")
+    with brain.db_conn(root) as conn:
+        old = (datetime.datetime.now() - datetime.timedelta(days=91)).isoformat(timespec="seconds")
+        conn.execute("UPDATE memories SET created=? WHERE id=?", (old, stale_m))
+    h2 = brain.health_report(root)
+    stale_ids = {m["id"] for m in h2["stale_memories"]}
+    assert stale_m in stale_ids and fresh_m not in stale_ids, h2["stale_memories"]
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE memories SET last_hit=? WHERE id=?",
+                     (datetime.datetime.now().isoformat(timespec="seconds"), stale_m))
+    h3 = brain.health_report(root)
+    assert stale_m not in {m["id"] for m in h3["stale_memories"]}, "近期唤起过不该进保鲜清单"
+    # 蒸馏元信息标注：「用户/执行/继续」开头=元信息；工作知识=否
+    brain.add_record(root, "acc项目", "X", datetime.date.today().isoformat(), "t",
+                     "【目的】用户拍板追加检查项三项")
+    brain.add_record(root, "acc项目", "X", datetime.date.today().isoformat(), "t",
+                     "【目的】修复部署不一致问题并验证六文件一致")
+    cands = brain.distill_candidates(root, limit=10)
+    by_meta = {c["gist"][:10]: c.get("meta") for c in cands}
+    assert any(m is True for m in by_meta.values()) and any(m is False for m in by_meta.values()), by_meta
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -781,6 +825,7 @@ def main():
     case("推送可观测（recall_push落表/体检top10/agent覆盖分布）", lambda: t_recall_push_log(tmp))
     case("写入时踩坑拦截（相似lesson/错误登记/无关不命中/limit）", lambda: t_similar_lessons(tmp))
     case("推送盲区修复（轮换排序/全局联想/拦截落痕）", lambda: t_recall_blindspots(tmp))
+    case("体检验收达成度+记忆保鲜+蒸馏元信息标注", lambda: t_health_acceptance(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))

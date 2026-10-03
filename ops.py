@@ -309,6 +309,26 @@ def wakeups(root: str, project: str) -> str:
             if n:
                 tips.append(f"hub_distill 有 {n} 条蒸馏候选待结晶")
                 brain.journal_add(root, "ops", "蒸馏提醒", target=project, note=f"{n} 条候选")
+        # 检索欠账闭环（v2.8.5）：零命中查询=「查的时候知识还没入脑」的欠账（2026-10-03 实测
+        # 7 条零命中 6 条如此）。水位线=searches 自增 id 存 meta 表——秒级 ts 同秒连发会碰撞
+        # （铁律：状态锚不用时间戳）；agent 判断本次工作是否包含答案，有则 hub_memory_write 沉淀
+        try:
+            with brain.db_conn(root) as conn:
+                wm = conn.execute("SELECT value FROM meta WHERE key='zero_hit_watermark'").fetchone()
+                wm_id = int(wm[0]) if wm else 0
+                hits0 = conn.execute(
+                    "SELECT DISTINCT query FROM searches WHERE hits=0 AND tool!='recall_push' "
+                    "AND id > ? ORDER BY ts DESC LIMIT 3", (wm_id,)).fetchall()
+                if hits0:
+                    new_wm = conn.execute("SELECT IFNULL(MAX(id),0) FROM searches").fetchone()[0]
+                    conn.execute("INSERT INTO meta(key,value) VALUES('zero_hit_watermark',?) "
+                                 "ON CONFLICT(key) DO UPDATE SET value=excluded.value", (str(new_wm),))
+            if hits0:
+                qs = "、".join("「" + r[0][:30] + "」" for r in hits0)
+                tips.append(f"近期有检索零命中（查时知识未入脑的欠账）：{qs}——若本次工作包含了答案，用 hub_memory_write 沉淀")
+                brain.journal_add(root, "ops", "欠账提醒", target=project, note=f"{len(hits0)} 条新欠账")
+        except Exception:  # noqa: BLE001
+            pass
         if not tips:
             return ""
         return "\n💡 收尾建议：" + "；".join(tips)

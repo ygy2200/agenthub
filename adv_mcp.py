@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.8.4"
+    assert r["serverInfo"]["version"] == "2.9.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -403,9 +403,10 @@ def t_bootstrap(tmp):
     assert core.inject_bootstrap(str(tgt2), root) == ""
     assert core.bootstrap_status(str(tgt2))
     # 四家目标定义完整
-    assert {t["agent"] for t in core.BOOTSTRAP_TARGETS} == {"ZCode", "Claude Code", "Codex", "DSH"}
+    assert {t["agent"] for t in core.BOOTSTRAP_TARGETS} == {"ZCode", "Claude Code", "Codex", "DSH", "hermes"}
     for t in core.BOOTSTRAP_TARGETS:
-        assert t["path"].startswith("~/")
+        # hermes 的 SOUL.md 在 D 盘（home 外），允许绝对路径
+        assert t["path"].startswith("~/") or t["path"][:3] in ("D:/", "C:/"), t
 
 
 def t_root_follow(tmp):
@@ -564,6 +565,15 @@ def t_log_work_intercept(tmp):
     assert jn2 == 1, jn2
 
 
+def t_health_acceptance_output(tmp):
+    """v2.8.5 hub_health 输出验收达成度行（协议级：四条标准的实时数据可一键复查）。"""
+    root = Path(tmp) / "hub_healthout"
+    build_hub(root)
+    out = m.call_tool("hub_health", {}, str(root))
+    assert "验收达成度" in out and "拦截命中" in out, out
+    assert "stalled 使用" in out and "置顶位工作知识" in out, out
+
+
 def t_archive_tool(tmp):
     """hub_archive_project（v2.7）：归档成功（状态+目录）/未找到报错/重复归档报错。"""
     root = Path(tmp) / "hub_archive_tool"
@@ -608,6 +618,7 @@ def main():
     case("检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）", lambda: t_search_output(tmp))
     case("memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）", lambda: t_memory_read_fallback(tmp))
     case("写入时踩坑拦截（相似lesson提醒/无关不附）", lambda: t_log_work_intercept(tmp))
+    case("体检验收达成度输出（协议级）", lambda: t_health_acceptance_output(tmp))
     case("项目归档工具（状态+目录/未找到/重复归档）", lambda: t_archive_tool(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))

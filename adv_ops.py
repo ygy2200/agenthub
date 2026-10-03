@@ -155,6 +155,16 @@ def main():
     wg4 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
     check("wakeups 全办完静默", wg4 == "", str(wg4)[:100])
 
+    # ---- 检索欠账闭环（v2.8.5）：零命中查询提醒 + journal 水位线（新欠账才再提）
+    brain.log_search(str(tmp), "hub_search", "欠账测试词甲", 0, agent="X")
+    wd1 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups 欠账提醒", "零命中" in wd1 and "欠账测试词甲" in wd1, str(wd1)[:120])
+    wd2 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups 欠账水位线不再提", "零命中" not in wd2, str(wd2)[:120])
+    brain.log_search(str(tmp), "hub_search", "欠账测试词乙", 0, agent="X")
+    wd3 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
+    check("wakeups 新欠账再提", "欠账测试词乙" in wd3, str(wd3)[:120])
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))

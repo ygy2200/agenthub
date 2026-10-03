@@ -1161,6 +1161,22 @@ def health_report(root: str) -> dict:
             "WHERE status='active' AND use_count>0 ORDER BY use_count DESC, id DESC LIMIT 10")]
         archived = conn.execute(
             "SELECT COUNT(*) FROM projects WHERE status='archived'").fetchone()[0]
+        # 验收达成度（2026-09-30 定四条可验证标准，2026-10-14 复查）
+        cross_agents = [r[0] for r in conn.execute(
+            "SELECT DISTINCT agent FROM searches WHERE tool!='recall_push' AND agent!='' ORDER BY agent")]
+        intercept_hits = conn.execute(
+            "SELECT COUNT(*) FROM journal WHERE action LIKE '拦截命中%'").fetchone()[0]
+        stalled_used = conn.execute(
+            "SELECT COUNT(*) FROM journal WHERE action LIKE '检查 stalled%' OR action LIKE '%archive%'").fetchone()[0]
+        pinned_total, pinned_work = conn.execute(
+            "SELECT COUNT(*), IFNULL(SUM(CASE WHEN kind IN ('lesson','fact','project') THEN 1 ELSE 0 END),0) "
+            "FROM memories WHERE status='active' AND pinned=1").fetchone()
+        # 记忆保鲜：lesson/fact 写入超 90 天且从未唤起/长期未唤起——环境漂移后可能已失真
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=90)).isoformat(timespec="seconds")
+        stale_rows = conn.execute(
+            "SELECT id, kind, substr(content,1,60) AS content FROM memories WHERE status='active' "
+            "AND kind IN ('lesson','fact') AND created < ? "
+            "AND (last_hit IS NULL OR last_hit < ?) ORDER BY id LIMIT 5", (cutoff, cutoff)).fetchall()
     return {"records": s["records"], "memories": s["memories"], "projects": s["projects"],
             "projects_stalled": s.get("projects_stalled", 0), "projects_archived": archived,
             "errors_open": s.get("errors_open", 0),
@@ -1171,6 +1187,10 @@ def health_report(root: str) -> dict:
             "recall_push_total": push_total, "push_by_agent": push_by_agent,
             "search_by_agent": search_by_agent, "tool_breakdown": tool_breakdown,
             "top_pushed": top_pushed,
+            "acceptance": {"cross_agent_searches": cross_agents, "intercept_hits": intercept_hits,
+                           "stalled_used": stalled_used, "pinned_total": pinned_total,
+                           "pinned_work": pinned_work},
+            "stale_memories": [dict(r) for r in stale_rows],
             "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
 
 
@@ -1296,8 +1316,11 @@ def distill_candidates(root: str, limit: int = 20) -> list:
             if not covered:
                 uncovered.append(seg.strip())
         if uncovered:
+            # 元信息标注（v2.8.5）：「用户拍板/执行/继续」开头的目的行是操作记录不是工作知识，
+            # 沉淀价值低（结晶率虚高的元信息霸榜，2026-10-03 实测 5 候选全元信息），标注供取舍
+            meta = bool(re.match(r"^(用户|执行|继续|批准|复盘)", gist))
             out.append({"id": r["id"], "project": r["project"], "date": r["date"],
-                        "agent": r["agent"], "gist": "；".join(uncovered)[:80]})
+                        "agent": r["agent"], "gist": "；".join(uncovered)[:80], "meta": meta})
         if len(out) >= max(1, min(limit, 50)):
             return out
     return out

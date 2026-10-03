@@ -723,6 +723,9 @@ MCP_TARGETS = [
 BOOTSTRAP_ONLY = [
     {"agent": "Codex", "path": "~/.codex/AGENTS.md"},
     {"agent": "DSH", "path": "~/.dsh/AGENTS.md"},
+    # hermes 的全局人格/指令文件（SOUL.md 每次会话载入）——此前缺 hermes 导致其
+    # 有 agenthub MCP 配置却从不心跳（2026-10-03 实测心跳 0 次，根因即引导缺失）
+    {"agent": "hermes", "path": "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/SOUL.md"},
 ]
 
 BOOTSTRAP_TARGETS = [{"agent": t["agent"], "path": t["boot"]} for t in MCP_TARGETS] + BOOTSTRAP_ONLY

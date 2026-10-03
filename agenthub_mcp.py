@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.8.4"}
+SERVER_INFO = {"name": "agenthub", "version": "2.9.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -460,7 +460,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         lines = [f"记忆蒸馏候选 {len(cands)} 条（记录→记忆的结晶流水线；确认价值后用 "
                  f"hub_memory_write 沉淀，kind 建议 lesson/fact；本轮已登记，之后不再重复推送）："]
         for c in cands:
-            lines.append(f"- #{c['id']} [{c['date']} {c['agent']}·{c['project']}] {c['gist'][:70]}")
+            mark = "[元信息?] " if c.get("meta") else ""
+            lines.append(f"- #{c['id']} [{c['date']} {c['agent']}·{c['project']}] {mark}{c['gist'][:70]}")
         return "\n".join(lines)
 
     if name == "hub_get_record":
@@ -498,6 +499,16 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines.append("- 唤起最多的记忆 top（推送反射弧记数，验收看工作知识占比）：")
             for m in h["top_pushed"][:5]:
                 lines.append(f"    #{m['id']}（{m['use_count']}次）[{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:50]}")
+        acc = h.get("acceptance", {})
+        if acc:
+            cross = "、".join(acc["cross_agent_searches"]) or "无"
+            lines.append(f"- 验收达成度（2026-10-14 复查）：①跨agent检索 [{cross}] "
+                         f"②拦截命中 {acc['intercept_hits']} 次 ③stalled 使用 {acc['stalled_used']} 次 "
+                         f"④置顶位工作知识 {acc['pinned_work']}/{acc['pinned_total']}")
+        if h.get("stale_memories"):
+            lines.append("记忆保鲜提醒（lesson/fact 超 90 天未唤起，环境可能已漂移——确认仍有效或更新/归档）：")
+            for m in h["stale_memories"][:5]:
+                lines.append(f"  · #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:50]}")
         return "\n".join(lines)
 
     if name == "hub_ops_list":
