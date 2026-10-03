@@ -31,6 +31,9 @@ CHECKS = {
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
     "brain": ("大脑健康一行摘要（记录/记忆/结晶率/待办/检索累计）", False),
+    "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
+    "stalled": ("停滞项目清单（90 天无活动，供归档清理决策）", False),
+    "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
 }
 
 
@@ -48,6 +51,12 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = fn(t)
     elif name == "env":
         r = _env()
+    elif name == "inbox":
+        r = _inbox(root)
+    elif name == "stalled":
+        r = _stalled(root)
+    elif name == "dup_mem":
+        r = _dup_mem(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""))
@@ -194,13 +203,65 @@ def _guess_root() -> str:
         return ""
 
 
+def _need_root(root: str):
+    return None if (root and Path(root).is_dir()) else {
+        "ok": False, "summary": "需要有效的大脑根目录（MCP server 启动参数）", "detail": []}
+
+
+def _import_brain():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import brain  # noqa: PLC0415
+    return brain
+
+
+def _inbox(root: str) -> dict:
+    if err := _need_root(root):
+        return err
+    inbox = Path(root) / "00_Inbox"
+    files = sorted(f.name for f in inbox.iterdir() if f.is_file()) if inbox.is_dir() else []
+    return {"ok": True,
+            "summary": f"Inbox 待分拣 {len(files)} 个（「项目」页可从 Inbox 引入）" if files else "Inbox 已清空",
+            "detail": files[:8]}
+
+
+def _stalled(root: str) -> dict:
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        with brain.db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT name, updated FROM projects WHERE status='stalled' ORDER BY updated LIMIT 8")]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    if not rows:
+        return {"ok": True, "summary": "无停滞项目（90 天无活动才标记）", "detail": []}
+    return {"ok": False,
+            "summary": f"{len(rows)} 个停滞项目——归档清理走 hub_archive_project（需用户拍板，可逆）",
+            "detail": [f"{r['name']}（最后活动 {r['updated'][:10]}）" for r in rows]}
+
+
+def _dup_mem(root: str) -> dict:
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        pairs = brain.similar_memories(root, limit=10)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    if not pairs:
+        return {"ok": True, "summary": "无疑似重复记忆", "detail": []}
+    return {"ok": False,
+            "summary": f"{len(pairs)} 组疑似重复——合并方式见记忆卫生约定（新记忆标「取代记忆#N」，全员裁决旧条目）",
+            "detail": [f"#{d['a']}~#{d['b']} 相似{d['sim']} [{d.get('verdict', '')}]：{d['content_a'][:36]}"
+                       for d in pairs[:8]]}
+
+
 def _brain(root: str) -> dict:
     if not root or not Path(root).is_dir():
         return {"ok": False, "summary": "需要有效的大脑根目录（MCP server 启动参数）", "detail": []}
     try:
-        sys.path.insert(0, str(Path(__file__).resolve().parent))
-        import brain  # noqa: PLC0415
-        h = brain.health_report(root)
+        h = _import_brain().health_report(root)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"体检失败：{type(e).__name__}: {str(e)[:100]}", "detail": []}
     return {"ok": True,

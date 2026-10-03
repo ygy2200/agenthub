@@ -22,9 +22,8 @@ def check(name, cond, detail=""):
 
 
 def build_fake_hub(root: Path):
-    """假大脑库：供 env/brain 检查降级路径用。"""
+    """不写 brain.db（坏字节会毒化后续真库用例）——真库由 brain.init_db 按需建。"""
     (root / "_hub").mkdir(parents=True, exist_ok=True)
-    (root / "_hub" / "brain.db").write_bytes(b"x" * 2048)
 
 
 def main():
@@ -78,6 +77,30 @@ def main():
     r = ops.run_check("brain", root=str(tmp / "不存在"))
     check("brain 无效 root 拒绝", not r["ok"])
 
+    # ---- inbox / stalled / dup_mem（真库造数）
+    import brain
+    brain.init_db(str(tmp))
+    r = ops.run_check("inbox", root=str(tmp))
+    check("inbox 空态", r["ok"] and "已清空" in r["summary"], str(r["summary"]))
+    (tmp / "00_Inbox").mkdir(exist_ok=True)
+    (tmp / "00_Inbox" / "待分拣甲.txt").write_text("x", encoding="utf-8")
+    (tmp / "00_Inbox" / "待分拣乙.md").write_text("x", encoding="utf-8")
+    r = ops.run_check("inbox", root=str(tmp))
+    check("inbox 列出积压", r["ok"] and "2 个" in r["summary"] and "待分拣甲" in "".join(r["detail"]))
+    with brain.db_conn(str(tmp)) as conn:
+        conn.execute("INSERT INTO projects(name,status,updated) VALUES('停滞项目-旧工具','stalled','2026-06-01T10:00:00')")
+        mid = conn.execute("SELECT MAX(id) FROM memories").fetchone()[0]
+    r = ops.run_check("stalled", root=str(tmp))
+    check("stalled 列出停滞项目", not r["ok"] and "停滞项目-旧工具" in "".join(r["detail"])
+          and "hub_archive_project" in r["summary"], str(r["summary"]))
+    brain.add_memory(str(tmp), "部署目录代码同步不等于真实库 schema 已升级，必须等新进程跑 init_db 才生效", "lesson")
+    brain.add_memory(str(tmp), "部署目录代码同步不等于真实库 schema 已升级，必须等新进程跑 init_db 才生效!", "lesson")
+    r = ops.run_check("dup_mem", root=str(tmp))
+    check("dup_mem 列出疑似重复", not r["ok"] and "~#" in "".join(r["detail"]), str(r["summary"]))
+    brain.delete_memory(str(tmp), mid)  # 占位（MAX(id) 指向最后一条相似记忆之一，清掉保持库净）
+    r = ops.run_check("dup_mem", root=str(tmp / "不存在"))
+    check("dup_mem 无效 root 拒绝", not r["ok"])
+
     # ---- deploy_diff 真实源码目录自检（本仓库自身）
     here = Path(__file__).resolve().parent
     r = ops.run_check("deploy_diff", str(here))
@@ -87,7 +110,7 @@ def main():
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
-    check("检查项共 6 个", len(ops.CHECKS) == 6, str(list(ops.CHECKS)))
+    check("检查项共 9 个", len(ops.CHECKS) == 9, str(list(ops.CHECKS)))
 
     print()
     if FAILED:

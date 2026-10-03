@@ -603,7 +603,7 @@ TOOLS = [
     {"name": "hub_ops_run", "description": "执行一项内置检查并返回精简摘要（不返回全量日志）。py_compile/git_status/regression/deploy_diff 必填 target=目录路径；env/brain 无需。regression 会执行 target 下的测试脚本（约1分钟），其余只读",
      "inputSchema": {"type": "object",
                      "properties": {"name": {"type": "string", "description": "检查项名（先 hub_ops_list 看清单）",
-                                             "enum": ["py_compile", "git_status", "regression", "deploy_diff", "env", "brain"]},
+                                             "enum": ["py_compile", "git_status", "regression", "deploy_diff", "env", "brain", "inbox", "stalled", "dup_mem"]},
                                     "target": {"type": "string", "description": "目标目录绝对路径（按检查项要求）"}},
                      "required": ["name"]}},
     {"name": "hub_health", "description": "大脑体检报告：规模/结晶率/待办线索/疑似重复记忆/检索活跃度+建议",
