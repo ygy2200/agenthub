@@ -3,7 +3,7 @@
 **中文** | [English](#english)
 
 把电脑上所有 AI agent（ZCode / Claude Code / hermes / deepseek CLI……）装进**同一个大脑**：
-统一的项目记录、投入产出文件管理、公用记忆、能力清单、进度对齐、技能市场。
+统一的项目记录、投入产出文件管理、公用记忆、能力清单、进度对齐。
 
 > 痛点：桌面上一半的项目目录是不同 agent 各建一份的平行副本，互不相通。
 > AgentHub 用「目录即真理 + 一本台账 + MCP 公用大脑」终结这件事。
@@ -15,8 +15,8 @@
 - **时间线**：全部 agent 的工作记录按时间倒序，可按 agent / 项目过滤，点开看完整操作步骤
 - **大脑**（v2.7 新增）：记忆唤起排行、各 agent 使用分布、**待办看板**（从记录提取欠账、一键勾销闭环）、置顶记忆——「大脑用起来没有」直接可见
 - **统计**：项目数、记录条数、各 agent 工作量分布、月度活跃、大脑体检摘要
-- **搜索**：全文 + 文件名搜索（Ctrl+F）
-- **能力中心**：自动探测各 agent 的技能库 / MCP 服务器 / 记忆 / 全局配置；**技能市场**一键安装 anthropics/skills；记忆与配置软件内编辑（自动备份）
+- **搜索**（v2.7.6 重构）：全脑检索（记录/记忆/文件/全盘分类过滤），回车即出结果（实测均 39ms），结果可直接打开 / 跳转项目，预览关键词高亮（Ctrl+F）
+- **能力中心**：自动探测各 agent 的技能库 / MCP 服务器 / 记忆 / 全局配置（技能同名自动去重）；记忆与配置软件内编辑（自动备份）
 - **接入中心**：一键把 agent 接入公用大脑（标准 MCP 协议，写入前自动备份原配置）
 - **对账**：揪出 agent 前缀平行目录 / 重复项目 / 野目录，杜绝记录分裂；项目归档一键清理（状态+目录移入 `99_Archive`，可逆）
 - **环境档案**（v2.4）：本机网络/系统/工具/路径的结构化登记，`hub_env_list` 可检索，`env_scan` 自动采集
@@ -49,6 +49,10 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 | v2.5 | 记忆蒸馏流水线（对标 mem0 / 腾讯 AgentMemory 的本地零依赖版） |
 | v2.6 | 检索召回补盲：中文 bigram 重试 + 记忆 0 命中兜底搜记录 |
 | v2.7 | 运营杠杆：推送可观测（体检 top10）、写入时踩坑拦截、项目归档、GUI 大脑页与待办看板 |
+| v2.7.3~b | GUI 加固：大脑页/统计页刷新残留修复、退出崩溃加固（blockSignals+挂起硬杀兜底） |
+| v2.7.5 | 大脑页滚动化（真实数据超高时不再压扁行）、唤起/置顶行可读性改造（类型徽章+可换行正文） |
+| v2.7.6 | 砍掉能力市场（远程安装走 GitHub 在多数环境不可用，MCP 片段与 Agent 中心重复）；搜索页重构（分类过滤/分栏/打开操作/关键词高亮） |
+| v2.7.7 | 搜索提速：本地查询同步化（回车即出，实测均 39ms），Everything 移后台异步补充 |
 
 ## 设计原则
 
@@ -92,7 +96,7 @@ unified project records, input/output file management, a public memory, capabili
 - **Unified workbench**: all agents log work into one place — no more parallel duplicate folders per agent
 - **Shared memory via MCP**: a zero-dependency MCP server (`agenthub_mcp.py`) exposes **25 tools** — public memory (with proactive push on agent start), full-text search with snippet preview, todo extraction & closure, memory distillation pipeline, and **duplicate-pitfall interception** (new work records are matched against known lessons before being committed)
 - **Brain dashboard** (v2.7): memory recall ranking, per-agent usage distribution, a todo board with one-click closure, and pinned memories — making "is the brain actually used?" visible
-- **Capability center**: auto-detects each agent's skills / MCP servers / memories / global configs (read-only); built-in skill marketplace
+- **Capability center**: auto-detects each agent's skills / MCP servers / memories / global configs (read-only, skill names deduplicated)
 - **Safety first**: the directory tree is the single source of truth; the app never silently writes to any agent's config — every write is backed up first; secrets are never displayed
 
 ## Install

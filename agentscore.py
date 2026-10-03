@@ -155,7 +155,14 @@ def _collect_skills(agent: str, roots: list, depths: dict) -> list:
         except OSError:
             continue
     out.sort(key=lambda s: (s.agent, s.name.lower()))
-    return out
+    # 同名去重：技能库常有顶层副本+分类子目录副本（实测 150 名中 93 个重复），取路径最浅的
+    dedup: dict = {}
+    for s in out:
+        k = (s.agent, s.name.lower())
+        old = dedup.get(k)
+        if old is None or len(Path(s.path).parts) < len(Path(old.path).parts):
+            dedup[k] = s
+    return list(dedup.values())
 
 
 def _parse_mcp_json(path: Path) -> dict:

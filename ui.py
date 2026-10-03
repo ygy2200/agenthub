@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""AgentHub GUI：总览 / 项目 / 时间线 / Agent 中心 / 能力市场 / 大脑 / 流水·对账 / 统计 / 搜索 / 接入。
+"""AgentHub GUI：总览 / 项目 / 时间线 / Agent 中心 / 大脑 / 流水·对账 / 统计 / 搜索 / 接入。
 
 数据全部来自 core.scan 现场扫描与大脑数据库（brain.db），agent 直写后按 F5 即见。
 """
@@ -256,6 +256,11 @@ def kind_badge(kind: str) -> QLabel:
     return lb
 
 
+def agent_disp(agent: str) -> str:
+    """流水/待办行里的 agent 显示名：空/unknown（历史数据来源）统一显示"未标注"。"""
+    return "未标注" if (agent or "").strip().lower() in ("", "unknown") else agent
+
+
 def badge(agent: str, raw: str) -> QLabel:
     # 未知 agent 显示自己的名字（中性色），"未标注"仅限 agent 字段真空——
     # 否则新接入的 agent 一律显示"未标注"（2026-10-01 dsh 实测踩坑）
@@ -436,6 +441,7 @@ class ProjectPage(QWidget):
         file_col = QVBoxLayout()
         file_col.addWidget(CaptionLabel("项目文件总览（历史项目无 input/output 时按实际位置分组 · 双击打开所在位置）"))
         self.fileList = ListWidget()
+        file_col.addWidget(self.fileList, 1)
         self.fileList.itemDoubleClicked.connect(self.open_file_loc)
 
         self.nameLabel = TitleLabel("—")
@@ -444,7 +450,7 @@ class ProjectPage(QWidget):
         right.addWidget(self.pathLabel)
         right.addWidget(self.issueLabel)
         right.addWidget(self.browser, 1)
-        right.addLayout(file_col)
+        right.addLayout(file_col, 1)  # 文件总览也参与伸缩：窗口矮时说明行不再被裁出可视区
 
         root.addLayout(left, 1)
         root.addLayout(right, 2)
@@ -688,8 +694,9 @@ class TimelinePage(QWidget):
             title.setToolTip(f"{r.get('project', '')} · {_display_title(r)}\n点击查看完整记录")
             title.setCursor(Qt.PointingHandCursor)
             title.clicked.connect(lambda _, rr=r: self.show_detail(rr))
-            proj_btn = PushButton(r.get("project", "")[:18])
+            proj_btn = PushButton(r.get("project", "")[:10] + ("…" if len(r.get("project", "")) > 10 else ""))
             proj_btn.setFixedHeight(26)
+            proj_btn.setMaximumWidth(140)  # 长项目名不设上限会把行撑出可视区，按钮被裁成半个
             proj_btn.setToolTip(r.get("project", ""))
             proj_btn.clicked.connect(lambda _, n=r.get("project", ""): self.jump(n))
             row.addWidget(title, 1)
@@ -1339,7 +1346,7 @@ class JournalPage(QWidget):
             act = self.ACTION_CN.get(e["action"], e["action"])
             tgt = str(e["target"] or "")
             tgt = Path(tgt).name if "/" in tgt or "\\" in tgt else tgt
-            self.jList.addItem(f"{e['ts']}  [{e['agent']}]  {act}  {tgt}"
+            self.jList.addItem(f"{e['ts']}  [{agent_disp(e['agent'])}]  {act}  {tgt}"
                                + (f"  {str(e['note'])[:70]}" if e["note"] else ""))
         if not self.journal:
             self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
@@ -1832,7 +1839,7 @@ class MarketPage(QWidget):
 
 class HubPage(QWidget):
     """Agent 中心：聚合电脑上各 agent 的技能 / MCP / 记忆 / 全局配置；
-    记忆可增删改，配置文件可编辑（自动备份）；技能安装见「能力市场」页。"""
+    记忆可增删改，配置文件可编辑（自动备份）。"""
 
     VIEWS = ["技能库", "MCP 服务器", "记忆", "全局配置", "环境档案"]
 
@@ -1960,6 +1967,7 @@ class HubPage(QWidget):
         self.fill_mcps()
         self.fill_memories()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
+        self.preview.setHtml("<p style='color:#888'>点选左侧技能 / MCP / 记忆查看详情，双击打开所在目录</p>")
         self.win.overview_page.set_agents(self.agents)
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
 
@@ -2249,8 +2257,8 @@ class ConnectPage(QWidget):
         top.addWidget(refreshBtn)
         lay.addLayout(top)
         lay.addWidget(CaptionLabel(
-            "AgentHub 通过标准 MCP 协议向所有 agent 提供 15 个工具：项目登记/新建、工作记录（可撤销）、"
-            "全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、技能/MCP 清单、进度对齐。"
+            "AgentHub 通过标准 MCP 协议向所有 agent 提供 25 个工具：项目登记/新建、工作记录（可撤销）、"
+            "全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、踩坑拦截、归档、技能/MCP 清单、进度对齐。"
             "「一键接入」写入 MCP 配置，「注入引导」把开工规则写进 agent 的全局指令文件——"
             "两步都做，agent 才会在每次会话自然使用公用大脑，无需口头提醒。"))
 
@@ -2394,9 +2402,9 @@ class HelpPage(QWidget):
     <li><b>时间线</b>：所有 agent 的工作记录按时间倒序，可按 agent/项目过滤，点击条目看完整操作步骤。</li>
     <li><b>流水</b>：错误登记（agent 出错自动/主动上报，可标记已修、看回滚方式）+ 操作流水（每次写操作一条，记录类可一键撤销）。</li>
     <li><b>统计</b>：项目数、记录数、各 agent 工作量、月度活跃。</li>
-    <li><b>搜索</b>：全文+文件名搜索，Ctrl+F 直达。</li>
+    <li><b>搜索</b>：全脑检索（记录/记忆/文件分类过滤），回车即出结果，结果可直接打开或跳转，Ctrl+F 直达。</li>
     <li><b>Agent 中心</b>：各 agent 的技能库 / MCP / 记忆 / 全局配置聚合，含注册档案（在线状态/累计记录）；记忆可增删改、配置可编辑（自动备份）。</li>
-    <li><b>能力市场</b>：技能双源安装（本地缓存 / GitHub 官方实时 + identifier 直装）；MCP 目录提供知名服务器标准配置片段，复制后自行粘贴到 agent 的 MCP 配置（不自动写入）。</li>
+    <li><b>大脑</b>：唤起排行 / 使用分布 / 待办看板（一键勾销）/ 置顶记忆，对准大脑验收四条标准。</li>
     <li><b>接入</b>：一键写 MCP 配置 + 注入开工引导到 agent 全局指令文件（均自动备份、可移除）；hermes 等复制配置片段手动粘贴。</li>
     <li><b>对账</b>：揪出 agent 前缀平行目录、重复项目、野目录，杜绝记录分裂。</li>
     </ul>
