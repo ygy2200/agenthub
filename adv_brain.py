@@ -866,6 +866,46 @@ def t_salience_feedback(tmp):
     assert sal() == p["salience_min"], sal()
 
 
+def t_progressive_disclosure(tmp):
+    """1.1 渐进式披露三级：full=现状全文；abstract=前200字；outline=段头骨架。
+    缺省必须是 full（向后兼容）；非法 level 按 full；坏 id 一律 {}。"""
+    root = Path(tmp) / "hub_level"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    body = ("**目的**：验证渐进式披露的三级读取\n"
+            "一级细节：这里是目的段的完整展开内容，包含大量正文细节。" + "补充说明。" * 20 + "\n"
+            "**做了什么**：实现 record_outline 与 get_record 的 level 参数\n"
+            "二级细节：做了什么段的正文展开，花了很多字描述实现过程。" + "实现细节。" * 20 + "\n"
+            "**验证结果**：三级输出与成本预期一致\n"
+            "三级细节：验证段的正文展开。" + "验证细节。" * 20 + "\n"
+            "**如何回滚**：git revert 即净")
+    rid = brain.add_record(rs, "披露测试-项目", "zcode", "2026-10-04", "t1", body)
+
+    full = brain.get_record(rs, rid)                 # 缺省=full（向后兼容）
+    assert full["content"] == body, "缺省 level 必须等于现状全文"
+    assert brain.get_record(rs, rid, level="full")["content"] == body
+    # abstract：前 200 字
+    ab = brain.get_record(rs, rid, level="abstract")["content"]
+    assert ab == body.strip()[:200], ab
+    # outline：四段头骨架，正文细节被裁掉
+    ol = brain.get_record(rs, rid, level="outline")["content"]
+    for head in ("**目的**", "**做了什么**", "**验证结果**", "**如何回滚**"):
+        assert head in ol, ol
+    assert "大量正文细节" not in ol and "实现过程" not in ol, "outline 不得携带段内正文"
+    assert len(ol) < len(body) // 2, (len(ol), len(body))
+    # 无段头结构的记录：outline 退化为前 4 行
+    rid2 = brain.add_record(rs, "披露测试-项目", "dsh", "2026-10-04", "t2",
+                            "第一行无结构\n第二行\n第三行\n第四行\n第五行")
+    ol2 = brain.get_record(rs, rid2, level="outline")["content"]
+    assert "第一行无结构" in ol2 and "第五行" not in ol2, ol2
+    # 对抗：非法 level 按 full；坏 id 一律 {}
+    assert brain.get_record(rs, rid, level="DROP TABLE")["content"] == body
+    assert brain.get_record(rs, rid, level=None)["content"] == body
+    for bad in (0, -1, "abc", 999999):
+        assert brain.get_record(rs, bad, level="abstract") == {}
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -1090,6 +1130,7 @@ def main():
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
+    case("渐进披露三级（full缺省/abstract200字/outline骨架/无结构退化/对抗参）", lambda: t_progressive_disclosure(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))

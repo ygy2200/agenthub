@@ -478,11 +478,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             rid = int(arguments.get("record_id", 0) or 0)
         except (TypeError, ValueError):
             rid = 0
-        rec = brain.get_record(root, rid)
+        level = str(arguments.get("level", "full") or "full").strip()
+        rec = brain.get_record(root, rid, level=level)
         if not rec:
             return f"未找到记录 #{rid}"
         tag = "" if rec["status"] == "active" else f"（status={rec['status']}，已软删/撤销）"
-        return (f"records#{rec['id']} [{rec['date']} {rec['agent']}·{rec['project']}]{tag}\n"
+        lv = f" · level={level}" if level != "full" else ""
+        return (f"records#{rec['id']} [{rec['date']} {rec['agent']}·{rec['project']}]{tag}{lv}\n"
                 f"标题：{rec['title']}\n\n{rec['content']}")
 
     if name == "hub_health":
@@ -695,9 +697,11 @@ TOOLS = [
     {"name": "hub_distill", "description": "记忆蒸馏候选：content 有「目的」结论但同项目无记忆覆盖的记录（结晶流水线，确认后用 hub_memory_write 沉淀）",
      "inputSchema": {"type": "object",
                      "properties": {"limit": {"type": "integer"}}}},
-    {"name": "hub_get_record", "description": "读取单条工作记录全文（hub_search/hub_distill 只给摘要；蒸馏候选精读、复盘引用原文用）",
+    {"name": "hub_get_record", "description": "读取单条工作记录（渐进披露三级：hub_search 行 → abstract/outline → full，每级成本差一个量级）",
      "inputSchema": {"type": "object",
-                     "properties": {"record_id": {"type": "integer", "description": "记录 id，如 2037"}},
+                     "properties": {"record_id": {"type": "integer", "description": "记录 id，如 2037"},
+                                    "level": {"type": "string", "enum": ["full", "abstract", "outline"],
+                                              "description": "full=全文（缺省）；abstract=前200字；outline=段头骨架"}},
                      "required": ["record_id"]}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},

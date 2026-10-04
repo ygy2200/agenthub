@@ -1227,8 +1227,25 @@ def extract_todos(root: str, limit: int = 20) -> list:
     return out
 
 
-def get_record(root: str, record_id: int) -> dict:
-    """单条记录全文读取：hub_search/distill 只给 gist，蒸馏与复盘精读需要全文。"""
+_OUTLINE_HEAD_RE = re.compile(r"^(#{1,4}\s+\S|\*\*[^*]{2,30}\*\*|【[^】]{1,14}】)")
+
+
+def record_outline(content: str) -> str:
+    """outline 级骨架：抽段头行（markdown 标题/加粗段头/【】段头），最多四段；
+    四段式记录的段头行自带同行摘要，无段头结构的记录退化为前 4 行。
+    渐进披露的第二级——比 full 便宜一个量级，比 abstract 多结构。"""
+    lines = [l for l in (content or "").splitlines() if l.strip()]
+    picked = [l.strip()[:100] for l in lines if _OUTLINE_HEAD_RE.match(l.strip())][:4]
+    if not picked:
+        picked = [l.strip()[:100] for l in lines[:4]]
+    return "\n".join(picked)
+
+
+def get_record(root: str, record_id: int, level: str = "full") -> dict:
+    """单条记录读取（渐进披露三级）：hub_search 行 → abstract/outline → full，
+    每级成本差一个量级、每一级都是一个可停下的地方。
+    level：full=全文（缺省，与旧版完全一致）；abstract=正文前 200 字；outline=段头骨架。
+    非法 level 一律按 full；坏 id 一律 {}。"""
     try:
         rid = int(record_id)
     except (TypeError, ValueError):
@@ -1239,7 +1256,13 @@ def get_record(root: str, record_id: int) -> dict:
         row = conn.execute(
             "SELECT id, project, agent, date, title, content, status FROM records WHERE id=?",
             (rid,)).fetchone()
-    return dict(row) if row else {}
+    d = dict(row) if row else {}
+    if d:
+        if level == "abstract":
+            d["content"] = (d["content"] or "").strip()[:200]
+        elif level == "outline":
+            d["content"] = record_outline(d["content"])
+    return d
 
 
 def mark_todo_done(root: str, record_id: int, todo: str, agent: str = "") -> str:
