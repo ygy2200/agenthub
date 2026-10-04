@@ -553,6 +553,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                      "文件系统目录另行归档（hub_archive_project）")
         return "\n".join(lines)
 
+    if name == "hub_report":
+        import report
+        path = report.generate_report(root)
+        frs = len(report._frictions(report._collect(root)))
+        return (f"反馈报告已生成（单文件 HTML，双击即开）：{path}\n"
+                f"检出摩擦点 {frs} 条（每条带修复）；报告里的规则/技能修改均为提案，采纳由人拍板")
+
     if name == "hub_ops_list":
         lines = ["大脑内置检查工具箱（把重复验证固化成一条命令，输出按省 token 设计）："]
         for n, (desc, need_t) in ops.CHECKS.items():
@@ -622,7 +629,7 @@ TOOLS = [
                                     "agent": {"type": "string", "description": "你的 agent 名"},
                                     "pinned": {"type": "boolean", "description": "置顶（每次读记忆优先展示）"},
                                     "feedback": {"type": "string",
-                                                 "description": "对已有记忆反馈（配合 memory_id 使用）：helpful/not_helpful/stale/wrong，调节其显著性"},
+                                                 "description": "对已有记忆反馈（配合 memory_id 使用）：helpful/not_helpful/stale/wrong 调节显著性；archive 归档该记忆（不硬删）"},
                                     "memory_id": {"type": "integer",
                                                   "description": "要反馈的记忆 id（配合 feedback 使用）"},
                                     "mode": {"type": "string", "enum": ["append", "overwrite"], "description": "append 新增（默认）；overwrite 按内容匹配更新"}},
@@ -664,12 +671,15 @@ TOOLS = [
      "description": "数据完整性检测（只读）：列出被 agent 前缀拆散的重复项目目录、内容逐字重复的记录组，以及迁移存量口径。不做任何修改",
      "inputSchema": {"type": "object", "properties": {
          "min_len": {"type": "integer", "description": "判定重复记录的最短内容长度，默认 80"}}}},
+    {"name": "hub_report",
+     "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_ops_list", "description": "大脑内置检查工具箱清单：把 agent 每次重复做的验证（编译检查/跑回归/部署一致性/git/环境预检）固化成可一键执行的检查项，输出精简省 token",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_ops_run", "description": "执行一项内置检查并返回精简摘要（不返回全量日志）。py_compile/git_status/regression/deploy_diff 必填 target=目录路径；env/brain 无需。regression 会执行 target 下的测试脚本（约1分钟），其余只读",
      "inputSchema": {"type": "object",
                      "properties": {"name": {"type": "string", "description": "检查项名（先 hub_ops_list 看清单）",
-                                             "enum": ["py_compile", "git_status", "regression", "deploy_diff", "env", "brain", "inbox", "stalled", "dup_mem"]},
+                                             "enum": ["py_compile", "git_status", "regression", "deploy_diff", "env", "brain", "inbox", "stalled", "dup_mem", "compress"]},
                                     "target": {"type": "string", "description": "目标目录绝对路径（按检查项要求）"}},
                      "required": ["name"]}},
     {"name": "hub_health", "description": "大脑体检报告：规模/结晶率/待办线索/疑似重复记忆/检索活跃度+建议",

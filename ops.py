@@ -28,13 +28,14 @@ PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一
 CHECKS = {
     "py_compile": ("编译检查 target 目录全部 .py（ast 语法解析，抓低级语法错），通用任意项目", True),
     "git_status": ("git 工作区是否干净（未提交/未跟踪清单），通用任意仓库", True),
-    "regression": ("跑 AgentHub 四套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema（约1分钟）", True),
+    "regression": ("跑 AgentHub 五套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report（约1分钟）", True),
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
     "brain": ("大脑健康一行摘要（记录/记忆/结晶率/待办/检索累计）", False),
     "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
     "stalled": ("停滞项目清单（90 天无活动，供归档清理决策）", False),
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
+    "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
 }
 
 
@@ -58,6 +59,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _stalled(root)
     elif name == "dup_mem":
         r = _dup_mem(root)
+    elif name == "compress":
+        r = _compress(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""))
@@ -129,7 +132,7 @@ def _regression(target: Path) -> dict:
     if not (target / "adv_brain.py").is_file():
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 adv_brain.py）", "detail": []}
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py"]
+    suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py", "adv_report.py"]
     detail, fails, cost = [], [], 0.0
     for s in suites:
         t0 = time.perf_counter()
@@ -253,6 +256,64 @@ def _dup_mem(root: str) -> dict:
             "summary": f"{len(pairs)} 组疑似重复——合并方式见记忆卫生约定（新记忆标「取代记忆#N」，全员裁决旧条目）",
             "detail": [f"#{d['a']}~#{d['b']} 相似{d['sim']} [{d.get('verdict', '')}]：{d['content_a'][:36]}"
                        for d in pairs[:8]]}
+
+
+# 冷记忆压缩的事实抽取（1.2，先做窄）：四类窄正则，只抽明确可沉淀的持久事实
+_FACT_PATTERNS = [
+    ("路径", r"[A-Za-z]:\\[^\s\"'，。）)\]]{3,60}|(?:/[A-Za-z0-9_.\-]+){2,}"),
+    ("错误", r"\b\w+(?:Error|Exception)\b|0x[0-9a-fA-F]{4,}"),
+    ("命令", r"(?:python|git|pip|ffmpeg|npx|npm)\s+[\w\-][^\s；;]{1,50}"),
+    ("决策", r"[^。；\n]{0,30}(?:改为|决定|弃用|作废|切换到|已迁移|不再使用)[^。；\n]{0,40}"),
+]
+
+
+def _compress(root: str) -> dict:
+    """冷记忆压缩候选（1.2 情景→语义）：retention 低的 project 类记忆里，
+    用窄规则抽持久事实（路径/错误码/命令行/决策句）→ 建议清单。
+    ⚠ 铁律 9：只出建议不落库——确认后 hub_memory_write 沉淀，
+    原记忆用 hub_memory_write(feedback=archive, memory_id=N) 归档（不硬删）。"""
+    if err := _need_root(root):
+        return err
+    try:
+        import re
+        brain = _import_brain()
+        now = _dt_now()
+        pats = [(tag, re.compile(rx)) for tag, rx in _FACT_PATTERNS]
+        with brain.db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, content, use_count, created, last_hit FROM memories "
+                "WHERE status='active' AND kind='project' AND use_count<=1 ORDER BY id LIMIT 300")]
+        cands = []
+        for r in rows:
+            facts, seen = [], set()
+            for tag, pat in pats:
+                for m in pat.findall(r["content"] or ""):
+                    v = m.strip()[:80]
+                    if v and v not in seen:
+                        seen.add(v)
+                        facts.append(f"{tag} {v}")
+                    if len(facts) >= 5:
+                        break
+                if len(facts) >= 5:
+                    break
+            if facts:
+                cands.append({"id": r["id"],
+                              "retention": round(brain.retention_score(r, now), 3),
+                              "facts": facts})
+        cands.sort(key=lambda c: c["retention"])
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"压缩候选扫描失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    if not cands:
+        return {"ok": True, "summary": "无压缩候选（project 类冷记忆中没抽到持久事实，或无此类记忆）", "detail": []}
+    detail = [f"#{c['id']}（retention {c['retention']}）→ {'；'.join(c['facts'][:3])}" for c in cands[:8]]
+    return {"ok": True,
+            "summary": f"{len(cands)} 条压缩候选（建议清单，不落库）：确认后沉淀为新事实并归档原记忆",
+            "detail": detail}
+
+
+def _dt_now():
+    import datetime
+    return datetime.datetime.now()
 
 
 def _brain(root: str) -> dict:
