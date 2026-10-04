@@ -914,6 +914,70 @@ def t_progressive_disclosure(tmp):
         assert brain.get_record(rs, bad, level="abstract") == {}
 
 
+def t_handoff(tmp):
+    """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
+    （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
+    root = Path(tmp) / "hub_handoff"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+
+    # ① create：typed 字段固定；空 project 拒绝
+    msg = brain.create_handoff(rs, "测试-交接项目", "zcode",
+                               done="完成了合并与复盘", next_step="跑全量回归后发版",
+                               excluded="方案A已验证不可行；B 方向勿再试")
+    assert "已创建交接 #" in msg, msg
+    hid = int(msg.split("#")[1].split("（")[0])
+    assert "必填" in brain.create_handoff(rs, "", "zcode", done="x")
+    assert "必填" in brain.create_handoff(rs, "测试-交接项目", "  ", done="x")
+
+    # ② list：open 状态按项目列出；claimed 后从 open 清单消失
+    hid2 = int(brain.create_handoff(rs, "测试-交接项目", "dsh", done="只做了一半").split("#")[1].split("（")[0])
+    rows = brain.list_handoffs(rs)
+    assert {r["id"] for r in rows} >= {hid, hid2}, rows
+    rows_proj = brain.list_handoffs(rs, project="测试-交接项目")
+    assert {r["id"] for r in rows_proj} == {hid, hid2}
+    assert rows_proj[0]["id"] == hid2, "list 应新在前"
+    assert all(r["status"] == "open" for r in rows_proj)
+
+    # ③ claim：exactly once；认领后 agent/时间落值
+    msg = brain.claim_handoff(rs, hid, "dsh")
+    assert "已认领" in msg, msg
+    row = brain.list_handoffs(rs, project="测试-交接项目", include_claimed=True)
+    mine = next(r for r in row if r["id"] == hid)
+    assert mine["status"] == "claimed" and mine["claimed_by"] == "dsh" and mine["claimed_at"], mine
+    assert not any(r["id"] == hid for r in brain.list_handoffs(rs, project="测试-交接项目")), \
+        "已认领的不应再出现在 open 清单"
+
+    # ④ 对抗：重复认领 / 不存在 id / 坏 id / 空 agent —— 均不改数据
+    assert "已被" in brain.claim_handoff(rs, hid, "zcode")
+    assert "不存在" in brain.claim_handoff(rs, 999999, "zcode")
+    assert "非法" in brain.claim_handoff(rs, -1, "zcode")
+    assert "非法" in brain.claim_handoff(rs, "abc", "zcode")
+    assert "agent 必填" in brain.claim_handoff(rs, hid2, "  ")
+
+    # ⑤ 并发双认领：8 线程同时 claim 同一 open 交接，恰好一个成功
+    results = []
+
+    def worker():
+        results.append(brain.claim_handoff(rs, hid2, f"race{threading.get_ident()}"))
+
+    ts = [threading.Thread(target=worker) for _ in range(8)]
+    [t.start() for t in ts]
+    [t.join() for t in ts]
+    wins = [r for r in results if "已认领" in r and "已被" not in r]
+    assert len(wins) == 1, results
+    assert len(results) == 8, results
+    with brain.db_conn(rs) as conn:
+        st, who = conn.execute("SELECT status, claimed_by FROM handoffs WHERE id=?",
+                               (hid2,)).fetchone()
+    assert st == "claimed" and who.startswith("race"), (st, who)
+
+    # ⑥ journal 落痕可追溯
+    js = brain.journal_list(rs, 50)
+    assert any("交接" in j["action"] for j in js), [j["action"] for j in js[:5]]
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -1139,6 +1203,7 @@ def main():
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
     case("渐进披露三级（full缺省/abstract200字/outline骨架/无结构退化/对抗参）", lambda: t_progressive_disclosure(tmp))
+    case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))

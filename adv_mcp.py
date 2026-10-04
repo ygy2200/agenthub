@@ -70,8 +70,8 @@ def t_protocol(root):
             "hub_get_project", "hub_create_project", "hub_get_rules", "hub_heartbeat",
             "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
-            "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report"} <= names, names
-    assert len(names) == 29
+            "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report", "hub_handoff"} <= names, names
+    assert len(names) == 30
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -194,6 +194,36 @@ def t_heartbeat_conflict(root):
     # agent 必填
     out = m.call_tool("hub_heartbeat", {"agent": "  "}, root)
     assert "必填" in out
+
+
+def t_handoff_tool(root):
+    """2.2 交接协议工具链：create → list（open）→ claim → 不可重复认领。"""
+    root = str(root)
+    out = m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目", "agent": "alpha",
+                                      "done": "回归全绿", "next_step": "发版", "excluded": "方案A"}, root)
+    assert "已创建交接 #" in out, out
+    hid = int(out.split("#")[1].split("（")[0])
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, root)
+    assert f"#{hid}" in out and "下一步：发版" in out and "已排除：方案A" in out, out
+    # 换 agent 认领
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "beta"}, root)
+    assert "已认领" in out and "beta" in out, out
+    # 认领后 open 清单为空；include_claimed 可见
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, root)
+    assert f"#{hid}" not in out, out
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目",
+                                      "include_claimed": True}, root)
+    assert "已被 beta 认领" in out, out
+    # 重复认领 / 不存在 id / agent 必填
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "alpha"}, root)
+    assert "已被" in out, out
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": 999999, "agent": "alpha"}, root)
+    assert "不存在" in out, out
+    out = m.call_tool("hub_handoff", {"action": "create", "project": "", "agent": "alpha"}, root)
+    assert "必填" in out, out
+    # 空 list 兜底文案
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "没有交接的项目"}, root)
+    assert "无未认领" in out, out
 
 
 def t_errors_flow(root):
@@ -605,7 +635,8 @@ def main():
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
-    case("MCP协议（握手/29工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
+    case("MCP协议（握手/30工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))

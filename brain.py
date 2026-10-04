@@ -153,6 +153,18 @@ CREATE TABLE IF NOT EXISTS distill_seen (
     record_id INTEGER PRIMARY KEY,
     ts TEXT
 );
+CREATE TABLE IF NOT EXISTS handoffs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT NOT NULL,
+    agent TEXT DEFAULT "",
+    done TEXT DEFAULT "",
+    next_step TEXT DEFAULT "",
+    excluded TEXT DEFAULT "",
+    status TEXT DEFAULT "open",
+    claimed_by TEXT DEFAULT "",
+    claimed_at TEXT DEFAULT "",
+    created TEXT DEFAULT ""
+);
 CREATE TABLE IF NOT EXISTS files (
     project TEXT, path TEXT, name TEXT, grp TEXT,
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
@@ -1091,6 +1103,69 @@ def error_set_status(root: str, error_id: int, status: str) -> str:
         if cur.rowcount == 0:
             return f"未找到 id={error_id} 的错误"
     return ""
+
+
+# ---------------------------------------------------------------- 交接协议（2.2）
+
+def create_handoff(root: str, project: str, agent: str, done: str = "",
+                   next_step: str = "", excluded: str = "") -> str:
+    """交接（handoff as a protocol）：换 agent 接手时写下 typed 固定字段——
+    做完了什么 / 下一步 / 哪些路已排除。返回错误或 "已创建交接 #id"。"""
+    project = (project or "").strip()
+    agent = _norm_agent(agent)
+    if not project:
+        return "project 必填"
+    if not agent:
+        return "agent 必填"
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "INSERT INTO handoffs(project,agent,done,next_step,excluded,created) VALUES(?,?,?,?,?,?)",
+            (project, agent, (done or "")[:2000], (next_step or "")[:2000],
+             (excluded or "")[:2000], _now()))
+        hid = cur.lastrowid
+    journal_add(root, agent, "创建交接", target=f"handoffs#{hid}",
+                note=f"{project}（下一步：{(next_step or '')[:60]}）")
+    return f"已创建交接 #{hid}（{project}，待接手 agent 认领）"
+
+
+def list_handoffs(root: str, project: str = "", include_claimed: bool = False) -> list:
+    """列交接：缺省只给 open（未认领），按 id 倒序（新在前）；include_claimed 时全量。"""
+    q = "SELECT * FROM handoffs"
+    args: list = []
+    if not include_claimed:
+        q += " WHERE status='open'"
+        if project:
+            q += " AND project=?"
+            args.append(project)
+    elif project:
+        q += " WHERE project=?"
+        args.append(project)
+    q += " ORDER BY id DESC LIMIT 50"
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(q, args)]
+
+
+def claim_handoff(root: str, handoff_id, agent: str) -> str:
+    """认领（claimed exactly once）：单语句 UPDATE ... WHERE status='open'，
+    SQLite 语句级原子性保证并发双认领恰一个 rowcount=1——不先查后改，无竞态窗口。
+    状态锚 = 自增 id（铁律：不用时间戳）。返回错误或 "已认领交接 #id"。"""
+    if not isinstance(handoff_id, int) or isinstance(handoff_id, bool) or handoff_id <= 0:
+        return f"交接 id 非法：{handoff_id!r}"
+    agent = _norm_agent(agent)
+    if not agent:
+        return "agent 必填"
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "UPDATE handoffs SET status='claimed', claimed_by=?, claimed_at=? "
+            "WHERE id=? AND status='open'", (agent, _now(), handoff_id))
+        if cur.rowcount == 0:
+            row = conn.execute("SELECT status, claimed_by FROM handoffs WHERE id=?",
+                               (handoff_id,)).fetchone()
+            if not row:
+                return f"交接 #{handoff_id} 不存在"
+            return f"交接 #{handoff_id} 已被 {row['claimed_by'] or '他人'} 认领（status={row['status']}），不可重复认领"
+    journal_add(root, agent, "认领交接", target=f"handoffs#{handoff_id}")
+    return f"已认领交接 #{handoff_id}（接手人：{agent}）"
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:

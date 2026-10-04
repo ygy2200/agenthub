@@ -553,6 +553,40 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                      "文件系统目录另行归档（hub_archive_project）")
         return "\n".join(lines)
 
+    if name == "hub_handoff":
+        action = str(arguments.get("action", "list")).strip()
+        agent = str(arguments.get("agent", "")).strip()
+        if action == "create":
+            pname = str(arguments.get("project", "")).strip()
+            done = str(arguments.get("done", "")).strip()
+            nxt = str(arguments.get("next_step", "")).strip()
+            excluded = str(arguments.get("excluded", "")).strip()
+            err = brain.create_handoff(root, pname, agent, done, nxt, excluded)
+            return err if err.startswith("已创建") else f"错误：{err}"
+        if action == "claim":
+            try:
+                hid = int(arguments.get("handoff_id", 0) or 0)
+            except (TypeError, ValueError):
+                hid = 0
+            err = brain.claim_handoff(root, hid, agent)
+            return err if err.startswith("已认领") else f"错误：{err}"
+        # list（缺省）：只给 open；带 project 过滤；include_claimed=1 看全部
+        rows = brain.list_handoffs(root, str(arguments.get("project", "")).strip(),
+                                   bool(arguments.get("include_claimed", False)))
+        if not rows:
+            return "（无未认领的交接。换 agent 接手前先 hub_handoff(action=create) 留下上下文）"
+        lines = [f"交接清单（{'全部' if arguments.get('include_claimed') else 'open'}，新在前）{len(rows)} 条："]
+        for r in rows:
+            mark = f"（已被 {r['claimed_by']} 认领）" if r["status"] != "open" else "（待认领）"
+            lines.append(f"- #{r['id']} [{r['project']}] 来自 {r['agent']} {mark}")
+            if r["done"]:
+                lines.append(f"  做完：{r['done'][:80]}")
+            if r["next_step"]:
+                lines.append(f"  下一步：{r['next_step'][:80]}")
+            if r["excluded"]:
+                lines.append(f"  已排除：{r['excluded'][:80]}")
+        return "\n".join(lines)
+
     if name == "hub_report":
         import report
         path = report.generate_report(root)
@@ -671,6 +705,18 @@ TOOLS = [
      "description": "数据完整性检测（只读）：列出被 agent 前缀拆散的重复项目目录、内容逐字重复的记录组，以及迁移存量口径。不做任何修改",
      "inputSchema": {"type": "object", "properties": {
          "min_len": {"type": "integer", "description": "判定重复记录的最短内容长度，默认 80"}}}},
+    {"name": "hub_handoff",
+     "description": "交接协议：换 agent 接手前用 action=create 留下 typed 上下文（做完/下一步/已排除的路），接手方 action=list 查看、action=claim 认领（同一交接仅一人可认领成功）",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["list", "create", "claim"],
+                                               "description": "list 列交接（缺省）/ create 创建 / claim 认领"},
+                                    "project": {"type": "string", "description": "create 必填；list 可按项目过滤"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（create/claim 必填）"},
+                                    "done": {"type": "string", "description": "create：做完了什么"},
+                                    "next_step": {"type": "string", "description": "create：下一步是什么"},
+                                    "excluded": {"type": "string", "description": "create：哪些路已排除（防接手方重蹈）"},
+                                    "handoff_id": {"type": "integer", "description": "claim：交接 id"},
+                                    "include_claimed": {"type": "boolean", "description": "list：含已认领"}}}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
