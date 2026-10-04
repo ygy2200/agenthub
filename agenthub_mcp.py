@@ -258,6 +258,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         err = _check_content(content, "content")
         if err:
             return err
+        # 反馈通道（0.4）：feedback+memory_id 同时给出时改走反馈分支，不新增记忆
+        fb = str(arguments.get("feedback", "")).strip()
+        mid_arg = arguments.get("memory_id")
+        if fb and mid_arg is not None:
+            try:
+                return brain.set_memory_feedback(root, int(mid_arg), fb)
+            except (TypeError, ValueError):
+                return f"memory_id 非法：{mid_arg!r}（应为正整数）"
         if mode not in ("append", "overwrite", "new"):
             return "错误：mode 只能是 append/new 或 overwrite"
         if mode == "overwrite":
@@ -611,6 +619,10 @@ TOOLS = [
                                     "project": {"type": "string", "description": "相关项目，可空"},
                                     "agent": {"type": "string", "description": "你的 agent 名"},
                                     "pinned": {"type": "boolean", "description": "置顶（每次读记忆优先展示）"},
+                                    "feedback": {"type": "string",
+                                                 "description": "对已有记忆反馈（配合 memory_id 使用）：helpful/not_helpful/stale/wrong，调节其显著性"},
+                                    "memory_id": {"type": "integer",
+                                                  "description": "要反馈的记忆 id（配合 feedback 使用）"},
                                     "mode": {"type": "string", "enum": ["append", "overwrite"], "description": "append 新增（默认）；overwrite 按内容匹配更新"}},
                      "required": ["content"]}},
     {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃时会收到撞车预警，长任务开工前先调用",

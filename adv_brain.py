@@ -833,6 +833,39 @@ def t_retention_decay(tmp):
     assert h["cold_memories"] and h["cold_memories"][0]["retention"] < brain.DECAY_PARAMS["cold_threshold"]
 
 
+def t_salience_feedback(tmp):
+    """0.4 反馈通道：helpful 升档封顶、wrong 落地板、非法枚举不崩、坏 id 不崩。"""
+    root = Path(tmp) / "hub_salience"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    mid = brain.add_memory(rs, "某条待反馈的记忆", kind="lesson", agent="dsh")
+    p = brain.DECAY_PARAMS
+
+    def sal():
+        v = brain.search_memories(rs, "", "", 20, count_hits=False)[0]["salience"]
+        return p["salience_default"] if v is None else float(v)
+
+    assert sal() == p["salience_default"], sal()
+    for _ in range(6):                      # 连升 6 次应封顶
+        brain.set_memory_feedback(rs, mid, "helpful")
+    assert sal() == p["salience_max"], sal()
+
+    brain.set_memory_feedback(rs, mid, "wrong")   # 直落地板
+    assert sal() == p["salience_min"], sal()
+
+    # 对抗：非法枚举 / 不存在的 id / 负数 id —— 均不崩且不改动
+    for bad in ("", "随便", None, 123):
+        brain.set_memory_feedback(rs, mid, bad)
+    before = sal()
+    assert brain.set_memory_feedback(rs, 999999, "helpful") is not None
+    assert brain.set_memory_feedback(rs, -1, "helpful") is not None
+    assert sal() == before, (before, sal())
+    # not_helpful 降档不破地板
+    brain.set_memory_feedback(rs, mid, "not_helpful")
+    assert sal() == p["salience_min"], sal()
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -1048,6 +1081,7 @@ def main():
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
+    case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))

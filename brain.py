@@ -840,6 +840,37 @@ def is_cold(mem: dict, now: datetime.datetime, params: dict | None = None) -> bo
     return retention_score(mem, now, params=p) < p["cold_threshold"]
 
 
+SALIENCE_STEP = 0.25
+_FEEDBACK_UP = {"helpful"}
+_FEEDBACK_DOWN = {"not_helpful"}
+_FEEDBACK_FLOOR = {"stale", "wrong"}
+
+
+def set_memory_feedback(root: str, mid: int, feedback: str) -> str:
+    """按反馈调节 salience：helpful 升档、not_helpful 降档、stale/wrong 直落地板。
+    非法枚举或坏 id 一律返回错误串，不改动任何数据（对抗用例要求）。"""
+    fb = (feedback or "").strip().lower() if isinstance(feedback, str) else ""
+    if fb not in _FEEDBACK_UP | _FEEDBACK_DOWN | _FEEDBACK_FLOOR:
+        return f"反馈值非法：{feedback!r}（可选 helpful/not_helpful/stale/wrong）"
+    if not isinstance(mid, int) or mid <= 0:
+        return f"记忆 id 非法：{mid!r}"
+    p = DECAY_PARAMS
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT id, salience FROM memories WHERE id=? AND status='active'",
+                           (mid,)).fetchone()
+        if not row:
+            return f"记忆不存在或已归档：#{mid}"
+        cur = float(row["salience"] if row["salience"] is not None else p["salience_default"])
+        if fb in _FEEDBACK_FLOOR:
+            new = p["salience_min"]
+        elif fb in _FEEDBACK_UP:
+            new = min(p["salience_max"], cur + SALIENCE_STEP)
+        else:
+            new = max(p["salience_min"], cur - SALIENCE_STEP)
+        conn.execute("UPDATE memories SET salience=?, updated=? WHERE id=?", (new, _now(), mid))
+    return f"记忆 #{mid} 反馈「{fb}」已记录：salience {cur} → {new}"
+
+
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
                     count_hits: bool = True) -> list:
     """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
