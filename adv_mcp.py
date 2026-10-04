@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.13.0"
+    assert r["serverInfo"]["version"] == "2.14.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -70,8 +70,9 @@ def t_protocol(root):
             "hub_get_project", "hub_create_project", "hub_get_rules", "hub_heartbeat",
             "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
-            "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report", "hub_handoff"} <= names, names
-    assert len(names) == 30
+            "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report",
+            "hub_handoff", "hub_status"} <= names, names
+    assert len(names) == 31
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -630,6 +631,78 @@ def t_distill_mark(tmp):
     assert "验证蒸馏展示标记" not in out2, f"已展示候选被重复推送：{out2}"
 
 
+def t_status_tool(tmp):
+    """hub_status 连续性层（3.1）：五问快照——正常/空库/脏数据/限条数/只读性/畸形参数。"""
+    root = fresh_hub(tmp, "status")
+    root_s = str(root)
+    today = datetime.date.today().isoformat()
+    # 正常库：塞全五问数据源
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "【目的】status 用例\n后续：还没做的待办甲"}, root_s)
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "hermes",
+                                 "content": "status 用例第二条"}, root_s)
+    m.call_tool("hub_report_error", {"title": "status用例未关闭坑", "agent": "zcode"}, root_s)
+    m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目", "agent": "zcode",
+                                "done": "A", "next_step": "B"}, root_s)
+    brain.add_memory(root_s, "置顶铁律测试%pinned_%", kind="lesson", pinned=True)
+    brain.heartbeat_touch(root_s, "zcode", "测试-项目", note="在线中")
+    out = m.call_tool("hub_status", {}, root_s)
+    assert "①" in out and "在线会话" in out and "zcode" in out, out
+    assert "活跃项目" in out and "测试-项目" in out, out
+    assert "今日新增" in out and "最近操作" in out, out
+    assert "未关闭错误 1 条" in out and "status用例未关闭坑" in out, out
+    assert "待认领交接 1 条" in out, out
+    assert "置顶记忆 1 条" in out and "置顶铁律测试%pinned_%" in out, out  # 通配符原样返回不被吞
+    assert "待办线索" in out and "待办甲" in out, out
+    assert today in out, out
+    # 真·空库（不经 build_hub，无迁移记录）：无任何数据也不炸，各区块给"无"
+    bare = Path(tmp) / "status_bare"
+    bare.mkdir(parents=True)
+    brain.init_db(str(bare))
+    out = m.call_tool("hub_status", {}, str(bare))
+    assert "①" in out and "在线会话：无" in out and "活跃项目（近7天）：无" in out, out
+    assert "未关闭错误：无" in out and "待认领交接：无" in out and "待办线索：无" in out, out
+    # 活跃窗口边界确定性：远古记录不算活跃、今日记录算——不随运行日期漂移
+    ctl = fresh_hub(tmp, "status_ctl")
+    brain.add_record(str(ctl), "古老-项目", "hermes", "2020-01-01", "远古记录", "内容")
+    brain.add_record(str(ctl), "测试-项目", "zcode", today, "今天记录", "内容")
+    out = m.call_tool("hub_status", {}, str(ctl))
+    assert "活跃项目（近7天）" in out, out
+    act = out.split("活跃项目（近7天）")[1].split("②")[0]
+    assert "测试-项目" in act, out
+    assert "古老-项目" not in act, out
+    # 畸形参数：零参数工具忽略未知键，不炸
+    out = m.call_tool("hub_status", {"limit": "abc", "x": None}, root_s)
+    assert "①" in out, out
+    # 脏数据：sessions 坏 ts、journal note 超长——容错截断不炸
+    import sqlite3 as _sq
+    with _sq.connect(str(Path(root_s) / "_hub" / "brain.db")) as c:
+        c.execute("INSERT INTO sessions(agent,project,note,ts) VALUES('bad','p','n','not-a-date')")
+        c.execute("UPDATE journal SET note=? WHERE id=(SELECT MAX(id) FROM journal)", ("命数" * 200,))
+    out = m.call_tool("hub_status", {}, root_s)
+    assert "①" in out, out  # 坏 ts 行被容错剔除/展示均不炸
+    # 限条数：journal 只展示 8 条；errors 展示最新 5 条但 total 是真实数 7
+    for i in range(12):
+        brain.journal_add(root_s, "zcode", f"流水{i}")
+    for i in range(7):
+        brain.error_add(root_s, "zcode", f"坑{i}")
+    out = m.call_tool("hub_status", {}, root_s)
+    assert "未关闭错误 8 条" in out, out  # 正常库段 1 条 + 本段 7 条
+    err_block = out.split("未关闭错误")[1].split("待认领")[0]
+    assert "坑6" in err_block and "坑1" not in err_block, err_block  # id DESC 最新 5 条封顶
+    assert len([ln for ln in out.splitlines() if "流水" in ln]) <= 8, out
+    # 只读性：调用后 records/journal/searches 行数不变
+    import re as _re
+    def counts():
+        with _sq.connect(str(Path(root_s) / "_hub" / "brain.db")) as c:
+            return (c.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+                    c.execute("SELECT COUNT(*) FROM journal").fetchone()[0],
+                    c.execute("SELECT COUNT(*) FROM searches").fetchone()[0])
+    before = counts()
+    m.call_tool("hub_status", {}, root_s)
+    assert counts() == before, "hub_status 产生了写入（必须纯只读）"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -646,6 +719,7 @@ def main():
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
     case("单条全文读取+Everything列表回归（畸形id/死代码bug）", lambda: t_get_record_and_search_files(tmp))
     case("蒸馏展示即登记（同一记录不重复推送）", lambda: t_distill_mark(tmp))
+    case("hub_status五问快照（正常/空库/脏数据/限条数/只读性/畸形参数）", lambda: t_status_tool(tmp))
     case("检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）", lambda: t_search_output(tmp))
     case("memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）", lambda: t_memory_read_fallback(tmp))
     case("写入时踩坑拦截（相似lesson提醒/无关不附）", lambda: t_log_work_intercept(tmp))

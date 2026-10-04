@@ -1230,6 +1230,49 @@ def list_agents(root: str) -> list:
     return rows
 
 
+# ---------------------------------------------------------------- 连续性层（3.1）
+
+STATUS_ACTIVE_DAYS = 7  # 项目"还活跃"窗口（天）：与 90 天 stalled 判定构成两端
+
+
+def status_snapshot(root: str) -> dict:
+    """此刻的活状态快照（ATANT 五问：什么活跃/什么变了/什么还开着/什么还重要/下一步）。
+    只读不写——状态查询不进 searches 表，避免高频调用污染读写比口径。"""
+    now = datetime.datetime.now()
+    today = now.date().isoformat()
+    cutoff = (now - datetime.timedelta(days=STATUS_ACTIVE_DAYS)).date().isoformat()
+    out = {"now": now.isoformat(timespec="minutes"), "today": today,
+           "sessions": active_sessions(root)}
+    with db_conn(root) as conn:
+        out["active_projects"] = [dict(r) for r in conn.execute(
+            "SELECT project AS name, MAX(date) AS last_date, COUNT(*) AS n FROM records "
+            "WHERE status='active' AND date>=? GROUP BY project "
+            "ORDER BY last_date DESC, n DESC LIMIT 5", (cutoff,))]
+        out["records_today"] = conn.execute(
+            "SELECT COUNT(*) FROM records WHERE substr(created,1,10)=?", (today,)).fetchone()[0]
+        out["memories_today"] = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE substr(created,1,10)=?", (today,)).fetchone()[0]
+        out["journal"] = [dict(r) for r in conn.execute(
+            "SELECT ts, agent, action, note FROM journal ORDER BY id DESC LIMIT 8")]
+        out["errors_open"] = [dict(r) for r in conn.execute(
+            "SELECT id, agent, title FROM errors WHERE status='open' ORDER BY id DESC LIMIT 5")]
+        out["errors_open_total"] = conn.execute(
+            "SELECT COUNT(*) FROM errors WHERE status='open'").fetchone()[0]
+        out["handoffs"] = [dict(r) for r in conn.execute(
+            "SELECT id, project, agent FROM handoffs WHERE status='open' ORDER BY id DESC LIMIT 5")]
+        out["handoffs_total"] = conn.execute(
+            "SELECT COUNT(*) FROM handoffs WHERE status='open'").fetchone()[0]
+        out["pinned"] = [dict(r) for r in conn.execute(
+            "SELECT id, kind, substr(content,1,50) AS content FROM memories "
+            "WHERE status='active' AND pinned=1 ORDER BY id LIMIT 5")]
+        out["stalled"] = [r["name"] for r in conn.execute(
+            "SELECT name FROM projects WHERE status='stalled' ORDER BY name LIMIT 5")]
+        out["stalled_total"] = conn.execute(
+            "SELECT COUNT(*) FROM projects WHERE status='stalled'").fetchone()[0]
+    out["todos"] = extract_todos(root, limit=5)
+    return out
+
+
 # ---------------------------------------------------------------- 备份
 
 def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:

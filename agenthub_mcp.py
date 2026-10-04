@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.13.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.14.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -626,6 +626,56 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"  {r['date']} {r['project']}：{r['title'][:60]}")
         return "\n".join(lines)
 
+    if name == "hub_status":
+        s = brain.status_snapshot(root)
+        today = s["today"]
+        lines = [f"大脑此刻状态（{s['now']}）——历史靠 hub_search，现在看这里："]
+        # ① 什么还是活跃的（会话级 + 项目级）
+        if s["sessions"]:
+            who = "；".join(f"{x['agent']}（{x['project'] or '未登记项目'}）" for x in s["sessions"])
+            lines.append(f"① 在线会话：{who}")
+        else:
+            lines.append("① 在线会话：无（开工先 hub_heartbeat 登记）")
+        if s["active_projects"]:
+            ps = "、".join(f"{p['name']}（{p['last_date']}，{p['n']}条）" for p in s["active_projects"])
+            lines.append(f"   活跃项目（近7天）：{ps}")
+        else:
+            lines.append("   活跃项目（近7天）：无")
+        # ② 什么变了
+        lines.append(f"② 今日新增：记录 {s['records_today']} 条 · 记忆 {s['memories_today']} 条；最近操作：")
+        for j in s["journal"]:
+            day, hm = (j["ts"][:10], j["ts"][11:16]) if len(j["ts"]) >= 16 else (j["ts"], "")
+            when = hm if day == today else day
+            note = f"：{j['note'][:40]}" if j["note"] else ""
+            lines.append(f"   {when} {j['agent']} {j['action']}{note}")
+        # ③ 什么还开着（未解决）
+        if s["errors_open"]:
+            es = "；".join(f"#{e['id']} {e['title'][:40]}" for e in s["errors_open"])
+            lines.append(f"③ 未关闭错误 {s['errors_open_total']} 条：{es}")
+        else:
+            lines.append("③ 未关闭错误：无")
+        if s["handoffs"]:
+            hs = "；".join(f"#{h['id']} [{h['project']}] 来自 {h['agent']}" for h in s["handoffs"])
+            lines.append(f"   待认领交接 {s['handoffs_total']} 条：{hs}（hub_handoff claim）")
+        else:
+            lines.append("   待认领交接：无")
+        # ④ 什么还重要
+        if s["pinned"]:
+            pm = "；".join(f"#{p['id']}[{brain.KIND_CN.get(p['kind'], p['kind'])}] {p['content'][:36]}" for p in s["pinned"])
+            lines.append(f"④ 置顶记忆 {len(s['pinned'])} 条：{pm}")
+        else:
+            lines.append("④ 置顶记忆：无")
+        if s["stalled"]:
+            lines.append(f"   停滞项目 {s['stalled_total']} 个：{'、'.join(s['stalled'])}（超90天无动静，确认结局或归档）")
+        # ⑤ 下一步该做什么
+        if s["todos"]:
+            lines.append("⑤ 待办线索（勾销用 hub_todo_done）：")
+            for t in s["todos"]:
+                lines.append(f"   [{t['date']} {t['agent']}·{t['project']}] {t['todo'][:60]}")
+        else:
+            lines.append("⑤ 待办线索：无")
+        return "\n".join(lines)
+
     return f"未知工具：{name}"
 
 
@@ -761,6 +811,8 @@ TOOLS = [
                      "required": ["record_id"]}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
+    {"name": "hub_status", "description": "大脑此刻状态（连续性层）：谁在线/活跃项目/今日变更/未关闭错误与待认领交接/置顶记忆与停滞项目/待办线索——历史靠 hub_search，现在看这里",
+     "inputSchema": {"type": "object", "properties": {}}},
 ]
 
 
