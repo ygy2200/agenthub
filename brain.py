@@ -772,19 +772,43 @@ def _memories_query(root: str, words: list, kind: str, limit: int) -> list:
         return [dict(r) for r in conn.execute(q, args)]
 
 
-def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20) -> list:
+def _bump_access(root: str, ids: list, now: str = "") -> None:
+    """命中即记一次唤起（与 recall_for 同款语义）：use_count+1 + last_hit。
+    只对实际返回给调用方的条目计数——用进废退。空列表直接返回，不发 SQL。
+    同时幂等埋一个口径锚：首次主动检索的时点（meta.active_recall_since），
+    供体检报告说明 use_count 语义；仅作说明性记录，不参与任何判断。"""
+    if not ids:
+        return
+    now = now or _now()
+    with db_conn(root) as conn:
+        conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('active_recall_since', ?)", (now,))
+        for mid in ids:
+            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
+                         (now, mid))
+
+
+def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
+                    count_hits: bool = True) -> list:
     """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
-    0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（与 search_records 同因）。"""
+    0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（与 search_records 同因）。
+
+    count_hits：带 query 的实际检索命中才计唤起（use_count+1）——主动检索是最高价值的
+    唤起信号，此前只统计被动推送，衰减/有用率的输入数据系统性失真（0.2 修复）。
+    空 query 列清单不计；写入查重等内部调用须显式传 False。"""
     words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
     rows = _memories_query(root, words, kind, limit)
-    if rows or not words:
-        return rows
-    retry = _retry_bigrams(query)
-    if not retry:
-        return []
-    rows = _memories_query(root, retry, kind, limit)
-    for r in rows:  # 同 search_records：放宽召回须可识别
-        r["_bigram"] = True
+    if not rows and words:
+        retry = _retry_bigrams(query)
+        if retry:
+            rows = _memories_query(root, retry, kind, limit)
+            for r in rows:  # 同 search_records：放宽召回须可识别
+                r["_bigram"] = True
+    if rows and words and count_hits:
+        now = _now()
+        _bump_access(root, [r["id"] for r in rows], now)
+        for r in rows:  # 返回值反映本次唤起后的计数（与 recall_for 一致）
+            r["use_count"] = (r["use_count"] or 0) + 1
+            r["last_hit"] = now
     return rows
 
 

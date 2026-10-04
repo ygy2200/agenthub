@@ -219,7 +219,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             limit = int(arguments.get("limit", 20))
         except (TypeError, ValueError):
             limit = 20
-        rows = brain.search_memories(root, query, kind, limit)
+        rows = brain.search_memories(root, query, kind, limit, count_hits=bool(query))
         brain.log_search(root, "hub_memory_read", query or (f"kind:{kind}" if kind else ""), len(rows),
                          agent=_guess_agent(root))
         total = brain.count_memories(root)
@@ -262,7 +262,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             return "错误：mode 只能是 append/new 或 overwrite"
         if mode == "overwrite":
             # overwrite 语义：按内容精确匹配更新旧条目（v1 文本时代遗留接口），否则当新条目
-            rows = brain.search_memories(root, content[:80], "", 1)
+            # count_hits=False：写入查重是内部调用，计唤起会让刚写的记忆立刻 +1，污染数据
+            rows = brain.search_memories(root, content[:80], "", 1, count_hits=False)
             if rows and rows[0]["content"] == content:
                 brain.edit_memory(root, rows[0]["id"], content=content, kind=kind if kind in brain.KINDS else "")
                 core.journal(root, agent, "memory_overwrite", f"brain:memories#{rows[0]['id']}")

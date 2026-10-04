@@ -691,6 +691,53 @@ def t_project_name_prefix_guard(tmp):
         assert core.validate_project_name(bad), f"{bad} 应被拒绝但通过了"
 
 
+def t_active_recall_count(tmp):
+    """0.2 主动检索计入唤起：带 query 命中才计数；空 query 列清单不计；查重检索不计。"""
+    root = Path(tmp) / "hub_active_recall"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    mid = brain.add_memory(rs, "校园网GitHub直连不通 改用代理端口7890", kind="fact", agent="dsh")
+    brain.add_memory(rs, "红色沙漠模组用DMM管理", kind="note", agent="dsh")
+
+    # ① 带 query 命中 → use_count +1，last_hit 落值
+    rows = brain.search_memories(rs, "校园网 代理")
+    hit = [r for r in rows if r["id"] == mid]
+    assert hit, [r["id"] for r in rows]
+    assert hit[0]["use_count"] == 1, hit[0]["use_count"]
+    assert hit[0]["last_hit"], "last_hit 应被写入"
+
+    # ② 再检索一次 → 累计到 2（验证是累加而非置 1）
+    rows2 = brain.search_memories(rs, "校园网 代理")
+    hit2 = [r for r in rows2 if r["id"] == mid][0]
+    assert hit2["use_count"] == 2, hit2["use_count"]
+
+    # ③ 空 query 列清单 → 不计数
+    before = {r["id"]: r["use_count"] for r in brain.search_memories(rs, "", "", 20)}
+    brain.search_memories(rs, "", "", 20)
+    after = {r["id"]: r["use_count"] for r in brain.search_memories(rs, "", "", 20)}
+    assert before == after, (before, after)
+
+    # ④ 0 命中 → 任何记忆都不该被计数
+    snap = {r["id"]: r["use_count"] for r in brain.search_memories(rs, "", "", 20)}
+    assert brain.search_memories(rs, "绝不存在的词zzz") == []
+    snap2 = {r["id"]: r["use_count"] for r in brain.search_memories(rs, "", "", 20)}
+    assert snap == snap2, (snap, snap2)
+
+    # ⑤ 查重场景排除（hub_memory_write 内部调用不得计唤起）
+    r3 = brain.search_memories(rs, "校园网 代理", "", 1, count_hits=False)
+    assert r3, r3
+    snap3 = {r["id"]: r["use_count"] for r in brain.search_memories(rs, "", "", 20)}
+    assert snap3[mid] == 2, snap3[mid]
+
+    # ⑥ 对抗：limit=0 / 全通配符 / 不存在 kind —— 不崩且不误计数
+    assert brain.search_memories(rs, "校园网", "", 0) == []
+    brain.search_memories(rs, "%", "", 20)
+    brain.search_memories(rs, "校园网", "不存在的kind", 20)
+    snap4 = {r["id"]: r["use_count"] for r in brain.search_memories(rs, "", "", 20)}
+    assert snap4[mid] >= 2, snap4[mid]
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -903,6 +950,7 @@ def main():
     case("体检验收达成度+记忆保鲜+蒸馏元信息标注", lambda: t_health_acceptance(tmp))
     case("数据完整性（前缀剥离/重复检测/合并需confirm/归属保留/对抗参）", lambda: t_data_integrity(tmp))
     case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
+    case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
