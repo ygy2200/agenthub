@@ -515,6 +515,127 @@ def search_records(root: str, kw: str, limit: int = 30) -> list:
     return rows
 
 
+# ---------------------------------------------------------------- 数据完整性（0.1）
+
+# 与 core.AGENT_PREFIX_RE 同源（多认 dsh）：识别历史平行目录 "deepseek - X" 的前缀
+_AGENT_PREFIX_RE = re.compile(r"^(deepseek|hermes|claude|zcode|dsh|codex)\s*[-–—]\s*", re.IGNORECASE)
+
+
+def strip_agent_prefix(name: str) -> str:
+    """剥掉 "deepseek - X" 里的 agent 前缀，返回真实项目名。
+    大小写不敏感；全半角空格与长短破折号都认（\\s 匹配全角空格）；
+    多重前缀递归剥（"hermes - deepseek - X" → "X"）；非已知 agent 前缀原样返回。"""
+    s = (name or "").strip()
+    while True:
+        m = _AGENT_PREFIX_RE.match(s)
+        if not m:
+            return s
+        s = s[m.end():].strip()
+
+
+def detect_duplicate_projects(root: str) -> list:
+    """只读：找出被拆成多个 agent 前缀目录的同一项目，不改任何数据。
+    首选名规则：无前缀者优先；都带前缀则取记录数最多者。按总量倒序。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT project, COUNT(*) n FROM records WHERE status='active' GROUP BY project")]
+    groups: dict = {}
+    for r in rows:
+        groups.setdefault(strip_agent_prefix(r["project"] or ""), []).append((r["project"], r["n"]))
+    out = []
+    for key, members in groups.items():
+        if len(members) < 2:
+            continue
+        exact = [m for m in members if m[0] == key]
+        canonical = exact[0][0] if exact else max(members, key=lambda x: x[1])[0]
+        out.append({"canonical": canonical,
+                    "members": sorted(m[0] for m in members),
+                    "counts": {m[0]: m[1] for m in members},
+                    "total": sum(m[1] for m in members)})
+    out.sort(key=lambda g: -g["total"])
+    return out
+
+
+def detect_duplicate_records(root: str, min_len: int = 80) -> list:
+    """只读：找出内容逐字相同的记录组。长度 ≤ min_len 的不算（避免空/极短内容误报）。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, project, agent, date, content, substr(content,1,80) AS head FROM records "
+            "WHERE status='active' AND length(content) > ? ORDER BY content, id", (min_len,))]
+    out, cur, cur_key = [], [], None
+
+    def flush():
+        if len(cur) > 1:
+            out.append({"ids": [x["id"] for x in cur],
+                        "projects": sorted({x["project"] for x in cur}),
+                        "agents": sorted({x["agent"] for x in cur}),
+                        "head": cur[0]["head"]})
+
+    for r in rows:
+        if r["content"] != cur_key:
+            flush()
+            cur, cur_key = [], r["content"]
+        cur.append(r)
+    flush()
+    out.sort(key=lambda g: -len(g["ids"]))
+    return out
+
+
+def migration_anchor(root: str) -> dict:
+    """口径分离锚（0.1 第 2 步）：识别一次性迁移存量的时点并登记 meta（records_migrated_at），
+    供体检按「迁移存量 vs AgentHub 时代新增」分口径展示——避免再得出 40:1 那种跨口径假象。
+    依据 created 日期分布：单日占比 ≥50% 判为迁移日（真实库 94% 集中于 2026-09-30；
+    迁移日当天 AgentHub 自己的新增记录也被计入存量，误差极小，属刻意接受的近似）。
+    幂等：meta 已登记则沿用不改。"""
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key='records_migrated_at'").fetchone()
+        total = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        if row and row["value"]:
+            at = row["value"]
+        else:
+            top = conn.execute(
+                "SELECT substr(created,1,10) AS d, COUNT(*) AS n FROM records "
+                "WHERE created!='' GROUP BY d ORDER BY n DESC LIMIT 1").fetchone()
+            if not top or not total or top["n"] * 2 < total:
+                return {"migrated_at": "", "migrated": 0, "era_new": total, "total": total}
+            at = top["d"]
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('records_migrated_at',?)", (at,))
+        migrated = conn.execute(
+            "SELECT COUNT(*) FROM records WHERE substr(created,1,10)=?", (at,)).fetchone()[0]
+    return {"migrated_at": at, "migrated": migrated, "era_new": total - migrated, "total": total}
+
+
+def merge_duplicate_projects(root: str, canonical: str, aliases: list,
+                             confirm: bool = False, agent: str = "") -> str:
+    """把 aliases 项目的记录并入 canonical。**confirm=False 时只预演，绝不改数据**。
+
+    安全约束（对抗用例要求）：
+    - canonical 不得出现在 aliases 里；目标项目必须已存在；空参直接返回
+    - 只 UPDATE records.project 与 memories.project，保留原 agent 字段（归属不丢）
+    - 不删除任何记录；写 journal 落痕；文件系统目录不在本函数处理（走 hub_archive_project，可逆）"""
+    aliases = [a for a in (aliases or []) if a]
+    if not confirm:
+        return (f"[预演] 将把 {len(aliases)} 个目录并入「{canonical}」：{'、'.join(aliases)}；"
+                f"加 confirm=True 才执行")
+    if not canonical or not aliases:
+        return "参数为空，未执行"
+    if canonical in aliases:
+        return "canonical 不能出现在 aliases 里，未执行"
+    with db_conn(root) as conn:
+        if not conn.execute("SELECT 1 FROM records WHERE project=? LIMIT 1", (canonical,)).fetchone():
+            return f"目标项目不存在：{canonical}，未执行"
+        moved = mem_moved = 0
+        for a in aliases:
+            moved += conn.execute("UPDATE records SET project=? WHERE project=?",
+                                  (canonical, a)).rowcount
+            mem_moved += conn.execute("UPDATE memories SET project=? WHERE project=?",
+                                      (canonical, a)).rowcount
+    journal_add(root, agent or "user", "合并重复项目",
+                f"{'、'.join(aliases)} → {canonical}（记录 {moved} 条 / 记忆 {mem_moved} 条）")
+    return (f"已把 {len(aliases)} 个目录并入「{canonical}」：迁移记录 {moved} 条、记忆 {mem_moved} 条"
+            f"（原 agent 字段已保留）")
+
+
 # ---------------------------------------------------------------- 大脑记忆（核心）
 
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",

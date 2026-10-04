@@ -367,6 +367,8 @@ def validate_project_name(name: str) -> str:
     stem = name.split(".")[0].upper()
     if stem in {"CON", "PRN", "AUX", "NUL"} or re.fullmatch(r"COM[1-9]|LPT[1-9]", stem):
         return f"{stem} 是 Windows 保留名，不能用作目录名"
+    if AGENT_PREFIX_RE.match(name):
+        return "项目名不能带 agent 前缀（deepseek - / hermes - / claude - 等），同一项目只允许一份目录"
     if "-" not in name:
         return "命名须为「对象-问题」结构，需包含连字符 -"
     return ""

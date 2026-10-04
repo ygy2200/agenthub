@@ -511,6 +511,30 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"  · #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:50]}")
         return "\n".join(lines)
 
+    if name == "hub_duplicates":
+        try:
+            ml = int(arguments.get("min_len", 80))
+        except (TypeError, ValueError):
+            ml = 80
+        projs = brain.detect_duplicate_projects(root)
+        recs = brain.detect_duplicate_records(root, min_len=max(0, ml))
+        mig = brain.migration_anchor(root)
+        s = brain.stats(root)
+        lines = [f"数据完整性检测（只读）：重复项目目录 {len(projs)} 组 · "
+                 f"逐字重复记录 {len(recs)} 组 · 记录总数 {s['records']}"]
+        if mig.get("migrated_at"):
+            lines.append(f"口径：迁移存量 {mig['migrated']} 条（{mig['migrated_at']} 一次性导入）"
+                         f"· AgentHub 时代新增 {mig['era_new']} 条——跨口径对比无意义")
+        for g in projs[:10]:
+            lines.append(f"  · 「{g['canonical']}」共 {g['total']} 条 ← " +
+                         "、".join(f"{m} {n}条" for m, n in g["counts"].items()))
+        if len(projs) > 10:
+            lines.append(f"  …另有 {len(projs) - 10} 组")
+        lines.append("合并须人工确认：源码层调用 brain.merge_duplicate_projects(root, canonical, "
+                     "aliases, confirm=True)（只改记录/记忆归属，保留 agent 字段，可 hub_undo 追溯）；"
+                     "文件系统目录另行归档（hub_archive_project）")
+        return "\n".join(lines)
+
     if name == "hub_ops_list":
         lines = ["大脑内置检查工具箱（把重复验证固化成一条命令，输出按省 token 设计）："]
         for n, (desc, need_t) in ops.CHECKS.items():
@@ -614,6 +638,10 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_list_todos", "description": "列出工作记录里的待办/承诺线索（后续/待验证/下一步…句式，元认知）",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认20"}}}},
+    {"name": "hub_duplicates",
+     "description": "数据完整性检测（只读）：列出被 agent 前缀拆散的重复项目目录、内容逐字重复的记录组，以及迁移存量口径。不做任何修改",
+     "inputSchema": {"type": "object", "properties": {
+         "min_len": {"type": "integer", "description": "判定重复记录的最短内容长度，默认 80"}}}},
     {"name": "hub_ops_list", "description": "大脑内置检查工具箱清单：把 agent 每次重复做的验证（编译检查/跑回归/部署一致性/git/环境预检）固化成可一键执行的检查项，输出精简省 token",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_ops_run", "description": "执行一项内置检查并返回精简摘要（不返回全量日志）。py_compile/git_status/regression/deploy_diff 必填 target=目录路径；env/brain 无需。regression 会执行 target 下的测试脚本（约1分钟），其余只读",

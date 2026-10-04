@@ -616,6 +616,81 @@ def t_health_acceptance(tmp):
     assert any(m is True for m in by_meta.values()) and any(m is False for m in by_meta.values()), by_meta
 
 
+def t_data_integrity(tmp):
+    """0.1 数据完整性：前缀剥离正确、重复目录/重复记录可检出、合并需 confirm、合并可回滚。"""
+    root = Path(tmp) / "hub_integrity"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+
+    # ① 前缀剥离：大小写 / 全角空格 / 无空格 / 多重前缀
+    assert brain.strip_agent_prefix("deepseek - 网络工具") == "网络工具"
+    assert brain.strip_agent_prefix("DeepSeek - 网络工具") == "网络工具"
+    assert brain.strip_agent_prefix("deepseek　- 网络工具") == "网络工具"   # 全角空格变体
+    assert brain.strip_agent_prefix("deepseek-网络工具") == "网络工具"      # 无空格
+    assert brain.strip_agent_prefix("hermes - deepseek - X") == "X"
+    assert brain.strip_agent_prefix("课表日程App") == "课表日程App"
+    assert brain.strip_agent_prefix("") == ""
+    assert brain.strip_agent_prefix("nottaprefix - X") == "nottaprefix - X"   # 非已知 agent 不剥
+
+    # ② 重复目录检出：同名项目被 agent 前缀拆成两份（每对 content 唯一且 >80 字）
+    for i in range(3):
+        body = f"项目{i}的验证结论与回滚方式" + "细节描述" * 30
+        brain.add_record(rs, "网络工具", "claude", "2026-10-01", f"标题{i}", body)
+        brain.add_record(rs, "deepseek - 网络工具", "deepseek", "2026-10-01", f"标题{i}", body)
+    brain.add_record(rs, "独立项目-唯一", "dsh", "2026-10-01", "独有",
+                     "独立内容不与上述重复" + "细节描述" * 30)
+    groups = brain.detect_duplicate_projects(rs)
+    assert len(groups) == 1, groups
+    g = groups[0]
+    assert g["canonical"] == "网络工具", g          # 无前缀者优先当首选名
+    assert set(g["members"]) == {"网络工具", "deepseek - 网络工具"}, g
+    assert g["total"] == 6, g
+
+    # ③ 重复记录检出（逐字相同 → 3 组）
+    dups = brain.detect_duplicate_records(rs, min_len=80)
+    assert len(dups) == 3, len(dups)
+    assert all(len(d["ids"]) == 2 for d in dups), dups
+
+    # ④ 对抗：短内容不算重复；不同内容不算重复
+    brain.add_record(rs, "独立项目-唯一", "dsh", "2026-10-01", "短", "短")
+    brain.add_record(rs, "独立项目-唯一", "dsh", "2026-10-01", "短", "短")
+    assert len(brain.detect_duplicate_records(rs, min_len=80)) == 3   # 短内容被排除
+
+    # ⑤ 合并必须 confirm —— 不传时零改动（预演）
+    before = brain.stats(rs)["records"]
+    msg = brain.merge_duplicate_projects(rs, "网络工具", ["deepseek - 网络工具"])
+    assert "预演" in msg, msg
+    assert brain.stats(rs)["records"] == before
+    assert brain.list_records(rs, "deepseek - 网络工具"), "预演不得改动任何记录"
+
+    # ⑥ confirm 后才合并；原 agent 字段保留
+    msg2 = brain.merge_duplicate_projects(rs, "网络工具", ["deepseek - 网络工具"],
+                                          confirm=True, agent="dsh")
+    assert "已把" in msg2, msg2
+    assert brain.list_records(rs, "deepseek - 网络工具") == []
+    kept = brain.list_records(rs, "网络工具", limit=100)
+    assert len(kept) == 6, len(kept)
+    assert {r["agent"] for r in kept} == {"claude", "deepseek"}, "原 agent 归属不得丢失"
+
+    # ⑦ 对抗：canonical 出现在 aliases / 目标不存在 / 空参 —— 均不改数据且返回提示
+    n0 = brain.stats(rs)["records"]
+    assert "不能" in brain.merge_duplicate_projects(rs, "网络工具", ["网络工具"], confirm=True)
+    assert "不存在" in brain.merge_duplicate_projects(rs, "根本没有的项目", ["X"], confirm=True)
+    assert brain.merge_duplicate_projects(rs, "", [], confirm=True)
+    assert brain.stats(rs)["records"] == n0
+
+    # ⑧ 合并后重复目录应消失
+    assert brain.detect_duplicate_projects(rs) == []
+
+
+def t_project_name_prefix_guard(tmp):
+    """0.1 顺带修复：validate_project_name 必须拒绝 agent 前缀（此前只校验"含连字符"，形同虚设）。"""
+    assert core.validate_project_name("网络工具-修复") == ""
+    for bad in ("deepseek - 网络工具", "hermes - X-Y", "Claude - A-B", "zcode - P-Q"):
+        assert core.validate_project_name(bad), f"{bad} 应被拒绝但通过了"
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -826,6 +901,8 @@ def main():
     case("写入时踩坑拦截（相似lesson/错误登记/无关不命中/limit）", lambda: t_similar_lessons(tmp))
     case("推送盲区修复（轮换排序/全局联想/拦截落痕）", lambda: t_recall_blindspots(tmp))
     case("体检验收达成度+记忆保鲜+蒸馏元信息标注", lambda: t_health_acceptance(tmp))
+    case("数据完整性（前缀剥离/重复检测/合并需confirm/归属保留/对抗参）", lambda: t_data_integrity(tmp))
+    case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
