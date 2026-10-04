@@ -29,7 +29,7 @@ PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一
 CHECKS = {
     "py_compile": ("编译检查 target 目录全部 .py（ast 语法解析，抓低级语法错），通用任意项目", True),
     "git_status": ("git 工作区是否干净（未提交/未跟踪清单），通用任意仓库", True),
-    "regression": ("跑 AgentHub 五套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report（约1分钟）", True),
+    "regression": ("跑 AgentHub 六套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log（约1分钟）", True),
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
     "brain": ("大脑健康一行摘要（记录/记忆/结晶率/待办/检索累计）", False),
@@ -133,7 +133,8 @@ def _regression(target: Path) -> dict:
     if not (target / "adv_brain.py").is_file():
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 adv_brain.py）", "detail": []}
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py", "adv_report.py"]
+    suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py",
+              "adv_report.py", "adv_auto_log.py"]
     detail, fails, cost = [], [], 0.0
     for s in suites:
         t0 = time.perf_counter()

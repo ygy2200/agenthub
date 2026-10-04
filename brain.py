@@ -449,15 +449,18 @@ def _migrate_columns(root: str) -> None:
 
 # ---------------------------------------------------------------- 工作记录
 
-def add_record(root: str, project: str, agent: str, date: str, title: str, content: str) -> int:
-    """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。"""
+def add_record(root: str, project: str, agent: str, date: str, title: str, content: str,
+               source: str = "hub") -> int:
+    """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。
+    source：hub=人工经 MCP 写入；auto=会话边界 hook 自动捕获（未经蒸馏，2.1）。"""
+    source = source if source in ("hub", "auto") else "hub"
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
-            "INSERT INTO records(project,agent,date,title,content,source,created) VALUES(?,?,?,?,?,'hub',?)",
-            (project, agent, date, title, content, _now()))
+            "INSERT INTO records(project,agent,date,title,content,source,created) VALUES(?,?,?,?,?,?,?)",
+            (project, agent, date, title, content, source, _now()))
         conn.execute("UPDATE projects SET updated=?, status='active' "
                      "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
         return cur.lastrowid
