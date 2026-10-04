@@ -738,6 +738,37 @@ def t_active_recall_count(tmp):
     assert snap4[mid] >= 2, snap4[mid]
 
 
+def t_health_honesty(tmp):
+    """0.5 诚实指标：有用率/读写比/元信息占比可算且与 SQL 一致；空库不崩。"""
+    root = Path(tmp) / "hub_honesty"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    # 空库：分母为 0 不能崩
+    h0 = brain.health_report(rs)
+    assert h0["honest"]["memories_total"] == 0
+    assert h0["honest"]["memory_use_rate"] == 0.0
+    assert h0["honest"]["read_write_ratio"] == 0.0
+    assert h0["honest"]["meta_ratio"] == 0.0
+
+    # 造数：3 条记忆（1 条元信息、1 条被用、1 条没用）+ 2 条记录 + 1 次检索
+    brain.add_record(rs, "测试-诚实", "dsh", "2026-10-03", "标题A", "正文A" * 20)
+    brain.add_record(rs, "测试-诚实", "dsh", "2026-10-03", "标题B", "正文B" * 20)
+    brain.add_memory(rs, "AgentHub 部署铁律：部署目录代码同步不等于生效", kind="lesson", agent="dsh")
+    m_used = brain.add_memory(rs, "校园网GitHub直连不通改用代理", kind="fact", agent="dsh")
+    brain.add_memory(rs, "红色沙漠模组用DMM管理", kind="note", agent="dsh")
+    brain.log_search(rs, "hub_search", "校园网", 1, agent="dsh")
+    brain.search_memories(rs, "校园网 代理")   # 制造一次真实唤起
+
+    h = brain.health_report(rs)["honest"]
+    assert h["memories_total"] == 3, h
+    assert h["memories_used"] == 1, h          # 只有 m_used 被唤起
+    assert h["memory_use_rate"] == round(1 * 100 / 3, 1), h
+    assert h["meta_memories"] == 1, h          # 含 AgentHub 的那条
+    assert h["read_write_ratio"] == 0.5, h     # 1 次检索 / 2 条记录
+    assert h["note"], "必须带口径注记"
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -951,6 +982,7 @@ def main():
     case("数据完整性（前缀剥离/重复检测/合并需confirm/归属保留/对抗参）", lambda: t_data_integrity(tmp))
     case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
+    case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))

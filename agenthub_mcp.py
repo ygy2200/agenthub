@@ -496,6 +496,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             cov = "、".join(f"{k} {v}次" for k, v in h["push_by_agent"].items())
             lines.append(f"- 记忆推送累计 {h.get('recall_push_total', 0)} 次（{cov}）；"
                          f"主动检索分布 {'、'.join(f'{k} {v}次' for k, v in h.get('search_by_agent', {}).items())}")
+        hn = h.get("honest", {})
+        if hn:
+            lines.append(f"- 诚实指标：记忆有用率 {hn['memory_use_rate']}%"
+                         f"（{hn['memories_used']}/{hn['memories_total']} 条被唤起过）"
+                         f"· 元信息占比 {hn['meta_ratio']}%"
+                         f"· 读写比 {hn['read_write_ratio']}:1")
+            lines.append(f"    （口径：{hn['note']}）")
         if h.get("top_pushed"):
             lines.append("- 唤起最多的记忆 top（推送反射弧记数，验收看工作知识占比）：")
             for m in h["top_pushed"][:5]:

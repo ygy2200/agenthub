@@ -1322,6 +1322,30 @@ def health_report(root: str) -> dict:
             "SELECT id, kind, substr(content,1,60) AS content FROM memories WHERE status='active' "
             "AND kind IN ('lesson','fact') AND created < ? "
             "AND (last_hit IS NULL OR last_hit < ?) ORDER BY id LIMIT 5", (cutoff, cutoff)).fetchall()
+        # 诚实指标（0.5）：数据健康度而非能力指标——先诚实，再谈能力（不照抄 LongMemEval/LOCOMO）
+        mem_total = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE status='active'").fetchone()[0]
+        mem_used = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE status='active' AND use_count>0").fetchone()[0]
+        mem_meta = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE status='active' "
+            "AND (content LIKE '%AgentHub%' OR content LIKE '%hub\\_%' ESCAPE '\\' "
+            "     OR content LIKE '%大脑%')").fetchone()[0]
+        rec_total = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+        srch_total = conn.execute(
+            "SELECT COUNT(*) FROM searches WHERE tool!='recall_push'").fetchone()[0]
+        # 读写比分母须同期同口径（0.5 ⚠️）：剔除迁移存量（meta.records_migrated_at 由 0.1 锚定），
+        # 否则 88 条时代新增 vs 全部 1523 条差 17 倍，比率全失真；无锚点时回退全部记录口径
+        rec_era, era_note = rec_total, "全部记录"
+        _mig_at = conn.execute("SELECT value FROM meta WHERE key='records_migrated_at'").fetchone()
+        if _mig_at and _mig_at[0]:
+            migrated_n = conn.execute(
+                "SELECT COUNT(*) FROM records WHERE substr(created,1,10)=?",
+                (_mig_at[0],)).fetchone()[0]
+            rec_era = max(0, rec_total - migrated_n)
+            era_note = f"仅时代新增（剔除 {_mig_at[0]} 迁移存量 {migrated_n} 条）"
+        _since = conn.execute("SELECT value FROM meta WHERE key='active_recall_since'").fetchone()
+        since_txt = _since[0] if _since else "尚无主动检索记录"
     return {"records": s["records"], "memories": s["memories"], "projects": s["projects"],
             "projects_stalled": s.get("projects_stalled", 0), "projects_archived": archived,
             "errors_open": s.get("errors_open", 0),
@@ -1336,6 +1360,16 @@ def health_report(root: str) -> dict:
                            "stalled_used": stalled_used, "pinned_total": pinned_total,
                            "pinned_work": pinned_work},
             "stale_memories": [dict(r) for r in stale_rows],
+            "honest": {
+                "memories_total": mem_total, "memories_used": mem_used,
+                "memory_use_rate": round(mem_used * 100 / max(1, mem_total), 1),
+                "meta_memories": mem_meta,
+                "meta_ratio": round(mem_meta * 100 / max(1, mem_total), 1),
+                "read_write_ratio": round(srch_total / max(1, rec_era), 2),
+                "read_write_records_total": rec_era,
+                "note": (f"use_count 自 {since_txt} 起才同时统计主动检索，此前只含被动推送；"
+                         f"读写比分母口径：{era_note}"),
+            },
             "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
 
 
