@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import datetime
 import json
+import math
 import os
 import re
 import sqlite3
@@ -29,6 +30,18 @@ SESSION_TTL = 1800     # 会话心跳陈旧阈值（秒）
 SESSION_ACTIVE = 300   # 同项目"正在工作"判定窗口（秒）
 STALL_DAYS = 90        # 项目停滞判定：超过该天数无记录即 stalled
 MAX_CONTENT = 128 * 1024
+
+# 记忆衰减（2026-10-04 引入，参数取自 ai-memory decay.rs；改动须过 adv_brain 回归）
+DECAY_PARAMS = {
+    "lam": 0.02,            # 年龄衰减系数 ≈35 天半衰期
+    "sigma": 0.6,           # 访问强化权重
+    "mu": 0.04,             # 距上次访问的衰减系数
+    "salience_default": 1.0,
+    "salience_min": 0.25,
+    "salience_max": 2.0,
+    "cold_threshold": 0.20,
+    "breadth_weight": 0.0,  # 0.0 = 恒等，不改变任何现有排序
+}
 
 
 def db_path(root: str) -> Path:
@@ -89,7 +102,8 @@ CREATE TABLE IF NOT EXISTS memories (
     created TEXT DEFAULT "",
     updated TEXT DEFAULT "",
     use_count INTEGER DEFAULT 0,
-    last_hit TEXT DEFAULT ""
+    last_hit TEXT DEFAULT "",
+    salience REAL DEFAULT 1.0
 );
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -399,6 +413,8 @@ def _migrate_columns(root: str) -> None:
             conn.execute("ALTER TABLE memories ADD COLUMN use_count INTEGER DEFAULT 0")
         if "last_hit" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN last_hit TEXT DEFAULT ''")
+        if "salience" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN salience REAL DEFAULT 1.0")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -785,6 +801,43 @@ def _bump_access(root: str, ids: list, now: str = "") -> None:
         for mid in ids:
             conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
                          (now, mid))
+
+
+def _parse_ts(ts) -> datetime.datetime | None:
+    """宽松解析时间戳：空/None/非法一律返回 None（调用方按"从未发生"处理）。"""
+    if not ts or not isinstance(ts, str):
+        return None
+    try:
+        return datetime.datetime.fromisoformat(ts[:19])
+    except ValueError:
+        return None
+
+
+def retention_score(mem: dict, now: datetime.datetime, actors: int = 1,
+                    params: dict | None = None) -> float:
+    """记忆保留分（纯函数，不碰数据库，便于测试）：越老越低、被访问越多越高。
+
+    retention = salience·exp(−λ·age) + σ·ln(1+use)·exp(−μ·since_access)·breadth
+    breadth 在 breadth_weight=0（默认）时为 1.0，即不影响结果。
+    只用于展示与后续 curator 决策，从不参与检索排序（ai-memory 同款约束）。"""
+    p = params or DECAY_PARAMS
+    created = _parse_ts(mem.get("created"))
+    age_days = max(0.0, (now - created).total_seconds() / 86400) if created else 365.0
+    last = _parse_ts(mem.get("last_hit"))
+    since = max(0.0, (now - last).total_seconds() / 86400) if last else age_days
+    sal = float(mem.get("salience") or p["salience_default"])
+    sal = max(p["salience_min"], min(p["salience_max"], sal))
+    use = max(0, int(mem.get("use_count") or 0))
+    breadth = 1.0 + p["breadth_weight"] * math.log(1 + max(int(actors or 1), 1) - 1)
+    base = sal * math.exp(-p["lam"] * age_days)
+    boost = p["sigma"] * math.log(1 + use) * math.exp(-p["mu"] * since)
+    return max(0.0, base + boost * breadth)
+
+
+def is_cold(mem: dict, now: datetime.datetime, params: dict | None = None) -> bool:
+    """冷记忆判定：保留分低于阈值。第一阶段只用于展示，不触发任何自动动作。"""
+    p = params or DECAY_PARAMS
+    return retention_score(mem, now, params=p) < p["cold_threshold"]
 
 
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
@@ -1346,6 +1399,15 @@ def health_report(root: str) -> dict:
             era_note = f"仅时代新增（剔除 {_mig_at[0]} 迁移存量 {migrated_n} 条）"
         _since = conn.execute("SELECT value FROM meta WHERE key='active_recall_since'").fetchone()
         since_txt = _since[0] if _since else "尚无主动检索记录"
+        # 冷记忆可见化（0.3）：衰减分最低在前，只展示不动作——衰减从不参与检索排序
+        now_dt = datetime.datetime.now()
+        cold_rows = [dict(r) for r in conn.execute(
+            "SELECT id, kind, substr(content,1,60) AS content, created, use_count, last_hit, salience "
+            "FROM memories WHERE status='active' AND pinned=0 ORDER BY id LIMIT 500")]
+        cold = [r for r in cold_rows if is_cold(r, now_dt)]
+        for r in cold:
+            r["retention"] = round(retention_score(r, now_dt), 4)
+        cold.sort(key=lambda r: r["retention"])
     return {"records": s["records"], "memories": s["memories"], "projects": s["projects"],
             "projects_stalled": s.get("projects_stalled", 0), "projects_archived": archived,
             "errors_open": s.get("errors_open", 0),
@@ -1360,6 +1422,7 @@ def health_report(root: str) -> dict:
                            "stalled_used": stalled_used, "pinned_total": pinned_total,
                            "pinned_work": pinned_work},
             "stale_memories": [dict(r) for r in stale_rows],
+            "cold_memories": cold[:10], "cold_count": len(cold),
             "honest": {
                 "memories_total": mem_total, "memories_used": mem_used,
                 "memory_use_rate": round(mem_used * 100 / max(1, mem_total), 1),

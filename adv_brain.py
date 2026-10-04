@@ -769,6 +769,70 @@ def t_health_honesty(tmp):
     assert h["note"], "必须带口径注记"
 
 
+def t_retention_decay(tmp):
+    """0.3 衰减：越老越低、访问越多越高、breadth_weight=0 时与无 breadth 项等价、参数可调。"""
+    import datetime as _dt
+
+    now = _dt.datetime(2026, 10, 3, 12, 0, 0)
+
+    def mem(created_days_ago, use=0, last_hit_days_ago=None, salience=1.0):
+        c = (now - _dt.timedelta(days=created_days_ago)).isoformat(timespec="seconds")
+        lh = "" if last_hit_days_ago is None else \
+            (now - _dt.timedelta(days=last_hit_days_ago)).isoformat(timespec="seconds")
+        return {"id": 1, "created": c, "use_count": use, "last_hit": lh,
+                "salience": salience, "pinned": 0, "status": "active"}
+
+    p = brain.DECAY_PARAMS
+    # ① 越老越低（其余相同）
+    fresh = brain.retention_score(mem(1), now)
+    old = brain.retention_score(mem(100), now)
+    assert fresh > old, (fresh, old)
+
+    # ② 同样老，访问多的分更高
+    few = brain.retention_score(mem(30, use=0, last_hit_days_ago=30), now)
+    many = brain.retention_score(mem(30, use=20, last_hit_days_ago=1), now)
+    assert many > few, (many, few)
+
+    # ③ 手动算一遍 35 天半衰期，验证公式没写错
+    import math
+    expect = 1.0 * math.exp(-p["lam"] * 0)
+    assert abs(brain.retention_score(mem(0), now) - expect) < 1e-9
+
+    # ④ breadth_weight=0（默认）时，actor 数不影响分数
+    a = brain.retention_score(mem(10, use=3, last_hit_days_ago=2), now, actors=1)
+    b = brain.retention_score(mem(10, use=3, last_hit_days_ago=2), now, actors=9)
+    assert a == b, (a, b)
+
+    # ⑤ 对抗：last_hit 空/None/未来时间/非法串 —— 不崩
+    for bad in ("", None, (now + _dt.timedelta(days=5)).isoformat(timespec="seconds"), "不是日期"):
+        s = brain.retention_score(mem(10, use=1, last_hit_days_ago=None) | {"last_hit": bad}, now)
+        assert isinstance(s, float) and s >= 0.0, (bad, s)
+
+    # ⑥ 对抗：use_count 负数、salience 越界 —— clamp 后不崩
+    assert brain.retention_score(mem(10, use=-5), now) >= 0.0
+    hi = brain.retention_score(mem(10, salience=99.0), now)
+    lo = brain.retention_score(mem(10, salience=0.0), now)
+    assert hi <= 1.0 * p["salience_max"], hi
+    assert lo >= 0.0, lo
+
+    # ⑦ 冷记忆判定
+    assert brain.is_cold(mem(400), now) is True
+    assert brain.is_cold(mem(0, use=50, last_hit_days_ago=0), now) is False
+
+    # ⑧ 真库联动：salience 列存在且默认 1.0，health_report 带冷记忆清单
+    root = Path(tmp) / "hub_decay"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    brain.add_memory(rs, "衰减测试用的老记忆", kind="note", agent="X")
+    with brain.db_conn(rs) as conn:
+        old_ts = (_dt.datetime.now() - _dt.timedelta(days=400)).isoformat(timespec="seconds")
+        conn.execute("UPDATE memories SET created=? WHERE kind='note'", (old_ts,))
+    h = brain.health_report(rs)
+    assert h["cold_count"] >= 1, h.get("cold_count")
+    assert h["cold_memories"] and h["cold_memories"][0]["retention"] < brain.DECAY_PARAMS["cold_threshold"]
+
+
 def t_bad_params(tmp):
     """对抗性参数：注入/畸形值不崩、不越权。"""
     root = str(Path(tmp) / "hub")
@@ -983,6 +1047,7 @@ def main():
     case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
+    case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
