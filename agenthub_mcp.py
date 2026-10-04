@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.10.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.11.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 

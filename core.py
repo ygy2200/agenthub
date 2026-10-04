@@ -733,7 +733,9 @@ BOOTSTRAP_ONLY = [
 BOOTSTRAP_TARGETS = [{"agent": t["agent"], "path": t["boot"]} for t in MCP_TARGETS] + BOOTSTRAP_ONLY
 
 MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
-SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py")
+# report.py（1.3 hub_report 依赖）与 ops.py（检查工具箱）必须随部署同步——
+# 缺了就是部署版 ImportError / 检查项不存在（03 已知空白①根修：ops.py 此前不在名单）
+SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py")
 
 
 def find_python() -> str:

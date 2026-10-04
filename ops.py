@@ -21,7 +21,7 @@ import time
 from pathlib import Path
 
 DEPLOY_DIR = Path.home() / ".agenthub" / "mcp_server"
-DEPLOY_FILES = ["ui.py", "core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py"]
+DEPLOY_FILES = ["ui.py", "core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py"]
 PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一致
 
 # name -> (一句话说明, 是否需要 target 目录)
