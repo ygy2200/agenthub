@@ -864,6 +864,14 @@ def t_salience_feedback(tmp):
     # not_helpful 降档不破地板
     brain.set_memory_feedback(rs, mid, "not_helpful")
     assert sal() == p["salience_min"], sal()
+    # archive 归档（1.2 原记忆处理通道）：状态 archived 不硬删，检索不可见
+    assert "已归档" in brain.set_memory_feedback(rs, mid, "archive")
+    with brain.db_conn(rs) as conn:
+        st = conn.execute("SELECT status FROM memories WHERE id=?", (mid,)).fetchone()[0]
+    assert st == "archived", st
+    assert all(r["id"] != mid for r in brain.search_memories(rs, "", "", 20, count_hits=False))
+    assert "已归档" in brain.set_memory_feedback(rs, mid, "archive"), "重复归档应幂等返回提示"
+    assert "反馈值非法" in brain.set_memory_feedback(rs, mid, "ARCHIVE2"), "相近非法值必须拒绝"
 
 
 def t_progressive_disclosure(tmp):

@@ -165,10 +165,24 @@ def main():
     wd3 = ops.wakeups(str(tmp), "仓库项目-收尾建议")
     check("wakeups 新欠账再提", "欠账测试词乙" in wd3, str(wd3)[:120])
 
+    # ---- 冷记忆压缩候选（1.2）：规则抽事实出建议清单，不落库
+    brain.init_db(str(tmp))
+    brain.add_memory(str(tmp), "部署目录在 C:\\Users\\y\\.agenthub\\mcp_server，同步后必须 deploy_diff 复核",
+                     kind="project", agent="X")
+    brain.add_memory(str(tmp), "曾有 FileNotFoundError：修法是把路径 os.path.expanduser 展开后再用",
+                     kind="project", agent="X")
+    brain.add_memory(str(tmp), "日常闲聊记忆，没有任何可抽取的持久事实", kind="note", agent="X")
+    cr = ops.run_check("compress", "", str(tmp))
+    check("compress 抽出路径事实", "mcp_server" in str(cr["detail"]), str(cr)[:200])
+    check("compress 抽出错误事实", "FileNotFoundError" in str(cr["detail"]), str(cr)[:200])
+    check("compress 不抽 note 类", "日常闲聊" not in str(cr["detail"]), str(cr)[:200])
+    cr2 = ops.run_check("compress", "", str(tmp))
+    check("compress 幂等只读（建议清单不消耗）", str(cr) == str(cr2), "")
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
-    check("检查项共 9 个", len(ops.CHECKS) == 9, str(list(ops.CHECKS)))
+    check("检查项共 10 个", len(ops.CHECKS) == 10, str(list(ops.CHECKS)))
 
     print()
     if FAILED:

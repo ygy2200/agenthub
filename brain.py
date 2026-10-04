@@ -847,14 +847,16 @@ SALIENCE_STEP = 0.25
 _FEEDBACK_UP = {"helpful"}
 _FEEDBACK_DOWN = {"not_helpful"}
 _FEEDBACK_FLOOR = {"stale", "wrong"}
+_FEEDBACK_ARCHIVE = {"archive"}
 
 
 def set_memory_feedback(root: str, mid: int, feedback: str) -> str:
-    """按反馈调节 salience：helpful 升档、not_helpful 降档、stale/wrong 直落地板。
+    """按反馈调节记忆：helpful 升档 / not_helpful 降档 / stale·wrong 直落地板（salience）；
+    archive = 归档（status='archived'，不硬删——1.2 压缩沉淀后处理原记忆用）。
     非法枚举或坏 id 一律返回错误串，不改动任何数据（对抗用例要求）。"""
     fb = (feedback or "").strip().lower() if isinstance(feedback, str) else ""
-    if fb not in _FEEDBACK_UP | _FEEDBACK_DOWN | _FEEDBACK_FLOOR:
-        return f"反馈值非法：{feedback!r}（可选 helpful/not_helpful/stale/wrong）"
+    if fb not in _FEEDBACK_UP | _FEEDBACK_DOWN | _FEEDBACK_FLOOR | _FEEDBACK_ARCHIVE:
+        return (f"反馈值非法：{feedback!r}（可选 helpful/not_helpful/stale/wrong/archive）")
     if not isinstance(mid, int) or mid <= 0:
         return f"记忆 id 非法：{mid!r}"
     p = DECAY_PARAMS
@@ -863,6 +865,10 @@ def set_memory_feedback(root: str, mid: int, feedback: str) -> str:
                            (mid,)).fetchone()
         if not row:
             return f"记忆不存在或已归档：#{mid}"
+        if fb in _FEEDBACK_ARCHIVE:
+            conn.execute("UPDATE memories SET status='archived', updated=? WHERE id=?",
+                         (_now(), mid))
+            return f"记忆 #{mid} 已归档（status=archived，不硬删；恢复=置回 active）"
         cur = float(row["salience"] if row["salience"] is not None else p["salience_default"])
         if fb in _FEEDBACK_FLOOR:
             new = p["salience_min"]
