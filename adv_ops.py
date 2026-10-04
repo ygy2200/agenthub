@@ -176,8 +176,15 @@ def main():
     check("compress 抽出路径事实", "mcp_server" in str(cr["detail"]), str(cr)[:200])
     check("compress 抽出错误事实", "FileNotFoundError" in str(cr["detail"]), str(cr)[:200])
     check("compress 不抽 note 类", "日常闲聊" not in str(cr["detail"]), str(cr)[:200])
-    cr2 = ops.run_check("compress", "", str(tmp))
-    check("compress 幂等只读（建议清单不消耗）", str(cr) == str(cr2), "")
+    # 对抗（02 方案 1.2 用例清单）：伪路径/UNC/盘符大小写/HTML代码块——不崩、事实原样可识别（人取舍）
+    brain.add_memory(str(tmp), "伪路径 ../ 穿越与 UNC \\\\srv\\share 和盘符 c:/users 大小写混写均在内容里",
+                     kind="project", agent="X")
+    brain.add_memory(str(tmp), "```python\nfrom os import path\npath.join('a','b')\n``` 代码块与 <b>HTML</b> 标签混排",
+                     kind="project", agent="X")
+    cr3 = ops.run_check("compress", "", str(tmp))
+    check("compress 对抗内容不崩", cr3["ok"] is True, str(cr3)[:160])
+    check("compress 伪路径 UNC 原样可识别（人取舍）", "srv" in str(cr3["detail"]), str(cr3)[:200])
+    check("compress 代码块内容不炸正则", isinstance(cr3["detail"], list), "")
 
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():

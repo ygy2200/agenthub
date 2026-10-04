@@ -55,7 +55,7 @@ def t_empty_hub(tmp):
 
 
 def t_xss_escape(tmp):
-    """对抗注入：项目名/记忆/错误登记/待办内容带 HTML 与事件属性 → 全部转义。"""
+    """对抗注入：进展示字段的恶意内容（项目名/被唤起记忆）必须转义为实体。"""
     root = Path(tmp) / "hub_xss"
     root.mkdir()
     rs = str(root)
@@ -63,13 +63,17 @@ def t_xss_escape(tmp):
     evil = "<script>alert(1)</script>"
     brain.add_record(rs, f"注入-{evil}", "zcode", "2026-10-04", f"<img src=x onerror={evil}>",
                      f"正文含 {evil} 与 \"引号\" 和 & 符号 " + "内容" * 60)
-    brain.add_memory(rs, f"记忆 {evil}", kind="lesson", agent="zcode", pinned=True)
+    mid = brain.add_memory(rs, f"记忆 {evil} <img src=x onerror=alert(2)>", kind="lesson",
+                           agent="zcode", pinned=True)
     brain.error_add(rs, "zcode", f"错误标题 {evil}", f"细节 {evil}", project=f"注入-{evil}")
     brain.log_search(rs, "hub_search", f"<b>{evil}", 1, agent="zcode")
+    brain.search_memories(rs, "记忆", "", 5, count_hits=True)   # 唤起 → top_pushed 展示该记忆
     doc = _read(report.generate_report(rs))
-    assert "<script>alert" not in doc, "script 标签未被转义！"
-    assert "onerror" not in doc.replace("&quot;", "").lower() or "onerror" not in doc.lower(), "事件属性泄漏"
-    assert "&lt;script&gt;" in doc, "应出现转义后的实体"
+    # 关键断言：恶意内容不得以标签形态出现（文本节点里的转义实体才合法）
+    assert "<script" not in doc.lower(), "script 标签未被转义！"
+    assert "<img" not in doc.lower(), "img 标签未被转义！"
+    assert "&lt;script&gt;" in doc, "项目名应出现转义后的实体"
+    assert "&lt;img" in doc, "被唤起记忆应出现转义后的实体"
     _Validator().feed(doc)
 
 

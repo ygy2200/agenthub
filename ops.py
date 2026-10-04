@@ -13,6 +13,7 @@ import ast
 import datetime
 import hashlib
 import os
+import re
 import shutil
 import socket
 import subprocess
@@ -260,7 +261,7 @@ def _dup_mem(root: str) -> dict:
 
 # 冷记忆压缩的事实抽取（1.2，先做窄）：四类窄正则，只抽明确可沉淀的持久事实
 _FACT_PATTERNS = [
-    ("路径", r"[A-Za-z]:\\[^\s\"'，。）)\]]{3,60}|(?:/[A-Za-z0-9_.\-]+){2,}"),
+    ("路径", r"[A-Za-z]:\\[^\s\"'，。）)\]]{3,60}|(?:/[A-Za-z0-9_.\-]+){2,}|\\\\[\w.\-]+\\[\w.\-]+"),
     ("错误", r"\b\w+(?:Error|Exception)\b|0x[0-9a-fA-F]{4,}"),
     ("命令", r"(?:python|git|pip|ffmpeg|npx|npm)\s+[\w\-][^\s；;]{1,50}"),
     ("决策", r"[^。；\n]{0,30}(?:改为|决定|弃用|作废|切换到|已迁移|不再使用)[^。；\n]{0,40}"),
@@ -275,9 +276,8 @@ def _compress(root: str) -> dict:
     if err := _need_root(root):
         return err
     try:
-        import re
         brain = _import_brain()
-        now = _dt_now()
+        now = datetime.datetime.now()
         pats = [(tag, re.compile(rx)) for tag, rx in _FACT_PATTERNS]
         with brain.db_conn(root) as conn:
             rows = [dict(r) for r in conn.execute(
@@ -309,11 +309,6 @@ def _compress(root: str) -> dict:
     return {"ok": True,
             "summary": f"{len(cands)} 条压缩候选（建议清单，不落库）：确认后沉淀为新事实并归档原记忆",
             "detail": detail}
-
-
-def _dt_now():
-    import datetime
-    return datetime.datetime.now()
 
 
 def _brain(root: str) -> dict:
