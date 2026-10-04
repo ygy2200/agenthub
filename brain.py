@@ -196,16 +196,19 @@ def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, recor
 
 
 def ensure_schema(root: str) -> str:
-    """仅建表（毫秒级，不跑文件迁移）：MCP server 启动/根目录切换时调用。
-    防"代码已部署但真实库缺新表"——v2.5.2 的 distill_seen 上轮只在测试库验证过，
-    真实库无任何新进程跑过 init_db，hub_distill 直接 no such table（2026-10-02 实锤）。
-    幂等，返回错误或 ""。根目录不存在时报错（与 init_db 一致，不凭空建目录）。"""
+    """仅建表 + 增量补列（毫秒级，不跑文件迁移）：MCP server 启动/根目录切换时调用。
+    防"代码已部署但真实库缺新表/新列"——v2.5.2 的 distill_seen 上轮只在测试库验证过，
+    真实库无任何新进程跑过 init_db，hub_distill 直接 no such table（2026-10-02 实锤）；
+    v2.10.0 的 salience 列再实锤一次（serve 只建表不补列，部署版反馈通道直接
+    no such column，2026-10-04 协议级实测抓到）。补列/回填均幂等且毫秒级。
+    返回错误或 ""。根目录不存在时报错（与 init_db 一致，不凭空建目录）。"""
     if not root or not os.path.isdir(root):
         return "根目录不存在"
     try:
         db_path(root).parent.mkdir(parents=True, exist_ok=True)
         with db_conn(root) as conn:
             conn.executescript(SCHEMA)
+        _migrate_columns(root)
         return ""
     except sqlite3.Error as e:
         return f"大脑 schema 初始化失败：{e}"

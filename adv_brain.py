@@ -1048,6 +1048,14 @@ def t_ensure_schema(tmp):
             "SELECT COUNT(*) FROM memories WHERE content LIKE 'schema自愈%'").fetchone()[0] == 1
     err2 = brain.ensure_schema(root)  # 幂等重跑
     assert err2 == ""
+    # 缺列自愈（v2.10.0 实锤：serve 只建表不补列，部署版 salience 直接 no such column）
+    with brain.db_conn(root) as conn:
+        conn.execute("ALTER TABLE memories DROP COLUMN salience")
+        assert "salience" not in {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+    err3 = brain.ensure_schema(root)
+    assert err3 == "", err3
+    with brain.db_conn(root) as conn:
+        assert "salience" in {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
     assert brain.ensure_schema(str(Path(tmp) / "不存在_目录xyz")) != ""  # 拒绝而非凭空建目录
 
 
