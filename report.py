@@ -33,7 +33,8 @@ def _esc(s) -> str:
 
 def _collect(root: str) -> dict:
     h = brain.health_report(root)
-    d = {"h": h, "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M")}
+    d = {"h": h, "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
+         "profile": brain.user_profile(root)}
     with brain.db_conn(root) as conn:
         d["proj_top"] = [dict(r) for r in conn.execute(
             "SELECT project, COUNT(*) n, COUNT(DISTINCT date) days, MIN(date) d1, MAX(date) d2 "
@@ -96,7 +97,8 @@ def _bar_chart(monthly: list) -> str:
         x = 10 + i * (bw + gap)
         parts.append(f"<rect x='{x}' y='{hmax + 10 - bh}' width='{bw}' height='{bh}' rx='3' class='bar'/>")
         parts.append(f"<text x='{x + bw // 2}' y='{hmax + 6 - bh}' text-anchor='middle' class='v'>{r['n']}</text>")
-        parts.append(f"<text x='{x + bw // 2}' y='{hmax + 28}' text-anchor='middle' class='m'>{_esc(r['m'][2:])}</text>")
+        parts.append(f"<text x='{x + bw // 2}' y='{hmax + 28}' text-anchor='middle' class='m'>"
+                     f"{_esc(r.get('label') or r['m'][2:])}</text>")
     parts.append("</svg>")
     return "".join(parts)
 
@@ -236,11 +238,32 @@ def _sec_horizon(d) -> str:
                    "记忆保鲜清单里的条目确认仍有效或更新后即可移出。</p>")
 
 
+def _sec_profile(d) -> str:
+    """3.3 用户建模：你是怎么工作的——全部实测统计+记忆原文引用（零 LLM，无推断结论）。"""
+    p = d["profile"]
+    bars = _bar_chart([{"m": k, "label": k.split("(")[0], "n": v}
+                       for k, v in p["time_bands"].items()])
+    ag = "、".join(f"{_esc(k)} {v}" for k, v in p["agents"].items())
+    stack = "、".join(f"<code>{_esc(w)}</code>×{n}" for w, n in p["stack"]) or "（暂无命中）"
+    lis = "".join(
+        f"<li>#{m['id']}（唤起 {_esc(m['use_count'])} 次）{_esc(m['content'][:70])}</li>"
+        for m in p["lessons"]) or "<li>（还没有 lesson 类记忆）</li>"
+    pref = (f"<p class='warn'>⚠ preference 类记忆 {p['preference_n']} 条——用户偏好仍埋在 lesson/记录里，"
+            f"蒸馏时把「用户怎么工作」的结论沉淀为 preference 类。</p>"
+            if p["preference_n"] == 0 else
+            f"<p class='muted'>preference 类记忆 {p['preference_n']} 条。</p>")
+    return (f"<p>活跃时段（样本=操作流水 {p['time_sample']} 条，v2 起才有）：批量任务宜避开活跃高峰。</p>"
+            f"{bars}<p>记录分工（{p['records']} 条）：{ag}</p>"
+            f"<h3>技术栈词频 top（记录正文实际出现，非声明清单）</h3><p>{stack}</p>"
+            f"<h3>用户纠正史 top（lesson 记忆按唤起排——同样的错不犯第二遍）</h3><ul>{lis}</ul>{pref}")
+
+
 # 章节注册表：顺序即报告顺序；增删章节改这里（模板可定制的落点）
 SECTIONS = [
     ("你在做什么", _sec_doing),
     ("你的时间花在哪类活上", _sec_time),
     ("你怎么用 agent", _sec_agents),
+    ("你是怎么工作的（画像）", _sec_profile),
     ("你做对了什么", _sec_wins),
     ("哪里出了问题", _sec_friction),
     ("值得一试的能力", _sec_try),

@@ -959,6 +959,54 @@ def t_decision_fields(tmp):
     assert any(h.get("id") == rid for h in hits2), hits2
 
 
+def t_user_profile(tmp):
+    """3.3 用户画像：空库不崩全零/时段聚合正确/畸形hh不计入/技术栈词频/单日项目口径/
+    lessons按唤起排/agents分工/只读不写库。"""
+    root = Path(tmp) / "hub_profile"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    # ① 空库不崩：全零且除法不炸
+    p = brain.user_profile(rs)
+    assert p["records"] == 0 and p["time_sample"] == 0 and p["oneday_pct"] == 0
+    assert p["stack"] == [] and p["lessons"] == [] and p["preference_n"] == 0
+    assert sum(p["time_bands"].values()) == 0
+    # ② 造数据：3 项目（甲/乙多日 + 丙单日）→ oneday_pct=33.3
+    brain.add_record(rs, "甲-项目", "zcode", "2026-10-01", "t1", "用 python 和 flask 干活")
+    brain.add_record(rs, "甲-项目", "zcode", "2026-10-02", "t2", "继续 python-docx")
+    brain.add_record(rs, "乙-项目", "dsh", "2026-10-03", "t3", "FFmpeg 转码与 MATLAB 仿真")
+    brain.add_record(rs, "乙-项目", "dsh", "2026-10-04", "t3b", "乙的后续事项")
+    brain.add_record(rs, "丙-单日", "dsh", "2026-10-04", "t4", "一天的事")
+    brain.add_memory(rs, "纠正一：先实测再动手", "lesson", "", agent="zcode")
+    brain.add_memory(rs, "纠正二", "lesson", "", agent="zcode")
+    # journal：09×2、15×1、23×3、畸形 hh×1（不计入样本）
+    with brain.db_conn(rs) as conn:
+        for ts in ["2026-10-05T09:00:00", "2026-10-05T09:30:00", "2026-10-05T15:00:00",
+                   "2026-10-05T23:00:00", "2026-10-05T23:10:00", "2026-10-05T23:59:59",
+                   "2026-10-05Txy:00:00"]:
+            conn.execute("INSERT INTO journal(ts,agent,action) VALUES(?,?,?)", (ts, "t", "测试"))
+        conn.execute("UPDATE memories SET use_count=2 WHERE id=1")  # 纠正一唤起更高
+    p = brain.user_profile(rs)
+    assert p["records"] == 5 and p["time_sample"] == 6, (p["records"], p["time_sample"])
+    tb = p["time_bands"]
+    assert tb["上午(6-12)"] == 2 and tb["下午(12-18)"] == 1 and tb["晚间(18-24)"] == 3, tb
+    assert p["oneday_pct"] == 33.3, p["oneday_pct"]
+    words = dict(p["stack"])
+    assert words.get("python") == 2 and words.get("flask") == 1, words  # python 含 python-docx 子串命中
+    assert words.get("python-docx") == 1 and words.get("ffmpeg") == 1 and words.get("matlab") == 1
+    assert p["agents"] == {"zcode": 2, "dsh": 3}, p["agents"]
+    assert p["lessons"][0]["content"].startswith("纠正一"), p["lessons"][0]
+    # ③ 只读：前后 records/journal 条数不变
+    with brain.db_conn(rs) as conn:
+        before = (conn.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+                  conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0])
+    brain.user_profile(rs)
+    with brain.db_conn(rs) as conn:
+        after = (conn.execute("SELECT COUNT(*) FROM records").fetchone()[0],
+                 conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0])
+    assert before == after
+
+
 def t_handoff(tmp):
     """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
     （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
@@ -1249,6 +1297,7 @@ def main():
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
     case("渐进披露三级（full缺省/abstract200字/outline骨架/无结构退化/对抗参）", lambda: t_progressive_disclosure(tmp))
     case("决策记录AgDR（全空不加段/半缺/多行缩进/畸形类型/outline必含决策段头/搜索命中/老记录零影响）", lambda: t_decision_fields(tmp))
+    case("用户画像3.3（空库不崩/时段聚合/畸形hh/技术栈词频/单日口径/唤起排序/只读）", lambda: t_user_profile(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))

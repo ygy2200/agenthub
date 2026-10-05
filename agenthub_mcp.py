@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.15.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.16.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -538,6 +538,26 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"  · #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:50]}")
         return "\n".join(lines)
 
+    if name == "hub_user_profile":
+        p = brain.user_profile(root)
+        tb, total = p["time_bands"], max(1, p["time_sample"])
+        lines = ["用户画像（零 LLM 实测统计+记忆原文引用，无推断结论）：",
+                 f"- 活跃时段（样本=操作流水 {p['time_sample']} 条）："
+                 + "、".join(f"{k}{v}({v * 100 // total}%)" for k, v in tb.items() if v),
+                 f"- 记录分工（共 {p['records']} 条）："
+                 + "、".join(f"{k} {v}" for k, v in p["agents"].items())
+                 + f"；单日项目占比 {p['oneday_pct']}%"]
+        if p["stack"]:
+            lines.append("- 技术栈词频 top：" + "、".join(f"{w}×{n}" for w, n in p["stack"]))
+        if p["lessons"]:
+            lines.append("- 用户纠正史 top（lesson 记忆按唤起排，开工对齐避免重蹈）：")
+            for m in p["lessons"][:6]:
+                lines.append(f"  · #{m['id']}（{m['use_count']}次）{m['content'][:64]}")
+        if p["preference_n"] == 0:
+            lines.append("⚠ preference 类记忆 0 条——用户偏好仍埋在 lesson/记录里，"
+                         "蒸馏时把「用户怎么工作」的结论沉淀为 preference 类")
+        return "\n".join(lines)
+
     if name == "hub_duplicates":
         try:
             ml = int(arguments.get("min_len", 80))
@@ -792,6 +812,8 @@ TOOLS = [
                                     "target": {"type": "string", "description": "目标目录绝对路径（按检查项要求）"}},
                      "required": ["name"]}},
     {"name": "hub_health", "description": "大脑体检报告：规模/结晶率/待办线索/疑似重复记忆/检索活跃度+建议",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_user_profile", "description": "用户画像：活跃时段/记录分工/技术栈词频/用户纠正史 top——判断用户偏好与习惯时先查（零 LLM 实测统计）",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_todo_done", "description": "勾销待办线索（处理完的欠账销账，闭环）——传 hub_list_todos 行里的待办串",
      "inputSchema": {"type": "object",

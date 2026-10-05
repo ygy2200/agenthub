@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.15.0"
+    assert r["serverInfo"]["version"] == "2.16.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -71,8 +71,8 @@ def t_protocol(root):
             "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
             "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report",
-            "hub_handoff", "hub_status"} <= names, names
-    assert len(names) == 31
+            "hub_handoff", "hub_status", "hub_user_profile"} <= names, names
+    assert len(names) == 32
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -631,6 +631,33 @@ def t_distill_mark(tmp):
     assert "验证蒸馏展示标记" not in out2, f"已展示候选被重复推送：{out2}"
 
 
+def t_profile_tool(tmp):
+    """hub_user_profile 用户画像（3.3）：空库不崩+preference=0 警告/正常库关键行/对抗脏参不炸。"""
+    root = fresh_hub(tmp, "profile")
+    root_s = str(root)
+    # ① 空库：不崩、标题在、preference=0 行动提示在
+    out = m.call_tool("hub_user_profile", {}, root_s)
+    assert "用户画像" in out and "preference 类记忆 0 条" in out, out
+    # ② 正常库：写记录+lesson 后关键行出现
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "用 python 和 flask 干活"}, root_s)
+    m.call_tool("hub_memory_write", {"content": "纠正：先实测再动手", "kind": "lesson",
+                                     "agent": "zcode"}, root_s)
+    out = m.call_tool("hub_user_profile", {}, root_s)
+    assert "活跃时段" in out and "记录分工" in out and "zcode" in out, out
+    assert "技术栈词频" in out and "python×" in out, out
+    assert "纠正史" in out and "先实测再动手" in out, out
+    # ③ preference 警告的语义：lesson 不消除它（教训≠偏好），写入 preference 才消除
+    assert "preference 类记忆 0 条" in out, out
+    m.call_tool("hub_memory_write", {"content": "偏好：先给方案再动手", "kind": "preference",
+                                     "agent": "zcode"}, root_s)
+    out = m.call_tool("hub_user_profile", {}, root_s)
+    assert "preference 类记忆 0 条" not in out, out
+    # ④ 对抗脏参（schema 无参数）：忽略不炸
+    out2 = m.call_tool("hub_user_profile", {"hack": "'; DROP TABLE records;--"}, root_s)
+    assert "用户画像" in out2, out2
+
+
 def t_status_tool(tmp):
     """hub_status 连续性层（3.1）：五问快照——正常/空库/脏数据/限条数/只读性/畸形参数。"""
     root = fresh_hub(tmp, "status")
@@ -761,7 +788,7 @@ def main():
     build_hub(root)
     print(f"临时目录：{tmp}\n")
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
-    case("MCP协议（握手/30工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/32工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
@@ -782,6 +809,7 @@ def main():
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))
     case("一键接入（两种布局/备份/移除/坏json/幂等）", lambda: t_mcp_access(tmp))
+    case("用户画像工具（空库/preference警告/正常库关键行/脏参）", lambda: t_profile_tool(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

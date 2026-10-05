@@ -1684,6 +1684,62 @@ def env_list(root: str, category: str = "", kw: str = "", limit: int = 200) -> l
         return [dict(r) for r in conn.execute(q, args)]
 
 
+# 用户画像技术栈词表（依据 AGENTS.md 技术栈速查；长词在前防子串重复计数）
+_STACK_WORDS = ["python-docx", "python-pptx", "pyinstaller", "qfluentwidgets", "pyside6",
+                "matplotlib", "flask", "ffmpeg", "matlab", "python", "sqlite",
+                "powershell", "git", "everything"]
+
+
+def user_profile(root: str) -> dict:
+    """用户画像（3.3 用户建模，零 LLM）：只做实测统计与记忆原文引用，不生成推断结论。
+
+    口径随行注记——时段样本=journal 操作流水（v2 起才有）；技术栈=记录正文词频出现；
+    单日项目口径与 report._sec_time 一致。preference 计数单列：为 0 时如实提示
+    「偏好未结构化」，这是蒸馏的行动信号而非错误。
+    """
+    with db_conn(root) as conn:
+        kinds = dict(conn.execute(
+            "SELECT kind, COUNT(*) FROM memories WHERE status='active' GROUP BY kind"))
+        hours = conn.execute(
+            "SELECT substr(ts,12,2) hh, COUNT(*) n FROM journal "
+            "WHERE ts GLOB '????-??-??T*' GROUP BY hh").fetchall()
+        agents = {r[0] or "其他": r[1] for r in conn.execute(
+            "SELECT agent, COUNT(*) n FROM records WHERE status='active' "
+            "GROUP BY agent ORDER BY n DESC LIMIT 8")}
+        n_records = conn.execute(
+            "SELECT COUNT(*) FROM records WHERE status='active'").fetchone()[0]
+        n_projects = conn.execute(
+            "SELECT COUNT(DISTINCT project) FROM records WHERE status='active'").fetchone()[0]
+        oneday = conn.execute(
+            "SELECT COUNT(*) FROM (SELECT project FROM records WHERE status='active' "
+            "GROUP BY project HAVING COUNT(DISTINCT date)=1)").fetchone()[0]
+        lessons = [dict(r) for r in conn.execute(
+            "SELECT id, content, use_count FROM memories "
+            "WHERE status='active' AND kind='lesson' ORDER BY use_count DESC, id DESC LIMIT 8")]
+        texts = [r[0] for r in conn.execute("SELECT content FROM records WHERE status='active'")]
+    bands = {"凌晨(0-6)": 0, "上午(6-12)": 0, "下午(12-18)": 0, "晚间(18-24)": 0}
+    keys = list(bands)
+    for hh, n in hours:
+        try:
+            bands[keys[min(int(hh) // 6, 3)]] += n
+        except (ValueError, TypeError):
+            continue  # 畸形小时位直接不计入
+    n_journal = sum(bands.values())  # 样本=有效时段样本（畸形 ts 不计入）
+    low = "\n".join(texts).lower()
+    stack = sorted(((w, low.count(w)) for w in _STACK_WORDS if low.count(w)), key=lambda t: -t[1])
+    return {
+        "kinds": kinds,
+        "preference_n": kinds.get("preference", 0),
+        "time_bands": bands,
+        "time_sample": n_journal,
+        "agents": agents,
+        "records": n_records,
+        "oneday_pct": round(oneday * 100 / max(1, n_projects), 1),
+        "stack": stack[:8],
+        "lessons": lessons,
+    }
+
+
 def env_scan(root: str, agent: str = "") -> int:
     """自动采集本机基础配置快照写入环境档案（幂等 UPSERT，仅标准库）。返回写入条数。"""
     import platform
