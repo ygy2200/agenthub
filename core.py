@@ -647,6 +647,10 @@ def bootstrap_text(root: str) -> str:
 - 重复检查别手写：hub_ops_list 有现成检查项（环境预检 env/语法检查 py_compile/回归 regression/
   部署一致性 deploy_diff/停滞项目 stalled…），hub_ops_run(name, target) 一条命令出精简摘要——
   开工跑 env，写完代码跑 py_compile，收尾前跑一次，动作自动进流水
+- 目录树直接翻（三条读取轨道之一）：数据就是普通文件——{root} 下项目目录（「对象-问题」命名）
+  可直接 ls/grep，工作记录.md 为唯一真理；output/ 放产出物
+- 写脚本分析工作史：AgentHub 部署目录（hub_ 工具的 agenthub_mcp.py 所在目录）加入 sys.path 后
+  import my.work——records(since="5d")/memories(kind=)/todos()/profile() 即用，详见其模块 docstring
 - 写错/写多的记录：hub_undo 可撤销你最近一条
 {BOOTSTRAP_END}"""
 
@@ -735,7 +739,9 @@ BOOTSTRAP_TARGETS = [{"agent": t["agent"], "path": t["boot"]} for t in MCP_TARGE
 MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # report.py（1.3 hub_report 依赖）与 ops.py（检查工具箱）必须随部署同步——
 # 缺了就是部署版 ImportError / 检查项不存在（03 已知空白①根修：ops.py 此前不在名单）
-SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py")
+# my/ 两件（3.4 可编程数据包）：部署目录自包含后，agent 对部署目录 sys.path 即可 import my.work
+SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py",
+                "my/__init__.py", "my/work/__init__.py")
 
 
 def find_python() -> str:
@@ -754,7 +760,11 @@ def deploy_server() -> tuple:
     try:
         MCP_SERVER_DIR.mkdir(parents=True, exist_ok=True)
         for f in SERVER_FILES:
-            shutil.copy2(src / f, MCP_SERVER_DIR / f)
+            rel = Path(f)
+            dst = MCP_SERVER_DIR / rel
+            if rel.parent != Path("."):
+                dst.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(src / rel, dst)
     except OSError:
         return find_python(), ""
     return find_python(), str(MCP_SERVER_DIR / "agenthub_mcp.py")

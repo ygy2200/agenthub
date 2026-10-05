@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 DEPLOY_DIR = Path.home() / ".agenthub" / "mcp_server"
-DEPLOY_FILES = ["ui.py", "core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py"]
+DEPLOY_FILES = ["ui.py", "core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py", "my/__init__.py", "my/work/__init__.py"]
 PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一致
 
 # name -> (一句话说明, 是否需要 target 目录)
@@ -134,7 +134,7 @@ def _regression(target: Path) -> dict:
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 adv_brain.py）", "detail": []}
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py",
-              "adv_report.py", "adv_auto_log.py"]
+              "adv_report.py", "adv_auto_log.py", "adv_mywork.py"]
     detail, fails, cost = [], [], 0.0
     for s in suites:
         t0 = time.perf_counter()

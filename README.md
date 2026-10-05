@@ -39,6 +39,8 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 
 **检查工具箱**（v2.8，`hub_ops_list` / `hub_ops_run`）：把 agent 每次重复手写的验证固化成一条命令——`py_compile`（任意项目 ast 语法检查）、`git_status`（工作区干净度）、`regression`（四套对抗回归一键跑）、`deploy_diff`（源码 vs 部署 md5 一致性）、`env`（开工环境预检：Python/es.exe/代理/备份/磁盘）、`brain`（健康一行摘要）。输出按省 token 设计：一行结论 + ≤8 行细节，动作自动落操作流水。
 
+**可编程数据包**（3.4 HPI 模式 + 3.6 目录树轨道）：数据本来就是普通文件和 SQLite——项目目录可直接 `ls`/`grep`（工作记录.md 为唯一真理）；写脚本分析自己则把本目录加入 sys.path 后 `import my.work`：`records(since="5d")` / `memories(kind=)` / `todos()` / `profile()`，全只读、不计入检索统计。
+
 接入方式：软件「接入中心」一键写入（ZCode / Claude Code / hermes / DSH 实测），或复制配置片段手动接入。
 
 ## 版本演进
