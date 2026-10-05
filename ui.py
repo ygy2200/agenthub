@@ -1945,6 +1945,8 @@ class HubPage(QWidget):
         self.skillFilter.setVisible(idx == 0)
         self.memFilter.setVisible(idx == 2)
         self.envFilter.setVisible(idx == 4)
+        if idx == 2:
+            self.fill_memories()  # 记忆与环境档案同源 DB 且 agent 可写，切入即重读
         if idx == 4:
             self.fill_env()  # 环境档案来自 DB 且 agent 可写（hub_env_set），切入即重读保证最新
 
@@ -2863,6 +2865,7 @@ class AgentHubWindow(FluentWindow):
         except Exception:
             self.overview_page.set_sessions([])
         self.journal_page.reload()
+        self.report_page.reload_reports()  # agent 侧 hub_report 可能生成了新报告，F5 后列表跟上
 
 
 def run_gui():

@@ -127,6 +127,12 @@ def main():
         env_it = w.hub_page.envList.item(0)
         check("环境档案切入即显示DB数据", bool(env_it and "测试代理" in env_it.text()),
               env_it.text() if env_it else "空列表")
+        # 记忆视图切入即显示（对齐环境档案：DB 实时数据切视图必须重读，agent 写入可见）
+        brain.add_memory(str(tmp), "冒烟切入测试记忆条目", "fact", "", agent="smoke")
+        w.hub_page.viewCombo.setCurrentIndex(2)
+        check("记忆视图切入即显示DB数据",
+              any("冒烟切入测试记忆条目" in w.hub_page.memList.item(i).text()
+                  for i in range(w.hub_page.memList.count())))
         # 能力市场已砍（v2.7.6：本地源仅16条官方演示技能/远程走GitHub不通/MCP片段与Agent中心重复）
         # 流水·对账合并页冒烟（分段切换）
         w.ledger_page.seg.setCurrentItem("audit")
