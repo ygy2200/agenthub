@@ -121,6 +121,12 @@ def main():
         check("Agent中心页存在且已切导航", w.hub_page is not None)
         w.hub_page.viewCombo.setCurrentIndex(1)  # MCP 视图切换不崩
         check("hub视图=5项(含环境档案)", w.hub_page.viewCombo.count() == 5)
+        # 环境档案切入即显示（回归：_on_scan 与切视图必须 fill_env，不得只靠手动采集触发）
+        brain.env_set(str(tmp), "网络", "测试代理", "7890", agent="smoke")
+        w.hub_page.viewCombo.setCurrentIndex(4)
+        env_it = w.hub_page.envList.item(0)
+        check("环境档案切入即显示DB数据", bool(env_it and "测试代理" in env_it.text()),
+              env_it.text() if env_it else "空列表")
         # 能力市场已砍（v2.7.6：本地源仅16条官方演示技能/远程走GitHub不通/MCP片段与Agent中心重复）
         # 流水·对账合并页冒烟（分段切换）
         w.ledger_page.seg.setCurrentItem("audit")

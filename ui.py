@@ -1945,6 +1945,8 @@ class HubPage(QWidget):
         self.skillFilter.setVisible(idx == 0)
         self.memFilter.setVisible(idx == 2)
         self.envFilter.setVisible(idx == 4)
+        if idx == 4:
+            self.fill_env()  # 环境档案来自 DB 且 agent 可写（hub_env_set），切入即重读保证最新
 
     def rescan(self):
         extra = core.load_config().get("extra_agents", {})
@@ -1968,6 +1970,7 @@ class HubPage(QWidget):
         self.fill_skills()
         self.fill_mcps()
         self.fill_memories()
+        self.fill_env()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
         self.preview.setHtml("<p style='color:#888'>点选左侧技能 / MCP / 记忆查看详情，双击打开所在目录</p>")
         self.win.overview_page.set_agents(self.agents)
