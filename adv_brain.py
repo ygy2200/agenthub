@@ -914,6 +914,51 @@ def t_progressive_disclosure(tmp):
         assert brain.get_record(rs, bad, level="abstract") == {}
 
 
+def t_decision_fields(tmp):
+    """3.2 AgDR 决策记录：全空不加段/半缺合法/多行缩进/畸形类型不炸/outline 必含
+    决策段头（四段式占满槽位也不挤掉）/渲染进 content 即被搜索命中/老记录零影响。"""
+    root = Path(tmp) / "hub_decision"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    # ① 全空不加段：None/空白/全空一个样（老调用零影响）
+    assert brain.render_decision() == ""
+    assert brain.render_decision(" ", "", None, "  \n ") == ""
+    # ② 正常渲染：四行齐全，段头固定「## 决策记录」
+    r = brain.render_decision("上下文X", "A：被否\nB：可行", "选 B", "接受代价 Y")
+    lines = [l for l in r.strip().splitlines() if l.strip()]
+    assert lines == ["## 决策记录", "- 上下文：上下文X", "- 权衡过的选项：A：被否",
+                     "  B：可行", "- 决策：选 B", "- 接受的取舍：接受代价 Y"], lines
+    # ③ 半缺合法：只有上下文没有决策（AgDR 允许渐进记录）
+    r = brain.render_decision(context="只有上下文")
+    assert [l for l in r.strip().splitlines() if l.strip()] == ["## 决策记录", "- 上下文：只有上下文"]
+    # ④ 畸形类型不炸：数字/None 转 str 处理；纯换行值视为空
+    assert brain.render_decision(123, None, True, "\n\n") == \
+        "\n\n## 决策记录\n- 上下文：123\n- 决策：True"
+    # ⑤ add_record 集成：决策段追加正文尾部；与四段式混排不破坏原段
+    body = "【目的】拍板方案\n【做了什么】定了 B\n【验证结果】回归绿\n【如何回滚】revert"
+    rid = brain.add_record(rs, "决策测试-项目", "zcode", "2026-10-04", "t1", body,
+                           context="前提 P", options="A 因 X 被否", decision="选 B", tradeoffs="接受 Z")
+    full = brain.get_record(rs, rid)["content"]
+    assert full.startswith(body) and "## 决策记录" in full and "- 决策：选 B" in full
+    # ⑥ outline：四段式占满 4 个槽位，决策段头仍必须被抽出（3.2 验收核心）
+    ol = brain.get_record(rs, rid, level="outline")["content"]
+    assert "【目的】" in ol and "决策记录" in ol, ol
+    # ⑦ 手写决策段头（不通过参数）同样能抽到；【决策记录】变体也算
+    rid2 = brain.add_record(rs, "决策测试-项目", "dsh", "2026-10-04", "t2",
+                            "正文\n\n【决策记录】\n- 决策：手写")
+    assert "【决策记录】" in brain.get_record(rs, rid2, level="outline")["content"]
+    # ⑧ 不传决策参数 = 老行为：content 原样、outline 无决策段头
+    rid3 = brain.add_record(rs, "决策测试-项目", "dsh", "2026-10-04", "t3", "老式记录")
+    assert brain.get_record(rs, rid3)["content"] == "老式记录"
+    assert "决策记录" not in brain.get_record(rs, rid3, level="outline")["content"]
+    # ⑨ 决策内容渲染进 content → 全文搜索直接命中（不加列的红利）
+    hits = brain.search_records(rs, "权衡过的选项")
+    assert any(h.get("id") == rid for h in hits), hits
+    hits2 = brain.search_records(rs, "前提P 前提")
+    assert any(h.get("id") == rid for h in hits2), hits2
+
+
 def t_handoff(tmp):
     """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
     （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
@@ -1203,6 +1248,7 @@ def main():
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
     case("渐进披露三级（full缺省/abstract200字/outline骨架/无结构退化/对抗参）", lambda: t_progressive_disclosure(tmp))
+    case("决策记录AgDR（全空不加段/半缺/多行缩进/畸形类型/outline必含决策段头/搜索命中/老记录零影响）", lambda: t_decision_fields(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))

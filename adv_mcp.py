@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.14.0"
+    assert r["serverInfo"]["version"] == "2.15.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -703,6 +703,58 @@ def t_status_tool(tmp):
     assert counts() == before, "hub_status 产生了写入（必须纯只读）"
 
 
+def t_decision_record(tmp):
+    """3.2 AgDR 决策记录（MCP 层）：带参写入/全空旧行为/outline 抽段/
+    畸形类型/超长拦截/content 空时决策字段不救场/Markdown 表格原样。"""
+    root = fresh_hub(tmp, "decision")
+    root_s = str(root)
+
+    def _rid(out):
+        return int(out.split("records#")[1].split("，")[0])
+
+    # ① 正常：四决策字段齐全 → content 尾部决策段，读回含决策内容
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "【目的】拍板\n【做了什么】定 B",
+                                       "context": "前提 X", "options": "A 被否\nC 代价高",
+                                       "decision": "选 B", "tradeoffs": "接受 Y"}, root_s)
+    assert "已记入大脑" in out, out
+    rid = _rid(out)
+    rec = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
+    assert "## 决策记录" in rec and "- 决策：选 B" in rec and "- 上下文：前提 X" in rec, rec
+    # ② outline 级抽出决策段头（3.2 验收：四段式占满槽位也不挤掉）
+    rec_ol = m.call_tool("hub_get_record", {"record_id": rid, "level": "outline"}, root_s)
+    assert "决策记录" in rec_ol and "【目的】" in rec_ol, rec_ol
+    # ③ 全空（不传）= 旧行为：无决策段
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "老式记录"}, root_s)
+    assert "决策记录" not in m.call_tool("hub_get_record", {"record_id": _rid(out)}, root_s)
+    # ④ 畸形类型：数字/None/对象/列表 → 转 str 不炸，空值跳过
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "畸形参数记录", "context": 123,
+                                       "options": None, "decision": {"嵌套": "对象"},
+                                       "tradeoffs": ["列", "表"]}, root_s)
+    assert "已记入大脑" in out, out
+    rec3 = m.call_tool("hub_get_record", {"record_id": _rid(out)}, root_s)
+    assert "- 上下文：123" in rec3 and "- 决策：" in rec3, rec3
+    # ⑤ 超长拦截：决策字段把正文顶过 MAX_CONTENT → 拒绝且不落库
+    before = len(brain.list_records(root_s, "测试-项目"))
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "超长攻击", "decision": "长" * (128 * 1024)},
+                      root_s)
+    assert "超长" in out, out
+    assert len(brain.list_records(root_s, "测试-项目")) == before, "超长记录不得落库"
+    # ⑥ content 空但决策字段有值 → 仍按 content 必填拒绝（决策字段不能替代正文）
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": " ", "decision": "只有决策"}, root_s)
+    assert "必填" in out, out
+    # ⑦ Markdown 表格/换行原样保留不炸
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "表格记录",
+                                       "options": "| 方案 | 代价 |\n|---|---|\n| A | X |",
+                                       "decision": "选 A"}, root_s)
+    assert "| 方案 | 代价 |" in m.call_tool("hub_get_record", {"record_id": _rid(out)}, root_s)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -720,6 +772,7 @@ def main():
     case("单条全文读取+Everything列表回归（畸形id/死代码bug）", lambda: t_get_record_and_search_files(tmp))
     case("蒸馏展示即登记（同一记录不重复推送）", lambda: t_distill_mark(tmp))
     case("hub_status五问快照（正常/空库/脏数据/限条数/只读性/畸形参数）", lambda: t_status_tool(tmp))
+    case("决策记录AgDR（带参写入/旧行为/outline抽段/畸形类型/超长拦截/表格原样）", lambda: t_decision_record(tmp))
     case("检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）", lambda: t_search_output(tmp))
     case("memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）", lambda: t_memory_read_fallback(tmp))
     case("写入时踩坑拦截（相似lesson提醒/无关不附）", lambda: t_log_work_intercept(tmp))

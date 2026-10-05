@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.14.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.15.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -139,15 +139,24 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         pname = str(arguments.get("project", "")).strip()
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
         content = str(arguments.get("content", "")).strip()
+        # 3.2 AgDR 决策字段（可选）：畸形类型转 str 兜底，空视为未传
+        ctx = str(arguments.get("context", "") or "").strip()
+        opts = str(arguments.get("options", "") or "").strip()
+        dec = str(arguments.get("decision", "") or "").strip()
+        tro = str(arguments.get("tradeoffs", "") or "").strip()
         err = _check_content(content, "content")
         if err:
             return err
         if not pname:
             return "错误：project 必填"
+        # 决策段拼进正文后整体受 MAX_CONTENT 把守（防超长决策字段绕过校验）；渲染点唯一在 add_record
+        if len(content + brain.render_decision(ctx, opts, dec, tro)) > MAX_CONTENT:
+            return f"错误：content+决策字段超长（{MAX_CONTENT} 上限），请精简后分条写入"
         # date 畸形兜底：从参数里提取 YYYY-MM-DD，取不到用今天
         dm = core.DATE_RE.search(str(arguments.get("date") or ""))
         date = dm.group(1) if dm else datetime.date.today().isoformat()
-        rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content)
+        rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
+                                  context=ctx, options=opts, decision=dec, tradeoffs=tro)
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
@@ -693,7 +702,11 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"project": {"type": "string"}, "agent": {"type": "string", "description": "你的 agent 名，如 ZCode/hermes"},
                                     "content": {"type": "string", "description": "做了什么/验证结果/如何回滚"},
-                                    "date": {"type": "string", "description": "YYYY-MM-DD，缺省今天"}},
+                                    "date": {"type": "string", "description": "YYYY-MM-DD，缺省今天"},
+                                    "context": {"type": "string", "description": "决策-上下文（AgDR，可选）：当时为什么面临这个选择"},
+                                    "options": {"type": "string", "description": "决策-权衡过的选项（可选）：评估了哪些方案、各自为何成/否"},
+                                    "decision": {"type": "string", "description": "决策-决策（可选）：最终选了什么"},
+                                    "tradeoffs": {"type": "string", "description": "决策-接受的取舍（可选）：选它付出的代价"}},
                      "required": ["project", "agent", "content"]}},
     {"name": "hub_search", "description": "跨项目全文搜索工作记录/记忆/文件名（记录行带 #id，判断不了价值先看片段，精读用 hub_get_record）",
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}},

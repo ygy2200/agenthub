@@ -449,11 +449,35 @@ def _migrate_columns(root: str) -> None:
 
 # ---------------------------------------------------------------- 工作记录
 
+def render_decision(context: str = "", options: str = "", decision: str = "",
+                    tradeoffs: str = "") -> str:
+    """3.2 AgDR：决策字段渲染成记录尾部「## 决策记录」段（字段名对齐 AgDR：
+    上下文/权衡过的选项/决策/接受的取舍——记录"为什么"而非"做了什么"）。
+    全空返回 ""（不加段，老调用零影响）；半缺合法（如只有上下文没有决策）。
+    多行值缩进续行，保持 markdown 可读；渲染进 content 即被搜索/存档/outline 全链路覆盖。"""
+    fields = [("上下文", context), ("权衡过的选项", options),
+              ("决策", decision), ("接受的取舍", tradeoffs)]
+    rows = []
+    for name, val in fields:
+        vl = [ln.strip() for ln in str(val or "").splitlines() if ln.strip()]
+        if not vl:
+            continue
+        rows.append(f"- {name}：{vl[0]}")
+        rows.extend(f"  {ln}" for ln in vl[1:])
+    if not rows:
+        return ""
+    return "\n\n## 决策记录\n" + "\n".join(rows)
+
+
 def add_record(root: str, project: str, agent: str, date: str, title: str, content: str,
-               source: str = "hub") -> int:
+               source: str = "hub", context: str = "", options: str = "",
+               decision: str = "", tradeoffs: str = "") -> int:
     """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。
-    source：hub=人工经 MCP 写入；auto=会话边界 hook 自动捕获（未经蒸馏，2.1）。"""
+    source：hub=人工经 MCP 写入；auto=会话边界 hook 自动捕获（未经蒸馏，2.1）。
+    决策字段（3.2 AgDR，可选）：context/options/decision/tradeoffs 传任意非空值即在
+    正文尾部追加「## 决策记录」段；全不传时行为与旧版完全一致。"""
     source = source if source in ("hub", "auto") else "hub"
+    content = content + render_decision(context, options, decision, tradeoffs)
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
         agent = _norm_agent(agent)
@@ -1355,16 +1379,25 @@ def extract_todos(root: str, limit: int = 20) -> list:
 
 
 _OUTLINE_HEAD_RE = re.compile(r"^(#{1,4}\s+\S|\*\*[^*]{2,30}\*\*|【[^】]{1,14}】)")
+_DECISION_HEAD_RE = re.compile(r"^(#{1,4}\s*决策记录|【决策记录】|\*\*决策记录\*\*)")
 
 
 def record_outline(content: str) -> str:
     """outline 级骨架：抽段头行（markdown 标题/加粗段头/【】段头），最多四段；
     四段式记录的段头行自带同行摘要，无段头结构的记录退化为前 4 行。
+    决策段头（3.2 AgDR）必含——四段式正好占满四个槽位，决策段按常规抽取会被挤掉，
+    故抽到即追加（最多 4+1 行）。
     渐进披露的第二级——比 full 便宜一个量级，比 abstract 多结构。"""
     lines = [l for l in (content or "").splitlines() if l.strip()]
     picked = [l.strip()[:100] for l in lines if _OUTLINE_HEAD_RE.match(l.strip())][:4]
     if not picked:
         picked = [l.strip()[:100] for l in lines[:4]]
+    for l in lines:
+        if _DECISION_HEAD_RE.match(l.strip()):
+            dl = l.strip()[:100]
+            if dl not in picked:
+                picked.append(dl)
+            break
     return "\n".join(picked)
 
 
