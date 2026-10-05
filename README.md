@@ -60,6 +60,13 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 | v2.8 | 检查工具箱：`hub_ops_run` 九项内置检查（py_compile / git_status / 回归 / 部署一致性 / 环境预检 / 体检 / Inbox / 停滞 / 重复记忆），输出按省 token 设计；收尾建议闭环（写完记录被提醒跑检查，当天已办即静默）；GUI 开机自检 |
 | v2.9 | 读侧激活：开工记忆推送盲区修复（零唤起优先轮换+全局记忆入联想池）、拦截命中落痕（验收可举证）、检索零命中欠账闭环（「查早了」的知识自动提醒沉淀）、hermes 引导接入、体检输出验收达成度与记忆保鲜清单、蒸馏候选元信息标注 |
 | v2.9.1 | 正式图标（hub 拓扑，多尺寸 ico + 窗口图标） |
+| v2.10 | 阶段0地基加固：数据完整性检测与合并（hub_duplicates）、主动检索计入唤起、记忆访问加权衰减、记忆反馈通道（salience）、体检诚实指标 |
+| v2.11 | 往外倒三任务：渐进披露三级（full/abstract/outline）、反馈报告 hub_report（单文件 HTML 九章节带 SVG 图）、冷记忆压缩候选（compress） |
+| v2.12 | 交接协议（handoff as a protocol：typed 字段 create/list/claim，exactly-once 原子认领） |
+| v2.13 | 写入自动化：ZCode Stop hook 会话边界自动捕获（auto_log，全链路静默容错不阻塞会话） |
+| v2.14 | 连续性层 hub_status（五问快照：谁在线/今天变了/还开着什么/还重要的/下一步） |
+| v2.15 | 决策记录层 AgDR：hub_log_work 新增 4 个可选决策字段（context/options/decision/tradeoffs），记录渲染「## 决策记录」段——记「为什么」而不只「做了什么」 |
+| v2.16 | 用户建模 hub_user_profile（画像：活跃时段/记录分工/技术栈词频/纠正史 top，preference=0 行动信号）+ 可编程数据包 my.work（sys.path 即 import，records/memories/todos/profile，只读不计唤起）+ 目录树读取轨道；GUI 运营报告页、环境档案切入即显示修复、检索统计 agent 名归一 |
 
 ## 设计原则
 

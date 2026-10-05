@@ -1176,6 +1176,13 @@ def t_recall_push_log(tmp):
     brain.recall_for(root, "", agent="dsh")
     h2 = brain.health_report(root)
     assert h2["recall_push_total"] == 2 and h2["push_by_agent"].get("dsh") == 1
+    # agent 身份归一：大写/带脏字符的 agent 落库统一小写（防 ZCode/zcode 统计分裂）
+    # 放用例末尾——log_search 落 tool='hub_search' 会进 search_by_agent，不能干扰上面的体检断言
+    brain.log_search(root, "hub_search", "归一测试", 1, agent="ZCode")
+    with brain.db_conn(root) as conn:
+        got = conn.execute(
+            "SELECT agent FROM searches WHERE query='归一测试'").fetchone()
+    assert got and got["agent"] == "zcode", got
 
 
 def t_similar_lessons(tmp):

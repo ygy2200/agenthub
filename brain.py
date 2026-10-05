@@ -792,11 +792,12 @@ def should_push(root: str, agent: str, project: str) -> bool:
 
 
 def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> None:
-    """检索日志（反馈回路）：谁/何时/用什么工具/查什么/命中几条。失败不影响检索本身。"""
+    """检索日志（反馈回路）：谁/何时/用什么工具/查什么/命中几条。失败不影响检索本身。
+    agent 过 _norm_agent——大小写/空白双身份会让检索统计分裂（实测 ZCode/zcode 各算各的）。"""
     try:
         with db_conn(root) as conn:
             conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
-                         (_now(), agent or "", tool, (query or "")[:200], max(0, int(hits or 0))))
+                         (_now(), _norm_agent(agent), tool, (query or "")[:200], max(0, int(hits or 0))))
     except sqlite3.Error:
         pass
 
