@@ -29,6 +29,7 @@ import agentscore
 import brain
 import core
 import ops
+import report
 
 
 def ic(name, fallback="INFO"):
@@ -2388,6 +2389,71 @@ class ConnectPage(QWidget):
         InfoBar.success("已复制", "粘贴到 agent 的 MCP 配置里即可", duration=2500, parent=self.win)
 
 
+class ReportPage(QWidget):
+    """运营报告页：一键生成 mentor 式反馈报告（复用 report.generate_report，单文件 HTML），
+    系统默认浏览器打开；历史报告列表可回看。"""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        lay.addWidget(TitleLabel("运营报告"))
+        lay.addWidget(CaptionLabel("大脑运营全景：你在做什么 / 摩擦点与修复 / 值得一试的能力——"
+                                   "单文件 HTML 零 LLM 拼装，同一天重复生成会覆盖"))
+
+        genCard = CardWidget()
+        g = QHBoxLayout(genCard)
+        g.setContentsMargins(20, 14, 20, 14)
+        gt = QVBoxLayout()
+        gt.addWidget(StrongBodyLabel("生成今日报告"))
+        gt.addWidget(BodyLabel("从大脑数据库实时统计，浏览器打开；历史报告保留在同目录可回看。"))
+        g.addLayout(gt, 1)
+        self.genBtn = PrimaryPushButton(ic("SYNC"), "生成并打开")
+        self.genBtn.clicked.connect(self.generate)
+        g.addWidget(self.genBtn)
+        lay.addWidget(genCard)
+
+        histCard = CardWidget()
+        hv = QVBoxLayout(histCard)
+        hv.setContentsMargins(20, 14, 20, 14)
+        hv.addWidget(StrongBodyLabel("历史报告（双击打开）"))
+        self.histList = ListWidget()
+        self.histList.itemDoubleClicked.connect(
+            lambda it: os.startfile(it.data(Qt.UserRole)))  # noqa: S606
+        hv.addWidget(self.histList, 1)
+        lay.addWidget(histCard, 1)
+        self.reload_reports()
+
+    def reload_reports(self):
+        self.histList.clear()
+        d = Path(self.win.root) / "_hub" / "reports" if self.win.root else None
+        if not d or not d.is_dir():
+            return
+        for p in sorted(d.glob("反馈报告-*.html"), reverse=True):
+            self.histList.addItem(p.stem)  # 既有模式：addItem(str) 后按行号 setData
+            self.histList.item(self.histList.count() - 1).setData(Qt.UserRole, str(p))
+
+    def generate(self):
+        if not self.win.root:
+            InfoBar.warning("未选择根目录", "先到「设置」页选择根目录", duration=4000, parent=self)
+            return
+        self.genBtn.setEnabled(False)
+        w = FnWorker(lambda: report.generate_report(self.win.root), self)
+        w.done.connect(self._on_generated)
+        self.win._workers.append(w)
+        w.start()
+
+    def _on_generated(self, result):
+        self.genBtn.setEnabled(True)
+        if isinstance(result, Exception):
+            InfoBar.error("报告生成失败", str(result), duration=6000, parent=self)
+            return
+        self.reload_reports()
+        os.startfile(result)  # noqa: S606
+        InfoBar.success("报告已生成", result, duration=5000, parent=self)
+
+
 class HelpPage(QWidget):
     """软件内帮助：有什么不懂的在这里找。"""
 
@@ -2403,6 +2469,7 @@ class HelpPage(QWidget):
     <li><b>时间线</b>：所有 agent 的工作记录按时间倒序，可按 agent/项目过滤，点击条目看完整操作步骤。</li>
     <li><b>流水</b>：错误登记（agent 出错自动/主动上报，可标记已修、看回滚方式）+ 操作流水（每次写操作一条，记录类可一键撤销）。</li>
     <li><b>统计</b>：项目数、记录数、各 agent 工作量、月度活跃。</li>
+    <li><b>运营报告</b>：一键生成大脑运营全景（你在做什么/摩擦点与修复/提案），浏览器打开，历史报告可回看。</li>
     <li><b>搜索</b>：全脑检索（记录/记忆/文件分类过滤），回车即出结果，结果可直接打开或跳转，Ctrl+F 直达。</li>
     <li><b>Agent 中心</b>：各 agent 的技能库 / MCP / 记忆 / 全局配置聚合，含注册档案（在线状态/累计记录）；记忆可增删改、配置可编辑（自动备份）。</li>
     <li><b>大脑</b>：唤起排行 / 使用分布 / 待办看板（一键勾销）/ 置顶记忆，对准大脑验收四条标准。</li>
@@ -2576,6 +2643,7 @@ class AgentHubWindow(FluentWindow):
         self.timeline_page = TimelinePage(self)
         self.stats_page = StatsPage(self)
         self.brain_page = BrainPage(self)
+        self.report_page = ReportPage(self)
         self.search_page = SearchPage(self)
         self.ledger_page = LedgerPage(self)
         self.audit_page = self.ledger_page.audit      # 原对账页别名，apply() 链路不变
@@ -2604,6 +2672,7 @@ class AgentHubWindow(FluentWindow):
             (self.brain_page, "LIBRARY", "大脑"),
             (self.ledger_page, "DICTIONARY", "流水·对账"),
             (self.stats_page, "TILES", "统计"),
+            (self.report_page, "REPORT", "运营报告"),
             (self.search_page, "SEARCH", "搜索"),
         ):
             w.setObjectName(text)
