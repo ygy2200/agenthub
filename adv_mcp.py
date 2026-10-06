@@ -135,7 +135,11 @@ def t_memory_overwrite(tmp):
     # overwrite 无匹配 -> 落为新增
     out = m.call_tool("hub_memory_write", {"content": "全新的记忆", "mode": "overwrite"}, root)
     assert "已写入" in out
-    assert len(brain.search_memories(root, "全新的记忆")) == 1
+    # P4.3 融合检索是宽容召回（部分 bigram 重叠的条目也会返回）——
+    # overwrite"无重复条目"语义按内容精确断言，不再数结果条数
+    rows_new = brain.search_memories(root, "全新的记忆")
+    assert rows_new and rows_new[0]["content"] == "全新的记忆", rows_new[:2]
+    assert len([r for r in rows_new if r["content"] == "全新的记忆"]) == 1
     # 非法 mode / 空 content / 超长
     out = m.call_tool("hub_memory_write", {"content": "x", "mode": "drop"}, root)
     assert "append" in out

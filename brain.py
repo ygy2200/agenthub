@@ -542,10 +542,11 @@ _CJK_ALL_RE = re.compile(r"[一-鿿]+")  # 任意长度中文段（_retry_bigram
 _BM25_K1, _BM25_B = 1.5, 0.75  # BM25 经典参数，进常量便于评测集调参（07 计划 P4.2）
 
 
-def _tokenize(text: str) -> list:
+def _tokenize(text: str, max_tokens: int = 64) -> list:
     """检索分词（P4.2 BM25 通道）：英文/数字按 \\w+ 词（小写），中文任意段相邻 2-gram
     （单字段保留原字）。与 _retry_bigrams 的区别：它只产出 ≥4 字长串的重试词表（原语义不动），
-    本函数是全量分词——中文整串拆成 bigram 才能治"整串 LIKE 全或无"（基线实锤盲区①）。"""
+    本函数是全量分词——中文整串拆成 bigram 才能治"整串 LIKE 全或无"（基线实锤盲区①）。
+    max_tokens 只该约束 query 侧；doc 侧必须传大值——截断会让长记忆后半无法命中（复盘实锤）。"""
     out: list = []
     for w in re.split(r"\s+", (text or "").strip()):
         if not w:
@@ -558,7 +559,9 @@ def _tokenize(text: str) -> list:
             else:
                 out.extend(seg[i:i + 2] for i in range(len(seg) - 1))
         out.extend(re.findall(r"\w+", rest))
-    return out[:64]  # 截断防超长输入拖垮打分
+        if len(out) >= max_tokens:
+            break
+    return out[:max_tokens]
 
 
 def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
@@ -580,7 +583,8 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
         return []
     docs = []
     for r in rows:
-        toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]))
+        toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]),
+                         max_tokens=2000)  # doc 侧不截断：截了长记忆后半无法命中（复盘实锤）
         docs.append((r, Counter(toks), len(toks)))
     n = len(docs)
     avgdl = sum(dl for _, _, dl in docs) / max(1, n)
@@ -985,6 +989,40 @@ def set_memory_feedback(root: str, mid: int, feedback: str) -> str:
     return f"记忆 #{mid} 反馈「{fb}」已记录：salience {cur} → {new}"
 
 
+_RRF_K = 60  # Hindsight 论文同款（07 计划 P4.3）
+_RRF_W_BM25 = 2.0  # BM25 路权重：评测实锤等权融合稀释强相关（0.905→0.715），BM25 是主路
+_RRF_ENABLED = True  # 融合回滚开关：False 即回 LIKE 单路旧行为
+
+
+def _memories_search_fused(root: str, query: str, words: list, kind: str, limit: int) -> list:
+    """P4.3 双路融合：LIKE/计分路（_memories_query）+ BM25 路（_bm25_rank）各自 rank →
+    RRF(f)=Σ1/(k+rank) 融合（rank 天然免归一化，这是选 RRF 的理由）。
+    pinned 不参与检索排序（评测三轮数据定案：硬前置 0.387 / 等权通道 0.449 / 纯相关 0.905
+    ——pinned 弱相关条目会压过强相关结果；其曝光职责在心跳推送/hub_status/置顶徽章）。
+    结果带 _channels={路: rank} 可解释（铁律 3）。两路全零命中返回 []——
+    bigram 重试由调用方按原语义触发。"""
+    like_rows = _memories_query(root, words, kind, limit=100)  # 候选池加深，融合后截 limit
+    bm25_rows = _bm25_rank(root, query, kind, limit=100)
+    if not like_rows and not bm25_rows:
+        return []
+    scores: dict = {}
+    channels: dict = {}
+    for rank, r in enumerate(like_rows):
+        scores[r["id"]] = scores.get(r["id"], 0.0) + 1.0 / (_RRF_K + rank + 1)
+        channels.setdefault(r["id"], {})["like"] = rank + 1
+    for rank, r in enumerate(bm25_rows):
+        scores[r["id"]] = scores.get(r["id"], 0.0) + _RRF_W_BM25 / (_RRF_K + rank + 1)
+        channels.setdefault(r["id"], {})["bm25"] = rank + 1
+    by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
+    fused = []
+    for mid, s in scores.items():
+        r = dict(by_id[mid])
+        r["_channels"] = channels[mid]
+        fused.append((s, mid, r))
+    fused.sort(key=lambda t: (-t[0], t[1]))
+    return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
+
+
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
                     count_hits: bool = True) -> list:
     """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
@@ -994,11 +1032,14 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
     唤起信号，此前只统计被动推送，衰减/有用率的输入数据系统性失真（0.2 修复）。
     空 query 列清单不计；写入查重等内部调用须显式传 False。"""
     words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
-    rows = _memories_query(root, words, kind, limit)
+    if _RRF_ENABLED:
+        rows = _memories_search_fused(root, query or "", words, kind, limit)
+    else:
+        rows = _memories_query(root, words, kind, limit)  # 回滚开关：走旧单路
     if not rows and words:
         retry = _retry_bigrams(query)
         if retry:
-            rows = _memories_query(root, retry, kind, limit)
+            rows = _memories_query(root, retry, kind, limit)  # 放宽重试保持旧路径（融合外）
             for r in rows:  # 同 search_records：放宽召回须可识别
                 r["_bigram"] = True
     if rows and words and count_hits:

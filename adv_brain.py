@@ -1022,7 +1022,8 @@ def t_bm25(tmp):
     assert "pyside6" in toks and "v2" in toks and "16" in toks, toks  # 英文/数字词
     assert "大" not in toks, toks  # 单字不独立产出（除非整段只有 1 字）
     assert brain._tokenize("字") == ["字"]  # 单字段保留原字
-    assert len(brain._tokenize("测" * 500)) <= 64  # 超长截断
+    assert len(brain._tokenize("测" * 500)) <= 64  # query 侧默认截断
+    assert len(brain._tokenize("测" * 500, max_tokens=2000)) == 499  # doc 侧大上限
     # ② 打分与排序：独有词（高 IDF）排前
     brain.add_memory(rs, "记忆蒸馏流水线：hub_distill 从记录候选蒸馏", "project", "", agent="zcode")
     brain.add_memory(rs, "FlClash 的 TUN 模式与系统代理并存冲突", "fact", "", agent="zcode")
@@ -1033,6 +1034,11 @@ def t_bm25(tmp):
     # 独有词命中："tun" 仅 FlClash 条含——唯一命中且排第一
     rows = brain._bm25_rank(rs, "tun")
     assert len(rows) == 1 and rows[0]["content"].startswith("FlClash"), rows
+    # doc 侧不截断：长记忆末尾的专有词必须能命中（复盘实锤的 bug 防回归）
+    long_content = "这是一条很长的记忆开头" + "填充内容" * 30 + "关键词qfluentwidgets在末尾"
+    brain.add_memory(rs, long_content, "fact", "", agent="zcode")
+    rows = brain._bm25_rank(rs, "qfluentwidgets")
+    assert len(rows) == 1 and rows[0]["content"].endswith("在末尾"), rows
     # ③ 边界：空/纯符号 → 空；kind 过滤；limit 边界；坏类型
     assert brain._bm25_rank(rs, "") == [] and brain._bm25_rank(rs, "!!! 🙂") == []
     assert len(brain._bm25_rank(rs, "记忆蒸馏", kind="project")) == 1
@@ -1047,6 +1053,53 @@ def t_bm25(tmp):
         pass
     else:
         raise AssertionError("limit='abc' 未被拒绝")
+
+
+def t_rrf_fused(tmp):
+    """P4.3 RRF 双路融合：两路命中排前/单路命中保留/_channels 完整/开关回旧路/
+    pinned 硬前置/融合空才触发 bigram 重试/count_hits 语义不变。"""
+    root = Path(tmp) / "hub_rrf"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    brain.add_memory(rs, "记忆蒸馏流水线：hub_distill 从记录候选蒸馏", "project", "", agent="zcode")
+    brain.add_memory(rs, "FlClash 的 TUN 模式与系统代理并存冲突", "fact", "", agent="zcode")
+    brain.add_memory(rs, "通用记录：记录被记录", "note", "", agent="zcode")
+    # ① 融合主路径：LIKE 路整串零命中但 BM25 命中 → 融合后有结果（单路盲区互补）
+    rows = brain.search_memories(rs, "记忆蒸馏是怎么做的", count_hits=False)
+    assert rows and rows[0]["content"].startswith("记忆蒸馏"), rows[:2]
+    assert rows[0]["_channels"].get("bm25"), rows[0]  # BM25 路可解释
+    # ② 两路都命中的条目 RRF 分高于单路（LIKE+BM25 同 hit）
+    rows = brain.search_memories(rs, "记录", count_hits=False)
+    top = rows[0]
+    assert len(top.get("_channels", {})) >= 1 and top["pinned"] in (0, 1), top
+    # ③ 开关回滚：_RRF_ENABLED=False 走旧单路（无 _channels）
+    brain._RRF_ENABLED = False
+    try:
+        rows = brain.search_memories(rs, "记忆蒸馏是怎么做的", count_hits=False)
+        assert rows and "_channels" not in rows[0], rows[:1]  # 旧路径整串零命中→bigram 重试标记
+    finally:
+        brain._RRF_ENABLED = True
+    # ④ 检索纯相关性：pinned 不参与排序（评测三轮数据定案——硬前置 0.387/等权通道
+    #    0.449/纯相关 0.905），pinned 弱相关不得压过强相关非 pinned
+    brain.add_memory(rs, "通用记录二号：记录的另一种记录", "note", "", agent="zcode", pinned=True)
+    rows = brain.search_memories(rs, "记忆蒸馏", count_hits=False)
+    by_content = {r["content"][:6]: i for i, r in enumerate(rows)}
+    i_distill = next(i for c, i in by_content.items() if "记忆蒸馏" in c)
+    i_pinned = next((i for c, i in by_content.items() if "通用记录二号" in c), None)
+    assert i_pinned is None or i_distill < i_pinned, rows  # 强相关排在 pinned 弱相关之前
+    assert any(r.get("_channels", {}).get("bm25") for r in rows), rows[:3]
+    # ⑤ 融合空才走 bigram 重试；BM25 命中即承担放宽召回（不再打 _bigram 标记）
+    brain.add_memory(rs, "这条讲的是访问加权衰减公式与半衰期", "lesson", "", agent="zcode")
+    rows = brain.search_memories(rs, "记忆的衰减机制说明", count_hits=False)
+    assert rows and any(r.get("_channels", {}).get("bm25") for r in rows), rows[:3]
+    # ⑥ count_hits 语义：融合命中照样计唤起
+    with brain.db_conn(rs) as conn:
+        before = dict(conn.execute("SELECT id, use_count FROM memories").fetchall())
+    brain.search_memories(rs, "记忆蒸馏", count_hits=True)
+    with brain.db_conn(rs) as conn:
+        after = dict(conn.execute("SELECT id, use_count FROM memories").fetchall())
+    assert any(after[i] > before[i] for i in before if after[i] != before[i]), (before, after)
 
 
 def t_handoff(tmp):
@@ -1182,9 +1235,20 @@ def t_cjk_bigram_retry(tmp):
     assert recs and "检索顺手度迭代优化" in recs[0]["content"] and recs[0]["score"] >= 1
     mems = brain.search_memories(root, "大迭代优化")
     assert mems and "先实测再动手" in mems[0]["content"]
-    # 重试命中行带 _bigram 标记（输出层据此提示放宽召回）；首轮命中行不带
-    assert all(r.get("_bigram") for r in recs) and all(m.get("_bigram") for m in mems)
+    # records 路未融合（P4.3b 未做）：重试命中行带 _bigram 标记；首轮命中行不带
+    assert all(r.get("_bigram") for r in recs)
     assert "_bigram" not in brain.search_records(root, "hub_search")[0]
+    # memories 路融合后（P4.3）：放宽召回由 BM25 通道承担（天然 bigram 打分），
+    # _bigram 重试标记不再出现——可解释字段换成了 _channels.bm25
+    assert all(m.get("_channels", {}).get("bm25") for m in mems), mems[:2]
+    assert not any(m.get("_bigram") for m in mems), mems[:2]
+    # 开关关闭回旧路径：_bigram 标记语义原样保留（旧行为回归锚）
+    brain._RRF_ENABLED = False
+    try:
+        mems_old = brain.search_memories(root, "大迭代优化")
+        assert mems_old and all(m.get("_bigram") for m in mems_old)
+    finally:
+        brain._RRF_ENABLED = True
     # 首轮有命中时直接返回，精确行为不变
     assert len(brain.search_records(root, "hub_search")) == 1
     # <4 字 CJK 不触发重试，0 命中仍 0；≥4 字但库里真无相关的也 0（不引入噪声）
@@ -1348,6 +1412,7 @@ def main():
     case("决策记录AgDR（全空不加段/半缺/多行缩进/畸形类型/outline必含决策段头/搜索命中/老记录零影响）", lambda: t_decision_fields(tmp))
     case("用户画像3.3（空库不崩/时段聚合/畸形hh/技术栈词频/单日口径/唤起排序/只读）", lambda: t_user_profile(tmp))
     case("BM25通道P4.2（分词边界/超长截断/独有词IDF/整串中文命中/kind与limit边界/坏类型）", lambda: t_bm25(tmp))
+    case("RRF融合P4.3（两路互补/_channels/开关回滚/pinned前置/bigram重试触发/count_hits）", lambda: t_rrf_fused(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
