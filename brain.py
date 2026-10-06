@@ -991,7 +991,24 @@ def set_memory_feedback(root: str, mid: int, feedback: str) -> str:
 
 _RRF_K = 60  # Hindsight 论文同款（07 计划 P4.3）
 _RRF_W_BM25 = 2.0  # BM25 路权重：评测实锤等权融合稀释强相关（0.905→0.715），BM25 是主路
+_RRF_W_RECENCY = 0.0  # recency 加成（P4.4）：评测三档定档 β=0.10→0.842 / 0.03→0.860 / 0→0.878，
+# 当前规模（79 条记忆条条常被唤起）recency 与相关性负相关，默认关闭；机制保留（对抗用例验证），
+# 触发重评条件=记忆规模显著增长或唤起分布变化（07 计划 v1.5）
 _RRF_ENABLED = True  # 融合回滚开关：False 即回 LIKE 单路旧行为
+
+
+def _recency_of(r: dict, now: datetime.datetime) -> float:
+    """recency ∈ [0,1]：exp(-λ·天数)，时间锚=max(updated, last_hit)（P4.4）。
+    λ 复用 DECAY_PARAMS（口径统一，不另立参数）。空白/畸形/未来时间戳 → 0（不加成不崩）。"""
+    anchor = max(r.get("updated") or "", r.get("last_hit") or "")
+    try:
+        dt = datetime.datetime.fromisoformat(anchor)
+    except (ValueError, TypeError):
+        return 0.0
+    days = (now - dt).total_seconds() / 86400
+    if days < 0:
+        return 0.0
+    return math.exp(-DECAY_PARAMS["lam"] * days)
 
 
 def _memories_search_fused(root: str, query: str, words: list, kind: str, limit: int) -> list:
@@ -999,8 +1016,9 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
     RRF(f)=Σ1/(k+rank) 融合（rank 天然免归一化，这是选 RRF 的理由）。
     pinned 不参与检索排序（评测三轮数据定案：硬前置 0.387 / 等权通道 0.449 / 纯相关 0.905
     ——pinned 弱相关条目会压过强相关结果；其曝光职责在心跳推送/hub_status/置顶徽章）。
-    结果带 _channels={路: rank} 可解释（铁律 3）。两路全零命中返回 []——
-    bigram 重试由调用方按原语义触发。"""
+    融合分乘 (1+β·recency)（P4.4）：同为命中时最近用到的排前；_channels 记录的是各路
+    融合前 rank（boost 属融合后调整，分层可解释）。结果带 _channels={路: rank} 可解释（铁律 3）。
+    两路全零命中返回 []——bigram 重试由调用方按原语义触发。"""
     like_rows = _memories_query(root, words, kind, limit=100)  # 候选池加深，融合后截 limit
     bm25_rows = _bm25_rank(root, query, kind, limit=100)
     if not like_rows and not bm25_rows:
@@ -1015,9 +1033,11 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
         channels.setdefault(r["id"], {})["bm25"] = rank + 1
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
     fused = []
+    now = datetime.datetime.now()
     for mid, s in scores.items():
         r = dict(by_id[mid])
         r["_channels"] = channels[mid]
+        s *= 1.0 + _RRF_W_RECENCY * _recency_of(r, now)  # P4.4：融合分 recency 加成
         fused.append((s, mid, r))
     fused.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]

@@ -1093,6 +1093,25 @@ def t_rrf_fused(tmp):
     brain.add_memory(rs, "这条讲的是访问加权衰减公式与半衰期", "lesson", "", agent="zcode")
     rows = brain.search_memories(rs, "记忆的衰减机制说明", count_hits=False)
     assert rows and any(r.get("_channels", {}).get("bm25") for r in rows), rows[:3]
+    # ⑦ P4.4 recency 机制验证（默认 β=0 关闭——评测三档定案当前规模负优化）：
+    #    β>0 时近似同分的两条最近更新的排前；畸形/未来时间戳静默按 0 不崩
+    brain.add_memory(rs, "苹果香蕉测试条目甲", "note", "", agent="zcode")
+    brain.add_memory(rs, "苹果香蕉测试条目乙", "note", "", agent="zcode")
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE memories SET updated='2026-07-01T00:00:00' WHERE content LIKE '%条目甲%'")
+    brain._RRF_W_RECENCY = 0.10
+    try:
+        rows = brain.search_memories(rs, "苹果香蕉测试", count_hits=False)
+        i_yi = next(i for i, r in enumerate(rows) if "条目乙" in r["content"])
+        i_jia = next(i for i, r in enumerate(rows) if "条目甲" in r["content"])
+        assert i_yi < i_jia, [(r['id'], r['updated'][:10] if r['updated'] else '') for r in rows]  # 新者排前
+    finally:
+        brain._RRF_W_RECENCY = 0.0
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE memories SET updated='garbage', last_hit='2999-01-01T00:00:00' "
+                     "WHERE content LIKE '%条目乙%'")  # 畸形+未来时间戳
+    rows = brain.search_memories(rs, "苹果香蕉测试", count_hits=False)
+    assert rows, "畸形时间戳不得导致检索崩/空"
     # ⑥ count_hits 语义：融合命中照样计唤起
     with brain.db_conn(rs) as conn:
         before = dict(conn.execute("SELECT id, use_count FROM memories").fetchall())
