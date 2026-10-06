@@ -15,7 +15,7 @@ from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QPushButton  #
 
 import brain  # noqa: E402
 import core  # noqa: E402
-from ui import AgentHubWindow, SearchWorker, md_to_html  # noqa: E402
+from ui import AgentHubWindow, FnWorker, SearchWorker, md_to_html  # noqa: E402
 
 FAILED = []
 
@@ -183,6 +183,14 @@ def main():
         w.overview_page.set_sessions([])
         check("总览活跃会话空态", w.overview_page.sessionBox.count() >= 1)
         brain.delete_memory(str(tmp), mid)
+        # 退出清理回归（用户报"有时候退出会报错"）：长任务运行中关闭窗口——
+        # closeEvent 需对 wait 超时线程 detach（切父子链+全局引用），不触发
+        # "QThread: Destroyed while thread is still running" abort
+        wt = FnWorker(lambda: __import__("time").sleep(5), w)
+        wt.done.connect(lambda _r: None)
+        w._workers.append(wt)
+        wt.start()
+        check("退出清理场景已布置（长任务运行中关闭）", wt.isRunning())
         w.close()
         app.quit()
 
@@ -191,8 +199,11 @@ def main():
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
-        sys.exit(1)
+        # os._exit 对齐真实 GUI 退出（run_gui 同款硬杀）：detached 线程不做解释器级 GC/析构——
+        # 若走 sys.exit 正常关闭，Python GC 会删掉还在跑的 detached QThread，复现 abort 反而误报
+        os._exit(1)
     print("SMOKE ALL PASS")
+    os._exit(0)
 
 
 if __name__ == "__main__":

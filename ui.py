@@ -41,6 +41,11 @@ AGENT_BADGE_COLOR = {
     "zcode": "#0078d4", "hermes": "#8764b8", "deepseek": "#0a7ea4",
     "claude": "#c76a42", "codex": "#4a6b8a", "dsh": "#00a67e", "其他": "#666666",
 }
+
+# 退出时未结束线程的全局引用（closeEvent 挂入）：切断 Qt 父子链后由它持住对象，
+# 进程经 os._exit 硬杀不触发析构——否则 "QThread: Destroyed while thread is still
+# running" abort 即用户报的"有时候退出会报错"（关闭时有耗时线程在跑，间歇性）
+_DETACHED_THREADS: list = []
 ISSUE_KIND_CN = {"prefix": "平行前缀目录", "wild": "野目录", "duplicate": "重复项目组", "no_record": "缺工作记录"}
 
 
@@ -2779,13 +2784,18 @@ class AgentHubWindow(FluentWindow):
         return getattr(mode, "name", "COMPACT") == "COMPACT"
 
     def closeEvent(self, e):
-        """退出前：断后台线程信号（防 wait 超时后回调触碰已关闭的 UI）、等线程结束，备份大脑，再记住状态。"""
+        """退出前：断后台线程信号（防 wait 超时后回调触碰已关闭的 UI）、等线程结束，备份大脑，再记住状态。
+        wait 2s 超时的线程：切断 Qt 父子链并由 _DETACHED_THREADS 持引用——窗口销毁不再删除
+        运行中线程（destroyed-while-running abort 即"有时候退出会报错"的根因），进程随后
+        经 os._exit 硬杀，不触发析构。SQLite 写入中途被杀由 WAL/退出自动备份兜底。"""
         for lst in (self._workers, getattr(self.hub_page, "_workers", []),
                     getattr(self.search_page, "_workers", [])):
             for t in list(lst):
                 try:
                     t.blockSignals(True)  # 阻断 done/finished 全部信号：wait 超时后线程回调不再进已关闭的界面
-                    t.wait(2000)
+                    if not t.wait(2000):
+                        t.setParent(None)
+                        _DETACHED_THREADS.append(t)
                 except Exception:
                     pass
         if self.root and os.path.isdir(self.root):
