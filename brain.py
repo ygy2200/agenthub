@@ -564,6 +564,29 @@ def _tokenize(text: str, max_tokens: int = 64) -> list:
     return out[:max_tokens]
 
 
+def _bm25_score(q_set: list, docs: list) -> list:
+    """BM25 打分纯函数（P4.3b 泛化，memories/records 两表共用）。
+    docs: [(row, Counter(tokens), dl)] → [(score, row)] 按分降序、同分 id 升序。"""
+    n = len(docs)
+    avgdl = sum(dl for _, _, dl in docs) / max(1, n)
+    df: Counter = Counter()
+    for _, tf, _dl in docs:
+        df.update(tf.keys())
+    scored: list = []
+    for r, tf, dl in docs:
+        s = 0.0
+        for w in q_set:
+            f = tf.get(w, 0)
+            if not f:
+                continue
+            idf = math.log(1.0 + (n - df[w] + 0.5) / (df[w] + 0.5))
+            s += idf * f * (_BM25_K1 + 1.0) / (f + _BM25_K1 * (1.0 - _BM25_B + _BM25_B * dl / max(avgdl, 1e-9)))
+        if s > 0:
+            scored.append((s, r))
+    scored.sort(key=lambda t: (-t[0], t[1]["id"]))
+    return scored
+
+
 def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
     """内存 BM25 通道（07 计划 P4.2）：active 全量拉行 → _tokenize 内存统计 → BM25 打分。
     数据量数千行毫秒级；>1 万行再议持久化倒排（不为未来规模做工程）。
@@ -586,24 +609,35 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
         toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]),
                          max_tokens=2000)  # doc 侧不截断：截了长记忆后半无法命中（复盘实锤）
         docs.append((r, Counter(toks), len(toks)))
-    n = len(docs)
-    avgdl = sum(dl for _, _, dl in docs) / max(1, n)
-    df: Counter = Counter()
-    for _, tf, _dl in docs:
-        df.update(tf.keys())
-    scored: list = []
-    for r, tf, dl in docs:
-        s = 0.0
-        for w in q_set:
-            f = tf.get(w, 0)
-            if not f:
-                continue
-            idf = math.log(1.0 + (n - df[w] + 0.5) / (df[w] + 0.5))
-            s += idf * f * (_BM25_K1 + 1.0) / (f + _BM25_K1 * (1.0 - _BM25_B + _BM25_B * dl / max(avgdl, 1e-9)))
-        if s > 0:
-            scored.append((s, r))
-    scored.sort(key=lambda t: (-t[0], t[1]["id"]))
-    return [dict(r, _bm25=round(s, 4)) for s, r in scored[:max(0, min(int(limit), 100))]]
+    return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
+
+
+_RECORDS_TOK_CACHE: dict = {}  # (root, record_id) → (Counter, dl)：记录内容不可变（只增不改），缓存进程内安全
+# 1559 条全文分词 ~300ms/查询（搜索页同步调用，用户抱怨过慢）→ 缓存后首查之外 <10ms
+# key 必须含 root——不同库的 id 空间独立（adv 多 tmp 库实测串库：id=1 在各库是不同内容）
+
+
+def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
+    """records 表的 BM25 通道（P4.3b）：匹配面 title+content+project（与 _records_query 一致）。
+    记录正文长（数百字）且无 updated 列——recency 不适用（β 全局关闭中）。返回带 _bm25 分。"""
+    q_set = list(dict.fromkeys(_tokenize(query)))
+    if not q_set:
+        return []
+    with db_conn(root) as conn:
+        rows = conn.execute("SELECT * FROM records WHERE status='active'").fetchall()
+    if not rows:
+        return []
+    docs = []
+    for r in rows:
+        ckey = (root, r["id"])
+        ent = _RECORDS_TOK_CACHE.get(ckey)
+        if ent is None:
+            toks = _tokenize(" ".join([r["title"] or "", r["content"] or "", r["project"] or ""]),
+                             max_tokens=2000)
+            ent = (Counter(toks), len(toks))
+            _RECORDS_TOK_CACHE[ckey] = ent
+        docs.append((r, ent[0], ent[1]))
+    return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
 
 
 def _records_query(root: str, words: list, limit: int) -> list:
@@ -626,11 +660,16 @@ def _records_query(root: str, words: list, limit: int) -> list:
 def search_records(root: str, kw: str, limit: int = 30) -> list:
     """多词评分检索：query 按空白切词，命中词数越多越靠前（同分按日期）。
     单词行为兼容旧版；评分让"多关键词"查询真正缩小范围而非取并集噪声。
-    0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（见 _retry_bigrams）。"""
+    0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（见 _retry_bigrams）。
+    P4.3b：_RRF_ENABLED 时走 LIKE+BM25 双路 RRF 融合（与 memories 检索同架构），
+    结果带 _channels；融合即宽容召回（部分 bigram 重叠也返回），无匹配才走 bigram 重试。"""
     words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
     if not words:
         return []
-    rows = _records_query(root, words, limit)
+    if _RRF_ENABLED:
+        rows = _records_search_fused(root, kw, words, limit)
+    else:
+        rows = _records_query(root, words, limit)
     if rows:
         return rows
     retry = _retry_bigrams(kw)
@@ -640,6 +679,31 @@ def search_records(root: str, kw: str, limit: int = 30) -> list:
     for r in rows:  # 放宽召回标记：真实大库里常见二字组合会命中弱相关，输出层须标注
         r["_bigram"] = True
     return rows
+
+
+def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
+    """records 双路融合（P4.3b，与 memories 同架构）：LIKE 路 + BM25 路 RRF。
+    差异：无 pinned/kind；tie-break 用 id（融合分并列罕见，date 语义由 LIKE 路单用时保留）。"""
+    like_rows = _records_query(root, words, limit=100)
+    bm25_rows = _records_bm25_rank(root, kw, limit=100)
+    if not like_rows and not bm25_rows:
+        return []
+    scores: dict = {}
+    channels: dict = {}
+    for rank, r in enumerate(like_rows):
+        scores[r["id"]] = scores.get(r["id"], 0.0) + 1.0 / (_RRF_K + rank + 1)
+        channels.setdefault(r["id"], {})["like"] = rank + 1
+    for rank, r in enumerate(bm25_rows):
+        scores[r["id"]] = scores.get(r["id"], 0.0) + _RRF_W_BM25 / (_RRF_K + rank + 1)
+        channels.setdefault(r["id"], {})["bm25"] = rank + 1
+    by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
+    fused = []
+    for mid, s in scores.items():
+        r = dict(by_id[mid])
+        r["_channels"] = channels[mid]
+        fused.append((s, mid, r))
+    fused.sort(key=lambda t: (-t[0], t[1]))
+    return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
 
 
 # ---------------------------------------------------------------- 数据完整性（0.1）

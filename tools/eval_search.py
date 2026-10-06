@@ -23,7 +23,7 @@ import brain  # noqa: E402
 import core  # noqa: E402
 
 
-def load_cases(path: Path) -> list:
+def load_cases(path: Path, table: str = "memories") -> list:
     """加载并校验评测集：缺字段/空集/重复查询/目标 id 不在库 → 报错退出不静默。"""
     if not path.is_file():
         raise SystemExit(f"评测集缺失：{path}")
@@ -32,7 +32,7 @@ def load_cases(path: Path) -> list:
         raise SystemExit("评测集为空或不是数组")
     with brain.db_conn(core.get_root()) as conn:
         valid_ids = {r[0] for r in conn.execute(
-            "SELECT id FROM memories WHERE status='active'")}
+            f"SELECT id FROM {table} WHERE status='active'")}
     seen, cases = set(), []
     for c in raw:
         if not isinstance(c, dict) or not c.get("q") or not c.get("targets"):
@@ -52,14 +52,26 @@ def load_cases(path: Path) -> list:
 
 def main() -> None:
     base = Path(__file__).resolve().parent
-    cases = load_cases(base / "eval_cases.json")
     root = core.get_root()
-    mode = "bm25" if "--bm25" in sys.argv else "like"  # P4.2：--bm25 跑单路对比
+    if "--records" in sys.argv:
+        # P4.3b：records 检索评测（search_records 主路径，cases 为记录 id）
+        cases = load_cases(base / "eval_records_cases.json", table="records")
+        mode = "records_fused"
 
-    def do_search(q: str) -> list:
-        if mode == "bm25":
+        def do_search(q: str) -> list:
+            return brain.search_records(root, q)  # count_hits 语义不适用于 records
+    elif "--bm25" in sys.argv:
+        cases = load_cases(base / "eval_cases.json")
+        mode = "bm25"
+
+        def do_search(q: str) -> list:
             return brain._bm25_rank(root, q)  # BM25 通道本身只读不计唤起
-        return brain.search_memories(root, q, count_hits=False)
+    else:
+        cases = load_cases(base / "eval_cases.json")
+        mode = "fused"  # P4.3 起默认模式即融合主路径
+
+        def do_search(q: str) -> list:
+            return brain.search_memories(root, q, count_hits=False)
 
     rr_sum = 0.0
     hits = {1: 0, 3: 0, 5: 0}

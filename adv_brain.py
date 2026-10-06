@@ -427,12 +427,18 @@ def t_search_score_and_todos(tmp):
         "顺带看了 FlClash 的设置页，与本任务无关的闲笔")
     brain.add_record(root, "评分测试-项目", "dsh", _td, "无关记录",
         "这里只讲校园网丢包")
-    # 多词评分：两词都命中的排最前
+    # 多词融合排序：两词全中的"规则迁移"条排最前（融合=宽容召回，top 内必有）
     res = brain.search_records(root, "FlClash 规则")
-    # 共享 hub 可能有多条含 FlClash 的记录，但两词全中的必须排最前（评分排序语义）
-    top = [r for r in res if r["score"] == 2]
-    assert any("规则迁移" in r["title"] for r in top), [(r["title"], r["score"]) for r in res[:4]]
-    assert all(res[i]["score"] >= res[i + 1]["score"] for i in range(len(res) - 1)), "评分未降序"
+    assert any("规则迁移" in r["title"] for r in res[:2]), [(r["title"],) for r in res[:3]]
+    # LIKE 路评分语义回归锚（score 字段仅旧路存在；融合排序见上）
+    brain._RRF_ENABLED = False
+    try:
+        res = brain.search_records(root, "FlClash 规则")
+        top = [r for r in res if r["score"] == 2]
+        assert any("规则迁移" in r["title"] for r in top), [(r["title"], r["score"]) for r in res[:4]]
+        assert all(res[i]["score"] >= res[i + 1]["score"] for i in range(len(res) - 1)), "评分未降序"
+    finally:
+        brain._RRF_ENABLED = True
     # 单词兼容
     assert len(brain.search_records(root, "FlClash")) >= 2  # 共享hub可能多条
     assert brain.search_records(root, "   ") == []
@@ -1121,6 +1127,38 @@ def t_rrf_fused(tmp):
     assert any(after[i] > before[i] for i in before if after[i] != before[i]), (before, after)
 
 
+def t_records_fused(tmp):
+    """P4.3b records 融合：BM25 整串中文命中/双路 _channels/开关回旧路/bigram 重试
+    触发条件（融合空）/limit 边界。"""
+    root = Path(tmp) / "hub_rec_fused"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    brain.add_record(rs, "甲-项目", "zcode", "2026-10-01", "t1", "记忆蒸馏流水线的候选蒸馏")
+    brain.add_record(rs, "乙-项目", "dsh", "2026-10-02", "t2", "FlClash 的 TUN 模式与系统代理冲突")
+    brain.add_record(rs, "丙-单日", "zcode", "2026-10-03", "t3", "无关内容一笔")
+    # ① 整串中文（无空格）：LIKE 全串零命中、BM25 bigram 命中——融合互补
+    rows = brain.search_records(rs, "记忆蒸馏是怎么做的")
+    assert rows and rows[0]["content"].startswith("记忆蒸馏"), rows[:2]
+    assert rows[0]["_channels"].get("bm25"), rows[0]
+    # ② 多词查询：两路命中的排前
+    rows = brain.search_records(rs, "FlClash TUN")
+    assert rows and rows[0]["content"].startswith("FlClash"), rows[:2]
+    assert rows[0]["_channels"].get("like") and rows[0]["_channels"].get("bm25"), rows[0]
+    # ③ 开关回旧路：整串 LIKE 零命中 → bigram 重试带标记
+    brain._RRF_ENABLED = False
+    try:
+        rows = brain.search_records(rs, "记忆蒸馏是怎么做的")
+        assert rows and all(r.get("_bigram") for r in rows), rows[:2]
+    finally:
+        brain._RRF_ENABLED = True
+    # ④ 融合空才走 bigram 重试：库里真无相关的 → 空
+    assert brain.search_records(rs, "zzz完全不存在") == []
+    # ⑤ limit 边界（"FlClash" 为 t2 独有词；"记录"两字在测试数据里不存在且 <4 字不触发重试）
+    assert len(brain.search_records(rs, "FlClash", limit=1)) == 1
+    assert brain.search_records(rs, "") == []
+
+
 def t_handoff(tmp):
     """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
     （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
@@ -1249,13 +1287,20 @@ def t_cjk_bigram_retry(tmp):
     brain.add_record(root, "迭代项目", "zcode", "2026-10-02", "t1",
         "本轮做检索顺手度迭代优化，hub_search 带 #id")
     brain.add_memory(root, "检索迭代优化的经验：先实测再动手", kind="lesson", agent="zcode")
-    # 连续长串整串 LIKE 0 命中（库里无连续"大迭代优化"）→ bigram 重试召回
+    # 连续长串整串 LIKE 0 命中（库里无连续"大迭代优化"）→ 放宽召回
     recs = brain.search_records(root, "大迭代优化")
-    assert recs and "检索顺手度迭代优化" in recs[0]["content"] and recs[0]["score"] >= 1
+    assert recs and "检索顺手度迭代优化" in recs[0]["content"]
+    if recs[0].get("_channels"):  # 融合路径：放宽由 BM25 承担
+        assert recs[0]["_channels"].get("bm25")
+    else:  # 旧路（开关关）：bigram 重试带 _bigram 标记 + LIKE score
+        assert recs[0].get("_bigram") and recs[0]["score"] >= 1
     mems = brain.search_memories(root, "大迭代优化")
     assert mems and "先实测再动手" in mems[0]["content"]
-    # records 路未融合（P4.3b 未做）：重试命中行带 _bigram 标记；首轮命中行不带
-    assert all(r.get("_bigram") for r in recs)
+    # records 路 P4.3b 融合：放宽召回由 BM25 承担（_channels.bm25）；旧路（开关关）仍 _bigram+score
+    if recs[0].get("_channels"):
+        assert all(r.get("_channels", {}).get("bm25") for r in recs), recs[:2]
+    else:
+        assert all(r.get("_bigram") for r in recs)
     assert "_bigram" not in brain.search_records(root, "hub_search")[0]
     # memories 路融合后（P4.3）：放宽召回由 BM25 通道承担（天然 bigram 打分），
     # _bigram 重试标记不再出现——可解释字段换成了 _channels.bm25
@@ -1270,10 +1315,12 @@ def t_cjk_bigram_retry(tmp):
         brain._RRF_ENABLED = True
     # 首轮有命中时直接返回，精确行为不变
     assert len(brain.search_records(root, "hub_search")) == 1
-    # <4 字 CJK 不触发重试，0 命中仍 0；≥4 字但库里真无相关的也 0（不引入噪声）
+    # <4 字 CJK 不触发重试，0 命中仍 0；≥4 字但库里真无相关的也 0（不引入噪声）。
+    # 注意宽容召回语义：查询必须与库内容零 bigram 交集（"完全无关的词"会与
+    # "与本任务无关的闲笔"共享"无关"，命中属设计行为——教训来自 P4.3b 实测）
     assert brain.search_records(root, "zzz不存在") == []
     assert brain.search_memories(root, "zzz不存在") == []
-    assert brain.search_records(root, "完全无关的词") == []
+    assert brain.search_records(root, "qqqxyz 蒙圈") == []
     # search_all 走同一逻辑
     res = brain.search_all(root, "大迭代优化")
     assert res["records"] and res["memories"]
@@ -1432,6 +1479,7 @@ def main():
     case("用户画像3.3（空库不崩/时段聚合/畸形hh/技术栈词频/单日口径/唤起排序/只读）", lambda: t_user_profile(tmp))
     case("BM25通道P4.2（分词边界/超长截断/独有词IDF/整串中文命中/kind与limit边界/坏类型）", lambda: t_bm25(tmp))
     case("RRF融合P4.3（两路互补/_channels/开关回滚/pinned前置/bigram重试触发/count_hits）", lambda: t_rrf_fused(tmp))
+    case("records融合P4.3b（整串bigram命中/双路_channels/开关回旧路/重试触发/limit）", lambda: t_records_fused(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))

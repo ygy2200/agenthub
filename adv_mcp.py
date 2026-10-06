@@ -561,7 +561,7 @@ def t_memory_read_fallback(tmp):
     out = m.call_tool("hub_memory_read", {"query": "着色器卡顿"}, root_s)
     assert "大脑记忆无命中" in out, out
     assert "记录里可能有相关线索" in out and "[记录#" in out, out
-    assert "放宽召回" in out, f"长串重试缺弱相关标注：{out}"
+    assert "弱相关线索" in out, f"兜底线索缺弱相关标注：{out}"
     rid = int(re.search(r"\[记录#(\d+)\]", out).group(1))
     rec = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
     assert "着色器" in rec, f"#id 无法精读，兜底链路断：{rec[:120]}"
