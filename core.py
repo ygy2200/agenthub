@@ -639,7 +639,8 @@ def bootstrap_text(root: str) -> str:
   用自己的判断精炼成一条 hub_memory_write（你刚干完活最懂上下文——日记会膨胀，笔记本只留精华）
 - 修正旧记忆别删：写一条新记忆并在开头标注「取代记忆#N」+错在哪，由全员共同裁决旧条目（免疫协议）
 - 检索带具体关键词：hub_memory_read/hub_search 的 query 写「项目名/组件名/错误类型」，
-  不要空查或只查一个泛词——问得越准，大脑答得越准
+  不要空查或只查一个泛词——问得越准，大脑答得越准；
+  重要决策依据的检索，自行精读 top5（hub_get_record）再下结论（宽容召回按相关度排序，弱相关自行取舍）
 - 新项目先 hub_create_project(name)，命名「对象-问题」结构；不确定项目名先 hub_list_projects
 - 团队规范：hub_get_rules
 - 出错/受阻/踩坑：hub_report_error(title, detail, undo) 登记，undo 写回滚方式，方便任何人查询和撤销
