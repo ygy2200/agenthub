@@ -54,6 +54,13 @@ def main() -> None:
     base = Path(__file__).resolve().parent
     cases = load_cases(base / "eval_cases.json")
     root = core.get_root()
+    mode = "bm25" if "--bm25" in sys.argv else "like"  # P4.2：--bm25 跑单路对比
+
+    def do_search(q: str) -> list:
+        if mode == "bm25":
+            return brain._bm25_rank(root, q)  # BM25 通道本身只读不计唤起
+        return brain.search_memories(root, q, count_hits=False)
+
     rr_sum = 0.0
     hits = {1: 0, 3: 0, 5: 0}
     n_strong = n_weak = n_weak_hit = 0
@@ -61,7 +68,7 @@ def main() -> None:
     misses: list = []
     for c in cases:
         t0 = time.perf_counter()
-        rows = brain.search_memories(root, c["q"], count_hits=False)
+        rows = do_search(c["q"])
         times.append(time.perf_counter() - t0)
         ids = [r["id"] for r in rows]
         ranks = [ids.index(t) + 1 for t in c["targets"] if t in ids]
@@ -82,7 +89,7 @@ def main() -> None:
                     hits[k] += 1
         if not (best and best <= 3):
             misses.append((c["q"], best, c["targets"]))
-    print(f"基线（n={len(cases)}：strong {n_strong} + weak {n_weak}）")
+    print(f"基线[{mode}]（n={len(cases)}：strong {n_strong} + weak {n_weak}）")
     print(f"MRR(strong)  = {rr_sum / n_strong:.3f}")
     print(f"Hit@1        = {hits[1]}/{n_strong} ({hits[1] * 100 // n_strong}%)")
     print(f"Hit@3        = {hits[3]}/{n_strong} ({hits[3] * 100 // n_strong}%)")

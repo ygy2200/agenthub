@@ -1007,6 +1007,48 @@ def t_user_profile(tmp):
     assert before == after
 
 
+def t_bm25(tmp):
+    """P4.2 内存 BM25 通道：分词边界（空/纯符号/emoji/超长截断/中英混合/单字段）/
+    打分（独有词 IDF 排前/零命中空/(kind 过滤/limit 边界/坏类型不静默)。"""
+    root = Path(tmp) / "hub_bm25"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    # ① _tokenize 边界
+    assert brain._tokenize("") == [] and brain._tokenize(None) == []
+    assert brain._tokenize("!!!@# ¥¥") == [] and brain._tokenize("🙂🎬") == []
+    toks = brain._tokenize("部署大迭代优化 pyside6 v2.16")
+    assert toks[:6] == ["部署", "署大", "大迭", "迭代", "代优", "优化"], toks  # 中文相邻 2-gram
+    assert "pyside6" in toks and "v2" in toks and "16" in toks, toks  # 英文/数字词
+    assert "大" not in toks, toks  # 单字不独立产出（除非整段只有 1 字）
+    assert brain._tokenize("字") == ["字"]  # 单字段保留原字
+    assert len(brain._tokenize("测" * 500)) <= 64  # 超长截断
+    # ② 打分与排序：独有词（高 IDF）排前
+    brain.add_memory(rs, "记忆蒸馏流水线：hub_distill 从记录候选蒸馏", "project", "", agent="zcode")
+    brain.add_memory(rs, "FlClash 的 TUN 模式与系统代理并存冲突", "fact", "", agent="zcode")
+    brain.add_memory(rs, "通用记录：记录被记录", "note", "", agent="zcode")
+    rows = brain._bm25_rank(rs, "记忆蒸馏是怎么做的")
+    assert rows and rows[0]["_bm25"] > 0, rows
+    assert "蒸馏" in rows[0]["content"], rows[:2]  # 整串中文 bigram 命中——基线盲区①的修复验证
+    # 独有词命中："tun" 仅 FlClash 条含——唯一命中且排第一
+    rows = brain._bm25_rank(rs, "tun")
+    assert len(rows) == 1 and rows[0]["content"].startswith("FlClash"), rows
+    # ③ 边界：空/纯符号 → 空；kind 过滤；limit 边界；坏类型
+    assert brain._bm25_rank(rs, "") == [] and brain._bm25_rank(rs, "!!! 🙂") == []
+    assert len(brain._bm25_rank(rs, "记忆蒸馏", kind="project")) == 1
+    assert all(r["kind"] == "project" for r in brain._bm25_rank(rs, "记忆蒸馏", kind="project"))
+    assert brain._bm25_rank(rs, "记忆蒸馏", limit=0) == []
+    assert len(brain._bm25_rank(rs, "记录", limit=1)) == 1
+    # 巨值数字串合法（int 任意精度 + min 截断=正确行为），非数字串才拒绝
+    assert len(brain._bm25_rank(rs, "记录", limit="99999999999999999999")) <= 100
+    try:
+        brain._bm25_rank(rs, "x", limit="abc")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("limit='abc' 未被拒绝")
+
+
 def t_handoff(tmp):
     """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
     （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
@@ -1305,6 +1347,7 @@ def main():
     case("渐进披露三级（full缺省/abstract200字/outline骨架/无结构退化/对抗参）", lambda: t_progressive_disclosure(tmp))
     case("决策记录AgDR（全空不加段/半缺/多行缩进/畸形类型/outline必含决策段头/搜索命中/老记录零影响）", lambda: t_decision_fields(tmp))
     case("用户画像3.3（空库不崩/时段聚合/畸形hh/技术栈词频/单日口径/唤起排序/只读）", lambda: t_user_profile(tmp))
+    case("BM25通道P4.2（分词边界/超长截断/独有词IDF/整串中文命中/kind与limit边界/坏类型）", lambda: t_bm25(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))

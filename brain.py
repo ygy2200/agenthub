@@ -15,6 +15,7 @@ import math
 import os
 import re
 import sqlite3
+from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
 
@@ -535,6 +536,70 @@ def _retry_bigrams(query: str) -> list:
     for seg in _CJK_RE.findall(query or ""):
         out.extend(seg[i:i + 2] for i in range(len(seg) - 1))
     return out[:16]
+
+
+_CJK_ALL_RE = re.compile(r"[一-鿿]+")  # 任意长度中文段（_retry_bigrams 的 {4,} 是重试语义，这里要全量分词）
+_BM25_K1, _BM25_B = 1.5, 0.75  # BM25 经典参数，进常量便于评测集调参（07 计划 P4.2）
+
+
+def _tokenize(text: str) -> list:
+    """检索分词（P4.2 BM25 通道）：英文/数字按 \\w+ 词（小写），中文任意段相邻 2-gram
+    （单字段保留原字）。与 _retry_bigrams 的区别：它只产出 ≥4 字长串的重试词表（原语义不动），
+    本函数是全量分词——中文整串拆成 bigram 才能治"整串 LIKE 全或无"（基线实锤盲区①）。"""
+    out: list = []
+    for w in re.split(r"\s+", (text or "").strip()):
+        if not w:
+            continue
+        cjk_spans = _CJK_ALL_RE.findall(w)
+        rest = _CJK_ALL_RE.sub(" ", w).lower()
+        for seg in cjk_spans:
+            if len(seg) == 1:
+                out.append(seg)
+            else:
+                out.extend(seg[i:i + 2] for i in range(len(seg) - 1))
+        out.extend(re.findall(r"\w+", rest))
+    return out[:64]  # 截断防超长输入拖垮打分
+
+
+def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
+    """内存 BM25 通道（07 计划 P4.2）：active 全量拉行 → _tokenize 内存统计 → BM25 打分。
+    数据量数千行毫秒级；>1 万行再议持久化倒排（不为未来规模做工程）。
+    只读不计唤起（count_hits 语义由调用方负责）。query 内部自行分词——
+    空格拆词对中文整串无效，正是本通道要治的病。返回 [{**row, "_bm25": 分数}]。"""
+    q_set = list(dict.fromkeys(_tokenize(query)))
+    if not q_set:
+        return []
+    sql = "SELECT * FROM memories WHERE status='active'"
+    args: list = []
+    if kind in KINDS:
+        sql += " AND kind=?"
+        args.append(kind)
+    with db_conn(root) as conn:
+        rows = conn.execute(sql, args).fetchall()
+    if not rows:
+        return []
+    docs = []
+    for r in rows:
+        toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]))
+        docs.append((r, Counter(toks), len(toks)))
+    n = len(docs)
+    avgdl = sum(dl for _, _, dl in docs) / max(1, n)
+    df: Counter = Counter()
+    for _, tf, _dl in docs:
+        df.update(tf.keys())
+    scored: list = []
+    for r, tf, dl in docs:
+        s = 0.0
+        for w in q_set:
+            f = tf.get(w, 0)
+            if not f:
+                continue
+            idf = math.log(1.0 + (n - df[w] + 0.5) / (df[w] + 0.5))
+            s += idf * f * (_BM25_K1 + 1.0) / (f + _BM25_K1 * (1.0 - _BM25_B + _BM25_B * dl / max(avgdl, 1e-9)))
+        if s > 0:
+            scored.append((s, r))
+    scored.sort(key=lambda t: (-t[0], t[1]["id"]))
+    return [dict(r, _bm25=round(s, 4)) for s, r in scored[:max(0, min(int(limit), 100))]]
 
 
 def _records_query(root: str, words: list, limit: int) -> list:
