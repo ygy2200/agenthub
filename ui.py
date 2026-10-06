@@ -2812,8 +2812,18 @@ class AgentHubWindow(FluentWindow):
             pass
         super().closeEvent(e)
         # 退出挂起兜底（qfw item view+QSS 偶发挂起，os._exit 兜底须 exec 返回才生效）：
-        # 走到这里备份/保存已全部完成，若 2 秒后事件循环仍未退出就硬杀，不给用户留"关不掉"
-        QTimer.singleShot(2000, lambda: os._exit(0) if not self.isVisible() else None)
+        # 走到这里备份/保存已全部完成，若 2 秒后事件循环仍未退出就硬杀，不给用户留"关不掉"。
+        # 旧写法 lambda 引用 self.isVisible()——2 秒后窗口 C++ 对象可能已删（销毁时序不定），
+        # 触发 "Internal C++ object already deleted" RuntimeError 未捕获 → windowed exe 弹
+        # PyInstaller 错误框（退出间歇性报错的候选根因，用户报障后仍复现）。改防御式访问。
+        def _force_exit():
+            try:
+                if self.isVisible():
+                    return  # 窗口仍可见（极罕见：关闭被外部阻止）——不杀，让用户继续用
+            except RuntimeError:
+                pass  # C++ 对象已删——窗口确实没了，正是要硬杀的场景
+            os._exit(0)
+        QTimer.singleShot(2000, _force_exit)
 
     def goto_search(self):
         self.switchTo(self.search_page)
