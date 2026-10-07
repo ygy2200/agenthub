@@ -353,7 +353,9 @@ class MoodPicker(QWidget):
                             "border:1px solid #c8c8c8;border-radius:4px;padding:2px 10px;font-size:12px;")
 
     def _pick(self, m):
-        on = not self._buttons[m].isChecked()
+        # clicked 信号发出时 Qt 已翻转 checkable 按钮的选中态——直接读当前态，
+        # 不可再取反（取反会导致永远选不上，2026-10-07 用户实测"心情选不了"）
+        on = self._buttons[m].isChecked()
         for k, b in self._buttons.items():
             b.setChecked(k == m and on)
             self._style(b, k == m and on)
