@@ -773,30 +773,12 @@ class BrainPage(QWidget):
             row.addLayout(col)
         lay.addLayout(row)
 
-        # 随记卡片（08 计划方向 A-Ⅰ）：人的顿悟/想法——第一人称思想层，与 memories 分层、检索互通
-        gb = CardWidget()
-        g = QVBoxLayout(gb)
-        g.setContentsMargins(20, 16, 20, 16)
-        g.setSpacing(8)
-        g.addWidget(StrongBodyLabel("随记（你的顿悟与想法——第一人称思想层，所有 agent 检索可见）"))
-        noteRow = QHBoxLayout()
-        self.noteInput = LineEdit()
-        self.noteInput.setPlaceholderText("随手记一条想法/顿悟/摘录…（回车即存）")
-        self.noteInput.setClearButtonEnabled(True)
-        self.noteInput.returnPressed.connect(self.save_note)
-        noteRow.addWidget(self.noteInput, 1)
-        self.noteMood = ComboBox()
-        self.noteMood.addItems(["心情（可选）"] + [m for m in brain._NOTE_MOODS if m])
-        self.noteMood.setFixedWidth(130)
-        noteRow.addWidget(self.noteMood)
-        noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
-        noteBtn.clicked.connect(self.save_note)
-        noteRow.addWidget(noteBtn)
-        g.addLayout(noteRow)
+        # 最近随记（读的入口留在数据页；输入条在首页总览——人的高频动作走最短路径）
+        lay.addSpacing(16)
+        lay.addWidget(StrongBodyLabel("随记（你的顿悟与想法——输入条在首页，所有 agent 检索可见）"))
         self.noteList = ListWidget()
         self.noteList.setFixedHeight(150)
-        g.addWidget(self.noteList)
-        lay.addWidget(gb)
+        lay.addWidget(self.noteList)
 
         self.topBox = QVBoxLayout()
         self.useBox = QVBoxLayout()
@@ -892,25 +874,6 @@ class BrainPage(QWidget):
             self.pinBox.addWidget(CaptionLabel("暂无置顶——agent 写记忆时可带 pinned=true 进置顶位"))
 
         self.reload_notes()
-
-    def save_note(self):
-        """随记保存（08 计划 A-Ⅰ）：回车或点「记下」即入 notes 表，人的思想进大脑。"""
-        content = self.noteInput.text().strip()
-        if not content:
-            InfoBar.warning("内容为空", "写点什么再记", duration=2500, parent=self.win)
-            return
-        mood = self.noteMood.currentText()
-        mood = "" if mood.startswith("心情") else mood
-        try:
-            nid = brain.add_note(self.win.root, content, mood=mood, source="human")
-        except Exception as e:  # noqa: BLE001
-            InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
-            return
-        self.noteInput.clear()
-        self.noteMood.setCurrentIndex(0)
-        self.reload_notes()
-        InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
-                        duration=3000, parent=self.win)
 
     def reload_notes(self):
         """最近随记列表填充（容错：库异常时保留旧内容不崩）。"""
@@ -1497,6 +1460,24 @@ class OverviewPage(QWidget):
         lay.addLayout(head)
         lay.addWidget(CaptionLabel("电脑上所有 agent 的工作入口，数据实时来自目录扫描（F5 刷新）"))
 
+        # 随记输入条（08 计划 A-Ⅰ：人的高频入口放首页=最短路径；最近随记列表在「大脑」页）
+        lay.addSpacing(16)
+        lay.addWidget(StrongBodyLabel("随记（你的顿悟与想法——回车即存，所有 agent 检索可见）"))
+        noteRow = QHBoxLayout()
+        self.noteInput = LineEdit()
+        self.noteInput.setPlaceholderText("随手记一条想法/顿悟/摘录…（回车即存）")
+        self.noteInput.setClearButtonEnabled(True)
+        self.noteInput.returnPressed.connect(self.save_note)
+        noteRow.addWidget(self.noteInput, 1)
+        self.noteMood = ComboBox()
+        self.noteMood.addItems(["心情（可选）"] + [m for m in brain._NOTE_MOODS if m])
+        self.noteMood.setFixedWidth(130)
+        noteRow.addWidget(self.noteMood)
+        noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
+        noteBtn.clicked.connect(self.save_note)
+        noteRow.addWidget(noteBtn)
+        lay.addLayout(noteRow)
+
         row = QHBoxLayout()
         self.cardProj = NumberCard("项目总数")
         self.cardRec = NumberCard("工作记录条数")
@@ -1553,6 +1534,25 @@ class OverviewPage(QWidget):
         page = {"timeline": self.win.timeline_page, "hub": self.win.hub_page,
                 "audit": self.win.audit_page, "search": self.win.search_page}[key]
         self.win.switchTo(page)
+
+    def save_note(self):
+        """随记保存（08 计划 A-Ⅰ）：回车或点「记下」即入 notes 表，人的思想进大脑。"""
+        content = self.noteInput.text().strip()
+        if not content:
+            InfoBar.warning("内容为空", "写点什么再记", duration=2500, parent=self.win)
+            return
+        mood = self.noteMood.currentText()
+        mood = "" if mood.startswith("心情") else mood
+        try:
+            nid = brain.add_note(self.win.root, content, mood=mood, source="human")
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
+            return
+        self.noteInput.clear()
+        self.noteMood.setCurrentIndex(0)
+        self.win.brain_page.reload_notes()  # 大脑页最近列表跟上
+        InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
+                        duration=3000, parent=self.win)
 
     def goto_todo(self):
         """待处理卡直达对账分段（2026-10-01 审计补充：数字卡可点击）。"""
