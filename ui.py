@@ -2941,7 +2941,33 @@ class AgentHubWindow(FluentWindow):
         self.report_page.reload_reports()  # agent 侧 hub_report 可能生成了新报告，F5 后列表跟上
 
 
+def _install_crash_hook():
+    """windowed exe 无控制台，未捕获异常只弹 PyInstaller 错误框、traceback 蒸发——
+    主线程/子线程异常统一落盘 %TEMP%，退出报错可回查（2026-10-07 用户再报退出报错取证用）。"""
+    import traceback
+    import tempfile
+    import threading
+
+    def _dump(tag, tp, val, tb):
+        try:
+            p = Path(tempfile.gettempdir()) / f"AgentHub-{tag}-{datetime.now():%Y%m%d-%H%M%S}.log"
+            p.write_text("".join(traceback.format_exception(tp, val, tb)), encoding="utf-8")
+        except Exception:
+            pass
+
+    def _hook(tp, val, tb):
+        _dump("crash", tp, val, tb)
+        sys.__excepthook__(tp, val, tb)
+
+    def _thook(args):
+        _dump("thread-crash", args.exc_type, args.exc_value, args.exc_traceback)
+
+    sys.excepthook = _hook
+    threading.excepthook = _thook
+
+
 def run_gui():
+    _install_crash_hook()
     setTheme(Theme.AUTO)
     app = QApplication(sys.argv)
     app.setFont(QFont("Microsoft YaHei UI", 9))

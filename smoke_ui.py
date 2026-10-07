@@ -83,8 +83,8 @@ def main():
               and w.timeline_page.projFilter.count() >= 5)
         check("时间线agent过滤生效", (w.timeline_page.agentFilter.setCurrentIndex(1)
                                       or True) and len(w.timeline_page._filtered()) > 0)
-        check("统计-项目数", w.stats_page.cardProj.value.text() == "4", w.stats_page.cardProj.value.text())
-        check("统计-记录数", w.stats_page.cardRec.value.text() == "3", w.stats_page.cardRec.value.text())
+        check("统计-项目数", w.stats_page.valProj.text() == "4", w.stats_page.valProj.text())
+        check("统计-记录数", w.stats_page.valRec.text() == "3", w.stats_page.valRec.text())
         check("对账问题>=3（前缀/野目录/缺记录）", len(w.audit_page.issues) >= 3)
         check("Inbox 读取", snap.inbox == ["待分拣.txt"])
         sw = SearchWorker(str(tmp), "存档", None)
@@ -155,7 +155,7 @@ def main():
         brain.log_search(str(tmp), "hub_search", "冒烟检索", 1, agent="zcode")
         brain.log_search(str(tmp), "hub_memory_read", "冒烟检索2", 0, agent="hermes")
         w.brain_page.reload()
-        check("大脑页填充不崩", w.brain_page.cardMem.value.text() != "")
+        check("大脑页填充不崩", w.brain_page.valMem.text() != "")
         # 残留回归（v2.7.3）：使用分布/待办看板塞的是行布局，clear 必须递归拆净——
         # 造非空数据后连刷两次，进度条（每 agent 一条）与勾销按钮（每待办一个）数量必须不变
         brain.log_search(str(tmp), "hub_search", "冒烟检索3", 2, agent="dsh")
