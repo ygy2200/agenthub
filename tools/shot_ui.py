@@ -39,6 +39,29 @@ if os.environ.get("SHOT_DEMO"):  # 只为验收时间线形态：monkeypatch 内
     ]
     _brain.list_notes = lambda root, limit=20: _demo[:max(0, min(int(limit), 200))]
 
+    def _fake_heatmap(root, days=180):
+        import datetime as _dt
+        out, cur = [], _dt.date.today() - _dt.timedelta(days=days - 1)
+        for i in range(days):
+            d = cur + _dt.timedelta(days=i)
+            if d.day % 3 == 0:
+                out.append((d.isoformat(), 2, "灵感"))
+            elif d.day % 4 == 0:
+                out.append((d.isoformat(), 1, ""))
+            else:
+                out.append((d.isoformat(), 0, ""))
+        return out
+
+    _brain.notes_heatmap = _fake_heatmap
+    _brain.daily_recall_notes = lambda root, k=5: [
+        {"id": 7, "ts": "2026-09-02T09:00:00", "content": "上个月想的：热力图颜色应该用心情色而不是单一绿", "tags": "创意", "mood": "灵感", "starred": 1, "open_at": ""},
+        {"id": 5, "ts": "2026-08-15T21:00:00", "content": "随记要有收藏功能，像 flomo 那样重温", "tags": "", "mood": "笃定", "starred": 0, "open_at": ""},
+    ][:k]
+    _brain.on_this_day_notes = lambda root: [
+        {"id": 2, "ts": "2025-10-07T12:00:00", "content": "一年前今天：如果有个大脑把所有 agent 串起来就好了", "tags": "愿景", "mood": "灵感", "starred": 0, "open_at": ""},
+    ]
+    _brain.capsule_notes = lambda root, due_only=False: []
+
 PAGES = [("01-overview", w.overview_page), ("02-notes", w.notes_page),
          ("03-brain", w.brain_page), ("04-stats", w.stats_page),
          ("05-ledger", w.ledger_page), ("06-timeline", w.timeline_page),

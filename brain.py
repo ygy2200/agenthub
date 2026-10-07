@@ -178,7 +178,10 @@ CREATE TABLE IF NOT EXISTS notes (
     content TEXT NOT NULL,
     tags TEXT DEFAULT "",
     link TEXT DEFAULT "",
-    mood TEXT DEFAULT ""
+    mood TEXT DEFAULT "",
+    starred INTEGER DEFAULT 0,
+    open_at TEXT DEFAULT "",
+    context TEXT DEFAULT ""
 );
 """
 
@@ -455,6 +458,14 @@ def _migrate_columns(root: str) -> None:
             conn.execute(
                 "UPDATE projects SET status='stalled' WHERE status='active' AND updated!='' "
                 "AND julianday('now')-julianday(updated) > ?", (STALL_DAYS,))
+        # notes 创意层三列（2026-10-07 批 A）：收藏重温 / 时光胶囊开启日 / 自动上下文
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)")}
+        if "starred" not in cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN starred INTEGER DEFAULT 0")
+        if "open_at" not in cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN open_at TEXT DEFAULT ''")
+        if "context" not in cols:
+            conn.execute("ALTER TABLE notes ADD COLUMN context TEXT DEFAULT ''")
 
 
 # ---------------------------------------------------------------- 工作记录
@@ -1257,9 +1268,11 @@ _NOTE_MOODS = ("", "兴奋", "笃定", "疑问", "纠结", "灵感", "低落", "
 
 
 def add_note(root: str, content: str, tags: str = "", link: str = "",
-             mood: str = "", source: str = "human") -> int:
+             mood: str = "", source: str = "human", open_at: str = "",
+             context: str = "") -> int:
     """写入一条人的随记（08 计划 A-Ⅰ）。与 memories 分层：notes=第一人称原始思想，
-    memories=结晶经验——检索互通（search_all），生命周期不同。mood 可选（零负担）。"""
+    memories=结晶经验——检索互通（search_all），生命周期不同。mood 可选（零负担）。
+    open_at 非空=时光胶囊（未到期对检索隐藏）；context=保存时的活跃项目/会话自动附。"""
     content = (content or "").strip()
     if not content:
         raise ValueError("content 必填")
@@ -1268,8 +1281,10 @@ def add_note(root: str, content: str, tags: str = "", link: str = "",
     mood = mood if mood in _NOTE_MOODS else ""
     with db_conn(root) as conn:
         cur = conn.execute(
-            "INSERT INTO notes(ts,source,content,tags,link,mood) VALUES(?,?,?,?,?,?)",
-            (_now(), source, content[:4000], (tags or "").strip(), (link or "").strip(), mood))
+            "INSERT INTO notes(ts,source,content,tags,link,mood,open_at,context) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (_now(), source, content[:4000], (tags or "").strip(), (link or "").strip(),
+             mood, (open_at or "").strip(), (context or "").strip()))
         return cur.lastrowid
 
 
@@ -1291,6 +1306,72 @@ def notes_count(root: str, month: bool = False) -> int:
         return int(row[0]) if row else 0
 
 
+def star_note(root: str, note_id: int, on: bool = True) -> None:
+    """收藏/取消收藏（收藏条目进每日回顾池优先抽——journal-partner 模式）。"""
+    with db_conn(root) as conn:
+        conn.execute("UPDATE notes SET starred=? WHERE id=?", (1 if on else 0, note_id))
+
+
+def _note_visible_clause() -> str:
+    """未到期时光胶囊对检索隐藏（GUI 时间线可见、灰显倒计时）。"""
+    return "(open_at='' OR open_at<=?)"
+
+
+def daily_recall_notes(root: str, k: int = 5) -> list:
+    """每日随机回顾（flomo"不期而遇"模式）：随机抽旧随记，收藏优先。
+    随机种子=当天日期——同一天内打开结果固定，跨天换一批。排除今天与未到期胶囊。"""
+    today = datetime.datetime.now().strftime("%Y-%m-%d")
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT * FROM notes WHERE substr(ts,1,10)<>? AND {_note_visible_clause()} "
+            "ORDER BY starred DESC, id DESC LIMIT 300", (today, _now()))]
+    if not rows:
+        return []
+    import random
+    rng = random.Random(today)  # 当日固定
+    return rng.sample(rows, min(max(1, int(k)), len(rows)))
+
+
+def on_this_day_notes(root: str) -> list:
+    """周年回放（On This Day）：往年今天的随记（按月-日匹配任意往年，最新年优先）。"""
+    md = datetime.datetime.now().strftime("%m-%d")
+    year = datetime.datetime.now().strftime("%Y")
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM notes WHERE ts LIKE ? AND substr(ts,1,4)<? ORDER BY ts DESC LIMIT 20",
+            (f"____-{md}%", year))]
+
+
+def capsule_notes(root: str, due_only: bool = False) -> list:
+    """时光胶囊随记（open_at 非空）。due_only=True 只返回已到期（含今天）。"""
+    with db_conn(root) as conn:
+        if due_only:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM notes WHERE open_at!='' AND open_at<=? ORDER BY open_at DESC",
+                (datetime.datetime.now().strftime("%Y-%m-%d"),))]
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM notes WHERE open_at!='' ORDER BY open_at")]
+
+
+def notes_heatmap(root: str, days: int = 365) -> list:
+    """近 N 天 [(日期, 条数, 当日心情)]（心情取当日第一条非空）——热力图色带数据。"""
+    start = (datetime.datetime.now() - datetime.timedelta(days=max(7, min(int(days), 730)) - 1)).strftime("%Y-%m-%d")
+    with db_conn(root) as conn:
+        counts = {r["d"]: r["n"] for r in conn.execute(
+            "SELECT substr(ts,1,10) d, COUNT(*) n FROM notes "
+            "WHERE substr(ts,1,10)>=? GROUP BY d", (start,))}
+        moods = {}
+        for r in conn.execute(
+                "SELECT substr(ts,1,10) d, mood FROM notes "
+                "WHERE substr(ts,1,10)>=? AND mood!='' ORDER BY id", (start,)):
+            moods.setdefault(r["d"], r["mood"])
+    out, cur = [], datetime.datetime.now() - datetime.timedelta(days=max(7, min(int(days), 730)) - 1)
+    for i in range(max(7, min(int(days), 730))):
+        d = (cur + datetime.timedelta(days=i)).strftime("%Y-%m-%d")
+        out.append((d, counts.get(d, 0), moods.get(d, "")))
+    return out
+
+
 def search_notes(root: str, kw: str, limit: int = 20) -> list:
     """随记检索（LIKE 词面；纳入 search_all 实现人-agent 检索互通）。"""
     words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
@@ -1304,8 +1385,9 @@ def search_notes(root: str, kw: str, limit: int = 20) -> list:
         args += [like, like, like]
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
-            f"SELECT * FROM notes WHERE ({conds}) ORDER BY id DESC LIMIT ?",
-            args + [max(0, min(int(limit), 100))])]
+            f"SELECT * FROM notes WHERE ({conds}) AND {_note_visible_clause()} "
+            "ORDER BY id DESC LIMIT ?",
+            args + [_now(), max(0, min(int(limit), 100))])]
 
 
 def update_files_index(root: str, rows: list) -> None:
