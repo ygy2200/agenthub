@@ -68,4 +68,4 @@ os.makedirs(OUT, exist_ok=True)
 QTimer.singleShot(2500, snap)  # 先让后台建库/刷新跑完
 rc = app.exec()
 print("exec rc =", rc, flush=True)
-os._exit(0)  # qfw item view 退出挂起兜底（已知坑）
+ui._hard_exit(0)  # qfw item view 退出挂起兜底（已知坑）

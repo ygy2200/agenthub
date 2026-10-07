@@ -14,16 +14,18 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QAbstractNativeEventFilter
 from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat, QTextCursor, QIcon
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
-                               QStackedWidget, QSizeGrip, QSplitter, QTextEdit)
+                               QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
+                               QDialog)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
                             FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
                             NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
                             ScrollArea, SearchLineEdit, SegmentedWidget, StrongBodyLabel,
-                            SubtitleLabel, TextBrowser, TextEdit, TitleLabel, setTheme, Theme)
+                            SubtitleLabel, TextBrowser, TextEdit, TitleLabel, setTheme, Theme,
+                            isDarkTheme)
 
 import agentscore
 import brain
@@ -294,6 +296,165 @@ def mood_badge(mood: str) -> QLabel:
         "border-radius:8px;padding:1px 8px;font-size:11px;")
     lb.setFixedHeight(20)
     return lb
+
+
+def rel_time(ts: str) -> str:
+    """memos 式相对时间：刚刚/N 分钟前/今天 HH:MM/昨天 HH:MM/MM-DD HH:MM。"""
+    try:
+        t = datetime.fromisoformat(ts)
+    except (ValueError, TypeError):
+        return ts or ""
+    now = datetime.now()
+    days = (now.date() - t.date()).days
+    if days == 0:
+        dm = now - t
+        if dm.total_seconds() < 60:
+            return "刚刚"
+        if dm.total_seconds() < 3600:
+            return f"{int(dm.total_seconds() // 60)} 分钟前"
+        if dm.total_seconds() < 43200:
+            return f"{int(dm.total_seconds() // 3600)} 小时前"
+        return f"今天 {t:%H:%M}"
+    if days == 1:
+        return f"昨天 {t:%H:%M}"
+    if t.year == now.year:
+        return f"{t:%m-%d %H:%M}"
+    return f"{t:%Y-%m-%d %H:%M}"
+
+
+class MoodPicker(QWidget):
+    """心情单选点排（Daily_You 式）：点选高亮为心情色，再点取消——替代下拉框，少一次点击。"""
+
+    changed = Signal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        h = QHBoxLayout(self)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(6)
+        self._buttons = {}
+        for m in [x for x in brain._NOTE_MOODS if x]:
+            b = QPushButton(m)
+            b.setCheckable(True)
+            b.setCursor(Qt.PointingHandCursor)
+            b.setFixedHeight(26)
+            b.clicked.connect(lambda _, mm=m: self._pick(mm))
+            self._style(b, False)
+            h.addWidget(b)
+            self._buttons[m] = b
+        h.addStretch(1)
+
+    def _style(self, b, on):
+        if on:
+            b.setStyleSheet(f"color:white;background:{MOOD_COLOR[b.text()]};"
+                            "border:none;border-radius:4px;padding:2px 10px;font-size:12px;")
+        else:
+            b.setStyleSheet("color:#666;background:transparent;"
+                            "border:1px solid #c8c8c8;border-radius:4px;padding:2px 10px;font-size:12px;")
+
+    def _pick(self, m):
+        on = not self._buttons[m].isChecked()
+        for k, b in self._buttons.items():
+            b.setChecked(k == m and on)
+            self._style(b, k == m and on)
+        self.changed.emit(m if on else "")
+
+    def mood(self):
+        for m, b in self._buttons.items():
+            if b.isChecked():
+                return m
+        return ""
+
+    def reset(self):
+        for b in self._buttons.values():
+            b.setChecked(False)
+            self._style(b, False)
+
+
+_WM_HOTKEY, _MOD_CONTROL, _MOD_ALT, _VK_N = 0x0312, 0x2, 0x1, 0x4E
+
+
+class _HotkeyFilter(QAbstractNativeEventFilter):
+    """Windows 全局热键消息过滤器：WM_HOTKEY(id=1) → 呼出随记捕捉小窗。"""
+
+    def __init__(self, cb):
+        super().__init__()
+        self.cb = cb
+
+    def nativeEventFilter(self, event_type, message):
+        if event_type == b"windows_generic_MSG":
+            import ctypes.wintypes as wt
+            msg = wt.MSG.from_address(int(message))
+            if msg.message == _WM_HOTKEY and msg.wParam == 1:
+                self.cb()
+        return False, 0
+
+
+class QuickNotePopup(QDialog):
+    """全局热键呼出的随记捕捉小窗（Thino Global Capture 式）：热键 → 输入 → Enter 落盘即关。"""
+
+    _instance = None
+
+    @classmethod
+    def popup(cls, win):
+        if cls._instance is not None and cls._instance.isVisible():
+            cls._instance.activateWindow()
+            cls._instance.raise_()
+            return
+        dlg = cls(win)
+        cls._instance = dlg
+        dlg.show()
+        dlg.input.setFocus()
+
+    def __init__(self, win):
+        super().__init__(win)
+        self.win = win
+        self.setWindowTitle("随记 · 快速捕捉（Ctrl+Alt+N）")
+        self.setWindowFlags(self.windowFlags() | Qt.WindowStaysOnTopHint)
+        self.resize(560, 190)
+        v = QVBoxLayout(self)
+        v.setContentsMargins(16, 16, 16, 12)
+        v.setSpacing(8)
+        self.input = TextEdit()
+        self.input.setPlaceholderText("随手记一条…\nEnter 保存并关闭 · Shift+Enter 换行 · Esc 取消")
+        self.input.installEventFilter(self)
+        v.addWidget(self.input, 1)
+        h = QHBoxLayout()
+        self.moodPicker = MoodPicker()
+        h.addWidget(self.moodPicker)
+        h.addStretch(1)
+        self.saveBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
+        self.saveBtn.setEnabled(False)  # 空内容灰禁用（memos 模式），省一次无效点击
+        self.saveBtn.clicked.connect(self._submit)
+        h.addWidget(self.saveBtn)
+        v.addLayout(h)
+        self.input.textChanged.connect(
+            lambda: self.saveBtn.setEnabled(bool(self.input.toPlainText().strip())))
+        self.setStyleSheet(f"QDialog{{background:{'#2b2b2b' if isDarkTheme() else '#f7f7f7'};}}")
+
+    def eventFilter(self, obj, ev):
+        if obj is self.input and ev.type() == QEvent.KeyPress:
+            if ev.key() in (Qt.Key_Return, Qt.Key_Enter) and not (ev.modifiers() & Qt.ShiftModifier):
+                self._submit()
+                return True
+        return super().eventFilter(obj, ev)
+
+    def _submit(self):
+        content = self.input.toPlainText().strip()
+        if not content:
+            return
+        try:
+            nid = brain.add_note(self.win.root, content, mood=self.moodPicker.mood(), source="human")
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
+            return
+        self.close()
+        try:
+            self.win.notes_page.reload()
+        except Exception:
+            pass
+        InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
+                        duration=3000, parent=self.win)
 
 
 def clear_layout(lay):  # 递归摘净控件与子布局（随记时间线重绘用；行布局不拆净会残留叠加）
@@ -941,8 +1102,8 @@ class NotesPage(QWidget):
         self.statLabel = CaptionLabel("")
         head.addWidget(self.statLabel)
         lay.addLayout(head)
-        lay.addWidget(CaptionLabel("你的顿悟与想法——第一人称思想层，所有 agent 检索可见"
-                                   "（agent 侧用 hub_note，或对 agent 说「记一下：…」）"))
+        lay.addWidget(CaptionLabel("你的顿悟与想法——第一人称思想层，所有 agent 检索可见；"
+                                   "全局热键 Ctrl+Alt+N 随时呼出捕捉（agent 侧用 hub_note）"))
 
         # 轻捕获：零决策输入区（无标题无模板，写完即存）
         lay.addSpacing(16)
@@ -951,15 +1112,16 @@ class NotesPage(QWidget):
         self.noteInput.setFixedHeight(76)
         lay.addWidget(self.noteInput)
         row = QHBoxLayout()
-        self.noteMood = ComboBox()
-        self.noteMood.addItems(["心情（可选）"] + [m for m in brain._NOTE_MOODS if m])
-        self.noteMood.setFixedWidth(130)
-        row.addWidget(self.noteMood)
+        self.moodPicker = MoodPicker()
+        row.addWidget(self.moodPicker)
         row.addStretch(1)
-        noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
-        noteBtn.clicked.connect(self.save_note)
-        row.addWidget(noteBtn)
+        self.noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
+        self.noteBtn.setEnabled(False)  # 空内容灰禁用（memos 模式），视觉引导+省无效点击
+        self.noteBtn.clicked.connect(self.save_note)
+        row.addWidget(self.noteBtn)
         lay.addLayout(row)
+        self.noteInput.textChanged.connect(
+            lambda: self.noteBtn.setEnabled(bool(self.noteInput.toPlainText().strip())))
 
         # 时间线主体：按日期分组的无框行流（行是线不是卡）
         self.tlBox = QVBoxLayout()
@@ -979,17 +1141,15 @@ class NotesPage(QWidget):
     def save_note(self):
         content = self.noteInput.toPlainText().strip()
         if not content:
-            InfoBar.warning("内容为空", "写点什么再记", duration=2500, parent=self.win)
-            return
-        mood = self.noteMood.currentText()
-        mood = "" if mood.startswith("心情") else mood
+            return  # 按钮空态已灰禁用，此路径仅防御（如程序化调用）
+        mood = self.moodPicker.mood()
         try:
             nid = brain.add_note(self.win.root, content, mood=mood, source="human")
         except Exception as e:  # noqa: BLE001
             InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
             return
         self.noteInput.clear()
-        self.noteMood.setCurrentIndex(0)
+        self.moodPicker.reset()
         self.reload()
         InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
                         duration=3000, parent=self.win)
@@ -1032,7 +1192,7 @@ class NotesPage(QWidget):
                 self.tlBox.addWidget(group)
             line = QHBoxLayout()
             line.setSpacing(8)
-            line.addWidget(CaptionLabel((n["ts"] or "")[11:16] or "--:--"))
+            line.addWidget(CaptionLabel(rel_time(n["ts"])))
             if n["mood"]:
                 line.addWidget(mood_badge(n["mood"]))
             body_l = BodyLabel(n["content"])
@@ -1594,7 +1754,7 @@ class OverviewPage(QWidget):
         lay.addLayout(head)
         lay.addWidget(CaptionLabel("电脑上所有 agent 的工作入口，数据实时来自目录扫描（F5 刷新）"))
 
-        # 随记输入条（08 计划 A-Ⅰ：人的高频入口放首页=最短路径；最近随记列表在「大脑」页）
+        # 随记输入条（08 计划 A-Ⅰ：人的高频入口放首页=最短路径；完整视图在「随记」页）
         lay.addSpacing(16)
         lay.addWidget(StrongBodyLabel("随记（你的顿悟与想法——回车即存，所有 agent 检索可见）"))
         noteRow = QHBoxLayout()
@@ -1603,14 +1763,15 @@ class OverviewPage(QWidget):
         self.noteInput.setClearButtonEnabled(True)
         self.noteInput.returnPressed.connect(self.save_note)
         noteRow.addWidget(self.noteInput, 1)
-        self.noteMood = ComboBox()
-        self.noteMood.addItems(["心情（可选）"] + [m for m in brain._NOTE_MOODS if m])
-        self.noteMood.setFixedWidth(130)
-        noteRow.addWidget(self.noteMood)
-        noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
-        noteBtn.clicked.connect(self.save_note)
-        noteRow.addWidget(noteBtn)
+        self.moodPicker = MoodPicker()
+        noteRow.addWidget(self.moodPicker)
+        self.noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
+        self.noteBtn.setEnabled(False)  # 空内容灰禁用（memos 模式）
+        self.noteBtn.clicked.connect(self.save_note)
+        noteRow.addWidget(self.noteBtn)
         lay.addLayout(noteRow)
+        self.noteInput.textChanged.connect(
+            lambda: self.noteBtn.setEnabled(bool(self.noteInput.text().strip())))
 
         row = QHBoxLayout()
         self.cardProj = NumberCard("项目总数")
@@ -1673,17 +1834,15 @@ class OverviewPage(QWidget):
         """随记保存（08 计划 A-Ⅰ）：回车或点「记下」即入 notes 表，人的思想进大脑。"""
         content = self.noteInput.text().strip()
         if not content:
-            InfoBar.warning("内容为空", "写点什么再记", duration=2500, parent=self.win)
-            return
-        mood = self.noteMood.currentText()
-        mood = "" if mood.startswith("心情") else mood
+            return  # 按钮空态已灰禁用，此路径仅防御（回车空内容）
+        mood = self.moodPicker.mood()
         try:
             nid = brain.add_note(self.win.root, content, mood=mood, source="human")
         except Exception as e:  # noqa: BLE001
             InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
             return
         self.noteInput.clear()
-        self.noteMood.setCurrentIndex(0)
+        self.moodPicker.reset()
         self.win.notes_page.reload()  # 随记页时间线跟上
         InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
                         duration=3000, parent=self.win)
@@ -3011,7 +3170,7 @@ class AgentHubWindow(FluentWindow):
                     return  # 窗口仍可见（极罕见：关闭被外部阻止）——不杀，让用户继续用
             except RuntimeError:
                 pass  # C++ 对象已删——窗口确实没了，正是要硬杀的场景
-            os._exit(0)
+            _hard_exit(0)
         QTimer.singleShot(2000, _force_exit)
 
     def goto_search(self):
@@ -3111,6 +3270,49 @@ def _install_crash_hook():
     threading.excepthook = _thook
 
 
+def _register_note_hotkey(w):
+    """注册全局热键 Ctrl+Alt+N 呼出随记捕捉小窗（Thino Global Capture 式）。
+    冲突时仅提示不崩——随记页/首页输入条仍可用。返回注销函数。"""
+    if sys.platform != "win32":
+        return None
+    try:
+        import ctypes
+        user32 = ctypes.windll.user32
+        if not user32.RegisterHotKey(None, 1, _MOD_CONTROL | _MOD_ALT, _VK_N):
+            InfoBar.warning("全局热键未注册", "Ctrl+Alt+N 已被其他程序占用，"
+                            "随记页与首页输入条仍可正常使用", duration=6000, parent=w)
+            return None
+    except Exception:
+        return None
+    f = _HotkeyFilter(lambda: QuickNotePopup.popup(w))
+    QApplication.instance().installNativeEventFilter(f)
+
+    def _unregister():
+        try:
+            ctypes.windll.user32.UnregisterHotKey(None, 1)
+        except Exception:
+            pass
+        QApplication.instance().removeNativeEventFilter(f)
+
+    return _unregister
+
+
+def _hard_exit(rc):
+    """带存活 detached 线程的退出路径专用：os._exit 走 Windows 进程终止时仍会
+    触发线程终止+Qt TLS（QThreadStorage）清理，在半死线程上下文偶发 access
+    violation（faulthandler 实证，smoke 6 跑 3 中）；TerminateProcess 跳过全部
+    DLL 卸载回调，实测 10+ 次无段错误。非 win32 或调用失败时回退 os._exit。"""
+    if sys.platform == "win32":
+        try:
+            import ctypes
+            k32 = ctypes.windll.kernel32
+            k32.GetCurrentProcess.restype = ctypes.c_void_p
+            k32.TerminateProcess(ctypes.c_void_p(k32.GetCurrentProcess()), rc)
+        except Exception:
+            pass
+    os._exit(rc)
+
+
 def run_gui():
     _install_crash_hook()
     setTheme(Theme.AUTO)
@@ -3118,8 +3320,11 @@ def run_gui():
     app.setFont(QFont("Microsoft YaHei UI", 9))
     w = AgentHubWindow()
     w.show()
+    _unreg = _register_note_hotkey(w)
+    if _unreg:
+        app.aboutToQuit.connect(_unreg)
     rc = app.exec()
-    os._exit(rc)  # qfluentwidgets item view 退出挂起兜底（已知坑）
+    _hard_exit(rc)  # qfw item view 退出挂起兜底（已知坑）；_hard_exit 另消 detached 线程段错误
 
 
 if __name__ == "__main__":

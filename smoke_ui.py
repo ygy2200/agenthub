@@ -10,12 +10,16 @@ import sys
 import tempfile
 from pathlib import Path
 
+import faulthandler  # noqa: E402
+faulthandler.enable(open(os.path.join(tempfile.gettempdir(), "AgentHub-fault.log"),
+                        "a", encoding="utf-8"))  # 间歇性退出段错误取证（2026-10-07）
+
 from PySide6.QtCore import QTimer  # noqa: E402
 from PySide6.QtWidgets import QApplication, QLabel, QProgressBar, QPushButton  # noqa: E402
 
 import brain  # noqa: E402
 import core  # noqa: E402
-from ui import AgentHubWindow, FnWorker, SearchWorker, md_to_html  # noqa: E402
+from ui import AgentHubWindow, FnWorker, SearchWorker, _hard_exit, md_to_html  # noqa: E402
 
 FAILED = []
 
@@ -201,9 +205,9 @@ def main():
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
         # os._exit 对齐真实 GUI 退出（run_gui 同款硬杀）：detached 线程不做解释器级 GC/析构——
         # 若走 sys.exit 正常关闭，Python GC 会删掉还在跑的 detached QThread，复现 abort 反而误报
-        os._exit(1)
+        _hard_exit(1)
     print("SMOKE ALL PASS")
-    os._exit(0)
+    _hard_exit(0)
 
 
 if __name__ == "__main__":

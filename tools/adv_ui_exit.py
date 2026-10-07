@@ -66,4 +66,4 @@ def do_scene():
 QTimer.singleShot(1500, do_scene)
 rc = app.exec()
 print("exec rc =", rc, flush=True)
-os._exit(rc if rc else 0)  # qfw item view 退出挂起兜底（已知坑）
+ui._hard_exit(rc if rc else 0)  # qfw item view 退出挂起兜底（已知坑）
