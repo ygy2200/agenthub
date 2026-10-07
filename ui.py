@@ -282,10 +282,13 @@ def badge(agent: str, raw: str) -> QLabel:
 
 
 class NumberCard(CardWidget):
+    """可点击指标卡：只给绑了 clicked 的实例用（卡片=可交互区域的 Fluent 语义），
+    纯展示读数直接用 TitleLabel+CaptionLabel 排版，不再包卡。"""
+
     def __init__(self, title, parent=None):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 14, 20, 14)
+        lay.setContentsMargins(20, 16, 20, 16)
         self.value = TitleLabel("0")
         self.title = CaptionLabel(title)
         lay.addWidget(self.value)
@@ -609,7 +612,7 @@ class TimelinePage(QWidget):
         self.container = QWidget()
         self.box = QVBoxLayout(self.container)
         self.box.setContentsMargins(4, 12, 16, 24)
-        self.box.setSpacing(8)
+        self.box.setSpacing(16)  # 日期组间距 > 组内行距 8，拉开分组
         self.scroll.setWidget(self.container)
         self.scroll.setWidgetResizable(True)
         self.scroll.enableTransparentBackground()
@@ -689,12 +692,13 @@ class TimelinePage(QWidget):
             d = r.get("date") or "日期未标注"
             if d != self._last_date or self._cur_card_lay is None:
                 self._last_date = d
-                card = CardWidget()
-                self._cur_card_lay = QVBoxLayout(card)
-                self._cur_card_lay.setContentsMargins(18, 12, 18, 12)
-                self._cur_card_lay.setSpacing(6)
+                # 日期组不包卡：无框容器，分组靠日期标题+组间距（Linear：行是线不是卡）
+                group = QWidget()
+                self._cur_card_lay = QVBoxLayout(group)
+                self._cur_card_lay.setContentsMargins(0, 0, 0, 0)
+                self._cur_card_lay.setSpacing(8)
                 self._cur_card_lay.addWidget(StrongBodyLabel(d))
-                self.box.addWidget(card)
+                self.box.addWidget(group)
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
             title = ClickBodyLabel(_display_title(r)[:80])
@@ -758,30 +762,55 @@ class BrainPage(QWidget):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(24, 24, 24, 24)
+        # 健康读数：纯展示不包卡（卡片语义留给可点区域），大数字+小标题直接排版
         row = QHBoxLayout()
-        self.cardMem = NumberCard("记忆总数")
-        self.cardCrys = NumberCard("结晶率（记忆/记录）")
-        self.cardPush = NumberCard("记忆推送累计")
-        self.cardTodo = NumberCard("待办线索")
-        for c in (self.cardMem, self.cardCrys, self.cardPush, self.cardTodo):
-            row.addWidget(c)
+        self.valMem, self.valCrys, self.valPush, self.valTodo = (TitleLabel("0") for _ in range(4))
+        for val, t in ((self.valMem, "记忆总数"), (self.valCrys, "结晶率（记忆/记录）"),
+                       (self.valPush, "记忆推送累计"), (self.valTodo, "待办线索")):
+            col = QVBoxLayout()
+            col.addWidget(val)
+            col.addWidget(CaptionLabel(t))
+            row.addLayout(col)
         lay.addLayout(row)
+
+        # 随记卡片（08 计划方向 A-Ⅰ）：人的顿悟/想法——第一人称思想层，与 memories 分层、检索互通
+        gb = CardWidget()
+        g = QVBoxLayout(gb)
+        g.setContentsMargins(20, 16, 20, 16)
+        g.setSpacing(8)
+        g.addWidget(StrongBodyLabel("随记（你的顿悟与想法——第一人称思想层，所有 agent 检索可见）"))
+        noteRow = QHBoxLayout()
+        self.noteInput = LineEdit()
+        self.noteInput.setPlaceholderText("随手记一条想法/顿悟/摘录…（回车即存）")
+        self.noteInput.setClearButtonEnabled(True)
+        self.noteInput.returnPressed.connect(self.save_note)
+        noteRow.addWidget(self.noteInput, 1)
+        self.noteMood = ComboBox()
+        self.noteMood.addItems(["心情（可选）"] + [m for m in brain._NOTE_MOODS if m])
+        self.noteMood.setFixedWidth(130)
+        noteRow.addWidget(self.noteMood)
+        noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
+        noteBtn.clicked.connect(self.save_note)
+        noteRow.addWidget(noteBtn)
+        g.addLayout(noteRow)
+        self.noteList = ListWidget()
+        self.noteList.setFixedHeight(150)
+        g.addWidget(self.noteList)
+        lay.addWidget(gb)
 
         self.topBox = QVBoxLayout()
         self.useBox = QVBoxLayout()
         self.todoBox = QVBoxLayout()
         self.pinBox = QVBoxLayout()
+        # 内容组不包卡：间距+小标题分组（Fluent Layout——分组靠 spacing，不需要每块加框）
         for box, t in ((self.topBox, "记忆唤起 top10（开工推送反射弧记数）"),
                        (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）"),
                        (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）"),
                        (self.pinBox, "置顶记忆（置顶位只放工作知识）")):
-            box.setSpacing(10)  # 行距：无间距时唤起/置顶行挤成一片
-            gb = CardWidget()
-            g = QVBoxLayout(gb)
-            g.setContentsMargins(20, 14, 20, 14)
-            g.addWidget(StrongBodyLabel(t))
-            g.addLayout(box)
-            lay.addWidget(gb)
+            box.setSpacing(8)  # 行距：无间距时唤起/置顶行挤成一片
+            lay.addSpacing(16)  # 组间距 > 行距，拉开层级
+            lay.addWidget(StrongBodyLabel(t))
+            lay.addLayout(box)
         lay.addStretch(1)
         self.scroll.setWidget(body)
         outer.addWidget(self.scroll, 1)
@@ -796,10 +825,10 @@ class BrainPage(QWidget):
             return
         # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
         self.scroll.verticalScrollBar().setValue(0)
-        self.cardMem.value.setText(str(h["memories"]))
-        self.cardCrys.value.setText(f"{h['crystallization']}%")
-        self.cardPush.value.setText(str(h.get("recall_push_total", 0)))
-        self.cardTodo.value.setText(str(h["todo_count"]))
+        self.valMem.setText(str(h["memories"]))
+        self.valCrys.setText(f"{h['crystallization']}%")
+        self.valPush.setText(str(h.get("recall_push_total", 0)))
+        self.valTodo.setText(str(h["todo_count"]))
 
         def clear(box):
             while box.count():
@@ -862,6 +891,38 @@ class BrainPage(QWidget):
         if not pins:
             self.pinBox.addWidget(CaptionLabel("暂无置顶——agent 写记忆时可带 pinned=true 进置顶位"))
 
+        self.reload_notes()
+
+    def save_note(self):
+        """随记保存（08 计划 A-Ⅰ）：回车或点「记下」即入 notes 表，人的思想进大脑。"""
+        content = self.noteInput.text().strip()
+        if not content:
+            InfoBar.warning("内容为空", "写点什么再记", duration=2500, parent=self.win)
+            return
+        mood = self.noteMood.currentText()
+        mood = "" if mood.startswith("心情") else mood
+        try:
+            nid = brain.add_note(self.win.root, content, mood=mood, source="human")
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
+            return
+        self.noteInput.clear()
+        self.noteMood.setCurrentIndex(0)
+        self.reload_notes()
+        InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
+                        duration=3000, parent=self.win)
+
+    def reload_notes(self):
+        """最近随记列表填充（容错：库异常时保留旧内容不崩）。"""
+        try:
+            self.noteList.clear()
+            for n in brain.list_notes(self.win.root, limit=10):
+                mood = f"（{n['mood']}）" if n["mood"] else ""
+                tags = f" #{n['tags']}" if n["tags"] else ""
+                self.noteList.addItem(f"{n['ts'][:10]}{mood}{tags} {n['content'][:80]}")
+        except Exception:
+            pass
+
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:
         """唤起/置顶行：类型徽章 + 编号·次数 + 正文（正常字号可换行）。
@@ -891,42 +952,40 @@ class StatsPage(QWidget):
         self.win = win
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
+        # 健康读数：纯展示不包卡，大数字+小标题直接排版
         row = QHBoxLayout()
-        self.cardProj = NumberCard("项目总数")
-        self.cardRec = NumberCard("工作记录条数")
-        self.cardIssue = NumberCard("对账问题数")
-        self.cardStalled = NumberCard("停滞项目（90天）")
-        self.cardSearch = NumberCard("检索（今日/累计）")
-        for c in (self.cardProj, self.cardRec, self.cardIssue, self.cardStalled, self.cardSearch):
-            row.addWidget(c)
+        self.valProj, self.valRec, self.valIssue, self.valStalled, self.valSearch = \
+            (TitleLabel("0") for _ in range(5))
+        for val, t in ((self.valProj, "项目总数"), (self.valRec, "工作记录条数"),
+                       (self.valIssue, "对账问题数"), (self.valStalled, "停滞项目（90天）"),
+                       (self.valSearch, "检索（今日/累计）")):
+            col = QVBoxLayout()
+            col.addWidget(val)
+            col.addWidget(CaptionLabel(t))
+            row.addLayout(col)
         lay.addLayout(row)
 
         self.agentBox = QVBoxLayout()
         self.monthBox = QVBoxLayout()
         self.healthLine = CaptionLabel("")
         self.healthLine.setWordWrap(True)
+        # 内容组不包卡：间距+小标题分组
         for box, t in ((self.agentBox, "各 agent 记录分布"), (self.monthBox, "近 6 个月活跃")):
-            gb = CardWidget()
-            g = QVBoxLayout(gb)
-            g.setContentsMargins(20, 14, 20, 14)
-            g.addWidget(StrongBodyLabel(t))
-            g.addLayout(box)
-            lay.addWidget(gb)
-        hc = CardWidget()
-        hg = QVBoxLayout(hc)
-        hg.setContentsMargins(20, 14, 20, 14)
-        hg.addWidget(StrongBodyLabel("大脑体检（智能摘要）"))
-        hg.addWidget(self.healthLine)
-        lay.addWidget(hc)
+            lay.addSpacing(16)
+            lay.addWidget(StrongBodyLabel(t))
+            lay.addLayout(box)
+        lay.addSpacing(16)
+        lay.addWidget(StrongBodyLabel("大脑体检（智能摘要）"))
+        lay.addWidget(self.healthLine)
         lay.addStretch(1)
 
     def set_db(self, s: dict):
         """统计页数据源 = 大脑数据库。"""
-        self.cardProj.value.setText(str(s.get("projects", 0)))
-        self.cardRec.value.setText(str(s.get("records", 0)))
-        self.cardIssue.value.setText(str(s.get("errors_open", 0)))
-        self.cardStalled.value.setText(str(s.get("projects_stalled", 0)))
-        self.cardSearch.value.setText(f"{s.get('searches_today', 0)} / {s.get('searches_total', 0)}")
+        self.valProj.setText(str(s.get("projects", 0)))
+        self.valRec.setText(str(s.get("records", 0)))
+        self.valIssue.setText(str(s.get("errors_open", 0)))
+        self.valStalled.setText(str(s.get("projects_stalled", 0)))
+        self.valSearch.setText(f"{s.get('searches_today', 0)} / {s.get('searches_total', 0)}")
         try:
             h = brain.health_report(self.win.root)
             dup = f"疑似重复记忆 {h['dup_memory_count']} 组"
@@ -1017,7 +1076,7 @@ class SearchPage(QWidget):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
-        rv.setSpacing(6)
+        rv.setSpacing(8)
         act = QHBoxLayout()
         act.addStretch(1)
         self.btnOpen = PushButton(ic("LINK", "INFO"), "打开")
@@ -1297,10 +1356,9 @@ class JournalPage(QWidget):
         lay.addWidget(CaptionLabel("agent 执行出错（自动/主动上报）在这里可查可流转；"
                                    "每一次写操作（记录/记忆/接入/引导/还原）都有流水，记录类可撤销。"))
 
-        errCard = CardWidget()
-        g1 = QVBoxLayout(errCard)
-        g1.setContentsMargins(18, 12, 18, 12)
-        g1.setSpacing(6)
+        # 列表区不包卡：ListWidget 自带边界，卡套列表=框中框
+        g1 = QVBoxLayout()
+        g1.setSpacing(8)
         g1.addWidget(StrongBodyLabel("错误登记（open=待处理 · fixed=已处理）"))
         self.errList = ListWidget()
         self.errList.setMinimumHeight(150)
@@ -1313,12 +1371,10 @@ class JournalPage(QWidget):
             errRow.addWidget(b)
         errRow.addStretch(1)
         g1.addLayout(errRow)
-        lay.addWidget(errCard, 2)
+        lay.addLayout(g1, 2)
 
-        jCard = CardWidget()
-        g2 = QVBoxLayout(jCard)
-        g2.setContentsMargins(18, 12, 18, 12)
-        g2.setSpacing(6)
+        g2 = QVBoxLayout()
+        g2.setSpacing(8)
         g2.addWidget(StrongBodyLabel("操作流水（最新在上，最近 200 条）"))
         self.jList = ListWidget()
         g2.addWidget(self.jList, 1)
@@ -1328,7 +1384,7 @@ class JournalPage(QWidget):
         jRow.addWidget(self.undoBtn)
         jRow.addStretch(1)
         g2.addLayout(jRow)
-        lay.addWidget(jCard, 3)
+        lay.addLayout(g2, 3)
 
         self.fixBtn.clicked.connect(lambda: self.set_status("fixed"))
         self.reopenBtn.clicked.connect(lambda: self.set_status("open"))
@@ -1455,45 +1511,40 @@ class OverviewPage(QWidget):
         self.cardToday.clicked.connect(lambda: self.win.switchTo(self.win.timeline_page))
         self.cardTodo.clicked.connect(self.goto_todo)
 
+        # 内容组不包卡：间距+小标题分组；NumberCard 保留框（绑了 clicked，卡片=可点区域）
         cols = QHBoxLayout()
+        cols.setSpacing(24)  # 左右两栏列距 > 行距，分组靠间距
         # 左：最近 agent 动态
-        recentCard = CardWidget()
-        g1 = QVBoxLayout(recentCard)
-        g1.setContentsMargins(18, 12, 18, 12)
-        g1.setSpacing(8)
-        g1.addWidget(StrongBodyLabel("最近动态（点击看详情）"))
+        recentCol = QVBoxLayout()
+        recentCol.addWidget(StrongBodyLabel("最近动态（点击看详情）"))
         self.recentBox = QVBoxLayout()
         self.recentBox.setSpacing(4)
-        g1.addLayout(self.recentBox)
-        g1.addStretch(1)
-        cols.addWidget(recentCard, 3)
+        recentCol.addLayout(self.recentBox)
+        recentCol.addStretch(1)
+        cols.addLayout(recentCol, 3)
         # 右：agent 阵容 + 快捷入口
         rightCol = QVBoxLayout()
-        agentCard = CardWidget()
-        g2 = QVBoxLayout(agentCard)
-        g2.setContentsMargins(18, 12, 18, 12)
-        g2.setSpacing(6)
-        g2.addWidget(StrongBodyLabel("Agent 阵容（Agent 中心探测）"))
+        rightCol.setSpacing(8)
+        rightCol.addWidget(StrongBodyLabel("Agent 阵容（Agent 中心探测）"))
         self.agentBox = QVBoxLayout()
-        self.agentBox.setSpacing(2)
-        g2.addLayout(self.agentBox)
-        g2.addWidget(StrongBodyLabel("当前活跃会话（hub_heartbeat 上报）"))
+        self.agentBox.setSpacing(4)
+        rightCol.addLayout(self.agentBox)
+        rightCol.addSpacing(16)
+        rightCol.addWidget(StrongBodyLabel("当前活跃会话（hub_heartbeat 上报）"))
         self.sessionBox = QVBoxLayout()
-        self.sessionBox.setSpacing(2)
-        g2.addLayout(self.sessionBox)
-        g2.addStretch(1)
-        rightCol.addWidget(agentCard, 2)
-        quickCard = CardWidget()
-        g3 = QVBoxLayout(quickCard)
-        g3.setContentsMargins(18, 12, 18, 12)
-        g3.setSpacing(6)
-        g3.addWidget(StrongBodyLabel("快捷入口"))
+        self.sessionBox.setSpacing(4)
+        rightCol.addLayout(self.sessionBox)
+        rightCol.addSpacing(16)
+        rightCol.addWidget(StrongBodyLabel("快捷入口"))
+        quickRow = QHBoxLayout()
         for text, target in (("打开时间线", "timeline"), ("打开 Agent 中心", "hub"),
                              ("检查对账问题", "audit"), ("搜索全部记录", "search")):
             b = PushButton(text)
             b.clicked.connect(lambda _, t=target: self.goto(t))
-            g3.addWidget(b)
-        rightCol.addWidget(quickCard, 1)
+            quickRow.addWidget(b)
+        quickRow.addStretch(1)
+        rightCol.addLayout(quickRow)
+        rightCol.addStretch(1)
         cols.addLayout(rightCol, 2)
         lay.addLayout(cols)
         lay.addStretch(1)
@@ -1875,7 +1926,7 @@ class HubPage(QWidget):
                                    "未列出的 agent 可手动添加根目录。"))
 
         self.cardsRow = QHBoxLayout()
-        self.cardsRow.setSpacing(10)
+        self.cardsRow.setSpacing(24)  # agent 列间距：去框后靠间距分列
         lay.addLayout(self.cardsRow)
 
         viewRow = QHBoxLayout()
@@ -2055,20 +2106,22 @@ class HubPage(QWidget):
             if item.widget():
                 item.widget().deleteLater()
         for a in self.agents:
-            card = CardWidget()
-            g = QVBoxLayout(card)
-            g.setContentsMargins(16, 10, 16, 10)
-            g.setSpacing(2)
-            g.addWidget(StrongBodyLabel(a.name))
-            g.addWidget(CaptionLabel((a.home or "未检测到（可手动添加目录）")[:60]))
-            g.addWidget(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
-                                     f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
+            # agent 列不包卡：纯展示读数，列间距分隔（卡只留给可点区域）
+            col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(4)
+            col.addWidget(StrongBodyLabel(a.name))
+            col.addWidget(CaptionLabel((a.home or "未检测到（可手动添加目录）")[:60]))
+            col.addWidget(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
+                                       f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
             reg = getattr(self, "_reg", {}).get(a.name.lower())
             if reg:
-                g.addWidget(CaptionLabel(
+                col.addWidget(CaptionLabel(
                     f"{'● 在线' if reg['online'] else '○ 离线'} · 记录 {reg['records']} 条 · "
                     f"最近活跃 {reg['last_seen'] or '—'}"))
-            self.cardsRow.addWidget(card)
+            wrap = QWidget()
+            wrap.setLayout(col)
+            self.cardsRow.addWidget(wrap)
         self.cardsRow.addStretch(1)
 
     def fill_skills(self):
@@ -2322,7 +2375,7 @@ class ConnectPage(QWidget):
         for r in rows:
             card = CardWidget()
             g = QHBoxLayout(card)
-            g.setContentsMargins(18, 10, 18, 10)
+            g.setContentsMargins(16, 12, 16, 12)
             col = QVBoxLayout()
             mcp_txt = "—（用下方配置片段手动接入）" if r["mcp"] is None else \
                 ("✓ 已接入公用大脑" if r["mcp"] else "○ 未接入")
@@ -2414,7 +2467,7 @@ class ReportPage(QWidget):
 
         genCard = CardWidget()
         g = QHBoxLayout(genCard)
-        g.setContentsMargins(20, 14, 20, 14)
+        g.setContentsMargins(20, 16, 20, 16)
         gt = QVBoxLayout()
         gt.addWidget(StrongBodyLabel("生成今日报告"))
         gt.addWidget(BodyLabel("从大脑数据库实时统计，浏览器打开；历史报告保留在同目录可回看。"))
@@ -2426,7 +2479,7 @@ class ReportPage(QWidget):
 
         histCard = CardWidget()
         hv = QVBoxLayout(histCard)
-        hv.setContentsMargins(20, 14, 20, 14)
+        hv.setContentsMargins(20, 16, 20, 16)
         hv.addWidget(StrongBodyLabel("历史报告（双击打开）"))
         self.histList = ListWidget()
         self.histList.itemDoubleClicked.connect(
@@ -2523,7 +2576,7 @@ class SettingsPage(QWidget):
 
         c1 = CardWidget()
         g1 = QVBoxLayout(c1)
-        g1.setContentsMargins(20, 14, 20, 14)
+        g1.setContentsMargins(20, 16, 20, 16)
         g1.addWidget(StrongBodyLabel("根目录"))
         row = QHBoxLayout()
         self.rootLabel = BodyLabel("未设置")
@@ -2539,7 +2592,7 @@ class SettingsPage(QWidget):
 
         c1b = CardWidget()
         g1b = QVBoxLayout(c1b)
-        g1b.setContentsMargins(20, 14, 20, 14)
+        g1b.setContentsMargins(20, 16, 20, 16)
         g1b.addWidget(StrongBodyLabel("大脑数据库（_hub\\brain.db —— 记忆/记录/流水的唯一真理）"))
         dbRow = QHBoxLayout()
         self.backupBtn = PrimaryPushButton(ic("SAVE", "INFO"), "立即备份大脑")
@@ -2554,7 +2607,7 @@ class SettingsPage(QWidget):
 
         c1c = CardWidget()
         g1c = QVBoxLayout(c1c)
-        g1c.setContentsMargins(20, 14, 20, 14)
+        g1c.setContentsMargins(20, 16, 20, 16)
         g1c.addWidget(StrongBodyLabel("窗口大小（点一下立即生效，边缘拖拽外的一键兜底）"))
         sizeRow = QHBoxLayout()
         for label, wd, ht in (("紧凑 1180×760", 1180, 760), ("标准 1400×900", 1400, 900),
@@ -2569,7 +2622,7 @@ class SettingsPage(QWidget):
 
         c2 = CardWidget()
         g2 = QVBoxLayout(c2)
-        g2.setContentsMargins(20, 14, 20, 14)
+        g2.setContentsMargins(20, 16, 20, 16)
         g2.addWidget(StrongBodyLabel("规则（存 _hub\\rules.md，将来 agent 接入后由工具注入）"))
         self.rulesEdit = TextEdit()
         self.rulesEdit.setMinimumHeight(220)
