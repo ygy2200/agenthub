@@ -171,6 +171,15 @@ CREATE TABLE IF NOT EXISTS files (
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
     PRIMARY KEY (project, path)
 );
+CREATE TABLE IF NOT EXISTS notes (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT,
+    source TEXT DEFAULT "human",
+    content TEXT NOT NULL,
+    tags TEXT DEFAULT "",
+    link TEXT DEFAULT "",
+    mood TEXT DEFAULT ""
+);
 """
 
 
@@ -1221,11 +1230,12 @@ def get_progress(root: str, limit: int = 30) -> list:
 
 
 def search_all(root: str, kw: str, limit: int = 30) -> dict:
-    """全脑检索：工作记录 + 记忆 + 文件名。返回 {"records": [...], "memories": [...], "files": [...]}"""
+    """全脑检索：工作记录 + 记忆 + 随记 + 文件名。返回 {"records": [...], "memories": [...], "notes": [...], "files": [...]}"""
     if not kw.strip():
-        return {"records": [], "memories": [], "files": []}
+        return {"records": [], "memories": [], "notes": [], "files": []}
     return {"records": search_records(root, kw, limit),
             "memories": search_memories(root, kw, limit),
+            "notes": search_notes(root, kw, limit),
             "files": search_files(root, kw, limit)}
 
 
@@ -1238,6 +1248,53 @@ def search_files(root: str, kw: str, limit: int = 20) -> list:
         return [dict(r) for r in conn.execute(
             f"SELECT project,name,path FROM files WHERE ({conds}) LIMIT ?",
             [f"%{_like_escape(w)}%" for w in words] + [max(1, min(limit, 100))])]
+
+
+# ---------------------------------------------------------------- 人的随记（08 计划方向 A）
+
+_NOTE_SOURCES = ("human", "agent", "web")
+_NOTE_MOODS = ("", "兴奋", "笃定", "疑问", "纠结", "灵感", "低落", "平静")
+
+
+def add_note(root: str, content: str, tags: str = "", link: str = "",
+             mood: str = "", source: str = "human") -> int:
+    """写入一条人的随记（08 计划 A-Ⅰ）。与 memories 分层：notes=第一人称原始思想，
+    memories=结晶经验——检索互通（search_all），生命周期不同。mood 可选（零负担）。"""
+    content = (content or "").strip()
+    if not content:
+        raise ValueError("content 必填")
+    if source not in _NOTE_SOURCES:
+        source = "human"
+    mood = mood if mood in _NOTE_MOODS else ""
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "INSERT INTO notes(ts,source,content,tags,link,mood) VALUES(?,?,?,?,?,?)",
+            (_now(), source, content[:4000], (tags or "").strip(), (link or "").strip(), mood))
+        return cur.lastrowid
+
+
+def list_notes(root: str, limit: int = 20) -> list:
+    """最近随记（ts 倒序）。GUI 随记卡片与每日回顾用。"""
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM notes ORDER BY id DESC LIMIT ?", (max(0, min(int(limit), 200)),))]
+
+
+def search_notes(root: str, kw: str, limit: int = 20) -> list:
+    """随记检索（LIKE 词面；纳入 search_all 实现人-agent 检索互通）。"""
+    words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
+    if not words:
+        return []
+    conds = " OR ".join(
+        ["(content LIKE ? ESCAPE '\\' OR tags LIKE ? ESCAPE '\\' OR mood LIKE ? ESCAPE '\\')"] * len(words))
+    args: list = []
+    for w in words:
+        like = f"%{_like_escape(w)}%"
+        args += [like, like, like]
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            f"SELECT * FROM notes WHERE ({conds}) ORDER BY id DESC LIMIT ?",
+            args + [max(0, min(int(limit), 100))])]
 
 
 def update_files_index(root: str, rows: list) -> None:

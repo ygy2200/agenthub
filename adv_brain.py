@@ -201,7 +201,7 @@ def t_search_all_and_stats(tmp):
     assert res["records"] and res["memories"] and not res["files"]
     res = brain.search_all(rs, "a.png")
     assert res["files"] and not res["records"], "文件名命中不应混入记录"
-    assert brain.search_all(rs, "  ") == {"records": [], "memories": [], "files": []}
+    assert brain.search_all(rs, "  ") == {"records": [], "memories": [], "notes": [], "files": []}
     s = brain.stats(rs)
     assert s["records"] >= 4 and s["memories"] >= 3 and "agent_counts" in s and "monthly_counts" in s
     assert s["today"] >= 1
@@ -1159,6 +1159,49 @@ def t_records_fused(tmp):
     assert brain.search_records(rs, "") == []
 
 
+def t_notes(tmp):
+    """08 计划 A-Ⅰ 人的随记：add/list/search（mood 合法值过滤/空 content 拒绝/来源白名单/
+    search_all 互通/LIKE 通配符字面/limit 边界）。"""
+    root = Path(tmp) / "hub_notes"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    # ① 基本写入与非法值
+    n1 = brain.add_note(rs, "顿悟：检索即记忆的读取接口", tags="顿悟,架构", mood="灵感")
+    assert n1 >= 1
+    brain.add_note(rs, "纯符号 !!! @@", mood="不合法心情")  # mood 不在白名单 → 落空串
+    with brain.db_conn(rs) as conn:
+        moods = [r[0] for r in conn.execute("SELECT mood FROM notes ORDER BY id")]
+    assert moods == ["灵感", ""], moods
+    try:
+        brain.add_note(rs, "   ")
+    except ValueError:
+        pass
+    else:
+        raise AssertionError("空 content 未被拒绝")
+    brain.add_note(rs, "链接随记", link="https://example.com/a%b", source="web")
+    # ② list 与 search
+    assert len(brain.list_notes(rs, limit=10)) == 3
+    rows = brain.search_notes(rs, "顿悟")
+    assert len(rows) == 1 and rows[0]["tags"] == "顿悟,架构", rows
+    rows = brain.search_notes(rs, "链接随记")
+    assert len(rows) == 1, rows  # 匹配面=content/tags/mood（link 不参与，如需按链接找用 GUI）
+    assert brain.search_notes(rs, "不存在的词组") == []
+    # LIKE 通配符按声明行为（% 命中任意）——字面查询用 brain._like_escape 由调用方处理
+    # ③ search_all 互通：随记进全脑检索
+    res = brain.search_all(rs, "顿悟")
+    assert len(res["notes"]) == 1 and res["records"] == [] and res["memories"] == []
+    # ④ mood/来源边界
+    brain.add_note(rs, "agent 代记一条", source="agent")
+    rows = brain.search_notes(rs, "agent 代记")
+    assert rows[0]["source"] == "agent", rows
+    brain.add_note(rs, "来源白名单", source="hacker")
+    with brain.db_conn(rs) as conn:
+        src = conn.execute("SELECT source FROM notes WHERE content='来源白名单'").fetchone()[0]
+    assert src == "human", src  # 非法来源落回 human
+    assert len(brain.list_notes(rs, limit=2)) == 2  # limit 边界
+
+
 def t_handoff(tmp):
     """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
     （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
@@ -1480,6 +1523,7 @@ def main():
     case("BM25通道P4.2（分词边界/超长截断/独有词IDF/整串中文命中/kind与limit边界/坏类型）", lambda: t_bm25(tmp))
     case("RRF融合P4.3（两路互补/_channels/开关回滚/pinned前置/bigram重试触发/count_hits）", lambda: t_rrf_fused(tmp))
     case("records融合P4.3b（整串bigram命中/双路_channels/开关回旧路/重试触发/limit）", lambda: t_records_fused(tmp))
+    case("人的随记A-Ⅰ（add/list/search_all互通/mood白名单/来源落回/空content拒绝/limit）", lambda: t_notes(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))

@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.16.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.17.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -194,7 +194,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if name == "hub_search":
         kw = str(arguments.get("keyword", "")).strip()
         res = brain.search_all(root, kw)
-        n_total = len(res["records"]) + len(res["memories"]) + len(res["files"])
+        n_total = (len(res["records"]) + len(res["memories"]) + len(res["files"])
+                   + len(res.get("notes", [])))  # notes 漏加=纯随记命中误报无结果（实测抓到）
         brain.log_search(root, "hub_search", kw, n_total, agent=_guess_agent(root))
         if not n_total:
             return (f"无结果：{kw}\n"
@@ -202,7 +203,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                     "③ hub_memory_read 查记忆 ④ hub_env_list 查环境档案）")
         words = [w for w in kw.split() if w][:8]
         lines = [f"全脑检索「{kw}」：命中 记录{len(res['records'])} · 记忆{len(res['memories'])} · "
-                 f"文件{len(res['files'])}（记录行带 #id，精读用 hub_get_record）"]
+                 f"随记{len(res.get('notes', []))} · 文件{len(res['files'])}"
+                 f"（记录行带 #id，精读用 hub_get_record）"]
         if any("_bigram" in r for r in res["records"]) or any("_bigram" in mem for mem in res["memories"]):
             lines.insert(1, "（连续长串无直接命中，已拆词放宽召回——按相关度排序，弱相关自行取舍）")
         for r in res["records"]:
@@ -212,11 +214,32 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"  ↳ {snip}")
         for mem in res["memories"]:
             lines.append(f"[记忆#{mem['id']}] {brain.KIND_CN.get(mem['kind'], mem['kind'])}：{mem['content'][:100]}")
+        for n in res.get("notes", []):
+            mood = f"（{n['mood']}）" if n.get("mood") else ""
+            lines.append(f"[随记#{n['id']}] {n['ts'][:10]}{mood}：{n['content'][:100]}")
         for f in res["files"]:
             lines.append(f"[文件] {f['project']}\\{f['name']}")
         if len(lines) > 41:  # 头部 1 行 + 内容 40 行
             lines = lines[:41] + ["（结果较多仅显示前 40 行，换更具体的关键词可缩小范围）"]
         return "\n".join(lines)
+
+    if name == "hub_note":
+        content = str(arguments.get("content", "")).strip()
+        if not content:
+            return "错误：content 必填——人说的原话/随记内容"
+        try:
+            nid = brain.add_note(
+                root, content,
+                tags=str(arguments.get("tags", "")).strip(),
+                link=str(arguments.get("link", "")).strip(),
+                mood=str(arguments.get("mood", "")).strip(),
+                source="human" if str(arguments.get("source", "human")) != "web" else "web")
+        except ValueError as e:
+            return f"错误：{e}"
+        core.journal(root, _guess_agent(root), "note_append", f"brain:notes#{nid}")
+        mood = f"（{arguments.get('mood')}）" if arguments.get("mood") else ""
+        return (f"已记入随记 #{nid}{mood}——人的思想已进大脑，所有 agent 检索可见；"
+                f"GUI「大脑」页随时回看")
 
     if name == "hub_get_rules":
         return core.load_rules(root)
@@ -239,8 +262,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 # 自动用同 query 搜记录给线索（search_records 内部含 bigram 重试）
                 recs = brain.search_records(root, query, 3)
                 if recs:
-                    note = "长串已拆词放宽召回，弱相关自行取舍；" if any("_bigram" in r for r in recs) else ""
-                    lines = [msg, f"记忆之外，工作记录里可能有相关线索（{note}hub_get_record #id 精读）："]
+                    lines = [msg, "记忆之外，工作记录里可能有相关线索（弱相关线索自行取舍，"
+                                  "hub_get_record #id 精读）："]
                     lines += [f"[记录#{r['id']}] {r['date']} {r['project']}（{r['agent']}）：{(r['title'] or '')[:60]}"
                               for r in recs]
                     return "\n".join(lines)
@@ -730,6 +753,13 @@ TOOLS = [
                      "required": ["project", "agent", "content"]}},
     {"name": "hub_search", "description": "跨项目全文搜索工作记录/记忆/文件名（记录行带 #id，判断不了价值先看片段，精读用 hub_get_record）",
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}},
+    {"name": "hub_note", "description": "记入人的随记（顿悟/想法/摘录，主人第一人称思想）——主人说\"记一下：XXX\"时调用；content 必填，tags/link/mood 可选。随记与工作经验（memories）分层但检索互通",
+     "inputSchema": {"type": "object",
+                     "properties": {"content": {"type": "string", "description": "随记内容（人说的原话或整理后的想法）"},
+                                    "tags": {"type": "string", "description": "标签，逗号分隔（如：顿悟,架构）"},
+                                    "link": {"type": "string", "description": "相关链接（URL/文件路径，可选）"},
+                                    "mood": {"type": "string", "description": "记下时的心情（可选：兴奋/笃定/疑问/纠结/灵感/低落/平静）"}},
+                     "required": ["content"]}},
     {"name": "hub_get_rules", "description": "读取团队协作规范（目录命名/记录格式/铁律）",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_memory_read", "description": "读取大脑记忆库（结构化：环境事实/用户偏好/踩坑经验/项目进展/随手记）。带 query 可关键词检索，kind 按类型过滤",
