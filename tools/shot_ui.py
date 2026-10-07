@@ -30,9 +30,19 @@ if not w.root or not os.path.isdir(w.root):
     brain.init_db(w.root)
     w.refresh()
 
-PAGES = [("01-overview", w.overview_page), ("02-brain", w.brain_page),
-         ("03-stats", w.stats_page), ("04-ledger", w.ledger_page),
-         ("05-timeline", w.timeline_page), ("06-hub", w.hub_page)]
+if os.environ.get("SHOT_DEMO"):  # 只为验收时间线形态：monkeypatch 内存演示数据，不落库
+    import brain as _brain
+    _demo = [
+        {"id": 3, "ts": "2026-10-07T14:20:00", "source": "human", "content": "随记页时间线验收演示——行是线不是卡", "tags": "", "link": "", "mood": "灵感"},
+        {"id": 2, "ts": "2026-10-07T10:02:00", "source": "human", "content": "第二条演示：心情徽章配色是否顺眼", "tags": "", "link": "", "mood": "笃定"},
+        {"id": 1, "ts": "2026-10-06T22:31:00", "source": "human", "content": "昨天的演示条目——按日期分组", "tags": "", "link": "", "mood": "疑问"},
+    ]
+    _brain.list_notes = lambda root, limit=20: _demo[:max(0, min(int(limit), 200))]
+
+PAGES = [("01-overview", w.overview_page), ("02-notes", w.notes_page),
+         ("03-brain", w.brain_page), ("04-stats", w.stats_page),
+         ("05-ledger", w.ledger_page), ("06-timeline", w.timeline_page),
+         ("07-hub", w.hub_page)]
 # 注意：journal/audit 是 ledger_page 的内部分段（不在导航栈），switchTo 只能用 ledger_page 本体
 state = {"i": 0}
 

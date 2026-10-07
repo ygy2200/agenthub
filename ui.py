@@ -281,6 +281,34 @@ def badge(agent: str, raw: str) -> QLabel:
     return lb
 
 
+MOOD_COLOR = {  # 心情徽章配色（Daily_You 式元信息呈现，随记页用）
+    "兴奋": "#d13438", "笃定": "#107c10", "疑问": "#0078d4", "纠结": "#8764b8",
+    "灵感": "#ca5010", "低落": "#5d5a58", "平静": "#4a6b8a",
+}
+
+
+def mood_badge(mood: str) -> QLabel:
+    lb = QLabel(mood)
+    lb.setStyleSheet(
+        f"color:white;background:{MOOD_COLOR.get(mood, '#8a8a8a')};"
+        "border-radius:8px;padding:1px 8px;font-size:11px;")
+    lb.setFixedHeight(20)
+    return lb
+
+
+def clear_layout(lay):  # 递归摘净控件与子布局（随记时间线重绘用；行布局不拆净会残留叠加）
+    while lay.count():
+        it = lay.takeAt(0)
+        w = it.widget()
+        if w:
+            w.setParent(None)
+            w.deleteLater()
+        sub = it.layout()
+        if sub:
+            clear_layout(sub)
+            sub.deleteLater()
+
+
 class NumberCard(CardWidget):
     """可点击指标卡：只给绑了 clicked 的实例用（卡片=可交互区域的 Fluent 语义），
     纯展示读数直接用 TitleLabel+CaptionLabel 排版，不再包卡。"""
@@ -773,15 +801,7 @@ class BrainPage(QWidget):
             row.addLayout(col)
         lay.addLayout(row)
 
-        # 最近随记（读的入口留在数据页；输入条在首页总览——人的高频动作走最短路径）
-        lay.addSpacing(16)
-        lay.addWidget(StrongBodyLabel("随记（你的顿悟与想法——输入条在首页，所有 agent 检索可见）"))
-        self.noteList = ListWidget()  # 高度随内容自适应（reload_notes 控制），空态不撑空盒子
-        self.noteList.setVisible(False)
-        lay.addWidget(self.noteList)
-        self.noteEmpty = CaptionLabel("还没有随记——回首页记一条，或直接对任何 agent 说「记一下：…」")
-        self.noteEmpty.setVisible(False)
-        lay.addWidget(self.noteEmpty)
+        # 随记已独立成页（NotesPage——人的模块容器），大脑页回归 agent 数据
 
         self.topBox = QVBoxLayout()
         self.useBox = QVBoxLayout()
@@ -876,24 +896,6 @@ class BrainPage(QWidget):
         if not pins:
             self.pinBox.addWidget(CaptionLabel("暂无置顶——agent 写记忆时可带 pinned=true 进置顶位"))
 
-        self.reload_notes()
-
-    def reload_notes(self):
-        """最近随记列表填充（容错：库异常时保留旧内容不崩）；高度自适应+空态切换。"""
-        try:
-            self.noteList.clear()
-            for n in brain.list_notes(self.win.root, limit=10):
-                mood = f"（{n['mood']}）" if n["mood"] else ""
-                tags = f" #{n['tags']}" if n["tags"] else ""
-                self.noteList.addItem(f"{n['ts'][:10]}{mood}{tags} {n['content'][:80]}")
-        except Exception:
-            pass
-        empty = self.noteList.count() == 0
-        self.noteEmpty.setVisible(empty)  # 空态是一等公民：一句引导，不撑空白盒子
-        self.noteList.setVisible(not empty)
-        if not empty:
-            self.noteList.setFixedHeight(min(240, self.noteList.sizeHint().height()))
-
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:
         """唤起/置顶行：类型徽章 + 编号·次数 + 正文（正常字号可换行）。
@@ -915,6 +917,130 @@ class BrainPage(QWidget):
             return
         InfoBar.success("已勾销", "该待办不再出现（闭环），操作可在流水页追溯", duration=3000, parent=self.win)
         self.reload()
+
+
+class NotesPage(QWidget):
+    """随记页（08 方向 A：人的模块容器）——memos 式（63.5k 星标杆）：轻捕获输入区 +
+    按日期分组的时间线主体。人的部分独立成页，大脑页回归 agent 数据。"""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        body = QWidget()
+        lay = QVBoxLayout(body)
+        lay.setContentsMargins(24, 24, 24, 24)
+
+        head = QHBoxLayout()
+        head.addWidget(TitleLabel("随记"))
+        head.addStretch(1)
+        self.statLabel = CaptionLabel("")
+        head.addWidget(self.statLabel)
+        lay.addLayout(head)
+        lay.addWidget(CaptionLabel("你的顿悟与想法——第一人称思想层，所有 agent 检索可见"
+                                   "（agent 侧用 hub_note，或对 agent 说「记一下：…」）"))
+
+        # 轻捕获：零决策输入区（无标题无模板，写完即存）
+        lay.addSpacing(16)
+        self.noteInput = TextEdit()
+        self.noteInput.setPlaceholderText("随手记一条想法/顿悟/摘录…\nCtrl+Enter 快速保存")
+        self.noteInput.setFixedHeight(76)
+        lay.addWidget(self.noteInput)
+        row = QHBoxLayout()
+        self.noteMood = ComboBox()
+        self.noteMood.addItems(["心情（可选）"] + [m for m in brain._NOTE_MOODS if m])
+        self.noteMood.setFixedWidth(130)
+        row.addWidget(self.noteMood)
+        row.addStretch(1)
+        noteBtn = PrimaryPushButton(ic("SEND", "INFO"), "记下")
+        noteBtn.clicked.connect(self.save_note)
+        row.addWidget(noteBtn)
+        lay.addLayout(row)
+
+        # 时间线主体：按日期分组的无框行流（行是线不是卡）
+        self.tlBox = QVBoxLayout()
+        self.tlBox.setContentsMargins(4, 12, 16, 24)
+        self.tlBox.setSpacing(16)
+        lay.addSpacing(16)
+        lay.addLayout(self.tlBox)
+        lay.addStretch(1)
+        self.scroll.setWidget(body)
+        outer.addWidget(self.scroll, 1)
+        QShortcut(QKeySequence("Ctrl+Return"), self.noteInput, self.save_note)
+
+    def showEvent(self, e):  # 切入即重读：agent 侧 hub_note 写入后 GUI 跟上
+        super().showEvent(e)
+        self.reload()
+
+    def save_note(self):
+        content = self.noteInput.toPlainText().strip()
+        if not content:
+            InfoBar.warning("内容为空", "写点什么再记", duration=2500, parent=self.win)
+            return
+        mood = self.noteMood.currentText()
+        mood = "" if mood.startswith("心情") else mood
+        try:
+            nid = brain.add_note(self.win.root, content, mood=mood, source="human")
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
+            return
+        self.noteInput.clear()
+        self.noteMood.setCurrentIndex(0)
+        self.reload()
+        InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
+                        duration=3000, parent=self.win)
+
+    def reload(self):
+        root = self.win.root
+        if not root:
+            return
+        try:
+            notes = brain.list_notes(root, limit=200)
+        except Exception:
+            return
+        try:
+            self.statLabel.setText(f"累计 {brain.notes_count(root)} 条 · "
+                                   f"本月 {brain.notes_count(root, month=True)} 条")
+        except Exception:
+            self.statLabel.setText("")
+        self.scroll.verticalScrollBar().setValue(0)
+        clear_layout(self.tlBox)
+        if not notes:
+            cap = CaptionLabel("还没有随记——在上面记第一条，或直接对任何 agent 说「记一下：…」")
+            cap.setAlignment(Qt.AlignCenter)
+            wrap = QWidget()
+            v = QVBoxLayout(wrap)
+            v.setContentsMargins(0, 24, 0, 0)
+            v.addWidget(cap)
+            self.tlBox.addWidget(wrap)
+            return
+        cur, box = None, None
+        for n in notes:
+            d = (n["ts"] or "")[:10] or "日期未标注"
+            if d != cur:
+                cur = d
+                group = QWidget()
+                g = QVBoxLayout(group)
+                g.setContentsMargins(0, 0, 0, 0)
+                g.setSpacing(8)
+                g.addWidget(StrongBodyLabel(d))
+                box = g
+                self.tlBox.addWidget(group)
+            line = QHBoxLayout()
+            line.setSpacing(8)
+            line.addWidget(CaptionLabel((n["ts"] or "")[11:16] or "--:--"))
+            if n["mood"]:
+                line.addWidget(mood_badge(n["mood"]))
+            body_l = BodyLabel(n["content"])
+            body_l.setWordWrap(True)
+            line.addWidget(body_l, 1)
+            wrap = QWidget()
+            wrap.setLayout(line)
+            box.addWidget(wrap)
 
 
 class StatsPage(QWidget):
@@ -1558,7 +1684,7 @@ class OverviewPage(QWidget):
             return
         self.noteInput.clear()
         self.noteMood.setCurrentIndex(0)
-        self.win.brain_page.reload_notes()  # 大脑页最近列表跟上
+        self.win.notes_page.reload()  # 随记页时间线跟上
         InfoBar.success("已记入随记", f"#{nid}——思想已进大脑，所有 agent 检索可见",
                         duration=3000, parent=self.win)
 
@@ -2714,6 +2840,7 @@ class AgentHubWindow(FluentWindow):
         self.timeline_page = TimelinePage(self)
         self.stats_page = StatsPage(self)
         self.brain_page = BrainPage(self)
+        self.notes_page = NotesPage(self)
         self.report_page = ReportPage(self)
         self.search_page = SearchPage(self)
         self.ledger_page = LedgerPage(self)
@@ -2740,6 +2867,7 @@ class AgentHubWindow(FluentWindow):
 
         self.navigationInterface.addItemHeader("数据")
         for w, icon, text in (
+            (self.notes_page, "EDIT", "随记"),
             (self.brain_page, "LIBRARY", "大脑"),
             (self.ledger_page, "DICTIONARY", "流水·对账"),
             (self.stats_page, "TILES", "统计"),

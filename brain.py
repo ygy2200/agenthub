@@ -1280,6 +1280,17 @@ def list_notes(root: str, limit: int = 20) -> list:
             "SELECT * FROM notes ORDER BY id DESC LIMIT ?", (max(0, min(int(limit), 200)),))]
 
 
+def notes_count(root: str, month: bool = False) -> int:
+    """随记总数；month=True 只数本月（随记页统计行："你记了多少"的即时反馈）。"""
+    with db_conn(root) as conn:
+        if month:
+            pre = datetime.datetime.now().strftime("%Y-%m")
+            row = conn.execute("SELECT COUNT(*) FROM notes WHERE ts LIKE ?", (pre + "%",)).fetchone()
+        else:
+            row = conn.execute("SELECT COUNT(*) FROM notes").fetchone()
+        return int(row[0]) if row else 0
+
+
 def search_notes(root: str, kw: str, limit: int = 20) -> list:
     """随记检索（LIKE 词面；纳入 search_all 实现人-agent 检索互通）。"""
     words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
