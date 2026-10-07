@@ -776,9 +776,12 @@ class BrainPage(QWidget):
         # 最近随记（读的入口留在数据页；输入条在首页总览——人的高频动作走最短路径）
         lay.addSpacing(16)
         lay.addWidget(StrongBodyLabel("随记（你的顿悟与想法——输入条在首页，所有 agent 检索可见）"))
-        self.noteList = ListWidget()
-        self.noteList.setFixedHeight(150)
+        self.noteList = ListWidget()  # 高度随内容自适应（reload_notes 控制），空态不撑空盒子
+        self.noteList.setVisible(False)
         lay.addWidget(self.noteList)
+        self.noteEmpty = CaptionLabel("还没有随记——回首页记一条，或直接对任何 agent 说「记一下：…」")
+        self.noteEmpty.setVisible(False)
+        lay.addWidget(self.noteEmpty)
 
         self.topBox = QVBoxLayout()
         self.useBox = QVBoxLayout()
@@ -876,7 +879,7 @@ class BrainPage(QWidget):
         self.reload_notes()
 
     def reload_notes(self):
-        """最近随记列表填充（容错：库异常时保留旧内容不崩）。"""
+        """最近随记列表填充（容错：库异常时保留旧内容不崩）；高度自适应+空态切换。"""
         try:
             self.noteList.clear()
             for n in brain.list_notes(self.win.root, limit=10):
@@ -885,6 +888,11 @@ class BrainPage(QWidget):
                 self.noteList.addItem(f"{n['ts'][:10]}{mood}{tags} {n['content'][:80]}")
         except Exception:
             pass
+        empty = self.noteList.count() == 0
+        self.noteEmpty.setVisible(empty)  # 空态是一等公民：一句引导，不撑空白盒子
+        self.noteList.setVisible(not empty)
+        if not empty:
+            self.noteList.setFixedHeight(min(240, self.noteList.sizeHint().height()))
 
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:
@@ -2943,10 +2951,19 @@ class AgentHubWindow(FluentWindow):
 
 def _install_crash_hook():
     """windowed exe 无控制台，未捕获异常只弹 PyInstaller 错误框、traceback 蒸发——
-    主线程/子线程异常统一落盘 %TEMP%，退出报错可回查（2026-10-07 用户再报退出报错取证用）。"""
+    主线程/子线程异常统一落盘 %TEMP%，退出报错可回查（2026-10-07 用户再报退出报错取证用）。
+    faulthandler 兜 C 层硬崩（段错误不走 excepthook，截图脚本实测间歇性复现）。"""
+    import faulthandler
     import traceback
     import tempfile
     import threading
+
+    try:
+        p = Path(tempfile.gettempdir()) / "AgentHub-fault.log"
+        p.write_text("", encoding="utf-8")
+        faulthandler.enable(open(p, "a", encoding="utf-8"))  # noqa: SIM115 段错误时转储原生栈
+    except Exception:
+        pass
 
     def _dump(tag, tp, val, tb):
         try:

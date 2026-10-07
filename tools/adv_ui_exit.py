@@ -10,6 +10,7 @@ offscreen 运行；退出码非 0 或 stderr 出现 Traceback 即判失败。
 """
 import os
 import sys
+import tempfile
 
 os.environ["QT_QPA_PLATFORM"] = "offscreen"
 _HERE = os.path.dirname(os.path.abspath(__file__))
@@ -17,13 +18,19 @@ sys.path.insert(0, os.path.dirname(_HERE))
 
 from PySide6.QtCore import QTimer
 
+import brain
 import ui
 from qfluentwidgets import setTheme, Theme
 
 setTheme(Theme.LIGHT)
 app = ui.QApplication(sys.argv)
 
+# 测试写随记（场景A）——必须用临时库，绝不碰真实 brain.db（2026-10-07 污染教训）
+TMP = tempfile.mkdtemp(prefix="agenthub-advexit-")
+brain.init_db(TMP)
+
 w = ui.AgentHubWindow()
+w.root = TMP  # 覆盖配置里的真实根目录，页面 reload 全部走临时库
 SCENES = ["A_write_exit", "B_popup_exit", "C_switch_all_exit", "D_instant_exit"]
 ROUNDS = 5
 state = {"i": 0}
