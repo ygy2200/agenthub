@@ -9,12 +9,14 @@
 """
 from __future__ import annotations
 
+import atexit
 import datetime
 import json
 import math
 import os
 import re
 import sqlite3
+import threading
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -49,11 +51,76 @@ def db_path(root: str) -> Path:
     return Path(root) / core.DIR_META / DB_NAME
 
 
+# ── WAL 常驻哨兵（2026-10-09 实测修复）──────────────────────────────────────
+# 现象：Windows 上短连接频繁开关时，最后一个连接关闭会删除 brain.db-wal/-shm，
+# 并发线程（8 线程）恰在此时打开库 → 拿到只读句柄 → 写语句抛
+# "attempt to write a readonly database"，心跳/记录静默丢失（实测 6~8/8 才成功）。
+# 修法：进程内为已存在的库常驻一条连接，让 -wal 不被反复删除（实测 8 轮 ×8 线程全 8/8）。
+_SENTINELS: dict[str, sqlite3.Connection] = {}
+_SENTINEL_LOCK = threading.Lock()
+_SENTINEL_MAX = 8  # 句柄上限：临时库（测试）增多时淘汰最旧的，避免句柄堆积
+
+
+def _keep_wal(root: str) -> None:
+    """为已存在的 brain.db 维持一条常驻连接（幂等、失败静默、永不建库）。"""
+    p = str(db_path(root))
+    if not os.path.exists(p):
+        return
+    with _SENTINEL_LOCK:
+        c = _SENTINELS.get(p)
+        if c is not None:
+            try:
+                c.execute("SELECT 1").fetchone()
+                return
+            except sqlite3.Error:
+                _SENTINELS.pop(p, None)
+        if len(_SENTINELS) >= _SENTINEL_MAX:
+            for k in list(_SENTINELS)[:max(1, _SENTINEL_MAX // 2)]:
+                try:
+                    _SENTINELS.pop(k).close()
+                except Exception:
+                    pass
+        try:
+            c = sqlite3.connect(p, timeout=5, check_same_thread=False)
+            c.execute("PRAGMA journal_mode=WAL")
+            c.execute("PRAGMA busy_timeout=5000")
+            _SENTINELS[p] = c
+        except sqlite3.Error:
+            pass
+
+
+def release_root(root: str) -> None:
+    """关闭该库在本进程的常驻连接（测试清理临时目录前调用，避免 Windows 文件占用）。"""
+    with _SENTINEL_LOCK:
+        c = _SENTINELS.pop(str(db_path(root)), None)
+    if c is not None:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+def _close_all_sentinels() -> None:
+    with _SENTINEL_LOCK:
+        items = list(_SENTINELS.items())
+        _SENTINELS.clear()
+    for _k, c in items:
+        try:
+            c.close()
+        except Exception:
+            pass
+
+
+atexit.register(_close_all_sentinels)
+
+
 @contextmanager
 def db_conn(root: str):
     """打开一个短连接（WAL + busy_timeout），用完即关。多进程并发安全。
-    不主动创建目录/文件——建库责任在 init_db，无效 root 直接抛错。"""
+    不主动创建目录/文件——建库责任在 init_db，无效 root 直接抛错。
+    打开前先确保本进程有常驻连接（防 Windows 上 -wal 反复删建导致的只读句柄）。"""
     p = db_path(root)
+    _keep_wal(root)
     conn = sqlite3.connect(str(p), timeout=5)
     conn.row_factory = sqlite3.Row
     try:
@@ -1312,6 +1379,38 @@ def star_note(root: str, note_id: int, on: bool = True) -> None:
         conn.execute("UPDATE notes SET starred=? WHERE id=?", (1 if on else 0, note_id))
 
 
+def get_note(root: str, note_id: int) -> dict | None:
+    """按 id 取单条随记（hub_note_read 工具用：agent 深挖/整理的读取通道）。
+    未到期胶囊对 agent 同样隐藏（与检索语义一致）。"""
+    with db_conn(root) as conn:
+        row = conn.execute(
+            f"SELECT * FROM notes WHERE id=? AND {_note_visible_clause()}",
+            (int(note_id), _now())).fetchone()
+    return dict(row) if row else None
+
+
+def latest_notes_for_agent(root: str, k: int = 3) -> list:
+    """主人最新随记（排除未到期胶囊）——agent 开工视野：开工即看见主人最近在想什么。"""
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            f"SELECT * FROM notes WHERE {_note_visible_clause()} ORDER BY id DESC LIMIT ?",
+            (_now(), max(1, min(int(k), 10))))]
+
+
+def active_context(root: str) -> str:
+    """最近活跃会话的项目名（30 分钟 TTL 内）——随记自动附上下文：
+    "这条灵感是在改 XX 时冒出来的"。无活跃会话返回空串。"""
+    try:
+        sess = active_sessions(root)
+    except Exception:
+        return ""
+    for s in sess:
+        if s.get("project"):
+            return s["project"]
+        return ""
+    return ""
+
+
 def _note_visible_clause() -> str:
     """未到期时光胶囊对检索隐藏（GUI 时间线可见、灰显倒计时）。"""
     return "(open_at='' OR open_at<=?)"
@@ -1329,7 +1428,10 @@ def daily_recall_notes(root: str, k: int = 5) -> list:
         return []
     import random
     rng = random.Random(today)  # 当日固定
-    return rng.sample(rows, min(max(1, int(k)), len(rows)))
+    picked = rng.sample(rows, min(max(1, int(k)), len(rows)))
+    # 抽样后恢复「收藏优先」：sample 会打乱顺序，不补排序则收藏优先形同虚设
+    picked.sort(key=lambda r: (-(int(r.get("starred") or 0)), -(int(r.get("id") or 0))))
+    return picked
 
 
 def on_this_day_notes(root: str) -> list:

@@ -23,7 +23,7 @@
 
 ## 公用大脑（MCP）
 
-AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **27 个工具**：
+AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **34 个工具**：
 
 **核心读写**：`hub_log_work`（写工作记录）、`hub_get_project` / `hub_list_projects` / `hub_create_project`、`hub_get_record`（单条精读）、`hub_get_progress`（进度对齐）
 
@@ -67,6 +67,8 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 | v2.14 | 连续性层 hub_status（五问快照：谁在线/今天变了/还开着什么/还重要的/下一步） |
 | v2.15 | 决策记录层 AgDR：hub_log_work 新增 4 个可选决策字段（context/options/decision/tradeoffs），记录渲染「## 决策记录」段——记「为什么」而不只「做了什么」 |
 | v2.16 | 用户建模 hub_user_profile（画像：活跃时段/记录分工/技术栈词频/纠正史 top，preference=0 行动信号）+ 可编程数据包 my.work（sys.path 即 import，records/memories/todos/profile，只读不计唤起）+ 目录树读取轨道；GUI 运营报告页、环境档案切入即显示修复、检索统计 agent 名归一 |
+| v2.17 | 人的随记（notes 表 + `hub_note`）：GUI 随记独立页（memos 式时间线、心情点排、相对时间、全局热键捕捉）、随记上首页、与记忆/记录检索互通 |
+| v2.18 | 随记批 A 创意八件套（180 天心情热力图 / 实时关联浮出 / 不期而遇每日回顾 / 往年今天回放 / 时光胶囊 / 收藏星 / #标签串 / 草稿自动保存）+ 批 B 随记-agent 融合层（`hub_note_read` 深挖与整理协议、开工视野与 `hub_status` 推送主人最新随记、随记自动附活跃上下文）；**并发可靠性修复**：WAL 常驻哨兵（Windows 短连接并发写丢心跳，实测 6~8/8 → 8/8）、每日回顾收藏优先（`random.sample` 打乱顺序致收藏优先失效）、并发建同名项目 `O_EXCL` 原子建文件（8 线程 5 个 Permission denied → 0） |
 
 ## 设计原则
 

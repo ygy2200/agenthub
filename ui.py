@@ -19,7 +19,7 @@ from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor, QColor, QText
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
-                               QDialog)
+                               QDialog, QCheckBox)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
                             FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
                             NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
@@ -446,7 +446,12 @@ class QuickNotePopup(QDialog):
         if not content:
             return
         try:
-            nid = brain.add_note(self.win.root, content, mood=self.moodPicker.mood(), source="human")
+            ctx = brain.active_context(self.win.root)
+        except Exception:
+            ctx = ""
+        try:
+            nid = brain.add_note(self.win.root, content, mood=self.moodPicker.mood(),
+                                 source="human", context=ctx)
         except Exception as e:  # noqa: BLE001
             InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
             return
@@ -1189,10 +1194,36 @@ class NotesPage(QWidget):
         self.capsuleBox.setSpacing(6)
         lay.addLayout(self.capsuleBox)
 
-        # 时间线主体：按日期分组的无框行流（行是线不是卡）
+        # 时间线主体：按日期分组的无框行流（行是线不是卡）+ 整理模式（素材勾选）
+        self.pick_mode = False
+        self.picked = set()
+        headRow = QHBoxLayout()
         self.tlHead = StrongBodyLabel("全部随记")
+        headRow.addWidget(self.tlHead)
+        headRow.addStretch(1)
+        self.pickToggle = ClickBodyLabel("整理")
+        self.pickToggle.setToolTip("勾选几条随记，生成整理指令交给 agent，提炼成一条记忆（NoteGen 式）")
+        self.pickToggle.clicked.connect(self._toggle_pick)
+        headRow.addWidget(self.pickToggle)
         lay.addSpacing(16)
-        lay.addWidget(self.tlHead)
+        lay.addLayout(headRow)
+        # 整理模式操作条（默认隐藏）
+        self.pickBar = QWidget()
+        pb = QHBoxLayout(self.pickBar)
+        pb.setContentsMargins(4, 4, 4, 4)
+        self.pickCount = CaptionLabel("已选 0 条")
+        pb.addWidget(self.pickCount)
+        pb.addStretch(1)
+        self.organizeBtn = PushButton("生成整理指令（复制）")
+        self.organizeBtn.setEnabled(False)
+        self.organizeBtn.clicked.connect(self._gen_organize)
+        pb.addWidget(self.organizeBtn)
+        cancelPick = PushButton("取消")
+        cancelPick.clicked.connect(self._toggle_pick)
+        pb.addWidget(cancelPick)
+        self.pickBar.setVisible(False)
+        self.pickBar.setStyleSheet("background:rgba(0,103,192,0.06);border-radius:4px;")
+        lay.addWidget(self.pickBar)
         self.tlBox = QVBoxLayout()
         self.tlBox.setContentsMargins(4, 12, 16, 24)
         self.tlBox.setSpacing(16)
@@ -1291,8 +1322,12 @@ class NotesPage(QWidget):
         if capsule_days:
             open_at = (datetime.datetime.now() + datetime.timedelta(days=capsule_days)).strftime("%Y-%m-%d")
         try:
+            ctx = brain.active_context(self.win.root)  # 随记自动附上下文：当时的活跃项目
+        except Exception:
+            ctx = ""
+        try:
             nid = brain.add_note(self.win.root, content, tags=tags, mood=mood,
-                                 source="human", open_at=open_at)
+                                 source="human", open_at=open_at, context=ctx)
         except Exception as e:  # noqa: BLE001
             InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
             return
@@ -1312,15 +1347,55 @@ class NotesPage(QWidget):
             return
         self.reload()
 
+    def _dig(self, nid):
+        """深挖协议入口：生成提示词进剪贴板，agent 读随记后向主人反问（Rosebud 模式）。"""
+        QApplication.clipboard().setText(
+            f"请深挖我的随记 #{nid}：用 hub_note_read 读全文，"
+            f"然后向我反问一个最能展开这个想法的问题")
+        InfoBar.success("深挖提示词已复制", "粘贴给任意 agent，它会读随记并向你反问",
+                        duration=4000, parent=self.win)
+
+    def _toggle_pick(self):
+        """整理模式：时间线行首出现勾选框，勾选素材生成整理指令（NoteGen 第②③步）。"""
+        self.pick_mode = not self.pick_mode
+        if not self.pick_mode:
+            self.picked = set()
+        self.pickBar.setVisible(self.pick_mode)
+        self.pickToggle.setText("退出整理" if self.pick_mode else "整理")
+        self.reload()
+
+    def _pick_toggle(self, nid, on):
+        if on:
+            self.picked.add(nid)
+        else:
+            self.picked.discard(nid)
+        self.pickCount.setText(f"已选 {len(self.picked)} 条")
+        self.organizeBtn.setEnabled(bool(self.picked))
+
+    def _gen_organize(self):
+        if not self.picked:
+            return
+        ids = " ".join(f"#{i}" for i in sorted(self.picked))
+        QApplication.clipboard().setText(
+            f"请整理我的随记：{ids}。用 hub_note_read 逐条读，提炼共同主题成一条记忆，"
+            f"用 hub_memory_write 写入（带 tags），写完告诉我你提炼出了什么")
+        InfoBar.success("整理指令已复制", "粘贴给任意 agent，提炼出的记忆会进大脑",
+                        duration=4000, parent=self.win)
+
     def _filter_tag(self, tag):
         self._tag_filter = "" if self._tag_filter == tag else tag
         self.reload()
 
     def _note_row(self, n, dim=False, star=True):
-        """通用行：收藏星 + 相对时间 + 心情徽章 + 标签胶囊 + 正文。
+        """通用行：收藏星 + 相对时间 + 心情徽章 + 标签胶囊 + 深挖 + 上下文 + 正文。
         时光胶囊未到期灰显+倒计时；标签胶囊点击=串成该主题的思想演化线。"""
         line = QHBoxLayout()
         line.setSpacing(8)
+        if self.pick_mode:
+            cb = QCheckBox()
+            cb.setChecked(n["id"] in self.picked)
+            cb.stateChanged.connect(lambda st, nid=n["id"]: self._pick_toggle(nid, bool(st)))
+            line.addWidget(cb)
         if star:
             s = ClickBodyLabel("★" if n.get("starred") else "☆")
             s.setToolTip("收藏后进每日回顾优先池")
@@ -1342,6 +1417,15 @@ class NotesPage(QWidget):
                 line.addWidget(CaptionLabel(f"{left} 天后开启"))
             except ValueError:
                 pass
+        dig = ClickBodyLabel("深挖")
+        dig.setStyleSheet("color:#0067c0;font-size:11px;")
+        dig.setToolTip("生成提示词：agent 会读这条随记并向你反问，把想法展开")
+        dig.clicked.connect(lambda _, nid=n["id"]: self._dig(nid))
+        line.addWidget(dig)
+        if n.get("context"):
+            cl = CaptionLabel(f"· {n['context']}")
+            cl.setToolTip("保存时自动附上的上下文：当时的活跃项目")
+            line.addWidget(cl)
         body_l = BodyLabel(n["content"])
         body_l.setWordWrap(True)
         if dim:
@@ -2080,7 +2164,11 @@ class OverviewPage(QWidget):
             return  # 按钮空态已灰禁用，此路径仅防御（回车空内容）
         mood = self.moodPicker.mood()
         try:
-            nid = brain.add_note(self.win.root, content, mood=mood, source="human")
+            ctx = brain.active_context(self.win.root)
+        except Exception:
+            ctx = ""
+        try:
+            nid = brain.add_note(self.win.root, content, mood=mood, source="human", context=ctx)
         except Exception as e:  # noqa: BLE001
             InfoBar.error("随记保存失败", str(e), duration=5000, parent=self.win)
             return

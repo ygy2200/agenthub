@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.17.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.18.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -239,7 +239,24 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         core.journal(root, _guess_agent(root), "note_append", f"brain:notes#{nid}")
         mood = f"（{arguments.get('mood')}）" if arguments.get("mood") else ""
         return (f"已记入随记 #{nid}{mood}——人的思想已进大脑，所有 agent 检索可见；"
-                f"GUI「大脑」页随时回看")
+                f"GUI「随记」页随时回看")
+
+    if name == "hub_note_read":
+        nid = str(arguments.get("note_id", "")).strip()
+        try:
+            n = brain.get_note(root, int(nid))
+        except (TypeError, ValueError):
+            return "错误：note_id 必须是数字（如 12）"
+        if not n:
+            return f"错误：随记 #{nid} 不存在（或为未到期的时光胶囊，对检索隐藏）"
+        mood = f"（{n['mood']}）" if n["mood"] else ""
+        tags = f" 标签:{n['tags']}" if n["tags"] else ""
+        ctx = f" 记于「{n['context']}」时" if n["context"] else ""
+        star = "★已收藏 " if n["starred"] else ""
+        return (f"随记 #{n['id']} {star}{n['ts'][:10]}{mood}{tags}{ctx}\n"
+                f"{n['content']}\n"
+                f"（深挖协议：向主人反问一个最能展开此想法的问题；"
+                f"整理协议：若主人要求，提炼成记忆用 hub_memory_write 写入）")
 
     if name == "hub_get_rules":
         return core.load_rules(root)
@@ -340,6 +357,17 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                     flag = "★" if m["pinned"] else "·"
                     lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}")
                 out = "\n".join(lines)
+        # 主人最新随记（开工视野）：agent 开工即看见主人最近在想什么——双向融入
+        try:
+            latest = brain.latest_notes_for_agent(root, k=2)
+        except Exception:
+            latest = []
+        if latest:
+            nl = ["", "[主人最新随记] 也许与你正要做的事有关（hub_note_read 可读全文）："]
+            for n in latest:
+                mood = f"（{n['mood']}）" if n["mood"] else ""
+                nl.append(f"· #{n['id']} {n['ts'][:10]}{mood} {n['content'][:80]}")
+            out = out + "\n".join(nl)
         return out
 
     if name == "hub_report_error":
@@ -726,6 +754,16 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"   [{t['date']} {t['agent']}·{t['project']}] {t['todo'][:60]}")
         else:
             lines.append("⑤ 待办线索：无")
+        # ⑥ 主人最新随记（开工视野）：主人的第一人称思想层，agent 感知主人的最新关切
+        try:
+            latest = brain.latest_notes_for_agent(root, k=3)
+        except Exception:
+            latest = []
+        if latest:
+            lines.append("⑥ 主人最新随记（hub_note_read 读全文，与手头工作相关时主动回应）：")
+            for n in latest:
+                mood = f"（{n['mood']}）" if n["mood"] else ""
+                lines.append(f"   #{n['id']} {n['ts'][:10]}{mood} {n['content'][:70]}")
         return "\n".join(lines)
 
     return f"未知工具：{name}"
@@ -760,6 +798,10 @@ TOOLS = [
                                     "link": {"type": "string", "description": "相关链接（URL/文件路径，可选）"},
                                     "mood": {"type": "string", "description": "记下时的心情（可选：兴奋/笃定/疑问/纠结/灵感/低落/平静）"}},
                      "required": ["content"]}},
+    {"name": "hub_note_read", "description": "按 id 读取一条主人的随记全文（含心情/标签/上下文）。两种用法：①深挖协议——主人说「深挖随记#N」时读它并反问一个最能展开想法的问题；②整理协议——主人说「整理随记#a #b #c」时逐条读，提炼共同主题成一条记忆，用 hub_memory_write 写入并汇报",
+     "inputSchema": {"type": "object",
+                     "properties": {"note_id": {"type": "string", "description": "随记 id（如 12）"}},
+                     "required": ["note_id"]}},
     {"name": "hub_get_rules", "description": "读取团队协作规范（目录命名/记录格式/铁律）",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_memory_read", "description": "读取大脑记忆库（结构化：环境事实/用户偏好/踩坑经验/项目进展/随手记）。带 query 可关键词检索，kind 按类型过滤",

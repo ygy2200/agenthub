@@ -1202,6 +1202,62 @@ def t_notes(tmp):
     assert len(brain.list_notes(rs, limit=2)) == 2  # limit 边界
 
 
+def t_notes_creative(tmp):
+    """随记创意批 A/B：收藏/每日回顾（当日固定种子）/周年回放/时光胶囊（检索隐藏与到期）/
+    热力图/get_note（未到期对 agent 隐藏）/latest_notes_for_agent 开工视野/active_context。"""
+    root = Path(tmp) / "hub_notes_creative"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    import datetime as dt
+    now = dt.datetime.now()
+    brain.add_note(rs, "昨日灵感随记", mood="灵感", context="某项目")
+    nid2 = brain.add_note(rs, "昨日普通随记")
+    brain.star_note(rs, nid2, True)
+    brain.add_note(rs, "去年的今天我在想这个")
+    brain.add_note(rs, "未来才能开的秘密", open_at=(now + dt.timedelta(days=1)).strftime("%Y-%m-%d"))
+    brain.add_note(rs, "到期的胶囊", open_at=(now - dt.timedelta(days=1)).strftime("%Y-%m-%d"))
+    yest = (now - dt.timedelta(days=1)).strftime("%Y-%m-%dT%H:%M:%S")
+    lastyear = (now - dt.timedelta(days=365)).strftime("%Y-%m-%dT%H:%M:%S")
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE notes SET ts=? WHERE content=?", (yest, "昨日灵感随记"))
+        conn.execute("UPDATE notes SET ts=? WHERE content=?", (yest, "昨日普通随记"))
+        conn.execute("UPDATE notes SET ts=? WHERE content=?", (lastyear, "去年的今天我在想这个"))
+    # 胶囊：到期判定与全量
+    due = brain.capsule_notes(rs, due_only=True)
+    assert len(due) == 1 and due[0]["content"] == "到期的胶囊"
+    assert len(brain.capsule_notes(rs)) == 2
+    # 每日回顾：排除今天与未到期胶囊；当日固定；收藏优先
+    r1 = brain.daily_recall_notes(rs, k=5)
+    assert all("未来才能开" not in x["content"] for x in r1)
+    assert all((x["ts"] or "")[:10] != now.strftime("%Y-%m-%d") for x in r1)
+    r2 = brain.daily_recall_notes(rs, k=5)
+    assert [x["id"] for x in r1] == [x["id"] for x in r2]
+    if len(r1) >= 2:
+        assert r1[0]["starred"] >= r1[1]["starred"]
+    # 周年回放
+    assert any("去年的今天" in x["content"] for x in brain.on_this_day_notes(rs))
+    # 热力图
+    hm = brain.notes_heatmap(rs, days=30)
+    assert len(hm) == 30 and hm[-1][1] >= 2
+    # 检索语义：未到期隐藏、到期可搜、时间线仍可见
+    assert brain.search_notes(rs, "秘密") == []
+    assert brain.search_notes(rs, "到期的胶囊")
+    assert any(x["content"] == "未来才能开的秘密" for x in brain.list_notes(rs, limit=50))
+    # get_note：正常/不存在/未到期对 agent 隐藏
+    assert brain.get_note(rs, nid2)["content"] == "昨日普通随记"
+    assert brain.get_note(rs, 99999) is None
+    hid = [x for x in brain.list_notes(rs, limit=50) if x["content"] == "未来才能开的秘密"][0]
+    assert brain.get_note(rs, hid["id"]) is None
+    # 开工视野：排除未到期胶囊
+    lt = brain.latest_notes_for_agent(rs, k=3)
+    assert lt and all("未来才能开" not in x["content"] for x in lt)
+    # active_context：无会话→空；有心跳→项目名
+    assert brain.active_context(rs) == ""
+    brain.heartbeat_touch(rs, "ZCode", "某项目", "测试上下文")
+    assert brain.active_context(rs) == "某项目"
+
+
 def t_handoff(tmp):
     """2.2 交接协议：typed 字段 create、list 只给 open、claim exactly once
     （8 线程并发双认领只有一个成功）、对抗坏参/重复认领/不存在 id。"""
@@ -1524,6 +1580,7 @@ def main():
     case("RRF融合P4.3（两路互补/_channels/开关回滚/pinned前置/bigram重试触发/count_hits）", lambda: t_rrf_fused(tmp))
     case("records融合P4.3b（整串bigram命中/双路_channels/开关回旧路/重试触发/limit）", lambda: t_records_fused(tmp))
     case("人的随记A-Ⅰ（add/list/search_all互通/mood白名单/来源落回/空content拒绝/limit）", lambda: t_notes(tmp))
+    case("随记创意批AB（收藏/每日回顾当日固定/周年回放/胶囊隐藏到期/热力图/get_note/开工视野/上下文）", lambda: t_notes_creative(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))

@@ -398,7 +398,15 @@ def create_project(root: str, name: str) -> str:
         rec = p / RECORD_NAME
         if not rec.exists():
             today = datetime.date.today().isoformat()
-            rec.write_text(RECORD_TEMPLATE.format(date=today), encoding="utf-8")
+            # 原子创建：并发建同名项目时（2026-10-09 实测 8 线程有 5 个报 Permission denied）
+            # 只有拿到 O_EXCL 的那个写文件，其余 FileExistsError 视为已建好（幂等）
+            try:
+                fd = os.open(str(rec), os.O_CREAT | os.O_EXCL | os.O_WRONLY)
+            except FileExistsError:
+                pass
+            else:
+                with os.fdopen(fd, "w", encoding="utf-8") as f:
+                    f.write(RECORD_TEMPLATE.format(date=today))
     except OSError as e:
         return f"创建失败：{e}"
     return ""
@@ -653,6 +661,10 @@ def bootstrap_text(root: str) -> str:
 - 写脚本分析工作史：AgentHub 部署目录（hub_ 工具的 agenthub_mcp.py 所在目录）加入 sys.path 后
   import my.work——records(since="5d")/memories(kind=)/todos()/profile() 即用，详见其模块 docstring
 - 写错/写多的记录：hub_undo 可撤销你最近一条
+- 主人的随记（第一人称思想层）：主人可能说「深挖随记#N」——用 hub_note_read 读全文，
+  然后向主人反问一个最能展开这个想法的问题（一次只问一个，别审问）；主人说
+  「整理随记#a #b #c」——逐条读后提炼共同主题成一条记忆，用 hub_memory_write 写入并汇报；
+  心跳与 hub_status 里出现的「主人最新随记」若与你手头工作相关，主动回应一句
 {BOOTSTRAP_END}"""
 
 
