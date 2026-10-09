@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.19.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.20.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -294,6 +294,47 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             tags = f" #{m['tags']}" if m["tags"] else ""
             lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]{tags} {m['content'][:160]}")
         lines.append("（hub_memory_write 写入；read 带 query/kind/limit 参数可检索）")
+        return "\n".join(lines)
+
+    if name == "hub_ask":
+        question = str(arguments.get("question", "")).strip()
+        project = str(arguments.get("project", "")).strip()
+        res = brain.ask(root, question, project, agent=_guess_agent(root))
+        brain.log_search(root, "hub_ask", question[:120], len(res["citations"]),
+                         agent=_guess_agent(root))
+        head = f"问大脑｜意图：{res['intent']}｜置信：{res['confidence']}"
+        if res["abstained"]:
+            return f"{head}\n{res['answer']}"
+        lines = [head, res["answer"], "", "出处："]
+        for c in res["citations"][:8]:
+            tag = f"[{c['kind']}]" if c.get("kind") else ""
+            dt = f" {c['date']}" if c.get("date") else ""
+            lines.append(f"· {c['type']}#{c['id']} {tag}{dt}")
+        lines.append(f"（{res['note']}；改用 hub_memory_read / hub_get_record #id 精读）")
+        return "\n".join(lines)
+
+    if name == "hub_metacognition":
+        mc = brain.metacognition(root)
+        g = mc["governance"]
+        lines = ["大脑自省（元认知 D10）——我记得什么 / 忘了什么 / 可能记错了什么：",
+                 f"· 现行记忆 {g['live']}（取代 {g['superseded']} / 过期 {g['expired']} / 作废 {g['retired']}）"
+                 f"，证据覆盖 {g['evidence_coverage']:.0%}，平均置信 {g['avg_confidence']}",
+                 f"· 元信息占比 {mc['meta_ratio']}% · 疑似矛盾对 {mc['dup_pairs']}"]
+        if mc["coverage_blindspots"]:
+            lines.append("· 覆盖盲区（有记录、零记忆，最该沉淀）：")
+            for b in mc["coverage_blindspots"][:5]:
+                lines.append(f"   - {b['project']}（{b['records']} 记录 / {b['memories']} 记忆）")
+        if mc["low_confidence"]:
+            lines.append("· 低置信现行记忆（可能记错，待复核）：")
+            for m in mc["low_confidence"][:5]:
+                lines.append(f"   - #{m['id']} [{m.get('kind')}] conf={m.get('confidence')} "
+                             f"{(m.get('content') or '')[:60]}")
+        if mc["pending_decisions"]:
+            lines.append("· 久未复核的决策（>30 天，验证回路未建）：")
+            for d in mc["pending_decisions"][:5]:
+                lines.append(f"   - {d['date']} {d['project']}「{(d.get('title') or '')[:30]}」"
+                             f"（记录#{d['id']}）")
+        lines.append("（大脑主动承认哪里不靠谱——盲区/低置信/矛盾/待复核；只读）")
         return "\n".join(lines)
 
     if name == "hub_memory_write":
@@ -829,6 +870,13 @@ TOOLS = [
                      "properties": {"query": {"type": "string", "description": "关键词检索，缺省返回置顶+最近概览"},
                                     "kind": {"type": "string", "enum": ["fact", "preference", "lesson", "project", "note"]},
                                     "limit": {"type": "integer"}}}},
+    {"name": "hub_ask", "description": "问大脑（D2）：把检索升级成「问句 → 结构化回答 + 逐条出处 + 明确弃权」。问「X 项目最大的风险是什么 / 为什么选了 Y / 还有哪些待办 / Z 现在什么状态」，返回带 #id 出处的结论；库里没有依据时明说「我不知道」而不拼凑。零 LLM（规则+检索），只读不计唤起",
+     "inputSchema": {"type": "object",
+                     "properties": {"question": {"type": "string", "description": "自然语言问句，如「AgentHub 最大的风险是什么」"},
+                                    "project": {"type": "string", "description": "限定项目名（缺省则自动从问句里匹配已知项目）"}},
+                     "required": ["question"]}},
+    {"name": "hub_metacognition", "description": "元认知面板（D10）：大脑的自我报告——我记得什么/忘了什么/可能记错了什么。列出覆盖盲区（有记录零记忆的项目）、低置信现行记忆、疑似矛盾对、久未复核决策、元信息占比、治理统计（取代/过期/作废/证据覆盖）。只读",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_memory_write", "description": "写入一条大脑记忆，供所有 agent 检索。kind 建议明确：环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project。批次A支持：supersedes 取代旧记忆（旧条退出推送但可追溯）、valid_until 有效期止(YYYY-MM-DD)、confidence 置信度(0~1)、evidence 证据链(r:记录id,m:记忆id)",
      "inputSchema": {"type": "object",
                      "properties": {"content": {"type": "string"},

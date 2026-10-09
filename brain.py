@@ -1453,6 +1453,48 @@ def memory_governance_stats(root: str) -> dict:
     }
 
 
+def metacognition(root: str) -> dict:
+    """元认知（D10）：大脑的自我报告——「我记得什么 / 我忘了什么 / 我可能记错了什么」。
+    只读聚合，不改数据。主动暴露自己的不靠谱处，是对外普遍缺失、我们成本极低的差异点。
+    返回：coverage_blindspots（有记录零记忆的项目）/ low_confidence（低置信现行记忆）/
+    dup_pairs（疑似矛盾对）/ pending_decisions（久未复核的决策记录）/ meta_ratio / governance。"""
+    with db_conn(root) as conn:
+        proj_rec = {r["project"]: r["n"] for r in conn.execute(
+            "SELECT project, COUNT(*) n FROM records WHERE status='active' AND project!='' "
+            "GROUP BY project")}
+        proj_mem = {r["project"]: r["n"] for r in conn.execute(
+            "SELECT project, COUNT(*) n FROM memories WHERE " + _live_sql()
+            + " AND project!='' GROUP BY project")}
+        lowconf = [dict(r) for r in conn.execute(
+            "SELECT id, kind, content, confidence, project FROM memories WHERE " + _live_sql()
+            + " AND confidence < 0.6 ORDER BY confidence ASC, id LIMIT 8")]
+        total = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE " + _live_sql()).fetchone()[0]
+        meta = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE " + _live_sql()
+            + " AND (content LIKE '%AgentHub%' OR content LIKE '%hub\\_%' ESCAPE '\\' "
+            "OR content LIKE '%大脑%')").fetchone()[0]
+        cutoff = (datetime.datetime.now() - datetime.timedelta(days=30)).strftime("%Y-%m-%d")
+        dec_rows = [dict(r) for r in conn.execute(
+            "SELECT id, project, date, title FROM records WHERE status='active' "
+            "AND content LIKE '%决策记录%' AND date!='' AND date < ? "
+            "ORDER BY date DESC LIMIT 8", (cutoff,))]
+    blindspots = sorted(
+        [{"project": p, "records": n, "memories": proj_mem.get(p, 0)}
+         for p, n in proj_rec.items() if not proj_mem.get(p)],
+        key=lambda x: -x["records"])[:8]
+    return {
+        "coverage_blindspots": blindspots,
+        "low_confidence": lowconf,
+        "dup_pairs": len(similar_memories(root, limit=20)),
+        "pending_decisions": [{"id": r["id"], "project": r["project"], "date": r["date"],
+                               "title": r["title"]} for r in dec_rows],
+        "meta_ratio": round(meta * 100 / max(1, total), 1),
+        "live_total": total,
+        "governance": memory_governance_stats(root),
+    }
+
+
 def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: str = "",
                 pinned: bool | None = None) -> str:
     """按 id 更新记忆字段（只改传入的）。返回错误或 ""。"""
@@ -1552,6 +1594,179 @@ def search_files(root: str, kw: str, limit: int = 20) -> list:
 
 _NOTE_SOURCES = ("human", "agent", "web")
 _NOTE_MOODS = ("", "兴奋", "笃定", "疑问", "纠结", "灵感", "低落", "平静")
+
+
+# ---------------------------------------------------------------- 问大脑（D2：Dialectic API 零 LLM 版）
+
+_ASK_INTENTS = (
+    ("risk", ("风险", "踩坑", "坑", "教训", "容易错", "雷区", "别踩", "失败", "注意")),
+    ("decision", ("决策", "为什么", "为何", "选型", "拍板", "取舍", "定过", "放弃", "方案")),
+    ("todo", ("待办", "要做", "接下来", "下一步", "还没", "欠", "剩下", "未完成", "遗留")),
+    ("status", ("状态", "进展", "进度", "现在怎样", "怎么样", "到哪", "哪些项目", "在做什么")),
+    ("fact", ("是什么", "哪里", "哪个", "什么时候", "在哪", "怎么配", "端口", "路径", "版本", "多少", "是谁")),
+)
+_INTENT_CN = {"risk": "风险/教训", "decision": "决策依据", "todo": "欠账/待办",
+              "status": "进展状态", "fact": "事实查询", "unknown": "未知"}
+_DECISION_MARK = ("决策记录", "## 决策", "【决策", "选型", "取舍")
+
+
+def _ask_intent(question: str) -> str:
+    for name, kws in _ASK_INTENTS:
+        if any(k in question for k in kws):
+            return name
+    return "fact"
+
+
+def _guess_project(root: str, question: str) -> str:
+    """问句里出现已知项目名则锁定（取最长匹配，避免子串误配）。"""
+    hit = ""
+    for p in list_projects(root, limit=300):
+        name = p["name"] if isinstance(p, dict) else str(p)
+        if name and name in question and len(name) > len(hit):
+            hit = name
+    return hit
+
+
+def ask(root: str, question: str, project: str = "", agent: str = "") -> dict:
+    """问大脑（D2）：把检索升级成「结构化回答 + 逐条出处 + 明确弃权」。
+    零 LLM：规则判意图 → 复用现有检索取证据 → 模板成文；无依据时明说「库里没有」，绝不拼凑。
+    只读：不写库、不计唤起（count_hits=False）。返回 dict（含 answer/citations/confidence/abstained）。"""
+    q = (question or "").strip()
+    if not q:
+        return {"question": "", "intent": "unknown", "project": "", "citations": [],
+                "confidence": "无", "abstained": True,
+                "answer": "问题为空。请给出具体问题，例如「<项目名> 最大的风险是什么」。", "note": ""}
+    intent = _ask_intent(q)
+    proj = (project or "").strip() or _guess_project(root, q)
+    # status 需要上下文：已知项目 / 明确问「项目·大脑·库·整体」；否则降级为 fact（可弃权，避免
+    # 「X 的进展如何」被误判成报告全库状态）
+    if intent == "status" and not proj and not any(
+            k in q for k in ("项目", "大脑", "库", "所有", "哪些", "整体", "全局")):
+        intent = "fact"
+    cites: list = []
+    parts: list = []
+
+    def _pick_mem(rows, cap):
+        if proj:
+            rows = [m for m in rows if (m.get("project") or "") == proj] or rows
+        out = []
+        for m in rows:
+            if len(out) >= cap:
+                break
+            out.append(m)
+            cites.append({"type": "memory", "id": m["id"], "kind": m.get("kind", ""),
+                          "project": m.get("project", "") or "",
+                          "excerpt": (m.get("content") or "")[:140]})
+        return out
+
+    def _pick_rec(rows, cap):
+        if proj:
+            rows = [r for r in rows if (r.get("project") or "") == proj] or rows
+        out = []
+        for r in rows:
+            if len(out) >= cap:
+                break
+            out.append(r)
+            cites.append({"type": "record", "id": r["id"], "date": r.get("date", ""),
+                          "project": r.get("project", "") or "",
+                          "excerpt": (r.get("title") or r.get("content") or "")[:140]})
+        return out
+
+    scope = f"（限定项目：{proj}）" if proj else ""
+    parts.append(f"关于「{q}」{scope}——问句意图判定：{_INTENT_CN[intent]}。")
+
+    if intent == "risk":
+        lessons = _pick_mem(search_memories(root, q, "lesson", 8, count_hits=False), 5)
+        if not lessons:
+            lessons = _pick_mem(search_memories(root, q, "", 8, count_hits=False), 4)
+        if lessons:
+            parts.append(f"已知的坑/教训（{len(lessons)} 条）：")
+            for m in lessons:
+                parts.append(f"· [{(m.get('kind') or '')}] {(m.get('content') or '')[:100]}（记忆#{m['id']}）")
+        recs = _pick_rec(search_records(root, q, 8), 3)
+        if recs:
+            parts.append("相关记录（自行精读）：")
+            for r in recs:
+                parts.append(f"· {r.get('date','')}「{(r.get('title') or '')[:40]}」（记录#{r['id']}）")
+
+    elif intent == "decision":
+        recs = _pick_rec(search_records(root, q, 12), 4)
+        decs = [r for r in recs if any(mk in (r.get("content") or "") for mk in _DECISION_MARK)]
+        if decs:
+            parts.append("相关决策记录（含「为什么」）：")
+            for r in decs[:3]:
+                for ln in (r.get("content") or "").splitlines():
+                    if any(mk in ln for mk in _DECISION_MARK):
+                        parts.append(f"· {ln.strip()[:100]}（记录#{r['id']}）")
+        if recs:
+            parts.append("背景记录：")
+            for r in recs[:3]:
+                parts.append(f"· {r.get('date','')}「{(r.get('title') or '')[:40]}」（记录#{r['id']}）")
+        if not decs:
+            parts.append("（未见结构化决策段；以上背景记录供参考。）")
+
+    elif intent == "todo":
+        todos = extract_todos(root, 60)
+        if proj:
+            todos = [t for t in todos if (t.get("project") or "") == proj] or todos
+        if todos:
+            parts.append(f"未办欠账（共 {len(todos)} 条，最多列 8）：")
+            for t in todos[:8]:
+                parts.append(f"· {t.get('todo','')[:100]}（记录#{t['id']} · {t.get('project','')}）")
+                cites.append({"type": "record", "id": t["id"], "date": t.get("date", ""),
+                              "project": t.get("project", "") or "",
+                              "excerpt": (t.get("todo") or "")[:140]})
+        else:
+            parts.append("目前没有未办待办（未扫描到「后续/待验证/下一步」类线索）。")
+
+    elif intent == "status":
+        s = stats(root)
+        parts.append(f"全库：记录 {s['records']} · 记忆 {s['memories']} · 项目 {s['projects']} · "
+                     f"未关错误 {s.get('errors_open', 0)}。")
+        if proj:
+            gp = get_project(root, proj)
+            if gp:
+                parts.append(f"项目「{proj}」最后活跃 {gp.get('last_active','?')}，最近记录：")
+                for r in gp.get("records", [])[:3]:
+                    parts.append(f"· {r.get('date','')}「{(r.get('title') or '')[:40]}」")
+                cites.append({"type": "project", "id": 0, "date": gp.get("last_active", ""),
+                              "project": proj, "excerpt": f"项目 {proj} 活跃 {gp.get('last_active','?')}"})
+        else:
+            recent = get_progress(root, 5)
+            if recent:
+                parts.append("最近记录：")
+            for r in recent:
+                parts.append(f"· {r.get('date','')}「{(r.get('title') or '')[:40]}」（{r.get('project','')}）")
+            if recent:
+                cites.append({"type": "status", "id": 0, "excerpt": "全库状态快照（见上）"})
+
+    else:  # fact
+        mems = _pick_mem(search_memories(root, q, "", 8, count_hits=False), 5)
+        if mems:
+            parts.append("相关记忆：")
+            for m in mems:
+                parts.append(f"· [{(m.get('kind') or '')}] {(m.get('content') or '')[:100]}（记忆#{m['id']}）")
+        recs = _pick_rec(search_records(root, q, 8), 3)
+        if recs:
+            parts.append("相关记录：")
+            for r in recs:
+                parts.append(f"· {r.get('date','')}「{(r.get('title') or '')[:40]}」（记录#{r['id']}）")
+
+    # status/todo 的「没有」是确定答案（如「没有待办」），不算弃权；fact/risk/decision 的 0 证据才是弃权
+    definitive = intent in ("status", "todo")
+    abstained = len(cites) == 0 and not definitive
+    if abstained:
+        answer = (f"库里没有关于「{q}」的依据，我不知道。"
+                  + (f"（限定项目：{proj}）" if proj else "")
+                  + " 建议换个说法，或先用 hub_search / hub_get_progress 看有哪些相关线索。")
+        confidence = "无"
+    else:
+        answer = "\n".join(parts)
+        conf_seq = {0: "中"}  # 确定性的「没有」（todo/status 空态）
+        confidence = conf_seq[0] if not cites else ("高" if len(cites) >= 3 else "中")
+    return {"question": q, "intent": intent, "project": proj, "answer": answer,
+            "citations": cites, "confidence": confidence, "abstained": abstained,
+            "note": "零 LLM 模板回答：只引用库内证据，弱相关自行取舍。"}
 
 
 def add_note(root: str, content: str, tags: str = "", link: str = "",

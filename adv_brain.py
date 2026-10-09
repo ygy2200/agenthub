@@ -1617,6 +1617,96 @@ def t_batchA_memory_governance(tmp):
     assert gs["with_evidence"] >= 1, gs
 
 
+def t_batchB_ask(tmp):
+    """批次B·D2 问大脑：意图识别 / 证据引用 / 明确弃权 / 只读不计唤起 / 空库不崩。"""
+    root = Path(tmp) / "hub_ask"
+    root.mkdir(parents=True, exist_ok=True)
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+
+    # 空库：任何意图都不崩；查不到就弃权（fact 无据必须明说不知道）
+    for q in ("风险是什么", "为什么这么定", "还有哪些待办", "我的项目进展", "端口是多少"):
+        r = brain.ask(rs, q)
+        assert isinstance(r, dict) and r.get("answer") and "citations" in r, r
+    assert brain.ask(rs, "")["abstained"] is True
+    assert brain.ask(rs, "端口是多少")["abstained"] is True
+    assert "不知道" in brain.ask(rs, "端口是多少")["answer"]
+
+    # 造数
+    brain.add_memory(rs, "FlClash 订阅更新会覆盖 profile_id 导致规则脱钩", "lesson",
+                     project="FlClash", agent="zcode")
+    brain.add_memory(rs, "强杀 FlClash 必留死代理，断网先查代理残留", "lesson",
+                     project="FlClash", agent="zcode")
+    brain.add_record(rs, "FlClash", "zcode", "2026-10-05", "订阅修复",
+                     "【目的】修代理规则脱钩\n## 决策记录\n方案：改 profile_id 落盘\n取舍：牺牲自动同步")
+    brain.add_record(rs, "FlClash", "zcode", "2026-10-06", "收尾",
+                     "下一步：把该规则写进 README")
+
+    # risk：命中教训，出处非空，置信非「无」
+    r = brain.ask(rs, "FlClash 最大的风险是什么", "FlClash")
+    assert r["intent"] == "risk", r
+    assert r["abstained"] is False and r["citations"], r
+    assert r["confidence"] in ("高", "中"), r
+    assert all("id" in c and "type" in c for c in r["citations"]), r["citations"]
+
+    # decision：含决策段
+    r = brain.ask(rs, "为什么 FlClash 要改 profile_id 落盘", "FlClash")
+    assert r["intent"] == "decision", r
+    assert "决策" in r["answer"], r["answer"]
+
+    # todo：命中待办；无待办时是确定答案、不弃权
+    r = brain.ask(rs, "还有哪些待办", "FlClash")
+    assert r["intent"] == "todo" and r["abstained"] is False, r
+    assert brain.ask(rs, "还有哪些待办", "不存在的项目ZZZ")["abstained"] is False
+
+    # status：需上下文才判 status；无上下文的状态词降级 fact（可弃权）
+    r = brain.ask(rs, "我的项目现在什么进展")
+    assert r["intent"] == "status" and r["citations"], r
+    assert brain.ask(rs, "量子计算机纠错码的进展如何")["intent"] == "fact"
+
+    # 项目名自动识别 + 对抗：空/超长问句
+    assert brain.ask(rs, "FlClash 有哪些坑")["project"] == "FlClash"
+    assert brain.ask(rs, "x" * 5000)["abstained"] in (True, False)
+
+    # 只读：ask 不得计唤起（use_count 不变）
+    before = {x["id"]: x["use_count"] for x in brain.search_memories(rs, "", "", 50)}
+    brain.ask(rs, "FlClash 风险", "FlClash")
+    brain.ask(rs, "FlClash 订阅 profile_id", "FlClash")
+    after = {x["id"]: x["use_count"] for x in brain.search_memories(rs, "", "", 50)}
+    assert before == after, (before, after)
+
+
+def t_batchB_metacognition(tmp):
+    """批次B·D10 元认知面板：覆盖盲区/低置信/待复核决策/元信息占比，空库不崩、与治理统计一致。"""
+    root = Path(tmp) / "hub_meta"
+    root.mkdir(parents=True, exist_ok=True)
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    mc = brain.metacognition(rs)
+    need = ("coverage_blindspots", "low_confidence", "dup_pairs",
+            "pending_decisions", "meta_ratio", "live_total", "governance")
+    assert all(k in mc for k in need), mc.keys()
+    assert mc["live_total"] == 0 and mc["dup_pairs"] == 0
+
+    # 覆盖盲区：有记录、零记忆的项目
+    brain.add_record(rs, "无记忆项目A", "zcode", "2026-10-01", "r1", "只为造记录")
+    brain.add_memory(rs, "有记忆项目B的经验", "lesson", project="有记忆项目B", agent="zcode")
+    blind = {b["project"] for b in brain.metacognition(rs)["coverage_blindspots"]}
+    assert "无记忆项目A" in blind and "有记忆项目B" not in blind, blind
+
+    # 低置信现行记忆
+    brain.add_memory(rs, "可疑结论（低置信）", "fact", agent="zcode", confidence=0.3)
+    assert any(m["confidence"] < 0.6 for m in brain.metacognition(rs)["low_confidence"])
+
+    # 待复核决策（>30 天）
+    brain.add_record(rs, "决策项目C", "zcode", "2026-01-01", "旧决策",
+                     "## 决策记录\n方案：X\n取舍：牺牲 Y")
+    assert any(d["project"] == "决策项目C" for d in brain.metacognition(rs)["pending_decisions"])
+
+    # 与治理统计一致
+    assert brain.metacognition(rs)["governance"]["live"] == brain.memory_governance_stats(rs)["live"]
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -1661,6 +1751,8 @@ def main():
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     case("批次A·记忆治理（取代链/双时相/证据链/置信度/latest-write-wins/治理统计）", lambda: t_batchA_memory_governance(tmp))
+    case("批次B·问大脑D2（意图识别/证据出处/明确弃权/只读不计唤起/空库不崩）", lambda: t_batchB_ask(tmp))
+    case("批次B·元认知D10（覆盖盲区/低置信/待复核决策/空库不崩/与治理统计一致）", lambda: t_batchB_metacognition(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:
