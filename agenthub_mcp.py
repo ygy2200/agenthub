@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.18.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.19.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -304,6 +304,17 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         project = str(arguments.get("project", "")).strip()
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
         pinned = bool(arguments.get("pinned", False))
+        # 批次 A：记忆取代 / 双时相 / 置信度 / 证据链
+        try:
+            supersedes = int(arguments.get("supersedes", 0) or 0)
+        except (TypeError, ValueError):
+            supersedes = 0
+        valid_until = str(arguments.get("valid_until", "")).strip()[:10]
+        try:
+            confidence = float(arguments.get("confidence", 1.0))
+        except (TypeError, ValueError):
+            confidence = 1.0
+        evidence = str(arguments.get("evidence", "")).strip()
         err = _check_content(content, "content")
         if err:
             return err
@@ -325,9 +336,18 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 brain.edit_memory(root, rows[0]["id"], content=content, kind=kind if kind in brain.KINDS else "")
                 core.journal(root, agent, "memory_overwrite", f"brain:memories#{rows[0]['id']}")
                 return f"已更新大脑记忆 #{rows[0]['id']}"
-        mid = brain.add_memory(root, content, kind, tags, project, agent, pinned)
+        mid = brain.add_memory(root, content, kind, tags, project, agent, pinned,
+                              supersedes=supersedes, valid_until=valid_until,
+                              confidence=confidence, evidence=evidence)
         core.journal(root, agent, "memory_append", f"brain:memories#{mid}", note=kind)
-        return f"已写入大脑记忆 #{mid}（{brain.KIND_CN.get(kind, kind)}），所有 agent 可读可检索"
+        extra = ""
+        if supersedes > 0:
+            extra += f"，已取代 #{supersedes}（旧条退出推送但仍可追溯）"
+        if valid_until:
+            extra += f"，有效期至 {valid_until}"
+        if evidence:
+            extra += f"，证据链 {evidence}"
+        return f"已写入大脑记忆 #{mid}（{brain.KIND_CN.get(kind, kind)}），所有 agent 可读可检索{extra}"
 
     if name == "hub_heartbeat":
         agent = str(arguments.get("agent", "")).strip()
@@ -809,7 +829,7 @@ TOOLS = [
                      "properties": {"query": {"type": "string", "description": "关键词检索，缺省返回置顶+最近概览"},
                                     "kind": {"type": "string", "enum": ["fact", "preference", "lesson", "project", "note"]},
                                     "limit": {"type": "integer"}}}},
-    {"name": "hub_memory_write", "description": "写入一条大脑记忆，供所有 agent 检索。kind 建议明确：环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project",
+    {"name": "hub_memory_write", "description": "写入一条大脑记忆，供所有 agent 检索。kind 建议明确：环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project。批次A支持：supersedes 取代旧记忆（旧条退出推送但可追溯）、valid_until 有效期止(YYYY-MM-DD)、confidence 置信度(0~1)、evidence 证据链(r:记录id,m:记忆id)",
      "inputSchema": {"type": "object",
                      "properties": {"content": {"type": "string"},
                                     "kind": {"type": "string", "enum": ["fact", "preference", "lesson", "project", "note"], "description": "记忆类型，缺省 note"},
@@ -821,7 +841,11 @@ TOOLS = [
                                                  "description": "对已有记忆反馈（配合 memory_id 使用）：helpful/not_helpful/stale/wrong 调节显著性；archive 归档该记忆（不硬删）"},
                                     "memory_id": {"type": "integer",
                                                   "description": "要反馈的记忆 id（配合 feedback 使用）"},
-                                    "mode": {"type": "string", "enum": ["append", "overwrite"], "description": "append 新增（默认）；overwrite 按内容匹配更新"}},
+                                    "mode": {"type": "string", "enum": ["append", "overwrite"], "description": "append 新增（默认）；overwrite 按内容匹配更新"},
+                                    "supersedes": {"type": "integer", "description": "取代的目标记忆 id：旧条自动退出推送但仍可追溯（记忆取代链）"},
+                                    "valid_until": {"type": "string", "description": "有效期止 YYYY-MM-DD，到期自动退出推送（双时相时效治理）"},
+                                    "confidence": {"type": "number", "description": "置信度 0~1，低置信记忆在治理统计中可识别"},
+                                    "evidence": {"type": "string", "description": "证据链，形如 r:2038,m:76（引用记录/记忆 id，provenance 溯源）"}},
                      "required": ["content"]}},
     {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃时会收到撞车预警，长任务开工前先调用",
      "inputSchema": {"type": "object",

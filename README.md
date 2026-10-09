@@ -69,6 +69,7 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 | v2.16 | 用户建模 hub_user_profile（画像：活跃时段/记录分工/技术栈词频/纠正史 top，preference=0 行动信号）+ 可编程数据包 my.work（sys.path 即 import，records/memories/todos/profile，只读不计唤起）+ 目录树读取轨道；GUI 运营报告页、环境档案切入即显示修复、检索统计 agent 名归一 |
 | v2.17 | 人的随记（notes 表 + `hub_note`）：GUI 随记独立页（memos 式时间线、心情点排、相对时间、全局热键捕捉）、随记上首页、与记忆/记录检索互通 |
 | v2.18 | 随记批 A 创意八件套（180 天心情热力图 / 实时关联浮出 / 不期而遇每日回顾 / 往年今天回放 / 时光胶囊 / 收藏星 / #标签串 / 草稿自动保存）+ 批 B 随记-agent 融合层（`hub_note_read` 深挖与整理协议、开工视野与 `hub_status` 推送主人最新随记、随记自动附活跃上下文）；**并发可靠性修复**：WAL 常驻哨兵（Windows 短连接并发写丢心跳，实测 6~8/8 → 8/8）、每日回顾收藏优先（`random.sample` 打乱顺序致收藏优先失效）、并发建同名项目 `O_EXCL` 原子建文件（8 线程 5 个 Permission denied → 0） |
+| v2.19 | **批次 A·可靠性地基**：记忆治理三层——①记忆取代链（`superseded_by`，旧结论退出推送但仍可 `memory_trace` 追溯）；②双时相时效（`valid_until`，到期自动退出检索）；③证据链（`evidence` 引用记录/记忆 id，provenance 溯源）+ 置信度 `confidence`。`memories` 表新增 4 列（幂等补列），所有「有效记忆」查询点（检索/推送/统计/蒸馏/去重/体检）统一走 `_live_sql()` 过滤被取代/过期记忆；`hub_memory_write` 透传 `supersedes/valid_until/confidence/evidence`；新增 `memory_governance_stats` 治理健康度（live/superseded/retired/expired/evidence_coverage/avg_confidence），直接服务 10-14 大脑验收②③；adv_brain 新增批次 A 对抗测试全绿 |
 
 ## 设计原则
 

@@ -1542,6 +1542,81 @@ def t_ensure_schema(tmp):
     assert brain.ensure_schema(str(Path(tmp) / "不存在_目录xyz")) != ""  # 拒绝而非凭空建目录
 
 
+def t_batchA_memory_governance(tmp):
+    """批次A·可靠性地基：记忆取代链 + 双时相 + 证据链 + 置信度 + 治理统计。
+    验证：被取代/过期/作废的记忆退出推送与检索但仍可追溯；latest-write-wins；
+    治理统计与 SQL 一致。"""
+    import datetime as _dt
+    root = Path(tmp) / "hub_batchA"
+    root.mkdir(parents=True, exist_ok=True)
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+
+    today = _dt.date.today()
+    yesterday = (today - _dt.timedelta(days=1)).isoformat()
+    future = (today + _dt.timedelta(days=10)).isoformat()
+
+    # ① 取代链：M1 旧结论，M2 取代它
+    m1 = brain.add_memory(rs, "旧端口是 7890", kind="fact", project="代理", agent="zcode")
+    m2 = brain.add_memory(rs, "端口已改为 7891", kind="fact", project="代理", agent="zcode",
+                         supersedes=m1)
+    live_ids = {r["id"] for r in brain.search_memories(rs, "", "", 100)}
+    assert m1 not in live_ids, "被取代的记忆不应再出现在有效检索"
+    assert m2 in live_ids
+    assert brain.count_memories(rs) == 1, brain.count_memories(rs)
+    # 取代链可追溯：旧记忆能看到自己被谁取代；live_version 追溯到最新有效版本
+    t1 = brain.memory_trace(rs, m1)
+    assert t1[0]["superseded_by"] == m2, t1
+    assert brain.live_version(rs, m1) == m2, "m1 的最新有效版本应为 m2"
+    # 新记忆是现行（superseded_by=0）
+    t2 = brain.memory_trace(rs, m2)
+    assert t2[0]["superseded_by"] == 0, t2
+
+    # ② 双时相：过期 vs 有效
+    m3 = brain.add_memory(rs, "临时结论（已过期）", kind="fact", valid_until=yesterday)
+    m4 = brain.add_memory(rs, "长期结论", kind="fact", valid_until=future)
+    live_ids2 = {r["id"] for r in brain.search_memories(rs, "", "", 100)}
+    assert m3 not in live_ids2, "过期记忆不应有效"
+    assert m4 in live_ids2
+    pushed = [r["id"] for r in brain.recall_for(rs, "代理")]
+    assert m3 not in pushed and m1 not in pushed
+    assert m2 in pushed, pushed
+
+    # ③ 作废（无继任）：退出有效集合
+    brain.retire_memory(rs, m4, reason="")
+    assert m4 not in {r["id"] for r in brain.search_memories(rs, "", "", 100)}
+
+    # ④ 证据链 + 置信度落库（引用真实存在的记录与记忆）
+    rid = brain.add_record(rs, "代理", "zcode", "2026-10-09", "测试记录", "端口配置相关证据")
+    m5 = brain.add_memory(rs, "结论带证据", kind="lesson", evidence=f"r:{rid},m:2")
+    g = brain.memory_trace(rs, m5)
+    refs = {c.get("ref") for c in g if c.get("role") == "evidence"}
+    assert f"r:{rid}" in refs, g
+    assert "m:2" in refs, g
+    row = next(r for r in brain.search_memories(rs, "", "", 100) if r["id"] == m5)
+    assert abs(float(row["confidence"]) - 1.0) < 1e-6
+
+    # ⑤ latest-write-wins：后写取代前写冲突结论
+    a = brain.add_memory(rs, "配置A：启用X", kind="fact", agent="zcode")
+    b = brain.add_memory(rs, "配置A：禁用X（更正）", kind="fact", agent="zcode", supersedes=a)
+    live_ab = {r["id"] for r in brain.search_memories(rs, "", "", 100)}
+    assert a not in live_ab and b in live_ab
+
+    # ⑥ pass^k 稳定性代理：反复检索不导致被取代，仍 live
+    for _ in range(5):
+        brain.search_memories(rs, "配置A", "", 10)
+    assert b in {r["id"] for r in brain.search_memories(rs, "", "", 100)}
+
+    # ⑦ 治理统计与 SQL 一致
+    gs = brain.memory_governance_stats(rs)
+    assert gs["total"] >= 5
+    assert gs["live"] == brain.count_memories(rs), (gs, brain.count_memories(rs))
+    assert gs["superseded"] >= 2, gs
+    assert gs["expired"] >= 1, gs
+    assert gs["retired"] >= 1, gs
+    assert gs["with_evidence"] >= 1, gs
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -1585,6 +1660,7 @@ def main():
     case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
+    case("批次A·记忆治理（取代链/双时相/证据链/置信度/latest-write-wins/治理统计）", lambda: t_batchA_memory_governance(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

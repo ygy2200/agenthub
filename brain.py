@@ -171,7 +171,11 @@ CREATE TABLE IF NOT EXISTS memories (
     updated TEXT DEFAULT "",
     use_count INTEGER DEFAULT 0,
     last_hit TEXT DEFAULT "",
-    salience REAL DEFAULT 1.0
+    salience REAL DEFAULT 1.0,
+    superseded_by INTEGER DEFAULT 0,
+    valid_until TEXT DEFAULT "",
+    confidence REAL DEFAULT 1.0,
+    evidence TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -510,6 +514,15 @@ def _migrate_columns(root: str) -> None:
             conn.execute("ALTER TABLE memories ADD COLUMN last_hit TEXT DEFAULT ''")
         if "salience" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN salience REAL DEFAULT 1.0")
+        # v2.19 时效治理四列（2026-10-09）：記憶失效的基本面
+        # superseded_by：被哪条记忆取代（0=现行）；valid_until：有效期止（''=长期）
+        # confidence：置信度 0~1；evidence：证据链 "r:12,r:34,m:7"（records/memories id）
+        for col, ddl in (("superseded_by", "INTEGER DEFAULT 0"),
+                         ("valid_until", "TEXT DEFAULT ''"),
+                         ("confidence", "REAL DEFAULT 1.0"),
+                         ("evidence", "TEXT DEFAULT ''")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -682,7 +695,7 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
     q_set = list(dict.fromkeys(_tokenize(query)))
     if not q_set:
         return []
-    sql = "SELECT * FROM memories WHERE status='active'"
+    sql = "SELECT * FROM memories WHERE " + _live_sql() + ""
     args: list = []
     if kind in KINDS:
         sql += " AND kind=?"
@@ -916,18 +929,181 @@ def merge_duplicate_projects(root: str, canonical: str, aliases: list,
 
 # ---------------------------------------------------------------- 大脑记忆（核心）
 
+def _clean_evidence(s: str) -> str:
+    """规范化证据引用串：只保留 r:<记录id> / m:<记忆id>，去重保序，逗号连接。
+
+    evidence 是「这条结论从前从哪来」——fleet-memory 治理四原语里的 provenance tracking
+    的另一半（AgentHub 此前只有 writer，没有 derivation）。"""
+    if s is None:
+        return ""
+    out, seen = [], set()
+    for tok in re.split(r"[,\s;]+", str(s).strip()):
+        tok = tok.strip().lower()
+        if not tok:
+            continue
+        kind, _, num = tok.partition(":")
+        if kind in ("r", "m") and num.isdigit():
+            key = f"{kind}:{int(num)}"
+            if key not in seen:
+                seen.add(key)
+                out.append(key)
+    return ",".join(out)
+
+
+def _live_sql(a: str = "") -> str:
+    """「现行有效」记忆的 SQL 条件片段：未软删 + 未被取代 + 未过期。
+
+    2026 业界共识（Graphiti 双时相 validFrom/validTo、Hindsight 按 mentioned_at 裁决冲突）：
+    **失效 ≠ 删除**——旧版本保留可追溯，但不得再参与推送与检索。
+    此前 AgentHub 只有连续的 salience 衰减，一条被更正的旧事实仍会以「高相似」推送，
+    是最昂贵的错法：agent 照着过期路径干活。"""
+    return (f"{a}status='active' AND {a}superseded_by=0 "
+            f"AND ({a}valid_until='' OR {a}valid_until>=date('now'))")
+
+
+def live_version(root: str, mid: int) -> int:
+    """沿取代链追溯到最新的有效版本 id；本身就是有效则返回自身。链有环时停在环上。"""
+    with db_conn(root) as conn:
+        cur, guard = int(mid), 0
+        seen = set()
+        while cur and guard < 64 and cur not in seen:
+            seen.add(cur)
+            row = conn.execute(
+                "SELECT superseded_by FROM memories WHERE id=?", (cur,)).fetchone()
+            if not row or not row["superseded_by"]:
+                return cur
+            nxt = int(row["superseded_by"])
+            if nxt <= 0:      # -1 = 无继任的作废
+                return cur
+            cur = nxt
+            guard += 1
+    return int(mid)
+
+
+def supersede_memory(root: str, old_id: int, new_id: int) -> str:
+    """显式「#new 取代 #old」：给已存在的两条记忆建立取代关系。返回错误或 ""。"""
+    old_id, new_id = int(old_id or 0), int(new_id or 0)
+    if old_id <= 0 or new_id <= 0:
+        return "old_id / new_id 必须是正整数"
+    if old_id == new_id:
+        return "不能自己取代自己"
+    with db_conn(root) as conn:
+        a = conn.execute("SELECT id FROM memories WHERE id=?", (old_id,)).fetchone()
+        b = conn.execute("SELECT id FROM memories WHERE id=?", (new_id,)).fetchone()
+        if not a or not b:
+            return f"记忆 #{old_id} 或 #{new_id} 不存在"
+        conn.execute("UPDATE memories SET superseded_by=?, updated=? WHERE id=?",
+                     (new_id, _now(), old_id))
+        conn.execute("UPDATE memories SET superseded_by=0, updated=? WHERE id=?",
+                     (_now(), new_id))
+    return ""
+
+
+def retire_memory(root: str, mid: int, reason: str = "") -> str:
+    """废弃一条记忆且无继任（superseded_by=-1）：结论不再成立、也没有新版本可指。
+    它会立刻退出推送与检索，但条目本体与 evidence 保留，GUI 里仍可查证。"""
+    mid = int(mid or 0)
+    if mid <= 0:
+        return "id 必须是正整数"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT id FROM memories WHERE id=?", (mid,)).fetchone()
+        if not row:
+            return f"记忆 #{mid} 不存在"
+        conn.execute(
+            "UPDATE memories SET superseded_by=-1, updated=?, evidence=? WHERE id=?",
+            (_now(), (_clean_evidence(reason) or
+                      conn.execute("SELECT evidence FROM memories WHERE id=?",
+                                   (mid,)).fetchone()["evidence"] or ""), mid))
+    return ""
+
+
+def memory_trace(root: str, mid: int) -> list:
+    """证据链（双向）：返回该记忆的取代链与它引用的证据原文摘要。
+
+    结构：[{"role":"chain"/"evidence","id":..,"kind":..,"content":..,"valid_until":..,
+            "confidence":..,"superseded_by":..}]
+    用于回答「这条结论从哪来、谁写的、现在还算不算数」——治理四原语中 provenance 的可读化。"""
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT * FROM memories WHERE id=?", (int(mid or 0),)).fetchone()
+        if not row:
+            return []
+        m = dict(row)
+    out = [{"role": "self", "id": m["id"], "kind": m["kind"], "content": m["content"],
+            "agent": m["agent"], "created": m["created"], "valid_until": m["valid_until"],
+            "confidence": m["confidence"], "superseded_by": m["superseded_by"]}]
+    # ① 向后：谁取代了它（含链式）
+    cur = int(m["superseded_by"] or 0)
+    guard = 0
+    while cur > 0 and guard < 32:
+        guard += 1
+        with db_conn(root) as conn:
+            r = conn.execute("SELECT * FROM memories WHERE id=?", (cur,)).fetchone()
+        if not r:
+            break
+        out.append({"role": "superseded_by", "id": r["id"], "kind": r["kind"],
+                    "content": r["content"], "agent": r["agent"], "created": r["created"],
+                    "valid_until": r["valid_until"], "confidence": r["confidence"],
+                    "superseded_by": r["superseded_by"]})
+        cur = int(r["superseded_by"] or 0)
+    if int(m["superseded_by"] or 0) == -1:
+        out.append({"role": "retired", "id": 0, "content": "（已废弃，无继任版本）"})
+    # ② 向前：它引用的证据
+    for tok in [t for t in (m["evidence"] or "").split(",") if t]:
+        kind, _, num = tok.partition(":")
+        num = int(num)
+        if kind == "r":
+            with db_conn(root) as conn:
+                r = conn.execute("SELECT id,project,title,content,agent,date FROM records "
+                                 "WHERE id=?", (num,)).fetchone()
+            if r:
+                out.append({"role": "evidence", "ref": tok, "type": "record", "id": r["id"],
+                            "content": (r["content"] or "")[:200], "project": r["project"],
+                            "title": r["title"], "agent": r["agent"], "date": r["date"]})
+        elif kind == "m":
+            with db_conn(root) as conn:
+                r = conn.execute("SELECT id,kind,content,agent,created FROM memories "
+                                 "WHERE id=?", (num,)).fetchone()
+            if r:
+                out.append({"role": "evidence", "ref": tok, "type": "memory", "id": r["id"],
+                            "content": (r["content"] or "")[:200], "kind": r["kind"],
+                            "agent": r["agent"], "created": r["created"]})
+    return out
+
+
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
-               project: str = "", agent: str = "", pinned: bool = False) -> int:
+               project: str = "", agent: str = "", pinned: bool = False,
+               supersedes: int = 0, valid_until: str = "",
+               confidence: float = 1.0, evidence: str = "") -> int:
+    """写一条记忆。supersedes=N 表示本条取代 #N（旧的自动退出推送但仍可追溯）。
+    valid_until=YYYY-MM-DD 表示有效期止（到期自动退出）。confidence 0~1。
+    evidence 形如 "r:2038,m:76"（支持的记录/记忆 id）。"""
     if kind not in KINDS:
         kind = "note"
+    old = int(supersedes or 0)
+    if old < 0:
+        raise ValueError("supersedes 必须为正整数或 0")
+    try:
+        conf = float(confidence)
+    except (TypeError, ValueError):
+        conf = 1.0
+    conf = max(0.0, min(1.0, conf))
+    vu, ev = (valid_until or "").strip()[:10], _clean_evidence(evidence)
     with db_conn(root) as conn:
+        if old > 0 and not conn.execute("SELECT id FROM memories WHERE id=?",
+                                        (old,)).fetchone():
+            raise ValueError(f"被取代的记忆 #{old} 不存在")
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
         cur = conn.execute(
-            "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (kind, content, tags.strip(), project, agent, 1 if pinned else 0, _now(), _now()))
-        return cur.lastrowid
+            "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated,"
+            "valid_until,confidence,evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (kind, content, tags.strip(), project, agent, 1 if pinned else 0,
+             _now(), _now(), vu, conf, ev))
+        nid = cur.lastrowid
+        if old > 0:
+            conn.execute("UPDATE memories SET superseded_by=?, updated=? WHERE id=?",
+                         (nid, _now(), old))
+        return nid
 
 
 PUSH_LIMIT_PROJECT = 3   # 记忆推送：项目相关最多条数（项目教训优先于全局置顶）
@@ -945,11 +1121,11 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
     越推越热、46 条记忆 39 条永远零唤起（2026-10-03 真实库实测的马太固化）。"""
     with db_conn(root) as conn:
         proj = [dict(r) for r in conn.execute(
-            "SELECT * FROM memories WHERE status='active' AND project=? "
+            "SELECT * FROM memories WHERE " + _live_sql() + " AND project=? "
             "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PROJECT))]
         pins = [dict(r) for r in conn.execute(
-            "SELECT * FROM memories WHERE status='active' AND pinned=1 "
+            "SELECT * FROM memories WHERE " + _live_sql() + " AND pinned=1 "
             "AND (project='' OR project IS NULL OR project!=?) "
             "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PINNED))]
@@ -963,7 +1139,7 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
         cur_toks = _tokens(cur_txt)
         if len(cur_toks) >= 4:
             others = [dict(r) for r in conn.execute(
-                "SELECT * FROM memories WHERE status='active' "
+                "SELECT * FROM memories WHERE " + _live_sql() + " "
                 "AND (project IS NULL OR project='' OR project!=?) LIMIT 300", (project or "",))]
             scored = []
             for om in others:
@@ -1023,7 +1199,7 @@ def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> 
 
 
 def _memories_query(root: str, words: list, kind: str, limit: int) -> list:
-    q = "SELECT * FROM memories WHERE status='active'"
+    q = "SELECT * FROM memories WHERE " + _live_sql() + ""
     args: list = []
     if words:
         conds, score_sql = [], []
@@ -1121,7 +1297,7 @@ def set_memory_feedback(root: str, mid: int, feedback: str) -> str:
         return f"记忆 id 非法：{mid!r}"
     p = DECAY_PARAMS
     with db_conn(root) as conn:
-        row = conn.execute("SELECT id, salience FROM memories WHERE id=? AND status='active'",
+        row = conn.execute("SELECT id, salience FROM memories WHERE id=? AND " + _live_sql(),
                            (mid,)).fetchone()
         if not row:
             return f"记忆不存在或已归档：#{mid}"
@@ -1224,13 +1400,57 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
 
 def count_memories(root: str, kind: str = "") -> int:
     """活跃记忆总数（SQL COUNT；替代"全捞 1000 条到 Python 再 len"的低效计数）。"""
-    q = "SELECT COUNT(*) FROM memories WHERE status='active'"
+    q = "SELECT COUNT(*) FROM memories WHERE " + _live_sql() + ""
     args: list = []
     if kind in KINDS:
         q += " AND kind=?"
         args.append(kind)
     with db_conn(root) as conn:
         return conn.execute(q, args).fetchone()[0]
+
+
+def memory_governance_stats(root: str) -> dict:
+    """记忆治理健康度（批次 A·可靠性地基）：现行有效 vs 已被取代/过期/作废，以及证据链覆盖与平均置信度。
+    只做统计、不改数据——让大脑的「取代链 + 双时相 + 证据链」治理效果可见、可验收
+    （直接服务 2026-10-14 大脑验收标准的②③④）。"""
+    with db_conn(root) as conn:
+        rows = conn.execute(
+            "SELECT id, status, superseded_by, valid_until, confidence, evidence "
+            "FROM memories").fetchall()
+    total = len(rows)
+    live, superseded, retired, expired = 0, 0, 0, 0
+    with_ev, conf_sum = 0, 0.0
+    today = datetime.date.today().isoformat()
+    for r in rows:
+        sb = int(r["superseded_by"] or 0)
+        if sb == -1:
+            retired += 1
+        elif sb > 0:
+            superseded += 1
+        else:
+            # 现行：再看是否过期
+            vu = (r["valid_until"] or "").strip()
+            if vu and vu < today:
+                expired += 1
+            else:
+                live += 1
+        ev = (r["evidence"] or "").strip()
+        if ev:
+            with_ev += 1
+        try:
+            conf_sum += float(r["confidence"] or 1.0)
+        except (TypeError, ValueError):
+            conf_sum += 1.0
+    return {
+        "total": total,
+        "live": live,
+        "superseded": superseded,
+        "retired": retired,
+        "expired": expired,
+        "with_evidence": with_ev,
+        "evidence_coverage": round(with_ev / total, 3) if total else 0.0,
+        "avg_confidence": round(conf_sum / total, 3) if total else 0.0,
+    }
 
 
 def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: str = "",
@@ -1514,13 +1734,14 @@ def stats(root: str) -> dict:
             "WHERE status='active' AND date!='' GROUP BY m ORDER BY m DESC LIMIT 6")}
         return {"projects": one("SELECT COUNT(*) FROM projects"),
                 "records": one("SELECT COUNT(*) FROM records WHERE status='active'"),
-                "memories": one("SELECT COUNT(*) FROM memories WHERE status='active'"),
+                "memories": one("SELECT COUNT(*) FROM memories WHERE " + _live_sql() + ""),
                 "today": one("SELECT COUNT(*) FROM records WHERE status='active' AND date=?", (today,)),
                 "errors_open": one("SELECT COUNT(*) FROM errors WHERE status='open'"),
                 "searches_today": one("SELECT COUNT(*) FROM searches WHERE substr(ts,1,10)=?", (today,)),
                 "searches_total": one("SELECT COUNT(*) FROM searches"),
                 "projects_stalled": one("SELECT COUNT(*) FROM projects WHERE status='stalled'"),
-                "agent_counts": agent_counts, "monthly_counts": monthly}
+                "agent_counts": agent_counts, "monthly_counts": monthly,
+                "mem_governance": memory_governance_stats(root)}
 
 
 # ---------------------------------------------------------------- 流水 / 错误 / 会话
@@ -1896,7 +2117,7 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
     返回 [{a, b, sim, verdict, content_a, content_b}]——verdict 为裁决辅助建议，最终由 agent/用户裁决。"""
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, kind, content FROM memories WHERE status='active' ORDER BY id")]
+            "SELECT id, kind, content FROM memories WHERE " + _live_sql() + " ORDER BY id")]
     toks = [(r["id"], r["kind"], r["content"], _tokens(r["content"])) for r in rows]
     out = []
     for i in range(len(toks)):
@@ -1927,7 +2148,7 @@ def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit:
         return []
     with db_conn(root) as conn:
         rows = [{"id": r["id"], "kind": r["kind"], "content": r["content"]} for r in conn.execute(
-            "SELECT id, kind, content FROM memories WHERE status='active' AND kind IN ('lesson','fact')")]
+            "SELECT id, kind, content FROM memories WHERE " + _live_sql() + " AND kind IN ('lesson','fact')")]
         rows += [{"id": -r["id"], "kind": "error", "content": f"{r['title']} {r['detail']}"}
                  for r in conn.execute("SELECT id, title, detail FROM errors WHERE status='open'")]
     out = []
@@ -2028,20 +2249,20 @@ def health_report(root: str) -> dict:
             "SELECT COUNT(*) FROM journal WHERE action LIKE '检查 stalled%' OR action LIKE '%archive%'").fetchone()[0]
         pinned_total, pinned_work = conn.execute(
             "SELECT COUNT(*), IFNULL(SUM(CASE WHEN kind IN ('lesson','fact','project') THEN 1 ELSE 0 END),0) "
-            "FROM memories WHERE status='active' AND pinned=1").fetchone()
+            "FROM memories WHERE " + _live_sql() + " AND pinned=1").fetchone()
         # 记忆保鲜：lesson/fact 写入超 90 天且从未唤起/长期未唤起——环境漂移后可能已失真
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=90)).isoformat(timespec="seconds")
         stale_rows = conn.execute(
-            "SELECT id, kind, substr(content,1,60) AS content FROM memories WHERE status='active' "
+            "SELECT id, kind, substr(content,1,60) AS content FROM memories WHERE " + _live_sql() + " "
             "AND kind IN ('lesson','fact') AND created < ? "
             "AND (last_hit IS NULL OR last_hit < ?) ORDER BY id LIMIT 5", (cutoff, cutoff)).fetchall()
         # 诚实指标（0.5）：数据健康度而非能力指标——先诚实，再谈能力（不照抄 LongMemEval/LOCOMO）
         mem_total = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE status='active'").fetchone()[0]
+            "SELECT COUNT(*) FROM memories WHERE " + _live_sql() + "").fetchone()[0]
         mem_used = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE status='active' AND use_count>0").fetchone()[0]
+            "SELECT COUNT(*) FROM memories WHERE " + _live_sql() + " AND use_count>0").fetchone()[0]
         mem_meta = conn.execute(
-            "SELECT COUNT(*) FROM memories WHERE status='active' "
+            "SELECT COUNT(*) FROM memories WHERE " + _live_sql() + " "
             "AND (content LIKE '%AgentHub%' OR content LIKE '%hub\\_%' ESCAPE '\\' "
             "     OR content LIKE '%大脑%')").fetchone()[0]
         rec_total = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
@@ -2063,7 +2284,7 @@ def health_report(root: str) -> dict:
         now_dt = datetime.datetime.now()
         cold_rows = [dict(r) for r in conn.execute(
             "SELECT id, kind, substr(content,1,60) AS content, created, use_count, last_hit, salience "
-            "FROM memories WHERE status='active' AND pinned=0 ORDER BY id LIMIT 500")]
+            "FROM memories WHERE " + _live_sql() + " AND pinned=0 ORDER BY id LIMIT 500")]
         cold = [r for r in cold_rows if is_cold(r, now_dt)]
         for r in cold:
             r["retention"] = round(retention_score(r, now_dt), 4)
@@ -2093,6 +2314,7 @@ def health_report(root: str) -> dict:
                 "note": (f"use_count 自 {since_txt} 起才同时统计主动检索，此前只含被动推送；"
                          f"读写比分母口径：{era_note}"),
             },
+            "mem_governance": memory_governance_stats(root),
             "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
 
 
@@ -2142,7 +2364,7 @@ def user_profile(root: str) -> dict:
     """
     with db_conn(root) as conn:
         kinds = dict(conn.execute(
-            "SELECT kind, COUNT(*) FROM memories WHERE status='active' GROUP BY kind"))
+            "SELECT kind, COUNT(*) FROM memories WHERE " + _live_sql() + " GROUP BY kind"))
         hours = conn.execute(
             "SELECT substr(ts,12,2) hh, COUNT(*) n FROM journal "
             "WHERE ts GLOB '????-??-??T*' GROUP BY hh").fetchall()
@@ -2244,7 +2466,7 @@ def distill_candidates(root: str, limit: int = 20) -> list:
             "WHERE status='active' AND id NOT IN "
             "(SELECT record_id FROM distill_seen) ORDER BY id DESC LIMIT 300")]
         mems = [dict(r) for r in conn.execute(
-            "SELECT project, content FROM memories WHERE status='active'")]
+            "SELECT project, content FROM memories WHERE " + _live_sql() + "")]
     mem_toks: dict = {}
     for m in mems:
         mem_toks.setdefault(m["project"], []).append(_tokens(m["content"]))
