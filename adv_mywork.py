@@ -88,6 +88,9 @@ def t_records_filter():
     # 组合过滤 + 倒序
     rows = records(since="2026-09-20", project="甲-项目", root=rs)
     assert [r["date"] for r in rows] == ["2026-10-01", "2026-09-28", "2026-09-20"]
+    # 相对日期边界：插一条今天的记录，避免写死日期随时间腐烂（2026-10-10 曾因此误报 FAIL）
+    import datetime
+    brain.add_record(rs, "甲-项目", "zcode", datetime.date.today().isoformat(), "t6", "今天的事")
     assert len(records(since="5d", root=rs, limit=1)) == 1
     # limit 边界
     assert len(records(root=rs, limit=0)) == 0
