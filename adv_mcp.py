@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.19.0"
+    assert r["serverInfo"]["version"] == "2.23.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -73,7 +73,7 @@ def t_protocol(root):
             "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report",
             "hub_handoff", "hub_status", "hub_user_profile", "hub_note", "hub_note_read",
             "hub_ask", "hub_metacognition"} <= names, names
-    assert len(names) == 36
+    assert len(names) == 37
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -116,10 +116,10 @@ def t_tools(root):
     assert "技能" in out
     out = m.call_tool("hub_list_mcps", {}, root_s)
     assert "MCP" in out
-    out = m.call_tool("hub_log_work", {"project": "", "agent": "x", "content": " "}, root_s)
+    out = m.call_tool("hub_log_work", {"project": "", "agent": "zcode", "content": " "}, root_s)
     assert "必填" in out
     # project 只作为 DB 文本行落库，无文件系统操作（穿越由 create_project 校验拦截）
-    out = m.call_tool("hub_log_work", {"project": "..\\逃逸", "agent": "x", "content": "y"}, root_s)
+    out = m.call_tool("hub_log_work", {"project": "..\\逃逸", "agent": "zcode", "content": "y"}, root_s)
     assert "已记入大脑" in out
 
 
@@ -153,14 +153,19 @@ def t_memory_overwrite(tmp):
     assert any(e.get("action") == "memory_append" for e in jl)
 
 
-def t_concurrent_log_work(tmp):
-    root = Path(tmp) / "hub"
+def t_concurrent_log_work(tmp, root=None):
+    # 独立 hub（2026-10-10）：agent 名改用注册表内取值后，靠名字前缀过滤 journal
+    # 不再可靠（会与其他用例同名串味），故用 fresh_hub 隔离。
+    root = root if root is not None else Path(tmp) / "hub"
     root_s = str(root)
     import threading
     errs = []
+    # 2026-10-10：agent 名改为**注册表内取值**——自报身份现在会被枚举校验
+    # （不在注册表即拒收，见 brain.check_agent）。并发语义不受影响：仍 8 个不同身份。
+    names = ["zcode", "dsh", "hermes", "claude", "codex", "workbuddy", "deepseek", "其他"]
 
     def worker(i):
-        out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": f"并发{i}",
+        out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": names[i],
                                            "content": f"第{i}号并发记录内容", "date": "2026-09-30"}, root_s)
         if "已记入大脑" not in out:
             errs.append(out)
@@ -171,32 +176,32 @@ def t_concurrent_log_work(tmp):
     assert not errs, errs
     recs = brain.list_records(root_s, project="测试-项目", limit=2000)
     for i in range(8):
-        assert any(f"（并发{i}）" in r["title"] and f"第{i}号并发记录内容" in r["content"] for r in recs), \
+        assert any(f"（{names[i]}）" in r["title"] and f"第{i}号并发记录内容" in r["content"] for r in recs), \
             f"并发第{i}条丢失"
     jl = brain.journal_list(root_s, 1000)
     log_entries = [e for e in jl if e.get("action") == "log_work"
-                   and str(e.get("agent", "")).startswith("并发")]
+                   and e.get("agent") in names]
     assert len(log_entries) == 8, f"journal 应有 8 条并发记录，实际 {len(log_entries)}"
 
 
 def t_heartbeat_conflict(root):
     root = str(root)
-    out = m.call_tool("hub_heartbeat", {"agent": "alpha", "project": "测试-项目", "note": "改UI"}, root)
+    out = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "测试-项目", "note": "改UI"}, root)
     assert "无其他活跃会话" in out
-    out = m.call_tool("hub_heartbeat", {"agent": "beta", "project": "测试-项目", "note": "改驱动"}, root)
-    assert "撞车预警" in out and "alpha" in out, out
-    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "alpha",
-                                       "content": "alpha 的活干完了"}, root)
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "测试-项目", "note": "改驱动"}, root)
+    assert "撞车预警" in out and "zcode" in out, out
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "zcode 的活干完了"}, root)
     assert "撞车预警" in out, out
-    out = m.call_tool("hub_heartbeat", {"agent": "beta", "project": "别的-项目"}, root)
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "别的-项目"}, root)
     assert "无其他活跃会话" in out
     # 陈旧清理：手改 ts
     with brain.db_conn(root) as conn:
-        conn.execute("UPDATE sessions SET ts='2026-09-30T08:00:00' WHERE agent='alpha'")
-    out = m.call_tool("hub_heartbeat", {"agent": "beta", "project": "测试-项目"}, root)
-    assert "alpha" not in out, "陈旧会话未被清理"
+        conn.execute("UPDATE sessions SET ts='2026-09-30T08:00:00' WHERE agent='zcode'")
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "测试-项目"}, root)
+    assert "zcode" not in out, "陈旧会话未被清理"
     with brain.db_conn(root) as conn:
-        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE agent='alpha'").fetchone()[0] == 0
+        assert conn.execute("SELECT COUNT(*) FROM sessions WHERE agent='zcode'").fetchone()[0] == 0
     # agent 必填
     out = m.call_tool("hub_heartbeat", {"agent": "  "}, root)
     assert "必填" in out
@@ -205,27 +210,27 @@ def t_heartbeat_conflict(root):
 def t_handoff_tool(root):
     """2.2 交接协议工具链：create → list（open）→ claim → 不可重复认领。"""
     root = str(root)
-    out = m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目", "agent": "alpha",
+    out = m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目", "agent": "zcode",
                                       "done": "回归全绿", "next_step": "发版", "excluded": "方案A"}, root)
     assert "已创建交接 #" in out, out
     hid = int(out.split("#")[1].split("（")[0])
     out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, root)
     assert f"#{hid}" in out and "下一步：发版" in out and "已排除：方案A" in out, out
     # 换 agent 认领
-    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "beta"}, root)
-    assert "已认领" in out and "beta" in out, out
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "dsh"}, root)
+    assert "已认领" in out and "dsh" in out, out
     # 认领后 open 清单为空；include_claimed 可见
     out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, root)
     assert f"#{hid}" not in out, out
     out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目",
                                       "include_claimed": True}, root)
-    assert "已被 beta 认领" in out, out
+    assert "已被 dsh 认领" in out, out
     # 重复认领 / 不存在 id / agent 必填
-    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "alpha"}, root)
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "zcode"}, root)
     assert "已被" in out, out
-    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": 999999, "agent": "alpha"}, root)
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": 999999, "agent": "zcode"}, root)
     assert "不存在" in out, out
-    out = m.call_tool("hub_handoff", {"action": "create", "project": "", "agent": "alpha"}, root)
+    out = m.call_tool("hub_handoff", {"action": "create", "project": "", "agent": "zcode"}, root)
     assert "必填" in out, out
     # 空 list 兜底文案
     out = m.call_tool("hub_handoff", {"action": "list", "project": "没有交接的项目"}, root)
@@ -259,34 +264,34 @@ def t_errors_flow(root):
 
 def t_undo_log(root):
     root_s = str(root)
-    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "undoA",
-                                       "content": "undoA 第一件事", "date": "2026-09-29"}, root_s)
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "zcode 第一件事", "date": "2026-09-29"}, root_s)
     assert "已记入大脑" in out, out
-    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "undoA",
-                                       "content": "undoA 第二件事写错了", "date": "2026-09-30"}, root_s)
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "zcode 第二件事写错了", "date": "2026-09-30"}, root_s)
     assert "已记入大脑" in out, out
-    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "undoB",
-                                       "content": "undoB 的事不能被误伤", "date": "2026-09-30"}, root_s)
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "hermes",
+                                       "content": "hermes 的事不能被误伤", "date": "2026-09-30"}, root_s)
     assert "已记入大脑" in out, out
-    # 撤 undoA 最新一条
-    out = m.call_tool("hub_undo", {"agent": "undoA"}, root_s)
+    # 撤 zcode 最新一条
+    out = m.call_tool("hub_undo", {"agent": "zcode"}, root_s)
     assert "已撤销" in out, out
     rows = brain.list_records(root_s, project="测试-项目", limit=2000)
     assert all("第二件事写错" not in r["content"] for r in rows), "目标记录仍可见"
-    assert any("undoA 第一件事" in r["content"] for r in rows), "误伤更早的记录"
-    assert any("undoB 的事不能被误伤" in r["content"] for r in rows), "误伤他人"
+    assert any("zcode 第一件事" in r["content"] for r in rows), "误伤更早的记录"
+    assert any("hermes 的事不能被误伤" in r["content"] for r in rows), "误伤他人"
     assert any("初始化记录" in r["content"] for r in rows), "误伤迁移记录"
     # 重复撤销 = 栈式撤上一条
-    out = m.call_tool("hub_undo", {"agent": "undoA"}, root_s)
+    out = m.call_tool("hub_undo", {"agent": "zcode"}, root_s)
     assert "已撤销" in out, out
     rows = brain.list_records(root_s, project="测试-项目", limit=2000)
-    assert all("undoA" not in r["agent"] for r in rows)
-    assert any("undoB 的事不能被误伤" in r["content"] for r in rows)
+    assert all("zcode" not in r["agent"] for r in rows)
+    assert any("hermes 的事不能被误伤" in r["content"] for r in rows)
     assert any("初始化记录" in r["content"] for r in rows)
     # 撤无可撤 / 无记录 agent / 必填
-    out = m.call_tool("hub_undo", {"agent": "undoA"}, root_s)
+    out = m.call_tool("hub_undo", {"agent": "zcode"}, root_s)
     assert "没有找到" in out
-    out = m.call_tool("hub_undo", {"agent": "没干活的"}, root_s)
+    out = m.call_tool("hub_undo", {"agent": "codex"}, root_s)
     assert "没有找到" in out
     out = m.call_tool("hub_undo", {"agent": ""}, root_s)
     assert "必填" in out
@@ -298,12 +303,12 @@ def t_undo_log(root):
 def t_new_tools(tmp):
     root_s = str(Path(tmp) / "hub")
     # 参数健壮化（v2）：content 超长拒绝、date 畸形兜底、limit 容错
-    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "x",
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
                                        "content": "y" * (m.MAX_CONTENT + 1)}, root_s)
     assert "超长" in out, out
     out = m.call_tool("hub_memory_write", {"content": "z" * (m.MAX_CONTENT + 1)}, root_s)
     assert "超长" in out, out
-    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "x",
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
                                        "content": "date畸形", "date": "明天下午"}, root_s)
     assert "已记入大脑" in out, out
     today = datetime.date.today().isoformat()
@@ -313,7 +318,7 @@ def t_new_tools(tmp):
     assert "各 agent 最近工作" in out
     out = m.call_tool("hub_get_progress", {"limit": 99999}, root_s)
     assert "各 agent 最近工作" in out
-    out = m.call_tool("hub_log_work", {"project": "", "agent": "x", "content": "y"}, root_s)
+    out = m.call_tool("hub_log_work", {"project": "", "agent": "zcode", "content": "y"}, root_s)
     assert "project 必填" in out
     # get_rules
     out = m.call_tool("hub_get_rules", {}, root_s)
@@ -438,8 +443,8 @@ def t_bootstrap(tmp):
     tgt2 = Path(tmp) / "boot2" / "deep" / "AGENTS.md"
     assert core.inject_bootstrap(str(tgt2), root) == ""
     assert core.bootstrap_status(str(tgt2))
-    # 四家目标定义完整
-    assert {t["agent"] for t in core.BOOTSTRAP_TARGETS} == {"ZCode", "Claude Code", "Codex", "DSH", "hermes"}
+    # 目标定义完整（2026-10-09：接入抽象后新增 workbuddy，Codex 升为全 MCP 目标）
+    assert {t["agent"] for t in core.BOOTSTRAP_TARGETS} == {"ZCode", "Claude Code", "Codex", "DSH", "hermes", "workbuddy"}
     for t in core.BOOTSTRAP_TARGETS:
         # hermes 的 SOUL.md 在 D 盘（home 外），允许绝对路径
         assert t["path"].startswith("~/") or t["path"][:3] in ("D:/", "C:/"), t
@@ -819,6 +824,110 @@ def t_ask_metacog_tool(tmp):
     assert "问大脑" in m.call_tool("hub_ask", {}, rs)
 
 
+# ---------------------------------------------------------------- B1/B2 身份锁定（2026-10-10）
+
+def t_server_agent_override(tmp):
+    """B2 单点派生：① 有锁定 → 覆盖自报 ② 无锁定 → 退回自报 ③ 筛选工具不下发 ④ 不一致留痕。"""
+    rs = str(fresh_hub(tmp, "sa"))
+    old = m.SERVER_AGENT
+    try:
+        # ① 无锁定：走自报（兼容旧接入）
+        m.SERVER_AGENT = ""
+        got = m.apply_server_agent("hub_log_work", {"agent": "zcode"}, rs)
+        assert got["agent"] == "zcode", got
+
+        # ② 有锁定：覆盖自报值
+        m.SERVER_AGENT = "dsh"
+        got = m.apply_server_agent("hub_log_work", {"agent": "zcode", "project": "x"}, rs)
+        assert got["agent"] == "dsh", got
+        # 不传 agent 也补上
+        got = m.apply_server_agent("hub_log_work", {"project": "x"}, rs)
+        assert got["agent"] == "dsh", got
+        # 不污染调用方原对象
+        orig = {"agent": "zcode"}
+        m.apply_server_agent("hub_log_work", orig, rs)
+        assert orig == {"agent": "zcode"}, "调用方 dict 被就地修改"
+
+        # ③ 只读筛选工具不下发（agent 参数是"查别人"，语义不同）
+        got = m.apply_server_agent("hub_list_skills", {"agent": "zcode"}, rs)
+        assert got["agent"] == "zcode", got
+
+        # ④ 不一致留痕
+        n0 = len([e for e in brain.journal_list(rs, 500) if e.get("action") == "agent_mismatch"])
+        m._MISMATCH_SEEN.clear()
+        m.apply_server_agent("hub_log_work", {"agent": "hermes"}, rs)
+        hits = [e for e in brain.journal_list(rs, 500) if e.get("action") == "agent_mismatch"]
+        assert len(hits) == n0 + 1, f"不一致未留痕（{n0}->{len(hits)}）"
+        assert "hermes" in hits[0]["note"] and "dsh" in hits[0]["note"], hits[0]  # journal 最新在前
+        # 节流：同类只记一次
+        m.apply_server_agent("hub_log_work", {"agent": "hermes"}, rs)
+        assert len([e for e in brain.journal_list(rs, 500)
+                    if e.get("action") == "agent_mismatch"]) == n0 + 1, "节流失效"
+
+        # ⑤ 端到端：锁定后写入的 agent 由服务端决定，自报被忽略
+        out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                          "content": "锁定身份下的写入"}, rs)
+        assert "已记入大脑" in out, out
+        rec = [r for r in brain.list_records(rs, project="测试-项目", limit=100)
+               if "锁定身份下的写入" in r["content"]]
+        assert rec and rec[0]["agent"] == "dsh", f"未按锁定身份落库：{rec}"
+    finally:
+        m.SERVER_AGENT = old
+        m._MISMATCH_SEEN.clear()
+
+
+def t_agent_check(tmp):
+    """A3 身份校验：注册表内放行、显示名归一、非法拒收、无主语义放行、锁定值不校验。"""
+    rs = str(fresh_hub(tmp, "ck"))
+    # 注册表内 / 显示名 / 别名
+    for raw, exp in [("zcode", "zcode"), ("ZCode", "zcode"), ("WorkBuddy", "workbuddy"),
+                     ("Claude Code", "claude"), ("DSH", "dsh"), ("deepseek", "deepseek")]:
+        got, err = brain.check_agent(raw, rs)
+        assert got == exp and not err, f"{raw} -> {got!r} {err}"
+    # 无主语义放行（不是"错误身份"）
+    for raw in ("unknown", "", "user", "migrated"):
+        got, err = brain.check_agent(raw, rs)
+        assert not err, f"{raw} 应放行：{err}"
+    # 不在册 → 拒收且给出可用名单
+    got, err = brain.check_agent("gpt4", rs)
+    assert got == "" and "不在注册表" in err and "zcode" in err, err
+    # 端到端拒收
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "gpt4", "content": "x"}, rs)
+    assert "拒收" in out, out
+    out = m.call_tool("hub_memory_write", {"content": "x", "agent": "gpt4"}, rs)
+    assert "拒收" in out, out
+    # ★ 锁定值不校验：接入配置配错名时不该让该 agent 连工作都记不了
+    old = m.SERVER_AGENT
+    try:
+        m.SERVER_AGENT = "typo-name"
+        got, err = m._agent_for_write({"agent": "zcode"}, rs)
+        assert got == "typo-name" and not err, (got, err)
+    finally:
+        m.SERVER_AGENT = old
+
+
+def t_parse_argv():
+    """B1 启动参数解析：--agent 具名参数不得与 root 位置参数冲突。"""
+    R = r"D:\some\root"
+    cases = [
+        ([], (None, False, "")),
+        (["--agent", "zcode"], (None, False, "zcode")),
+        (["--agent=dsh"], (None, False, "dsh")),
+        ([R], (R, True, "")),
+        (["--agent", "dsh", R], (R, True, "dsh")),
+        ([R, "--agent", "hermes"], (R, True, "hermes")),
+        (["--agent"], (None, False, "")),          # 缺值不崩
+    ]
+    for argv, (exp_root, exp_fixed, exp_agent) in cases:
+        root, fixed, agent = m.parse_argv(argv)
+        assert fixed == exp_fixed and agent == exp_agent, f"{argv} -> {fixed},{agent}"
+        if exp_root:
+            assert root == exp_root, f"{argv} -> root={root}"
+        else:
+            # 未传 root → 必须走动态跟随（取 config），不能误当 fixed
+            assert root == core.get_root(), f"{argv} 应动态跟随，实际 {root}"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -829,7 +938,7 @@ def main():
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
-    case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp))
+    case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp, fresh_hub(tmp, "conc")))
     case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))
     case("撤销（只切自己最新段/误伤检查/栈式撤销）", lambda: t_undo_log(fresh_hub(tmp, "undo")))
@@ -849,6 +958,9 @@ def main():
     case("一键接入（两种布局/备份/移除/坏json/幂等）", lambda: t_mcp_access(tmp))
     case("用户画像工具（空库/preference警告/正常库关键行/脏参）", lambda: t_profile_tool(tmp))
     case("随记工具（写入/空content拒绝/检索互通随记段）", lambda: t_note_tool(tmp))
+    case("B1/B2身份锁定（覆盖自报/兼容旧接入/筛选不下发/不一致留痕/节流）", lambda: t_server_agent_override(tmp))
+    case("身份校验（注册表放行/显示名归一/非法拒收/锁定值不校验）", lambda: t_agent_check(tmp))
+    case("B1启动参数解析（--agent与root位置参数不冲突）", lambda: t_parse_argv())
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

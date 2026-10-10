@@ -17,6 +17,8 @@ import time
 from dataclasses import dataclass, field
 from pathlib import Path
 
+import codec  # 同目录：配置文件的读 + 外科式编辑（P8）
+
 DIR_INBOX = "00_Inbox"
 DIR_PROJECTS = "projects"
 DIR_ARCHIVE = "99_Archive"
@@ -31,8 +33,13 @@ CONFIG_FILE = CONFIG_DIR / "config.json"
 
 # 历史上各 agent 建平行目录用的前缀，对账时识别
 AGENT_PREFIX_RE = re.compile(r"^(deepseek|hermes|claude|zcode|codex)\s*-\s*", re.IGNORECASE)
-# 归一化前缀（含不带空格的 "deepseek -" 与 "deepseek-" 两种写法）
-AGENT_KNOWN = {"zcode", "hermes", "deepseek", "claude", "codex", "其他"}
+# 历史前缀归一白名单（deepseek 已并入 dsh，但历史目录/记录仍以此名存在，故保留）
+# ★ 现行 agent 名不再硬编码在这里——由agent_known_names() 从 AGENT_ADAPTERS +
+#   config.agents.json 动态派生（2026-10-09：硬编码白名单漏了 dsh/workbuddy，
+#   导致历史段头"##日期（dsh）"认不出→迁移时 fallback 一律猜 zcode）。
+AGENT_LEGACY = {"zcode", "hermes", "deepseek", "claude", "codex", "其他"}
+# 兼容旧引用（勿在新代码里直接用；它是历史集合，不含 dsh/workbuddy）
+AGENT_KNOWN = AGENT_LEGACY
 
 # 工作记录段头：## 或 ### 开头
 HEADER_RE = re.compile(r"^#{2,3}\s+(.+?)\s*$")
@@ -135,31 +142,73 @@ def set_root(root: str) -> None:
 
 # ---------------------------------------------------------------- 工作记录解析
 
-def parse_agent_from_header(title: str) -> tuple[str, str]:
-    """从段头提取归一化 agent 名。返回 (agent, 原文)。"""
+def agent_key(name: str) -> str:
+    """agent 显示名/别名 → 库内规范 id（小写、去空格连字符、只取首词）。
+
+    "Claude Code"→claude、DSH→dsh、workbuddy→workbuddy、ZCode→zcode。
+    取首词是因为 Claude Code 这类带空格的两段名，段头里习惯只写（claude）。"""
+    s = (name or "").strip().lower()
+    s = re.split(r"[\s_\-·]", s)[0]
+    return re.sub(r"[^a-z0-9一-鿿]", "", s)
+
+
+def agent_known_names(root: str = "") -> dict:
+    """现行 agent 注册表 {规范id: 显示名}——AGENT_ADAPTERS + config.agents.json 叠历史别名。
+
+    **单一事实来源**（2026-10-09）：过去core.AGENT_KNOWN 是硬编码集合，漏了 dsh/workbuddy，
+    导致 parse_agent_from_header 认不出这两个主力 agent 的段头 → 迁移时 fallback 一律猜 zcode。
+    现在注册表来自适配器配置，新增 agent 只改 config.agents.json、零改码。
+    历史别名（deepseek 等）保留在 AGENT_LEGACY 里一并纳入，避免老记录重判失败。"""
+    out: dict = {}
+    for n in AGENT_LEGACY:
+        out.setdefault(n, n)
+    for a in AGENT_ADAPTERS + load_agent_adapters(root):
+        name = (a.get("agent") or "").strip()
+        k = agent_key(name)
+        if k:
+            out[k] = name
+    return out
+
+
+def parse_agent_from_header(title: str, known: dict | None = None) -> tuple[str, str]:
+    """从段头提取归一化 agent 名。返回 (agent, 原文)。
+
+    known：可选注册表 {id: 显示名}，缺省用 agent_known_names()（不带 root，只取内置适配器）。
+    匹配用「首词相等或前缀命中」，故"（Claude Code）""（claude）"都归到 claude。"""
     m = AGENT_RE.search(title)
     raw = m.group(1).strip() if m else ""
     if not raw:
         return "", ""
     # "ZCode·第二条" 之类，取 · 前段
     head = re.split(r"[·•]", raw)[0].strip()
-    low = head.lower()
-    for name in AGENT_KNOWN:
-        if low == name or low.startswith(name):
+    names = known if known is not None else agent_known_names()
+    # 长名优先（claude code 要先于 claude 命中，否则永远匹配到 claude）
+    for name in sorted(names, key=len, reverse=True):
+        if head.lower() == name or head.lower().startswith(name):
             return name, raw
+    k = agent_key(head)
+    if k in names:
+        return k, raw
     return "", raw
 
 
-def parse_record(text: str, fallback_agent: str = "", fallback_date: str = "") -> list:
+def parse_record(text: str, fallback_agent: str = "", fallback_date: str = "",
+                 known: dict | None = None) -> list:
     """按 ##/### 段头切段解析。畸形内容不抛异常。
 
-    agent：段头括号白名单优先，否则用目录前缀推断的 fallback_agent；
+    agent 三级回退（2026-10-10 加第 2 级）：
+      ① 段头括号命中注册表 → 用它（最可信）
+      ② **继承最近的 `##` 父段 agent**（`###` 子段如"### 验证结果"/"### 做了什么"
+         本无 agent 语义，天然跟随所属会话；过去直接落 fallback 会猜错）
+      ③ 目录前缀推断的 fallback_agent
     日期：段头日期优先，其次段内首个日期，最后 fallback_date（文件 mtime）；
     body：段正文截断保留（时间线详情展开用）。
+    known：可选 agent 注册表（见 agent_known_names），缺省用内置适配器派生。
     """
     entries = []
     cur = None
     body_lines: list = []
+    parent_agent = ""  # 最近的 ## 级段头解析出的 agent，供 ### 子段继承
 
     def push():
         if cur is not None:
@@ -173,8 +222,15 @@ def parse_record(text: str, fallback_agent: str = "", fallback_date: str = "") -
             body_lines = []
             title = m.group(1).strip()
             dm = DATE_RE.search(title)
-            agent, raw = parse_agent_from_header(title)
-            cur = RecordEntry(date=dm.group(1) if dm else "", agent=agent or fallback_agent,
+            agent, raw = parse_agent_from_header(title, known)
+            # ## 级（非 ###）才能刷新父段归属——### 自己就是子段，不该成为别人的父
+            is_top = not line.lstrip().startswith("###")
+            if agent and is_top:
+                parent_agent = agent
+            elif is_top:
+                parent_agent = ""  # 新的 ## 段没写 agent：不沿用上一个 ## 的（避免跨会话串味）
+            cur = RecordEntry(date=dm.group(1) if dm else "",
+                              agent=agent or (parent_agent if not is_top else "") or fallback_agent,
                               agent_raw=raw, title=title, line_no=i)
         else:
             if cur is not None:
@@ -306,7 +362,8 @@ def scan(root: str) -> Snapshot:
                 snap.issues.append(AuditIssue("no_record", str(p), f"项目目录缺 {RECORD_NAME}"))
         if rec_file.is_file() or doc_file is not None:
             proj.records = parse_record(read_text(src), fallback_agent=proj_agent,
-                                        fallback_date=_mtime_date(src))
+                                        fallback_date=_mtime_date(src),
+                                        known=agent_known_names())
             if not proj.records:  # 整篇无段头（如纯计划文档），文件级一条入时间线
                 proj.records = [RecordEntry(date=_mtime_date(src), agent=proj_agent, agent_raw="",
                                             title=f"[主文档] {src.name}", line_no=0,
@@ -623,18 +680,17 @@ def init_hub(root: str) -> str:
 
 BOOTSTRAP_BEGIN = "<!-- agenthub:begin -->"
 BOOTSTRAP_END = "<!-- agenthub:end -->"
+# 引导块格式版本：内容格式变更时 +1，让 bootstrap_version() 识别「注入了但过时」的块
+BOOTSTRAP_VERSION = "1"
 
-# 引导注入目标：各 agent 的全局指令文件（不存在则创建）
-BOOTSTRAP_TARGETS = [
-    {"agent": "ZCode", "path": "~/AGENTS.md"},
-    {"agent": "Claude Code", "path": "~/.claude/CLAUDE.md"},
-    {"agent": "Codex", "path": "~/.codex/AGENTS.md"},
-    {"agent": "DSH", "path": "~/.dsh/AGENTS.md"},
-]
+# 注：引导注入目标已统一到下方 AGENT_ADAPTERS（单一事实来源）。
+# 2026-10-09 清理死代码：此处原有一份 BOOTSTRAP_TARGETS，被文件末尾同名派生版本覆盖，
+# 易误改——今删除。
 
 
 def bootstrap_text(root: str) -> str:
     return f"""{BOOTSTRAP_BEGIN}
+<!-- agenthub:version:{BOOTSTRAP_VERSION} -->
 ## AgentHub 公用大脑（自动接入，请勿删除本标记块）
 
 你已接入 AgentHub 大脑（SQLite 数据库，工具前缀 hub_），数据根目录：{root}
@@ -678,6 +734,15 @@ def _strip_bootstrap(text: str) -> str:
 def bootstrap_status(path: str) -> bool:
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     return p.is_file() and BOOTSTRAP_BEGIN in read_text(p)
+
+
+def bootstrap_version(path: str) -> str:
+    """已注入引导块的版本号；未注入 / 无版本行（旧块）→ 返回 ""。"""
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    if not p.is_file():
+        return ""
+    m = re.search(r"agenthub:version:(\S+?)\s*-->", read_text(p))
+    return m.group(1) if m else ""
 
 
 def inject_bootstrap(path: str, root: str, agent: str = "user") -> str:
@@ -733,27 +798,117 @@ def remove_bootstrap(path: str, root: str, agent: str = "user") -> str:
 
 # 各 agent 的 MCP 配置文件位置与 mcpServers 字典的键路径（存在才接入）。
 # boot = 该 agent 的引导注入目标（全局指令文件，inject_bootstrap 写入）。
-MCP_TARGETS = [
-    {"agent": "ZCode", "path": "~/.zcode/cli/config.json", "layout": "zcode", "boot": "~/AGENTS.md"},
-    {"agent": "Claude Code", "path": "~/.claude.json", "layout": "standard", "boot": "~/.claude/CLAUDE.md"},
+# 各 agent 的接入适配器（**单一事实来源**，2026-10-09 由 workbuddy 抽象）。
+#   channel    : instr_file = 引导写进该 agent 的全局指令文件，其引擎自动读；
+#                hook_pull  = 引导仍写文件，但该 agent 引擎**不自动读**，需其侧钩子把文件送达会话。
+#   instr_path : 引导注入目标（全局指令 / 人格文件）。
+#   mcp        : {"path","layout"} 或 None；layout ∈ {"zcode","standard","toml_codex"}。
+# 名单可被大脑根目录的 config.agents.json 覆盖/追加（见 load_agent_adapters）——新 agent 零改码。
+AGENT_ADAPTERS = [
+    {"agent": "ZCode", "channel": "instr_file", "instr_path": "~/AGENTS.md",
+     "mcp": {"path": "~/.zcode/cli/config.json", "layout": "zcode"}},
+    {"agent": "Claude Code", "channel": "instr_file", "instr_path": "~/.claude/CLAUDE.md",
+     "mcp": {"path": "~/.claude.json", "layout": "standard"}},
+    {"agent": "Codex", "channel": "instr_file", "instr_path": "~/.codex/AGENTS.md",
+     "mcp": {"path": "~/.codex/config.toml", "layout": "toml_codex"}},
+    {"agent": "DSH", "channel": "instr_file", "instr_path": "~/.dsh/AGENTS.md",
+     # DSH 的 MCP 由 cordis bundle 提供（@local/agenthub-mcp），path 指向 profile 目录
+     "mcp": {"path": "~/.dsh/profiles/desktop", "layout": "bundle_dsh"}},
+    # hermes：SOUL.md 是全局人格/指令文件；MCP 在 config.yaml（YAML，P8 起可外科写入）
+    {"agent": "hermes", "channel": "instr_file",
+     "instr_path": "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/SOUL.md",
+     "mcp": {"path": "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml", "layout": "yaml"}},
+    # WorkBuddy：引擎不读 ~/.workbuddy/AGENTS.md，靠其 SessionStart 钩子（rules-inject.mjs）
+    # 把该文件作为 system-reminder 送达会话——故 channel=hook_pull。
+    {"agent": "workbuddy", "channel": "hook_pull", "instr_path": "~/.workbuddy/AGENTS.md",
+     "mcp": {"path": "~/.workbuddy/mcp.json", "layout": "standard"}},
 ]
 
-# 引导-only：暂不支持自动写 MCP 配置、但可注入引导规则的 agent
-BOOTSTRAP_ONLY = [
-    {"agent": "Codex", "path": "~/.codex/AGENTS.md"},
-    {"agent": "DSH", "path": "~/.dsh/AGENTS.md"},
-    # hermes 的全局人格/指令文件（SOUL.md 每次会话载入）——此前缺 hermes 导致其
-    # 有 agenthub MCP 配置却从不心跳（2026-10-03 实测心跳 0 次，根因即引导缺失）
-    {"agent": "hermes", "path": "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/SOUL.md"},
-]
+AGENTS_CONFIG_NAME = "config.agents.json"
 
-BOOTSTRAP_TARGETS = [{"agent": t["agent"], "path": t["boot"]} for t in MCP_TARGETS] + BOOTSTRAP_ONLY
+
+def load_agent_adapters(root: str = "") -> list:
+    """有效的接入适配器表 = 内置 AGENT_ADAPTERS，叠加大脑根 config.agents.json（若有）。
+    文件形如 {"agents":[{agent,channel,instr_path,mcp:{path,layout}|null}]}；同名覆盖、新名追加。
+    文件缺失 / 坏 json / 结构不符 → 退回内置表（绝不阻断）。
+
+    **按归一 id 去重**（2026-10-10）：此前按原字符串比对，config 里写 "WorkBuddy"、
+    内置表写 "workbuddy" 时会被当成两个 agent 各登记一遍（实测：状态页出现 7 行，
+    workbuddy 重复）。改用 agent_key 归一后比对，同一实体的不同写法正确合并、config 胜出。"""
+    import copy
+    adapters = copy.deepcopy(AGENT_ADAPTERS)
+    if not root:
+        return adapters
+    p = Path(root) / AGENTS_CONFIG_NAME
+    if not p.is_file():
+        return adapters
+    try:
+        data = json.loads(read_text(p))
+    except (OSError, ValueError):
+        return adapters
+    extra = data.get("agents") if isinstance(data, dict) else data
+    if not isinstance(extra, list):
+        return adapters
+    by_key = {agent_key(a["agent"]): a for a in adapters}
+    order = [agent_key(a["agent"]) for a in adapters]
+    for item in extra:
+        if isinstance(item, dict) and item.get("agent"):
+            k = agent_key(item["agent"])
+            if k and k not in by_key:
+                order.append(k)
+            if k:
+                by_key[k] = item
+    return [by_key[k] for k in order]
+
+
+def _boot_path(a: dict) -> str:
+    return a.get("instr_path") or a.get("boot") or ""
+
+
+# 派生视图（向后兼容：GUI 与既有代码仍可用旧名）
+MCP_TARGETS = [{"agent": a["agent"], "path": a["mcp"]["path"], "layout": a["mcp"]["layout"],
+                "boot": _boot_path(a)} for a in AGENT_ADAPTERS if a.get("mcp")]
+BOOTSTRAP_ONLY = [{"agent": a["agent"], "path": _boot_path(a)} for a in AGENT_ADAPTERS if not a.get("mcp")]
+BOOTSTRAP_TARGETS = [{"agent": a["agent"], "path": _boot_path(a)} for a in AGENT_ADAPTERS if _boot_path(a)]
+
+
+def find_adapter(root: str, agent: str) -> dict:
+    """按 agent 名（不区分大小写）找适配器；找不到返回 {}。"""
+    want = (agent or "").strip().lower()
+    for a in load_agent_adapters(root):
+        if (a.get("agent") or "").strip().lower() == want:
+            return a
+    return {}
+
+
+def agent_bootstrap_status(root: str = "") -> list:
+    """每个 agent 的接入状态（只读）：引导是否已注入 + MCP 是否已配 agenthub。
+    返回 [{agent, channel, instr_path, boot, mcp_path, layout, mcp}]（mcp 为 None=该 agent 不配 MCP）。"""
+    rows = []
+    for a in load_agent_adapters(root):
+        boot = _boot_path(a)
+        mcp = a.get("mcp") or {}
+        layout = mcp.get("layout", "")
+        exists = bool(boot) and bootstrap_status(boot)
+        bver = bootstrap_version(boot) if boot else ""
+        rows.append({
+            "agent": a.get("agent", ""),
+            "channel": a.get("channel", "instr_file"),
+            "instr_path": boot,
+            "boot": exists,
+            "boot_version": bver,
+            "boot_stale": exists and bver != BOOTSTRAP_VERSION,  # 注入了但版本不是当前
+            "mcp_path": mcp.get("path", "") if mcp else "",
+            "layout": layout,
+            "mcp": mcp_has_agenthub(mcp.get("path", ""), layout) if mcp else None,
+        })
+    return rows
 
 MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # report.py（1.3 hub_report 依赖）与 ops.py（检查工具箱）必须随部署同步——
 # 缺了就是部署版 ImportError / 检查项不存在（03 已知空白①根修：ops.py 此前不在名单）
 # my/ 两件（3.4 可编程数据包）：部署目录自包含后，agent 对部署目录 sys.path 即可 import my.work
-SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py",
+SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
                 "my/__init__.py", "my/work/__init__.py")
 
 
@@ -783,10 +938,20 @@ def deploy_server() -> tuple:
     return find_python(), str(MCP_SERVER_DIR / "agenthub_mcp.py")
 
 
-def _mcp_entry(python_exe: str, server_py: str, root: str = "") -> dict:
-    """接入条目不传 root：v2.2.1 起 server 每请求动态跟随 config（传 argv 反而锁死 fixed 模式，
-    根目录迁移后旧接入会指向失效路径——2026-10-01 复盘发现 claude/zcode 旧接入即此问题）。"""
-    return {"command": python_exe, "args": [server_py]}
+def _mcp_entry(python_exe: str, server_py: str, root: str = "", agent: str = "") -> dict:
+    """接入条目。返回 {command, args}。
+
+    **不传 root**：v2.2.1 起 server 每请求动态跟随 config（传 argv 位置参数反而锁死 fixed 模式，
+    根目录迁移后旧接入会指向失效路径——2026-10-01 复盘发现 claude/zcode 旧接入即此问题）。
+
+    **传 --agent <名>**（B1，2026-10-10）：把身份写进**启动参数**，server 启动时锁定，
+    此后所有工具调用以它为准、忽略 agent 自报（过去六家启动参数一模一样、server 不知道
+    自己是谁 → 只能靠自报 → 必然填错）。用**具名参数**正是为了不与上面的 root 位置参数冲突。"""
+    args = [server_py]
+    key = agent_key(agent)
+    if key:
+        args += ["--agent", key]
+    return {"command": python_exe, "args": args}
 
 
 def _ensure_servers_dict(data: dict, layout: str) -> dict:
@@ -805,11 +970,29 @@ def _ensure_servers_dict(data: dict, layout: str) -> dict:
     return servers
 
 
+def _read_toml_mcp(p: Path) -> dict:
+    """读 TOML（Codex 的 [mcp_servers]）并**归一成 {"mcpServers": {...}}**，
+    便于上层沿用同一套 "mcpServers" 读取逻辑。无 tomllib（<3.11）或解析失败 → {}。"""
+    try:
+        import tomllib  # Python 3.11+ 标准库
+    except Exception:  # noqa: BLE001
+        return {}
+    try:
+        data = tomllib.loads(p.read_text(encoding="utf-8", errors="replace"))
+    except Exception:  # noqa: BLE001
+        return {}
+    servers = data.get("mcp_servers") if isinstance(data, dict) else None
+    return {"mcpServers": servers} if isinstance(servers, dict) else {}
+
+
 def read_mcp_config(path: str) -> dict | None:
-    """读取 agent 的 MCP 配置 json；文件不存在返回 None，坏 json 返回 {}。"""
+    """读取 agent 的 MCP 配置；文件不存在返回 None，坏内容返回 {}。
+    .toml 走 _read_toml_mcp（归一为 mcpServers），其余按 json。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     if not p.is_file():
         return None
+    if p.suffix.lower() == ".toml":
+        return _read_toml_mcp(p)
     try:
         data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
         return data if isinstance(data, dict) else {}
@@ -843,20 +1026,95 @@ def _prune_backups(p: Path, keep: int = BACKUP_KEEP) -> None:
         pass
 
 
-def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, root: str) -> str:
-    """把 agenthub server 写入 agent 的 MCP 配置（先备份，写失败自动还原）。返回错误或 ""。"""
+# MCP 布局 → (格式, 键路径)。layout 保留向后兼容名；adapter 也可直接给 mcp.format + mcp.keyPath。
+_MCP_LAYOUTS = {
+    "zcode": ("json", ["mcp", "servers"]),
+    "standard": ("json", ["mcpServers"]),
+    "toml_codex": ("toml", ["mcp_servers"]),
+    "yaml": ("yaml", ["mcp_servers"]),
+    "yaml_hermes": ("yaml", ["mcp_servers"]),
+    # DSH（DeepSeek Harness）：MCP 由 cordis **bundle** 提供（非配置文件），path 指向 profile 目录
+    "bundle_dsh": ("bundle", []),
+}
+
+
+def _dsh_bundle_has_agenthub(profile_dir: str) -> bool:
+    """DSH 的 MCP 探针：profile 下有 node_modules/@local/agenthub-mcp，
+    且 cordis.patch.yml 没把 mcp-agenthub 关掉。"""
+    base = Path(os.path.expandvars(os.path.expanduser(profile_dir)))
+    if not (base / "node_modules" / "@local" / "agenthub-mcp").is_dir():
+        return False
+    patch = base / "cordis.patch.yml"
+    if patch.is_file():
+        try:
+            txt = patch.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return True
+        m = re.search(r"-\s*id:\s*mcp-agenthub\b(.*?)(?=\n-\s|\Z)", txt, re.S)
+        if m and re.search(r"disabled:\s*true", m.group(1)):
+            return False
+    return True
+
+
+def _default_key_path(fmt: str) -> list:
+    return ["mcp_servers"] if fmt in ("toml", "yaml") else ["mcpServers"]
+
+
+def _mcp_spec(layout: str, path: str) -> tuple:
+    """(format, key_path)：优先按 layout 查表；未知则按路径格式探测。"""
+    if layout in _MCP_LAYOUTS:
+        return _MCP_LAYOUTS[layout]
+    fmt = codec.detect_format(path)
+    return fmt, _default_key_path(fmt)
+
+
+def _mcp_spec_of(a: dict):
+    """从 adapter 的 mcp 段解析 (path, format, key_path)；无 mcp 段返回 None。"""
+    mcp = a.get("mcp") or {}
+    if not mcp:
+        return None
+    path = mcp.get("path", "")
+    if mcp.get("format"):
+        fmt = mcp["format"]
+        return path, fmt, list(mcp.get("keyPath") or _default_key_path(fmt))
+    full = os.path.expandvars(os.path.expanduser(path))
+    fmt, kp = _mcp_spec(mcp.get("layout", ""), full)
+    return path, fmt, kp
+
+
+def _backup_copy(p: Path) -> str:
+    """复制式备份（保留原文件；外科编辑用）。命名同 _backup：<name>.bak-agenthub-<ts>。"""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S-%f")[:-3]
+    bak = p.with_suffix(p.suffix + f".bak-agenthub-{stamp}")
+    n = 1
+    while bak.exists():
+        bak = p.with_suffix(p.suffix + f".bak-agenthub-{stamp}({n})")
+        n += 1
+    shutil.copy2(p, bak)
+    _prune_backups(p)
+    return str(bak)
+
+
+def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, root: str,
+                      agent: str = "") -> str:
+    """把 agenthub server 写入 agent 的 MCP 配置（**外科式**，格式无关；先备份，失败还原）。
+    layout 可以是 "zcode"/"standard"/"toml_codex"/"yaml"，未知则按文件格式探测。
+    agent（B1）：传入则写进启动参数 `--agent <名>`，server 据此锁定身份。返回错误或 ""。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
-    data = read_mcp_config(path)
-    if data is None:
-        data = {}
-        p.parent.mkdir(parents=True, exist_ok=True)
-    if data == {} and p.is_file():
-        return "配置文件存在但不是合法 json，拒绝自动写入（请手工处理）"
-    servers = _ensure_servers_dict(data, layout)
-    servers["agenthub"] = _mcp_entry(python_exe, server_py, root)
-    bak = _backup(p) if p.is_file() else ""
+    fmt, key_path = _mcp_spec(layout, str(p))
+    if fmt == "bundle":
+        return "该 agent 的 MCP 由 bundle 提供（非普通配置文件），暂不自动写——请在它的 patch 里启用 mcp-agenthub"
+    # 坏 JSON 拒写（保护用户文件）
+    if p.is_file() and fmt == "json":
+        try:
+            json.loads(p.read_text(encoding="utf-8", errors="replace") or "{}")
+        except ValueError:
+            return "配置文件存在但不是合法 json，拒绝自动写入（请手工处理）"
+    bak = ""
     try:
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        p.parent.mkdir(parents=True, exist_ok=True)
+        bak = _backup_copy(p) if p.is_file() else ""
+        codec.insert_entry(p, "agenthub", _mcp_entry(python_exe, server_py, root, agent), key_path, fmt)
     except OSError as e:
         if bak:
             try:
@@ -868,18 +1126,23 @@ def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, r
 
 
 def remove_mcp_entry(path: str, layout: str) -> str:
-    """从 agent 的 MCP 配置移除 agenthub 条目（先备份，写失败自动还原）。返回错误或 ""。"""
+    """从 agent 的 MCP 配置移除 agenthub 条目（外科式；先备份，失败还原）。返回错误或 ""。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
-    data = read_mcp_config(path)
-    if data is None:
+    fmt, key_path = _mcp_spec(layout, str(p))
+    if fmt == "bundle":
+        return "该 agent 的 MCP 由 bundle 提供（非普通配置文件），暂不自动改"
+    if not p.is_file():
         return "配置文件不存在"
-    servers = _ensure_servers_dict(data, layout)
-    if "agenthub" not in servers:
-        return "未接入"
-    del servers["agenthub"]
-    bak = _backup(p) if p.is_file() else ""
+    fmt, key_path = _mcp_spec(layout, str(p))
     try:
-        p.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        if not codec.contains(p, "agenthub", key_path, fmt):
+            return "未接入"
+    except OSError:
+        return "未接入"
+    bak = ""
+    try:
+        bak = _backup_copy(p)
+        codec.remove_entry(p, "agenthub", key_path, fmt)
     except OSError as e:
         if bak:
             try:
@@ -888,6 +1151,92 @@ def remove_mcp_entry(path: str, layout: str) -> str:
                 pass
         return f"写入失败：{e}"
     return ""
+
+
+def mcp_has_agenthub(path: str, layout: str = "") -> bool:
+    """该 agent 的 MCP 配置里是否已配 agenthub（格式无关：JSON/TOML/YAML/**bundle** 通吃）。"""
+    fmt, key_path = _mcp_spec(layout, str(Path(os.path.expandvars(os.path.expanduser(path)))))
+    if fmt == "bundle":                      # DSH：bundle 形式，不是配置文件
+        return _dsh_bundle_has_agenthub(path)
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    if not p.is_file():
+        return False
+    try:
+        return codec.contains(p, "agenthub", key_path, fmt)
+    except OSError:
+        return False
+
+
+# ---------------------------------------------------------------- P9：发现层
+
+# 常见 agent 目录种子（发现用；不追求穷举）
+_AGENT_DIRS = (".zcode", ".claude", ".codex", ".dsh", ".cursor", ".windsurf", ".codeium",
+               ".gemini", ".qwen", ".continue", ".cline", ".roo", ".aider", ".opencode",
+               ".crush", ".goose", ".workbuddy", ".config", ".agents")
+_SKIP_DIRS = {"node_modules", ".git", "__pycache__", "cache", "logs", "backups", ".cache"}
+# 「看起来是 MCP 配置」的特征（容器键）
+_MCP_HINTS = (r'"mcpServers"\s*:', r'"mcp"\s*:\s*\{', r"\[\s*mcp_servers\s*\]",
+              r"^\s*mcp_servers\s*:", r"\[\s*mcpServers\s*\]", r'"servers"\s*:\s*\{')
+
+
+def _looks_like_mcp_config(path: Path) -> bool:
+    try:
+        head = path.read_text(encoding="utf-8", errors="replace")[:4000]
+    except OSError:
+        return False
+    return any(re.search(h, head, re.M) for h in _MCP_HINTS)
+
+
+def discover_agent_configs(root: str = "", max_depth: int = 2, max_files: int = 300) -> list:
+    """P9 发现层：扫常见位置，找「看起来是 agent MCP 配置」的文件。
+    返回 [{"path", "format", "registered"(已登记的 agent 名或 "")}]——只读、有界（跳 node_modules 等）。"""
+    home = Path.home()
+    found = set()
+    n = 0
+    for d in _AGENT_DIRS:
+        base = home / d
+        if not base.is_dir():
+            continue
+        base_depth = len(base.parts)
+        for dirpath, dirnames, filenames in os.walk(base):
+            dirnames[:] = [x for x in dirnames if x not in _SKIP_DIRS]
+            if len(Path(dirpath).parts) - base_depth >= max_depth:
+                dirnames[:] = []
+            for fn in filenames:
+                if n >= max_files:
+                    break
+                p = Path(dirpath) / fn
+                if p.suffix.lower() not in (".json", ".toml", ".yaml", ".yml"):
+                    continue
+                if ".bak" in p.name or fn.startswith("."):
+                    continue
+                n += 1
+                if _looks_like_mcp_config(p):
+                    found.add(str(p))
+            if n >= max_files:
+                break
+    # 顶层 dot 文件（如 ~/.claude.json）
+    try:
+        for p in home.glob(".*"):
+            if (p.is_file() and p.suffix.lower() in (".json", ".toml", ".yaml", ".yml")
+                    and ".bak" not in p.name and _looks_like_mcp_config(p)):
+                found.add(str(p))
+    except OSError:
+        pass
+    reg = {}
+    for a in load_agent_adapters(root):
+        spec = _mcp_spec_of(a)
+        if spec:
+            full = os.path.abspath(os.path.expanduser(os.path.expandvars(spec[0])))
+            reg[os.path.normcase(full)] = a["agent"]
+            if os.path.exists(full):        # 已登记但不在 home 的（如 hermes 在 D 盘 / DSH 的 bundle 目录）也纳入
+                found.add(full)
+    out = []
+    for path in sorted(found):
+        np = os.path.normcase(os.path.abspath(path))
+        out.append({"path": path, "format": codec.detect_format(path),
+                    "registered": reg.get(np, "")})
+    return out
 
 
 # ---------------------------------------------------------------- 规则与收编建议

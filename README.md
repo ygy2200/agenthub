@@ -23,7 +23,7 @@
 
 ## 公用大脑（MCP）
 
-AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **36 个工具**：
+AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **37 个工具**：
 
 **核心读写**：`hub_log_work`（写工作记录）、`hub_get_project` / `hub_list_projects` / `hub_create_project`、`hub_get_record`（单条精读）、`hub_get_progress`（进度对齐）
 
@@ -41,7 +41,9 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 
 **可编程数据包**（3.4 HPI 模式 + 3.6 目录树轨道）：数据本来就是普通文件和 SQLite——项目目录可直接 `ls`/`grep`（工作记录.md 为唯一真理）；写脚本分析自己则把本目录加入 sys.path 后 `import my.work`：`records(since="5d")` / `memories(kind=)` / `todos()` / `profile()`，全只读、不计入检索统计。
 
-接入方式：软件「接入中心」一键写入（ZCode / Claude Code / hermes / DSH 实测），或复制配置片段手动接入。
+接入方式：软件「接入中心」一键写入，或命令行 `python cli.py onboard <agent>`（**一条命令**：外科式写 MCP 配置 + 注入引导）。
+`python cli.py discover` 扫本机有哪些 agent 配置（含未登记的）；`python cli.py status` 查各 agent 接入状态；`python cli.py refresh` 刷新引导。
+agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 agent、**零改码**）。**配置格式通吃 JSON / TOML / YAML**（外科式编辑，保注释）。
 
 ## 版本演进
 
@@ -70,7 +72,7 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 | v2.17 | 人的随记（notes 表 + `hub_note`）：GUI 随记独立页（memos 式时间线、心情点排、相对时间、全局热键捕捉）、随记上首页、与记忆/记录检索互通 |
 | v2.18 | 随记批 A 创意八件套（180 天心情热力图 / 实时关联浮出 / 不期而遇每日回顾 / 往年今天回放 / 时光胶囊 / 收藏星 / #标签串 / 草稿自动保存）+ 批 B 随记-agent 融合层（`hub_note_read` 深挖与整理协议、开工视野与 `hub_status` 推送主人最新随记、随记自动附活跃上下文）；**并发可靠性修复**：WAL 常驻哨兵（Windows 短连接并发写丢心跳，实测 6~8/8 → 8/8）、每日回顾收藏优先（`random.sample` 打乱顺序致收藏优先失效）、并发建同名项目 `O_EXCL` 原子建文件（8 线程 5 个 Permission denied → 0） |
 | v2.19 | **批次 A·可靠性地基**：记忆治理三层——①记忆取代链（`superseded_by`，旧结论退出推送但仍可 `memory_trace` 追溯）；②双时相时效（`valid_until`，到期自动退出检索）；③证据链（`evidence` 引用记录/记忆 id，provenance 溯源）+ 置信度 `confidence`。`memories` 表新增 4 列（幂等补列），所有「有效记忆」查询点（检索/推送/统计/蒸馏/去重/体检）统一走 `_live_sql()` 过滤被取代/过期记忆；`hub_memory_write` 透传 `supersedes/valid_until/confidence/evidence`；新增 `memory_governance_stats` 治理健康度（live/superseded/retired/expired/evidence_coverage/avg_confidence），直接服务 10-14 大脑验收②③；adv_brain 新增批次 A 对抗测试全绿 |
-| v2.20 | **批次 B·对话式大脑**：①`hub_ask` 问大脑（D2，Honcho Dialectic API 零 LLM 版）——自然语言问句 → 规则判意图（风险/决策/待办/状态/事实）→ 复用现有检索取证据 → 结构化回答 + 逐条 `#id` 出处 + 明确弃权（无依据时明说「库里没有，我不知道」），只读不计唤起；②`hub_metacognition` 元认知面板（D10）——大脑自我报告：覆盖盲区（有记录零记忆的项目）/ 低置信现行记忆 / 疑似矛盾对 / 久未复核决策 / 元信息占比 / 治理统计，主动暴露自己哪里不靠谱。工具数 34→36；adv_brain / adv_mcp 新增批次 B 对抗测试全绿 |
+| v2.22 | **接入层：格式通吃 + 发现 + 一条命令**（2026-10-09，workbuddy）：①新增 `codec.py`——**外科式编辑**（只插/删目标段，其余原样），一举支持 **JSON / TOML / YAML**（`yaml.safe_dump` 会抹注释、`tomllib` 只读，都不能 round-trip，故走文本级外科）；②`install/remove/read_mcp_entry` 改为 codec 驱动、**格式无关**（layout → format+keyPath 数据化），Codex（TOML）、hermes（YAML）**首次可自动接入**；③新增 **`core.discover_agent_configs`**（P9 发现层：扫常见位置 + 启发式）+ `cli.py discover` 升级为真扫描；④`cli.py onboard` 升级为**一条命令全流程**（外科写 MCP + 注入引导）；⑤`cli.py` 增 `deploy`/`release` 子命令；⑥`ops.py` 增 `release` 检查项（exe 比源码旧即报警）。 |
 
 ## 设计原则
 
@@ -112,7 +114,7 @@ unified project records, input/output file management, a public memory, capabili
 ## Highlights
 
 - **Unified workbench**: all agents log work into one place — no more parallel duplicate folders per agent
-- **Shared memory via MCP**: a zero-dependency MCP server (`agenthub_mcp.py`) exposes **25 tools** — public memory (with proactive push on agent start), full-text search with snippet preview, todo extraction & closure, memory distillation pipeline, and **duplicate-pitfall interception** (new work records are matched against known lessons before being committed)
+- **Shared memory via MCP**: a zero-dependency MCP server (`agenthub_mcp.py`) exposes **37 tools** — public memory (with proactive push on agent start), full-text search with snippet preview, todo extraction & closure, memory distillation pipeline, and **duplicate-pitfall interception** (new work records are matched against known lessons before being committed)
 - **Brain dashboard** (v2.7): memory recall ranking, per-agent usage distribution, a todo board with one-click closure, and pinned memories — making "is the brain actually used?" visible
 - **Capability center**: auto-detects each agent's skills / MCP servers / memories / global configs (read-only, skill names deduplicated)
 - **Safety first**: the directory tree is the single source of truth; the app never silently writes to any agent's config — every write is backed up first; secrets are never displayed

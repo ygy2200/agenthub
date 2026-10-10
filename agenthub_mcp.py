@@ -37,7 +37,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.20.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.23.0"}
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -63,8 +63,64 @@ def _check_content(content: str, what: str) -> str:
     return ""
 
 
+# ---------------------------------------------------------------- 进程身份（B1/B2，2026-10-10）
+
+# 本进程所属 agent：由启动参数 --agent 锁定，**进程存活期内不可变**。
+# 为什么要有它：接入条目过去只有 {command, args}、六家 agent 启动参数一模一样，
+# server 被拉起时不知道自己是谁 → 只能靠工具调用参数里的 agent 自报 → 必然填错。
+# 现在身份在**启动那一刻**由接入配置写死（--agent zcode），此后所有工具调用
+# 一律以它为准，调用参数里的 agent 只作交叉校验、不再参与判定。
+SERVER_AGENT = ""
+# 交叉校验留痕节流：同类不一致每进程只记一次（避免刷爆 journal）
+_MISMATCH_SEEN: set = set()
+# 只读筛选参数白名单：这些工具的 agent 参数是"查别人"用，**不下发**（保持原语义）。
+# 其余工具一律下发——身份是"我是谁"，不是"我想查谁"。
+_AGENT_FILTER_TOOLS = {"hub_list_skills", "hub_bootstrap_status"}
+
+
+def apply_server_agent(tname: str, arguments: dict, root: str) -> dict:
+    """把进程锁定的身份下发到本次调用（B2 单点派生）。
+
+    一处覆盖全部 agent 消费点——不必逐个工具改，新工具自动受益。
+    无 SERVER_AGENT（旧接入条目/手工调用）时原样返回，退回调用参数语义（兼容）。
+    自报值与锁定值不符时留一条 journal（B3b 运行期交叉校验）。
+    """
+    if not SERVER_AGENT or tname in _AGENT_FILTER_TOOLS:
+        return arguments
+    called = str(arguments.get("agent", "") or "").strip()
+    if called and brain._norm_agent(called) != SERVER_AGENT and root:
+        key = (called.lower(), SERVER_AGENT)
+        if key not in _MISMATCH_SEEN:
+            _MISMATCH_SEEN.add(key)
+            try:
+                core.journal(root, SERVER_AGENT, "agent_mismatch", f"mcp:{tname}",
+                             note=f"调用参数自称 {called}，以启动参数 {SERVER_AGENT} 为准")
+            except Exception:  # noqa: BLE001 留痕失败不影响主流程
+                pass
+    out = dict(arguments)  # 不改调用方原对象
+    out["agent"] = SERVER_AGENT
+    return out
+
+
+def _agent_for_write(arguments: dict, root: str) -> tuple[str, str]:
+    """写入类工具的 agent 取值。返回 (agent, 错误或"")。
+
+    ★ 关键区分（2026-10-10）：**锁定值不校验，自报值才校验**。
+      · 锁定值来自接入配置（`--agent <名>`），是**操作者设定**，不是模型编的。
+        配错了只该在启动日志里警告——若在这里拒收，会让该 agent 连一条工作都记不了，
+        那是比"归属不精确"严重得多的故障。
+      · 自报值来自工具调用参数（**模型可控**），才是需要防的填错对象。
+    """
+    if SERVER_AGENT:
+        return SERVER_AGENT, ""
+    return brain.check_agent(str(arguments.get("agent", "unknown")), root)
+
+
 def _guess_agent(root: str) -> str:
-    """从活跃会话推断检索者身份：单会话时可靠；多会话取最近心跳者并加 ? 标注不确定。"""
+    """推断检索者身份：**优先用进程锁定的身份**（B1 起，可靠）；
+    无锁定（旧接入/手工调用）才退回"活跃会话"启发式（单会话可靠、多会话加 ? 标注）。"""
+    if SERVER_AGENT:
+        return SERVER_AGENT
     try:
         rows = brain.active_sessions(root)
         if len(rows) == 1:
@@ -112,6 +168,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
         return f"错误：AgentHub 根目录不存在：{root}"
+    # B2 单点派生：把进程锁定身份下发到本次调用（覆盖 agent 参数）。
+    # 放在最前，后面所有工具的 arguments.get("agent") 拿到的都是已校验的锁定值。
+    arguments = apply_server_agent(name, arguments, root)
 
     if name == "hub_list_projects":
         rows = brain.list_projects(root)
@@ -137,7 +196,11 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
 
     if name == "hub_log_work":
         pname = str(arguments.get("project", "")).strip()
-        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
+        # agent 身份校验（2026-10-09）：名不再自由文本。填错会污染时间线归属/过滤/统计，
+        # 故在写入前当场拒收并给出可用名单；确无归属时传 unknown（合法）。
+        agent, aerr = _agent_for_write(arguments, root)
+        if aerr:
+            return "错误：" + aerr
         content = str(arguments.get("content", "")).strip()
         # 3.2 AgDR 决策字段（可选）：畸形类型转 str 兜底，空视为未传
         ctx = str(arguments.get("context", "") or "").strip()
@@ -343,7 +406,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         kind = str(arguments.get("kind", "note")).strip()
         tags = str(arguments.get("tags", "")).strip()
         project = str(arguments.get("project", "")).strip()
-        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
+        # agent 身份校验，同 hub_log_work（记忆归属错会误导推送与统计）
+        agent, aerr = _agent_for_write(arguments, root)
+        if aerr:
+            return "错误：" + aerr
         pinned = bool(arguments.get("pinned", False))
         # 批次 A：记忆取代 / 双时相 / 置信度 / 证据链
         try:
@@ -496,6 +562,25 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 merged.setdefault(m.name, []).append(a.name)
         for server_name, agents_ in sorted(merged.items()):
             lines.append(f"- {server_name}  配置于 {'、'.join(agents_)}")
+        return "\n".join(lines)
+
+    if name == "hub_bootstrap_status":
+        want = str(arguments.get("agent", "")).strip().lower()
+        rows = core.agent_bootstrap_status(root)
+        if want:
+            rows = [r for r in rows if want in r["agent"].lower()]
+        if not rows:
+            return f"未找到 agent：{want}"
+        lines = [f"agent 接入状态（当前引导块版本 v{core.BOOTSTRAP_VERSION}；引导=规则已注入 / MCP=已配 agenthub）："]
+        for r in rows:
+            if r.get("boot_stale"):
+                boot = f"⚠旧v{r.get('boot_version') or '?'}"
+            elif r["boot"]:
+                boot = f"✓v{r.get('boot_version') or '?'}"
+            else:
+                boot = "✗"
+            mcp = "—" if r["mcp"] is None else ("✓" if r["mcp"] else "✗")
+            lines.append(f"- {r['agent']}  [{r['channel']}]  引导:{boot}  MCP:{mcp}  {r['instr_path']}")
         return "\n".join(lines)
 
     if name == "hub_list_agents":
@@ -842,7 +927,9 @@ TOOLS = [
                      "required": ["project"]}},
     {"name": "hub_log_work", "description": "向项目工作记录.md 追加一条工作记录（所有 agent 应在完成任务后调用；走此工具的记录可撤销、进操作流水）",
      "inputSchema": {"type": "object",
-                     "properties": {"project": {"type": "string"}, "agent": {"type": "string", "description": "你的 agent 名，如 ZCode/hermes"},
+                     "properties": {"project": {"type": "string"},
+                                    "agent": {"type": "string", "enum": ["zcode", "dsh", "claude", "codex", "hermes", "workbuddy", "unknown"],
+                                              "description": "你的 agent 名（注册表内取值，会被校验；显示名如 WorkBuddy/DSH 也接受并自动归一）。确实无法归属时传 unknown，不要编造"},
                                     "content": {"type": "string", "description": "做了什么/验证结果/如何回滚"},
                                     "date": {"type": "string", "description": "YYYY-MM-DD，缺省今天"},
                                     "context": {"type": "string", "description": "决策-上下文（AgDR，可选）：当时为什么面临这个选择"},
@@ -883,7 +970,8 @@ TOOLS = [
                                     "kind": {"type": "string", "enum": ["fact", "preference", "lesson", "project", "note"], "description": "记忆类型，缺省 note"},
                                     "tags": {"type": "string", "description": "标签，逗号分隔"},
                                     "project": {"type": "string", "description": "相关项目，可空"},
-                                    "agent": {"type": "string", "description": "你的 agent 名"},
+                                    "agent": {"type": "string", "enum": ["zcode", "dsh", "claude", "codex", "hermes", "workbuddy", "unknown"],
+                                              "description": "你的 agent 名（注册表内取值，会被校验）"},
                                     "pinned": {"type": "boolean", "description": "置顶（每次读记忆优先展示）"},
                                     "feedback": {"type": "string",
                                                  "description": "对已有记忆反馈（配合 memory_id 使用）：helpful/not_helpful/stale/wrong 调节显著性；archive 归档该记忆（不硬删）"},
@@ -924,6 +1012,9 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "可选，过滤 agent 名"}}}},
     {"name": "hub_list_mcps", "description": "列出本机各 agent 已配置的 MCP 服务器",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_bootstrap_status",
+     "description": "各 agent 的接入状态（只读）：引导规则是否已注入 + MCP 是否已配 agenthub + 送达通道。用于核对「谁还没接上大脑」",
+     "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "可选，只看某个 agent"}}}},
     {"name": "hub_list_agents", "description": "列出注册 agent 身份表（在线状态/累计记录/心跳次数/最近活跃）",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_list_todos", "description": "列出工作记录里的待办/承诺线索（后续/待验证/下一步…句式，元认知）",
@@ -1039,11 +1130,31 @@ def handle_message(msg: dict, root: str) -> dict | None:
             "error": {"code": -32601, "message": f"method not found: {method}"}}
 
 
-def serve(root: str, fixed: bool = False) -> int:
+def serve(root: str, fixed: bool = False, agent: str = "") -> int:
     """stdio 主循环。EOF/键盘中断退出。
+
     fixed=False 时每条请求重读 config 的 root：根目录迁移后旧进程自动跟随，
-    杜绝"进程启动时缓存旧路径、静默读写幽灵旧库"（2026-09-30 搬家实测踩坑）。"""
+    杜绝"进程启动时缓存旧路径、静默读写幽灵旧库"（2026-09-30 搬家实测踩坑）。
+
+    agent（B1）：接入配置用 `--agent <名>` 传入的进程身份，**启动时锁定**，
+    本进程存活期内不变（stdio 一进程一客户端，身份无歧义）。
+    留空=旧接入条目，退回调用参数自报语义（兼容，但会失去防填错能力）。
+    """
+    global SERVER_AGENT
     log = lambda s: print(f"[agenthub-mcp] {s}", file=sys.stderr)  # noqa: E731
+    if agent:
+        # 归一 + 注册表校验：配错名字要当场说清楚，而不是静默按错的写
+        key = core.agent_key(agent)
+        reg = core.agent_known_names(root)
+        if key in reg:
+            SERVER_AGENT = key
+            log(f"进程身份已锁定：{SERVER_AGENT}（来自 --agent {agent}）")
+        else:
+            SERVER_AGENT = key or ""
+            log(f"⚠ --agent「{agent}」不在注册表 {sorted(reg)}，仍按 {SERVER_AGENT!r} 锁定；"
+                f"请核对接入配置")
+    else:
+        log("未指定 --agent：身份退回工具调用参数自报（建议在接入配置里补 --agent <名>）")
     log(f"启动，根目录：{root}" + ("（固定）" if fixed else "（动态跟随 config）"))
     err = brain.ensure_schema(root)  # 建表责任前移到 server：代码部署后旧库缺新表也能自愈
     if err:
@@ -1075,10 +1186,45 @@ def serve(root: str, fixed: bool = False) -> int:
     return 0
 
 
+def parse_argv(argv: list) -> tuple[str, bool, str]:
+    """解析命令行：返回 (root, fixed, agent)。
+
+    支持（顺序无关）：
+        agenthub_mcp.py                        → 动态跟随 config
+        agenthub_mcp.py --agent zcode          → 动态跟随 + 锁定身份（**接入配置的标准形态**）
+        agenthub_mcp.py <root>                 → 固定根目录（向后兼容）
+        agenthub_mcp.py --agent zcode <root>   → 两者兼有
+
+    ★ `--agent` 必须用**具名参数**，不能复用位置参数：位置参数语义是 root，
+      且一旦传入就切"固定模式"（根目录搬家后旧接入会指向失效路径，2026-10-01 踩过）。
+      故只传 --agent 时仍保持动态跟随，两者互不干扰。
+    """
+    agent = ""
+    rest: list = []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--agent":
+            if i + 1 < len(argv):
+                agent = argv[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        if a.startswith("--agent="):
+            agent = a.split("=", 1)[1]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    fixed = len(rest) > 0
+    root = rest[0] if fixed else core.get_root()
+    return root, fixed, agent
+
+
 def main():
-    fixed = len(sys.argv) > 1  # 命令行显式指定根目录 = 固定模式（向后兼容）
-    root = sys.argv[1] if fixed else core.get_root()
-    sys.exit(serve(root, fixed))
+    root, fixed, agent = parse_argv(sys.argv[1:])
+    sys.exit(serve(root, fixed, agent))
 
 
 if __name__ == "__main__":

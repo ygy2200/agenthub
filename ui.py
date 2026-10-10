@@ -15,7 +15,8 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QAbstractNativeEventFilter
-from PySide6.QtGui import QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat, QTextCursor, QIcon
+from PySide6.QtGui import (QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat,
+                          QTextCursor, QIcon, QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
@@ -266,18 +267,25 @@ def kind_badge(kind: str) -> QLabel:
 
 
 def agent_disp(agent: str) -> str:
-    """流水/待办行里的 agent 显示名：空/unknown（历史数据来源）统一显示"未标注"。"""
-    return "未标注" if (agent or "").strip().lower() in ("", "unknown") else agent
+    """流水/待办行里的 agent 显示名。空/unknown（无主语义）→"未知来源"，
+    其余走注册表取规范显示名（2026-10-10：原来直接回显原名，workbuddy 会显示小写）。"""
+    a = (agent or "").strip().lower()
+    if a in ("", "unknown"):
+        return "未知来源"
+    return AGENT_CN.get(a) or a
 
 
 def badge(agent: str, raw: str) -> QLabel:
-    # 未知 agent 显示自己的名字（中性色），"未标注"仅限 agent 字段真空——
-    # 否则新接入的 agent 一律显示"未标注"（2026-10-01 dsh 实测踩坑）
-    text = {"zcode": "ZCode", "hermes": "hermes", "deepseek": "deepseek",
-            "claude": "claude", "codex": "codex", "dsh": "DSH"}.get(agent, raw or agent or "未标注")
+    # 显示名走**注册表**（2026-10-10：此前硬编码表漏了 workbuddy，
+    # 新接入 agent 一律显示小写原名/未标注）。注册表给的是适配器里的规范名。
+    a = (agent or "").strip().lower()
+    if not a:
+        text = raw or "未知来源"  # 确实无归属：诚实标未知，不伪造名字
+    else:
+        text = AGENT_CN.get(a) or raw or a
     lb = QLabel(text)
     lb.setStyleSheet(
-        f"color:white;background:{AGENT_BADGE_COLOR.get(agent, '#8a8a8a')};"
+        f"color:white;background:{AGENT_BADGE_COLOR.get(a, '#8a8a8a')};"
         "border-radius:8px;padding:1px 8px;font-size:11px;")
     lb.setFixedHeight(20)
     return lb
@@ -777,8 +785,31 @@ class ProjectPage(QWidget):
             self.listw.setCurrentRow(names.index(name))
 
 
-AGENT_CN = {"zcode": "ZCode", "hermes": "hermes", "deepseek": "deepseek",
-            "claude": "claude", "codex": "codex", "dsh": "DSH", "其他": "其他"}
+def _agent_cn() -> dict:
+    """agent id → 显示名。**由core 注册表派生**（2026-10-09）。
+
+    过去是硬编码 AGENT_CN，漏了 workbuddy → 时间线徽章显示小写 workbuddy 而非 WorkBuddy。
+    现在改从 core.agent_known_names() 取，新增 agent 零改码；取不到时退回旧硬编码表。"""
+    try:
+        reg = core.agent_known_names(core.get_root())
+        #注册表给的是适配器里的原名（"Claude Code"/"ZCode"），直接用作显示名
+        return {k: v for k, v in reg.items() if v}
+    except Exception:  # noqa: BLE001
+        return {"zcode": "ZCode", "hermes": "hermes", "deepseek": "deepseek",
+                "claude": "claude", "codex": "codex", "dsh": "DSH", "其他": "其他"}
+
+
+AGENT_CN = _agent_cn()  # 模块级快照（导入时求值一次；运行期刷新见refresh_agent_cn）
+# 显示名（小写）→ 库内 id 的反查表（过滤用：下拉给显示名，库里存 id）
+_AGENT_DISP2ID = {v.strip().lower(): k for k, v in AGENT_CN.items() if v}
+
+
+def refresh_agent_cn() -> dict:
+    """重取注册表并刷新 AGENT_CN（大脑根切换/新增 agent 后调用）。返回新表。"""
+    global AGENT_CN, _AGENT_DISP2ID
+    AGENT_CN = _agent_cn()
+    _AGENT_DISP2ID = {v.strip().lower(): k for k, v in AGENT_CN.items() if v}
+    return AGENT_CN
 
 
 class TimelinePage(QWidget):
@@ -846,8 +877,11 @@ class TimelinePage(QWidget):
         pj = self.projFilter.currentText()
         out = self.all_entries
         if a and a != "全部":
+            # 显示名反查库内 id 再比（2026-10-10）：下拉显示的是显示名（"Claude Code"/
+            # "WorkBuddy"），而库里存的是 id（claude/workbuddy）。直接拿显示名比会滤光记录。
+            want = _AGENT_DISP2ID.get(a.lower(), a).lower()
             # casefold 比较：agent 存值大小写曾混杂（ZCode/zcode），精确 == 会滤光记录
-            out = [r for r in out if (r.get("agent") or "").lower() == a.lower()]
+            out = [r for r in out if (r.get("agent") or "").lower() == want]
         if pj and pj != "全部":
             out = [r for r in out if r.get("project", "") == pj]
         return out
@@ -2951,12 +2985,24 @@ class ConnectPage(QWidget):
             "「一键接入」写入 MCP 配置，「注入引导」把开工规则写进 agent 的全局指令文件——"
             "两步都做，agent 才会在每次会话自然使用公用大脑，无需口头提醒。"))
 
+        # 卡片列表装滚动容器（2026-10-09 修：原先直接挂页面布局，窗口一缩小卡片被压扁、
+        # 三行文字被裁掉看不见——用户报「拉大才完整、缩小就缺字」的真凶）。
+        self.scroll = ScrollArea()
         self.rows = QVBoxLayout()
-        lay.addLayout(self.rows)
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        self.rowsHost = QWidget()
+        self.rowsHost.setLayout(self.rows)
+        self.rows.setContentsMargins(0, 0, 8, 0)
+        self.rows.setSpacing(10)
+        self.scroll.setWidget(self.rowsHost)
+        # stretch=2 给卡片区，让它拿走富余高度；下方手动接入区固定不参与拉伸
+        lay.addWidget(self.scroll, 2)
         lay.addWidget(StrongBodyLabel("手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）"))
         self.snippet = TextBrowser()
+        self.snippet.setMinimumHeight(110)
         self.snippet.setMaximumHeight(180)
-        lay.addWidget(self.snippet)
+        lay.addWidget(self.snippet, 1)
         copyBtn = PushButton(ic("COPY", "INFO"), "复制配置片段")
         copyBtn.clicked.connect(self.copy_snippet)
         lay.addWidget(copyBtn, 0, Qt.AlignRight)
@@ -2970,18 +3016,17 @@ class ConnectPage(QWidget):
     def _rows_data(self):
         py, server = core.deploy_server()
         rows = []
-        for t in core.MCP_TARGETS:
-            data = core.read_mcp_config(t["path"])
-            servers = {}
-            if isinstance(data, dict):
-                servers = (data.get("mcp", {}).get("servers") if t["layout"] == "zcode"
-                           else data.get("mcpServers")) or {}
-            rows.append({"agent": t["agent"], "path": t["path"], "layout": t["layout"],
-                         "mcp": isinstance(servers, dict) and "agenthub" in servers,
-                         "boot_path": t["boot"]})
-        for b in core.BOOTSTRAP_ONLY:
-            rows.append({"agent": b["agent"], "path": "", "layout": "", "mcp": None,
-                         "boot_path": b["path"]})
+        for a in core.load_agent_adapters(self.win.root):
+            boot_path = a.get("instr_path") or a.get("boot") or ""
+            mcp = a.get("mcp") or None
+            if not mcp:
+                rows.append({"agent": a["agent"], "path": "", "layout": "", "mcp": None,
+                             "boot_path": boot_path})
+                continue
+            path, layout = mcp.get("path", ""), mcp.get("layout", "standard")
+            rows.append({"agent": a["agent"], "path": path, "layout": layout,
+                         "mcp": core.mcp_has_agenthub(path, layout),
+                         "boot_path": boot_path})
         return py, server, rows
 
     def refresh_status(self):
@@ -2998,6 +3043,7 @@ class ConnectPage(QWidget):
             self.pyLabel.setText(f"服务端就绪：{server}")
         for r in rows:
             card = CardWidget()
+            card.setMinimumHeight(96)  # 锁最小高度：三行文字不被压扁裁掉
             g = QHBoxLayout(card)
             g.setContentsMargins(16, 12, 16, 12)
             col = QVBoxLayout()
@@ -3018,7 +3064,7 @@ class ConnectPage(QWidget):
                 else:
                     btn = PrimaryPushButton(ic("LINK", "INFO"), "一键接入")
                     btn.setEnabled(bool(py and server))
-                    btn.clicked.connect(lambda _, p=r["path"], l=r["layout"]: self.do_connect(p, l))
+                    btn.clicked.connect(lambda _, p=r["path"], l=r["layout"], ag=r["agent"]: self.do_connect(p, l, ag))
                     g.addWidget(btn)
             if boot_on:
                 rb = PushButton("移除引导")
@@ -3030,12 +3076,13 @@ class ConnectPage(QWidget):
                 g.addWidget(ib)
             self.rows.addWidget(card)
 
-    def do_connect(self, path, layout):
+    def do_connect(self, path, layout, agent=""):
         py, server, _ = self._rows_data()
         if not py or not server:
             InfoBar.error("无法接入", "python 或服务端未就绪", duration=3000, parent=self.win)
             return
-        err = core.install_mcp_entry(path, layout, py, server, self.win.root)
+        # agent 名写进启动参数（B1）：server 据此锁定身份，忽略工具调用里的自报值
+        err = core.install_mcp_entry(path, layout, py, server, self.win.root, agent=agent)
         if err:
             InfoBar.error("接入失败", err, duration=5000, parent=self.win)
         else:
@@ -3644,11 +3691,36 @@ def _hard_exit(rc):
     os._exit(rc)
 
 
+def _setup_app_font(app):
+    """高分屏字体修复（2026-10-09，用户报「接入页字看不清」）。
+
+    症状：125% 缩放屏上，缩小窗口时字形被裁掉一部分，拉大窗口才完整。
+    根因：Qt 默认对缩放因子取整（Round 策略）+ DirectWrite 全 hinting，
+    非整数缩放（1.25）下字形位图被舍入裁剪。
+    修法：① 缩放策略改 PassThrough，保留 1.25 小数不取整；
+          ② hinting 改 PreferVerticalHinting，只锁垂直方向不裁字宽；
+          ③ 关掉 kerning/ligature 的位图缓存路径，走线性缩放。
+    """
+    # ① 高分屏缩放策略：必须在 QApplication 创建前设置
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+    f = QFont("Microsoft YaHei UI", 9)
+    # ② 只做垂直 hinting：字宽不锁死，避免小字号下左右笔画被裁
+    f.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)
+    f.setStyleStrategy(QFont.StyleStrategy.PreferAntialias)
+    f.setKerning(True)
+    app.setFont(f)
+    return f
+
+
 def run_gui():
     _install_crash_hook()
     setTheme(Theme.AUTO)
+    # 高分屏缩放策略要在 QApplication 之前设，故在此先调一次
+    QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
+        Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
-    app.setFont(QFont("Microsoft YaHei UI", 9))
+    _setup_app_font(app)
     w = AgentHubWindow()
     w.show()
     _unreg = _register_note_hotkey(w)

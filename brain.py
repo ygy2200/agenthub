@@ -271,6 +271,32 @@ def _norm_agent(agent: str) -> str:
     return (agent or "").strip().lower()
 
 
+def check_agent(agent: str, root: str = "") -> tuple[str, str]:
+    """校验 agent 参数是否在注册表内。返回 (规范 id 或 "", 错误或 "")。
+
+    2026-10-09 新增：agent 名此前是自由文本，填错（填成别家/自造名）无人拦，
+    直接污染时间线归属、过滤与统计。改为**当场拦下**并给出可用名单。
+
+    宽容处理：
+    - 空/unknown/migrated/user → 放行（这些是"无主"语义，不是错误身份）
+    - 显示名与 id 混填（"Claude Code"/"WorkBuddy"）→ 归一到 id，不报错
+    - 不在册的名字 → 报错（不静默改写，错了要让人知道）
+    """
+    raw = (agent or "").strip()
+    low = _norm_agent(raw)
+    if low in _NON_AGENT:
+        return low, ""
+    reg = core.agent_known_names(root)
+    key = core.agent_key(raw)
+    if key in reg:
+        return key, ""
+    if low in reg:  # agent_key可能把带空格名拆过头，这里兜一层原样小写
+        return low, ""
+    avail = "、".join(sorted(reg))
+    return "", (f"agent 名「{raw}」不在注册表内，已拒收（避免时间线归属/统计出错）。"
+                f"可用：{avail}；确实无法归属时传 unknown。")
+
+
 def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, record: bool = False) -> None:
     """agent 注册制：所有写动作顺带登记身份（轻量 upsert，见 agents 表）。"""
     agent = _norm_agent(agent)
@@ -344,8 +370,16 @@ def _migrate_records(root: str) -> int:
     n = 0
     with db_conn(root) as conn:
         conn.execute("DELETE FROM records WHERE source LIKE 'migrated:%' AND date=''")
-        known = {(r["project"], r["date"], r["agent"], r["title"], (r["content"] or "")[:256])
-                 for r in conn.execute("SELECT project,date,agent,title,content FROM records")}
+        # ★ 去重键 = (project, source, title, content[:256])，**不含 agent、也不含 date**（2026-10-10 修）：
+        #   · 不含 agent：agent 是派生值，会随解析规则改进变化（白名单补全/fallback 调整），
+        #     放进去会让"同一段文字在两套规则下算出不同 agent"被误判为新记录、整批重插。
+        #   · 不含 date：无段内日期的条目用**文件 mtime** 兜底，而 agent 每次追加记录都会改 mtime，
+        #     于是这些条目会反复被判定为新增（实测：追加一段后重跑，105→164 条）。
+        #   · 用 source（migrated:<文件>:<行号>）作稳定身份——追加到文件末尾不影响既有行号。
+        #   ⚠ 改这里必须同步改下方 key 的构造，两者结构必须完全一致（上一版只改此处漏改对方，
+        #     导致键结构不匹配、去重彻底失效、每次 init_db 全量重插 451 条）。
+        known = {(r["project"], r["source"] or "", r["title"], (r["content"] or "")[:256])
+                 for r in conn.execute("SELECT project,source,title,content FROM records")}
         for entry in os.scandir(root):
             if not entry.is_dir() or entry.name in core.RESERVED:
                 continue
@@ -363,15 +397,24 @@ def _migrate_records(root: str) -> int:
                     continue
                 src = max(cands, key=lambda f: f.stat().st_mtime)
             pm = core.AGENT_PREFIX_RE.match(entry.name)
-            fallback = pm.group(1).lower() if pm else "zcode"
+            # 目录前缀推断不出就留空——**不猜 zcode**（2026-10-09：旧代码兜底 "zcode"，
+            # 让 858 条无主记录被错误归到 zcode 名下，时间线按 agent 过滤/统计随之出错）。
+            # 空值入库即 unknown，_NON_AGENT 已含它→ 不会污染 agents 表统计。
+            fallback = pm.group(1).lower() if pm else ""
             entries = core.parse_record(core.read_text(src), fallback_agent=fallback,
-                                        fallback_date=core._mtime_date(src))
+                                        fallback_date=core._mtime_date(src),
+                                        known=core.agent_known_names(root))
             if not entries and src.name != core.RECORD_NAME:  # 主文档整篇无段头 → 文件级一条
                 entries = [core.RecordEntry(date=core._mtime_date(src), agent=fallback,
                                             agent_raw="", title=f"[主文档] {src.name}", line_no=0,
                                             body=core.read_text(src)[:4000])]
             for r in entries:
-                key = (entry.name, r.date, r.agent, r.title, (r.body or "")[:256])
+                # ★ key 必须与上面 known 的元素**同结构**（2026-10-10 二次修复）：
+                #   known = (project, source, title, content[:256])，本处同构。
+                #   上一版只改了 known、没改这里，两套键永不相等 → 去重彻底失效、
+                #   每次 init_db 全量重插（实测临时库两次跑 210→420）。
+                key = (entry.name, f"migrated:{src.name}:{r.line_no}", r.title,
+                       (r.body or "")[:256])
                 if key in known:
                     continue
                 conn.execute(

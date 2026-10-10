@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 
 DEPLOY_DIR = Path.home() / ".agenthub" / "mcp_server"
-DEPLOY_FILES = ["ui.py", "core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py", "my/__init__.py", "my/work/__init__.py"]
+DEPLOY_FILES = ["core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py", "cli.py", "codec.py", "my/__init__.py", "my/work/__init__.py"]
 PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一致
 
 # name -> (一句话说明, 是否需要 target 目录)
@@ -31,12 +31,14 @@ CHECKS = {
     "git_status": ("git 工作区是否干净（未提交/未跟踪清单），通用任意仓库", True),
     "regression": ("跑 AgentHub 六套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log（约1分钟）", True),
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
+    "release": ("发布一致性：GUI exe 是否比关键源码（main/ui/core/brain/agentscore）旧 + 桌面副本是否同步——防止「改了源码没重打包」", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
     "brain": ("大脑健康一行摘要（记录/记忆/结晶率/待办/检索累计）", False),
     "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
     "stalled": ("停滞项目清单（90 天无活动，供归档清理决策）", False),
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
+    "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
 }
 
 
@@ -49,7 +51,7 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
     if needs_target and t is None:
         return {"ok": False, "summary": f"{name} 需要 target=已存在的目录路径（当前：{target!r}）", "detail": []}
     fn = {"py_compile": _py_compile, "git_status": _git_status,
-          "regression": _regression, "deploy_diff": _deploy_diff}.get(name)
+          "regression": _regression, "deploy_diff": _deploy_diff, "release": _release}.get(name)
     if fn:
         r = fn(t)
     elif name == "env":
@@ -62,6 +64,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _dup_mem(root)
     elif name == "compress":
         r = _compress(root)
+    elif name == "agents":
+        r = _agents(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""))
@@ -176,6 +180,38 @@ def _deploy_diff(target: Path) -> dict:
             "detail": diffs[:8]}
 
 
+def _release(target: Path) -> dict:
+    """发布一致性：GUI exe 是否比「GUI 关键源码」旧；桌面副本是否与 dist 同步。
+    防的是「改了源码却没重打包」——exe 是打包时冻结的，源码改了不重打就发的是旧 GUI。"""
+    if not (target / "ui.py").is_file():
+        return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 ui.py）", "detail": []}
+    exe = target / "dist" / "AgentHub.exe"
+    if not exe.is_file():
+        return {"ok": False, "summary": "未找到 dist/AgentHub.exe（还没打过包？跑 build.bat）", "detail": []}
+    key = ["main.py", "ui.py", "core.py", "brain.py", "agentscore.py"]  # 改了这些就必须重打包
+    newest, newest_name = 0.0, ""
+    for f in key:
+        p = target / f
+        if p.is_file() and p.stat().st_mtime > newest:
+            newest, newest_name = p.stat().st_mtime, f
+    fmt = lambda t: datetime.datetime.fromtimestamp(t).strftime("%m-%d %H:%M")  # noqa: E731
+    exe_mt, exe_sz = exe.stat().st_mtime, exe.stat().st_size
+    desktop = Path.home() / "Desktop" / "AgentHub.exe"
+    detail = [f"exe       {fmt(exe_mt)}  {exe_sz // 1024 // 1024}MB",
+              f"最新源码  {newest_name} {fmt(newest)}"]
+    if desktop.is_file():
+        same = desktop.stat().st_size == exe_sz
+        detail.append(("桌面副本  同步" if same else "桌面副本  **不一致**") + f"  {fmt(desktop.stat().st_mtime)}")
+    else:
+        detail.append("桌面副本  不存在")
+    if newest > exe_mt:
+        return {"ok": False,
+                "summary": f"exe 旧了：{newest_name} 比 exe 新 —— 需重打包（build.bat）", "detail": detail}
+    if desktop.is_file() and desktop.stat().st_size != exe_sz:
+        return {"ok": False, "summary": "桌面副本与 dist 不一致 —— 重跑 build.bat（含拷贝）", "detail": detail}
+    return {"ok": True, "summary": "发布一致：exe 不旧于关键源码，桌面副本同步", "detail": detail}
+
+
 def _env(root: str = "") -> dict:
     rows = [f"Python {sys.version.split()[0]} @ {sys.executable}"]
     es = Path.home() / ".agenthub" / "bin" / "es.exe"
@@ -215,6 +251,48 @@ def _import_brain():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import brain  # noqa: PLC0415
     return brain
+
+
+def _import_core():
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import core  # noqa: PLC0415
+    return core
+
+
+def _agents(root: str) -> dict:
+    """各 agent 接入状态：引导是否注入 + 版本是否当前 + MCP 是否配 agenthub。"""
+    if err := _need_root(root):
+        return err
+    try:
+        core = _import_core()
+        rows = core.agent_bootstrap_status(root)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    miss_boot = [r["agent"] for r in rows if not r["boot"]]
+    stale = [r["agent"] for r in rows if r.get("boot_stale")]
+    miss_mcp = [r["agent"] for r in rows if r["mcp"] is False]
+    detail = []
+    for r in rows:
+        if r.get("boot_stale"):
+            b = f"⚠旧v{r.get('boot_version') or '?'}"
+        elif r["boot"]:
+            b = f"✓v{r.get('boot_version') or '?'}"
+        else:
+            b = "✗"
+        m = "—" if r["mcp"] is None else ("✓" if r["mcp"] else "✗")
+        detail.append(f"{r['agent']}: 引导{b} MCP{m}")
+    if not (miss_boot or stale or miss_mcp):
+        summary = f"接入齐备：{len(rows)} 个 agent 引导(当前版)+MCP 均就位"
+    else:
+        bits = []
+        if miss_boot:
+            bits.append(f"缺引导 {'/'.join(miss_boot)}")
+        if stale:
+            bits.append(f"引导过时 {'/'.join(stale)}")
+        if miss_mcp:
+            bits.append(f"缺MCP {'/'.join(miss_mcp)}")
+        summary = "接入缺口：" + "；".join(bits)
+    return {"ok": not (miss_boot or stale or miss_mcp), "summary": summary, "detail": detail[:8]}
 
 
 def _inbox(root: str) -> dict:

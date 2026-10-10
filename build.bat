@@ -6,7 +6,9 @@ rem 不排除则 exe 达 361MB；排除后 49MB。新增依赖若运行时报缺
 rem ⚠ win32print 绝不能排除：qframelesswindow（qfluentwidgets 依赖）运行时必需，
 rem   误排会导致启动崩（且 windowed 模式进程仍存活，需用 MainWindowTitle 验证）。
 cd /d "%~dp0"
-D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --name AgentHub ^
+rem ⚠ 禁用 UPX（--noupx）：UPX 压缩 Qt 官方 DLL 会破坏图形管线——实测表现为
+rem   窗口首次启动不渲染内容（全透明）、文字模糊发虚（2026-10-09 用户报「接入页字看不清」）。
+D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx --name AgentHub ^
   --icon assets\agenthub.ico --add-data "assets\agenthub.ico;." ^
   --exclude-module aiohttp --exclude-module aiohappyeyeballs --exclude-module aiosignal --exclude-module yarl --exclude-module multidict --exclude-module frozenlist --exclude-module propcache ^
   --exclude-module PIL --exclude-module numpy --exclude-module pandas --exclude-module matplotlib --exclude-module scipy --exclude-module sklearn ^

@@ -27,6 +27,10 @@ import core  # noqa: E402
 PROJECT_NAME = "ZCode会话轨迹-自动捕获"
 MAX_PREVIEW = 200
 _FALLBACK_ROOT = r"D:\agent资料\zcode项目记录"
+# 本 hook 的归属 agent。默认 zcode（它是 ZCode 的 Stop hook），
+# 但允许 env 覆盖——若日后复制给别家 agent 用，设 AGENTHUB_AGENT 即可，不必改码。
+# （2026-10-10：此前硬编码 "zcode"，一旦被复用就会给别家记录错标归属。）
+OWNER_AGENT = (os.environ.get("AGENTHUB_AGENT") or "zcode").strip().lower()
 
 
 def _preview(payload: dict) -> str:
@@ -96,8 +100,8 @@ def _capture(root: str, session_id: str, workdir: str, payload: dict) -> str:
                f"响应预览：{preview}\n"
                "【验证结果】自动捕获无验证；后续轮次详情见 journal「会话边界」流水\n"
                "【如何回滚】直接删除本记录（source=auto，不影响任何人工记录）")
-    rid = brain.add_record(root, PROJECT_NAME, "zcode", today,
-                           f"{today}（auto-hook）· 会话 {sid} 轨迹锚点",
+    rid = brain.add_record(root, PROJECT_NAME, OWNER_AGENT, today,
+                           f"{today}（{OWNER_AGENT}）· 会话 {sid} 轨迹锚点",
                            content, source="auto")
     return f"records#{rid} 已自动捕获（session {sid[:12]}）"
 
