@@ -17,7 +17,7 @@ from pathlib import Path
 from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QAbstractNativeEventFilter
 from PySide6.QtGui import (QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat,
                           QTextCursor, QIcon, QGuiApplication)
-from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
+from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QSizePolicy,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
                                QDialog, QCheckBox)
@@ -97,6 +97,39 @@ def empty_state(icon_name: str, title: str, desc: str = "",
 # 可定制导航项（3E+）：设置页勾选控制侧边栏显隐；总览/设置固定不可藏（隐藏页仍可 Ctrl+K 打开）
 NAV_CUSTOMIZABLE = ("项目", "时间线", "Agent 中心", "随记", "大脑",
                     "流水·对账", "统计", "运营报告", "搜索", "接入", "帮助")
+
+
+def flex_label(lb):
+    """长文本行标签防撑宽（批次 3 修复）：水平 Ignored = 布局按可用空间分配、超出裁剪
+    （全文见 tooltip）。背景：最近动态/时间线标题的无换行 QLabel 把页面最小宽度撑到
+    2000px+，窄窗口下数字卡等被横向挤出（2026-10-10 实机截图像素级定位）。"""
+    lb.setSizePolicy(QSizePolicy.Ignored, lb.sizePolicy().verticalPolicy())
+    return lb
+
+
+def guard_overflow(root_widget):
+    """防横向溢出守卫（批次 3 修复）：信息类长文本标签设水平 Ignored（幂等）。
+
+    背景：8 个页面存在"无换行长文本（行标题/统计行/说明）撑破页面最小宽度"——
+    930px 窗口下总览数字卡被挤出可视区（实机截图）+ 逐层 min 追踪定位。
+    规则：Body/Caption/StrongBody 类 + 文本 > 16 字符 + 非换行 + 非标题 →
+    Ignored（空间充足时零视觉影响；不足时按可用宽压缩，全文保留在 tooltip/原文处）。
+    每次数据刷新（apply）后对全页巡检。wordWrap 的标签由其自理，不动。"""
+    if root_widget is None:
+        return
+    for lb in root_widget.findChildren(QLabel):
+        try:
+            if lb.wordWrap() or isinstance(lb, (TitleLabel, SubtitleLabel)):
+                continue
+            if lb.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored:
+                continue
+            if not isinstance(lb, (BodyLabel, CaptionLabel, StrongBodyLabel)):
+                continue
+            if len(lb.text() or "") <= 16:
+                continue
+            lb.setSizePolicy(QSizePolicy.Ignored, lb.sizePolicy().verticalPolicy())
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def tight_rows(listw, h: int = 36):
@@ -727,6 +760,7 @@ class ProjectPage(QWidget):
         self.fileList.itemDoubleClicked.connect(self.open_file_loc)
 
         self.nameLabel = TitleLabel("—")
+        self.nameLabel.setWordWrap(True)  # 长项目名换行（防右下详情列被标题撑宽，2026-10-10 溢出体检）
         right.addWidget(self.nameLabel)
         right.addLayout(head)
         right.addWidget(self.pathLabel)
@@ -1001,7 +1035,7 @@ class TimelinePage(QWidget):
                 self.box.addWidget(group)
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
-            title = ClickBodyLabel(_display_title(r)[:80])
+            title = flex_label(ClickBodyLabel(_display_title(r)[:80]))
             title.setToolTip(f"{r.get('project', '')} · {_display_title(r)}\n点击查看完整记录")
             title.setCursor(Qt.PointingHandCursor)
             title.clicked.connect(lambda _, rr=r: self.show_detail(rr))
@@ -1232,8 +1266,10 @@ class NotesPage(QWidget):
         self.statLabel = CaptionLabel("")
         head.addWidget(self.statLabel)
         lay.addLayout(head)
-        lay.addWidget(CaptionLabel("你的顿悟与想法——第一人称思想层，所有 agent 检索可见；"
-                                   "正文打 #标签 可分类串成演化线；全局热键 Ctrl+Alt+N 随时呼出"))
+        _notesDesc = CaptionLabel("你的顿悟与想法——第一人称思想层，所有 agent 检索可见；"
+                                  "正文打 #标签 可分类串成演化线；全局热键 Ctrl+Alt+N 随时呼出")
+        _notesDesc.setWordWrap(True)
+        lay.addWidget(_notesDesc)
 
         # 心情色带热力图：一格一天，颜色=当日心情/有无记录（近半年，悬停看详情）
         lay.addSpacing(8)
@@ -1242,7 +1278,7 @@ class NotesPage(QWidget):
         self._heat_cells = []
         for _ in range(180):
             cell = QLabel()
-            cell.setFixedSize(4, 18)
+            cell.setFixedSize(3, 18)  # 4→3px：180 格半年图总宽 540（原 720 在 920 窄窗下超限，2026-10-10 溢出体检）
             self.heatRow.addWidget(cell)
             self._heat_cells.append(cell)
         lay.addLayout(self.heatRow)
@@ -2220,7 +2256,9 @@ class OverviewPage(QWidget):
         self.quickNew.clicked.connect(lambda: self.win.project_page.new_project())
         head.addWidget(self.quickNew)
         lay.addLayout(head)
-        lay.addWidget(CaptionLabel("电脑上所有 agent 的工作入口，数据实时来自目录扫描（F5 刷新）"))
+        _ovDesc = CaptionLabel("电脑上所有 agent 的工作入口，数据实时来自目录扫描（F5 刷新）")
+        _ovDesc.setWordWrap(True)
+        lay.addWidget(_ovDesc)
 
         # 随记输入条（08 计划 A-Ⅰ：人的高频入口放首页=最短路径；完整视图在「随记」页）
         lay.addSpacing(16)
@@ -2347,12 +2385,12 @@ class OverviewPage(QWidget):
         for r in self.recent:
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
-            t = ClickBodyLabel(_display_title(r)[:72])
+            t = flex_label(ClickBodyLabel(_display_title(r)[:72]))
             t.setToolTip(_display_title(r))
             t.setCursor(Qt.PointingHandCursor)
             t.clicked.connect(lambda _, rr=r: RecordDetailDialog(self.win, rr).exec())
             row.addWidget(t, 1)
-            pn = CaptionLabel(r.get("project", "")[:14])
+            pn = flex_label(CaptionLabel(r.get("project", "")[:14]))
             pn.setToolTip(r.get("project", ""))
             row.addWidget(pn)
             wrap = QWidget()
@@ -2386,8 +2424,10 @@ class OverviewPage(QWidget):
                 "PEOPLE", "暂无活跃会话", "agent 开工调 hub_heartbeat 后显示"))
             return
         for s in sessions[:6]:
-            self.sessionBox.addWidget(CaptionLabel(
-                f"● {s.get('agent')} → {s.get('project') or '未指定'}  {s.get('note') or ''}"))
+            _lb = CaptionLabel(
+                f"● {s.get('agent')} → {s.get('project') or '未指定'}  {s.get('note') or ''}")
+            _lb.setToolTip(f"{s.get('agent')} → {s.get('project') or '未指定'}\n{s.get('note') or ''}")
+            self.sessionBox.addWidget(flex_label(_lb))
 
 
 class HubPage(QWidget):
@@ -2416,9 +2456,11 @@ class HubPage(QWidget):
         rescanBtn.clicked.connect(self.rescan)
         top.addWidget(rescanBtn)
         lay.addLayout(top)
-        lay.addWidget(CaptionLabel("自动探测本机 agent 及其技能 / MCP / 记忆 / 全局配置；"
-                                   "记忆可增删改，配置文件可编辑保存（自动备份）；MCP 出于安全只读。"
-                                   "未列出的 agent 可手动添加根目录。"))
+        _hubDesc = CaptionLabel("自动探测本机 agent 及其技能 / MCP / 记忆 / 全局配置；"
+                                "记忆可增删改，配置文件可编辑保存（自动备份）；MCP 出于安全只读。"
+                                "未列出的 agent 可手动添加根目录。")
+        _hubDesc.setWordWrap(True)
+        lay.addWidget(_hubDesc)
 
         self.cardsRow = QHBoxLayout()
         self.cardsRow.setSpacing(24)  # agent 列间距：去框后靠间距分列
@@ -2605,15 +2647,15 @@ class HubPage(QWidget):
             col = QVBoxLayout()
             col.setContentsMargins(0, 0, 0, 0)
             col.setSpacing(4)
-            col.addWidget(StrongBodyLabel(a.name))
-            col.addWidget(CaptionLabel((a.home or "未检测到（可手动添加目录）")[:60]))
-            col.addWidget(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
-                                       f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
+            col.addWidget(flex_label(StrongBodyLabel(a.name)))
+            col.addWidget(flex_label(CaptionLabel((a.home or "未检测到（可手动添加目录）")[:60])))
+            col.addWidget(flex_label(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
+                                                  f"记忆 {len(a.memories)} · 配置 {len(a.configs)}")))
             reg = getattr(self, "_reg", {}).get(a.name.lower())
             if reg:
-                col.addWidget(CaptionLabel(
+                col.addWidget(flex_label(CaptionLabel(
                     f"{'● 在线' if reg['online'] else '○ 离线'} · 记录 {reg['records']} 条 · "
-                    f"最近活跃 {reg['last_seen'] or '—'}"))
+                    f"最近活跃 {reg['last_seen'] or '—'}")))
             wrap = QWidget()
             wrap.setLayout(col)
             self.cardsRow.addWidget(wrap)
@@ -3578,6 +3620,13 @@ class AgentHubWindow(FluentWindow):
             self.overview_page.set_sessions([])
         self.journal_page.reload()
         self.report_page.reload_reports()  # agent 侧 hub_report 可能生成了新报告，F5 后列表跟上
+        # 防横向溢出守卫（批次 3 修复）：刷新后对全页统一巡检（幂等、无视觉副作用）
+        for _pg in (self.overview_page, self.project_page, self.timeline_page,
+                    self.hub_page, self.notes_page, self.brain_page,
+                    self.ledger_page, self.stats_page, self.report_page,
+                    self.search_page, self.connect_page, self.help_page,
+                    self.settings_page):
+            guard_overflow(_pg)
 
 
 def _install_crash_hook():
