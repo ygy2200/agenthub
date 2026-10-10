@@ -33,6 +33,7 @@ import brain
 import core
 import ops
 import report
+import tokens
 
 
 def ic(name, fallback="INFO"):
@@ -40,10 +41,9 @@ def ic(name, fallback="INFO"):
     return getattr(FIF, name, getattr(FIF, fallback))
 
 
-AGENT_BADGE_COLOR = {
-    "zcode": "#0078d4", "hermes": "#8764b8", "deepseek": "#0a7ea4",
-    "claude": "#c76a42", "codex": "#4a6b8a", "dsh": "#00a67e", "其他": "#666666",
-}
+# 徽章色统一走 tokens 单一来源（UI 重构·批次1 2026-10-10）：
+# 修正 dsh/claude 白字不达标色、补 workbuddy（原表缺失导致落灰）——详见 tokens.py 验算注释
+AGENT_BADGE_COLOR = tokens.AGENT_BADGE
 
 # 退出时未结束线程的全局引用（closeEvent 挂入）：切断 Qt 父子链后由它持住对象，
 # 进程经 os._exit 硬杀不触发析构——否则 "QThread: Destroyed while thread is still
@@ -250,17 +250,14 @@ def _display_title(r: dict) -> str:
     return t or "(无标题)"
 
 
-KIND_BADGE_COLOR = {
-    "lesson": "#c76a42", "fact": "#0078d4", "preference": "#8764b8",
-    "project": "#00a67e", "note": "#666666",
-}
+KIND_BADGE_COLOR = tokens.KIND_BADGE
 
 
 def kind_badge(kind: str) -> QLabel:
     """记忆类型徽章：唤起排行/置顶记忆的正文行用小字灰文本看不清，类型先入彩色徽章分层。"""
     lb = QLabel(brain.KIND_CN.get(kind, kind))
     lb.setStyleSheet(
-        f"color:white;background:{KIND_BADGE_COLOR.get(kind, '#8a8a8a')};"
+        f"color:white;background:{KIND_BADGE_COLOR.get(kind, tokens.BADGE_FALLBACK)};"
         "border-radius:8px;padding:1px 8px;font-size:11px;")
     lb.setFixedHeight(20)
     return lb
@@ -285,22 +282,19 @@ def badge(agent: str, raw: str) -> QLabel:
         text = AGENT_CN.get(a) or raw or a
     lb = QLabel(text)
     lb.setStyleSheet(
-        f"color:white;background:{AGENT_BADGE_COLOR.get(a, '#8a8a8a')};"
+        f"color:white;background:{AGENT_BADGE_COLOR.get(a, tokens.BADGE_FALLBACK)};"
         "border-radius:8px;padding:1px 8px;font-size:11px;")
     lb.setFixedHeight(20)
     return lb
 
 
-MOOD_COLOR = {  # 心情徽章配色（Daily_You 式元信息呈现，随记页用）
-    "兴奋": "#d13438", "笃定": "#107c10", "疑问": "#0078d4", "纠结": "#8764b8",
-    "灵感": "#ca5010", "低落": "#5d5a58", "平静": "#4a6b8a",
-}
+MOOD_COLOR = tokens.MOOD_BADGE  # 心情徽章配色（Daily_You 式元信息呈现，随记页用）
 
 
 def mood_badge(mood: str) -> QLabel:
     lb = QLabel(mood)
     lb.setStyleSheet(
-        f"color:white;background:{MOOD_COLOR.get(mood, '#8a8a8a')};"
+        f"color:white;background:{MOOD_COLOR.get(mood, tokens.BADGE_FALLBACK)};"
         "border-radius:8px;padding:1px 8px;font-size:11px;")
     lb.setFixedHeight(20)
     return lb
@@ -357,8 +351,8 @@ class MoodPicker(QWidget):
             b.setStyleSheet(f"color:white;background:{MOOD_COLOR[b.text()]};"
                             "border:none;border-radius:4px;padding:2px 10px;font-size:12px;")
         else:
-            b.setStyleSheet("color:#666;background:transparent;"
-                            "border:1px solid #c8c8c8;border-radius:4px;padding:2px 10px;font-size:12px;")
+            b.setStyleSheet(f"color:{tokens.C(tokens.TEXT_2)};background:transparent;"
+                            f"border:1px solid {tokens.C(tokens.STROKE)};border-radius:4px;padding:2px 10px;font-size:12px;")
 
     def _pick(self, m):
         # clicked 信号发出时 Qt 已翻转 checkable 按钮的选中态——直接读当前态，
@@ -440,7 +434,7 @@ class QuickNotePopup(QDialog):
         v.addLayout(h)
         self.input.textChanged.connect(
             lambda: self.saveBtn.setEnabled(bool(self.input.toPlainText().strip())))
-        self.setStyleSheet(f"QDialog{{background:{'#2b2b2b' if isDarkTheme() else '#f7f7f7'};}}")
+        self.setStyleSheet(f"QDialog{{background:{tokens.C(tokens.BG_L2)};}}")
 
     def eventFilter(self, obj, ev):
         if obj is self.input and ev.type() == QEvent.KeyPress:
@@ -519,7 +513,7 @@ class NewProjectDialog(MessageBoxBase):
     def _check(self):
         err = core.validate_project_name(self.edit.text().strip())
         self.hint.setText(err or "命名合法，可以创建")
-        self.hint.setStyleSheet("color:#d13438;" if err else "color:#107c10;")
+        self.hint.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};" if err else f"color:{tokens.C(tokens.SUCCESS)};")
         self.yesButton.setEnabled(not err)
 
     def name(self):
@@ -647,10 +641,10 @@ class ProjectPage(QWidget):
             head.addWidget(b)
         self.pathLabel = CaptionLabel("")
         self.issueLabel = BodyLabel("")
-        self.issueLabel.setStyleSheet("color:#d13438;")
+        self.issueLabel.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};")
 
         self.browser = TextBrowser()
-        self.browser.setHtml("<p style='color:#888'>左侧选择项目查看工作记录</p>")
+        self.browser.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>左侧选择项目查看工作记录</p>")
 
         file_col = QVBoxLayout()
         file_col.addWidget(CaptionLabel("项目文件总览（历史项目无 input/output 时按实际位置分组 · 双击打开所在位置）"))
@@ -725,7 +719,7 @@ class ProjectPage(QWidget):
         elif proj_scan and proj_scan.doc_path:
             self.browser.setHtml(md_to_html(core.read_text(Path(proj_scan.doc_path))))
         else:
-            self.browser.setHtml("<p style='color:#888'>大脑中无此项目记录，目录中也无可用主文档</p>")
+            self.browser.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>大脑中无此项目记录，目录中也无可用主文档</p>")
         self.fileList.clear()
         if proj_scan:
             for group, rp, fp in proj_scan.files:
@@ -1256,7 +1250,7 @@ class NotesPage(QWidget):
         cancelPick.clicked.connect(self._toggle_pick)
         pb.addWidget(cancelPick)
         self.pickBar.setVisible(False)
-        self.pickBar.setStyleSheet("background:rgba(0,103,192,0.06);border-radius:4px;")
+        self.pickBar.setStyleSheet(f"background:{tokens.C(tokens.ACCENT_SOFT)};border-radius:4px;")
         lay.addWidget(self.pickBar)
         self.tlBox = QVBoxLayout()
         self.tlBox.setContentsMargins(4, 12, 16, 24)
@@ -1332,7 +1326,7 @@ class NotesPage(QWidget):
             line = QHBoxLayout()
             line.setSpacing(8)
             lb = QLabel(kind)
-            lb.setStyleSheet("color:#fff;background:#8a8a8a;border-radius:8px;"
+            lb.setStyleSheet(f"color:#fff;background:{tokens.BADGE_FALLBACK};border-radius:8px;"
                              "padding:1px 8px;font-size:11px;")
             lb.setFixedHeight(20)
             line.addWidget(lb)
@@ -1440,8 +1434,8 @@ class NotesPage(QWidget):
             line.addWidget(mood_badge(n["mood"]))
         for t in (n.get("tags") or "").split():
             tg = ClickBodyLabel(f"#{t}")
-            tg.setStyleSheet("color:#0067c0;background:rgba(0,103,192,0.08);"
-                             "border-radius:8px;padding:1px 8px;font-size:11px;")
+            tg.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};background:{tokens.C(tokens.ACCENT_SOFT)};"
+                             f"border-radius:8px;padding:1px 8px;font-size:11px;")
             tg.setFixedHeight(20)
             tg.clicked.connect(lambda _, tt=t: self._filter_tag(tt))
             line.addWidget(tg)
@@ -1452,7 +1446,7 @@ class NotesPage(QWidget):
             except ValueError:
                 pass
         dig = ClickBodyLabel("深挖")
-        dig.setStyleSheet("color:#0067c0;font-size:11px;")
+        dig.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};font-size:11px;")
         dig.setToolTip("生成提示词：agent 会读这条随记并向你反问，把想法展开")
         dig.clicked.connect(lambda _, nid=n["id"]: self._dig(nid))
         line.addWidget(dig)
@@ -1463,7 +1457,7 @@ class NotesPage(QWidget):
         body_l = BodyLabel(n["content"])
         body_l.setWordWrap(True)
         if dim:
-            body_l.setStyleSheet("color:#999;")  # 未到期胶囊灰显（本体可见、检索隐藏）
+            body_l.setStyleSheet(f"color:{tokens.C(tokens.TEXT_3)};")  # 未到期胶囊灰显（本体可见、检索隐藏）
         line.addWidget(body_l, 1)
         wrap = QWidget()
         wrap.setLayout(line)
@@ -1474,12 +1468,12 @@ class NotesPage(QWidget):
             data = brain.notes_heatmap(root, days=len(self._heat_cells))
         except Exception:
             return
-        dim_gray = "rgba(255,255,255,0.12)" if isDarkTheme() else "rgba(128,128,128,0.18)"
+        dim_gray = tokens.C(tokens.STROKE)
         for cell, (d, cnt, mood) in zip(self._heat_cells, data):
             if cnt and mood:
-                color = MOOD_COLOR.get(mood, "#00a67e")
+                color = MOOD_COLOR.get(mood, tokens.C(tokens.SUCCESS))
             elif cnt:
-                color = "#00a67e"
+                color = tokens.C(tokens.SUCCESS)
             else:
                 color = dim_gray
             cell.setStyleSheet(f"background:{color};border-radius:1px;")
@@ -1568,7 +1562,16 @@ class StatsPage(QWidget):
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.win = win
-        lay = QVBoxLayout(self)
+        # 外层滚动（#2055 修复模式）：内容超高时滚动，永不压缩成重叠细条
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        _body = QWidget()
+        self.scroll.setWidget(_body)
+        outer.addWidget(self.scroll)
+        lay = QVBoxLayout(_body)
         lay.setContentsMargins(24, 24, 24, 24)
         # 健康读数：纯展示不包卡，大数字+小标题直接排版
         row = QHBoxLayout()
@@ -1821,7 +1824,7 @@ class SearchPage(QWidget):
 
     def _preview_html(self, kind, h):
         if kind in (None, "info"):
-            return "<p style='color:#888'>点选左侧条目查看详情</p>"
+            return f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选左侧条目查看详情</p>"
         if kind == "evfile":
             return md_to_html(f"**全盘文件（Everything 检索）**\n\n`{h}`")
         if kind == "record":
@@ -2102,7 +2105,16 @@ class OverviewPage(QWidget):
         self.win = win
         self.recent: list = []
         self.snap = None
-        lay = QVBoxLayout(self)
+        # 外层滚动（#2055 修复模式）：内容超高时滚动，永不压缩成重叠细条
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        _body = QWidget()
+        self.scroll.setWidget(_body)
+        outer.addWidget(self.scroll)
+        lay = QVBoxLayout(_body)
         lay.setContentsMargins(24, 24, 24, 24)
 
         head = QHBoxLayout()
@@ -2404,7 +2416,7 @@ class MarketPage(QWidget):
         m.addWidget(self.mcpList, 1)
         self.mcpPreview = TextBrowser()
         self.mcpPreview.setMaximumHeight(150)
-        self.mcpPreview.setHtml("<p style='color:#888'>点选上方条目查看配置片段</p>")
+        self.mcpPreview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选上方条目查看配置片段</p>")
         m.addWidget(self.mcpPreview)
         self.stack.addWidget(mp)
 
@@ -2502,8 +2514,8 @@ class MarketPage(QWidget):
             return
         name, desc, repo, cfg = self._mcp_entries[row]
         self.mcpPreview.setHtml(
-            f"<p><b>{name}</b> — {desc}</p><p style='color:#888'>仓库：{repo}</p>"
-            f"<pre style='background:#f5f5f5;padding:8px'>{html.escape(cfg)}</pre>")
+            f"<p><b>{name}</b> — {desc}</p><p style='color:{tokens.C(tokens.TEXT_3)}'>仓库：{repo}</p>"
+            f"<pre style='background:{tokens.C(tokens.BG_L2)};padding:8px'>{html.escape(cfg)}</pre>")
 
     def copy_mcp_config(self):
         row = self.mcpList.currentRow()
@@ -2646,7 +2658,7 @@ class HubPage(QWidget):
 
         self.preview = TextBrowser()
         self.preview.setMaximumHeight(240)
-        self.preview.setHtml("<p style='color:#888'>点击左侧列表项预览</p>")
+        self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点击左侧列表项预览</p>")
         lay.addWidget(self.preview)
 
         self._workers = []
@@ -2671,7 +2683,7 @@ class HubPage(QWidget):
         w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
         self._workers.append(w)
         w.start()
-        self.preview.setHtml("<p style='color:#888'>探测中…</p>")
+        self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>探测中…</p>")
 
     def _on_scan(self, result):
         if isinstance(result, Exception):
@@ -2688,7 +2700,7 @@ class HubPage(QWidget):
         self.fill_memories()
         self.fill_env()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
-        self.preview.setHtml("<p style='color:#888'>点选左侧技能 / MCP / 记忆查看详情，双击打开所在目录</p>")
+        self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选左侧技能 / MCP / 记忆查看详情，双击打开所在目录</p>")
         self.win.overview_page.set_agents(self.agents)
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
 
@@ -2825,7 +2837,7 @@ class HubPage(QWidget):
         self.cur_path = path
         self.cur_editable = False
         if not path:
-            self.preview.setHtml("<p style='color:#888'>无内容</p>")
+            self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>无内容</p>")
             return
         # 环境档案条目（data = env:category|key）
         if isinstance(path, str) and path.startswith("env:"):
@@ -2846,7 +2858,7 @@ class HubPage(QWidget):
             if m:
                 meta = f"类型 {brain.KIND_CN.get(m['kind'], m['kind'])} · 置顶{'是' if m['pinned'] else '否'}" \
                        f" · 标签 {m['tags'] or '无'} · {m['created']}"
-                self.preview.setHtml(f"<p style='color:#888'>{meta}</p>" + md_to_html(m["content"]))
+                self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>{meta}</p>" + md_to_html(m["content"]))
             return
         p = Path(path)
         if self.stack.currentIndex() == 1:  # MCP：只显示来源，不读内容（防密钥外泄到界面日志）
@@ -2861,7 +2873,7 @@ class HubPage(QWidget):
         if p.is_file():
             self.preview.setHtml(md_to_html(core.read_text(p, limit=200 * 1024)))
         else:
-            self.preview.setHtml("<p style='color:#888'>(文件尚不存在，编辑保存后创建)</p>")
+            self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>(文件尚不存在，编辑保存后创建)</p>")
             self.cur_editable = False
 
     def edit_current(self):
@@ -3242,8 +3254,35 @@ class SettingsPage(QWidget):
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.win = win
-        lay = QVBoxLayout(self)
+        # 外层滚动（#2055 修复模式）：内容超高时滚动，永不压缩成重叠细条
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        _body = QWidget()
+        self.scroll.setWidget(_body)
+        outer.addWidget(self.scroll)
+        lay = QVBoxLayout(_body)
         lay.setContentsMargins(24, 24, 24, 24)
+
+        c0 = CardWidget()
+        g0 = QVBoxLayout(c0)
+        g0.setContentsMargins(20, 16, 20, 16)
+        g0.addWidget(StrongBodyLabel("外观"))
+        themeRow = QHBoxLayout()
+        self._themeBtns = {}
+        for _m in tokens.THEME_MODES:
+            _b = PushButton(tokens.MODE_CN[_m])
+            _b.clicked.connect(lambda _, mm=_m: self._on_theme_pick(mm))
+            themeRow.addWidget(_b)
+            self._themeBtns[_m] = _b
+        themeRow.addStretch(1)
+        g0.addLayout(themeRow)
+        g0.addWidget(CaptionLabel("深色为默认（色值经 WCAG 对比度验算，全部达标）；"
+                                  "「跟随系统」会随 Windows 深浅色切换自动响应。"))
+        lay.addWidget(c0)
+        self._sync_theme_btns()
 
         c1 = CardWidget()
         g1 = QVBoxLayout(c1)
@@ -3306,6 +3345,23 @@ class SettingsPage(QWidget):
         pickBtn.clicked.connect(self.pick_root)
         self.initBtn.clicked.connect(self.init_struct)
         saveBtn.clicked.connect(self.save_rules)
+
+    def _sync_theme_btns(self):
+        """外观三键同步：当前主题键禁用（表达"已选中"），其余可点。"""
+        cur = tokens.load_theme_choice()
+        for _m, _b in self._themeBtns.items():
+            _b.setEnabled(_m != cur)
+            _b.setToolTip("当前主题" if _m == cur else f"切换到{tokens.MODE_CN[_m]}")
+
+    def _on_theme_pick(self, mode):
+        """外观切换（深/浅/跟随系统）：两段式应用（覆盖 qfw setTheme 短路）+ 持久化 + 全窗重刷。
+        重刷让 HTML 内联色（tokens.C 生成）随主题更新；qfw 组件由 setTheme 自动换肤。"""
+        tokens.apply_theme(mode)
+        tokens.save_theme_choice(mode)
+        self._sync_theme_btns()
+        InfoBar.success("外观已切换", f"主题：{tokens.MODE_CN.get(mode, mode)}",
+                        duration=1500, parent=self.win)
+        QTimer.singleShot(80, self.win.refresh)
 
     def showEvent(self, e):
         self.reload()
@@ -3713,9 +3769,13 @@ def _setup_app_font(app):
     return f
 
 
+_THEME_LISTENER = None  # 系统主题监听（auto 模式联动用；进程级保引用，防 GC 回收 QThread）
+
+
 def run_gui():
+    global _THEME_LISTENER
     _install_crash_hook()
-    setTheme(Theme.AUTO)
+    tokens.apply_theme(tokens.load_theme_choice())  # 主题：两段式应用（覆盖 qfw setTheme 短路）
     # 高分屏缩放策略要在 QApplication 之前设，故在此先调一次
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
@@ -3723,6 +3783,7 @@ def run_gui():
     _setup_app_font(app)
     w = AgentHubWindow()
     w.show()
+    _THEME_LISTENER = tokens.start_system_listener()  # 系统深浅切换联动（仅 auto 模式响应）
     _unreg = _register_note_hotkey(w)
     if _unreg:
         app.aboutToQuit.connect(_unreg)
