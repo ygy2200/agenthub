@@ -458,6 +458,36 @@ def t_search_score_and_todos(tmp):
     assert not any("wigolo" in t["todo"] for t in h["todos"])
 
 
+def t_time_range_parse(tmp):
+    """P0-2 时间语义解析：相对/绝对时间词 → 正确 [lo,hi] 区间；非时间查询 → None（fail-open）。"""
+    import datetime as _dt
+    today = _dt.date.today().isoformat()
+    # 相对：最近（默认 30 天）/ 最近N天 / 今天 / 昨天 / 本月 / 上个月 / 本周 / 上周
+    lo, hi = brain._parse_time_range("最近的踩坑记录")
+    assert lo < today <= hi and _dt.date.fromisoformat(lo) >= _dt.date.today() - _dt.timedelta(days=31), (lo, hi)
+    assert brain._parse_time_range("最近3天的改动") == (
+        (_dt.date.today() - _dt.timedelta(days=3)).isoformat(), today)
+    assert brain._parse_time_range("今天的事") == (today, today)
+    assert brain._parse_time_range("昨天的事") == (
+        (_dt.date.today() - _dt.timedelta(days=1)).isoformat(),) * 2
+    assert brain._parse_time_range("本月总结")[0].endswith("-01") and brain._parse_time_range("本月总结")[1] == today
+    # 绝对：X月初 / X月（阿拉伯与中文数字）
+    assert brain._parse_time_range("十月初的环境事实") == ("2026-10-01", "2026-10-10")
+    assert brain._parse_time_range("10月初的发布") == ("2026-10-01", "2026-10-10")
+    oct_full = brain._parse_time_range("十月部署记录")
+    assert oct_full[0] == "2026-10-01" and oct_full[1] == "2026-10-31"
+    # fail-open：非时间查询返回 None（绝不污染排序）
+    assert brain._parse_time_range("FlClash 配置") is None
+    assert brain._parse_time_range("检索准确率怎么提高") is None
+    # _time_boost 仅在落区间时加分；越界/空日期/无区间 → 0
+    in_range = {"created": "2026-10-05"}
+    out_range = {"created": "2026-01-05"}
+    assert brain._time_boost(in_range, ("2026-10-01", "2026-10-10")) == brain._TIME_BOOST
+    assert brain._time_boost(out_range, ("2026-10-01", "2026-10-10")) == 0.0
+    assert brain._time_boost({"created": ""}, ("2026-10-01", "2026-10-10")) == 0.0
+    assert brain._time_boost(in_range, None) == 0.0
+
+
 
 def t_env_profile(tmp):
     """环境档案：UPSERT/浏览过滤/自动采集幂等。"""
@@ -1753,6 +1783,7 @@ def main():
     case("批次A·记忆治理（取代链/双时相/证据链/置信度/latest-write-wins/治理统计）", lambda: t_batchA_memory_governance(tmp))
     case("批次B·问大脑D2（意图识别/证据出处/明确弃权/只读不计唤起/空库不崩）", lambda: t_batchB_ask(tmp))
     case("批次B·元认知D10（覆盖盲区/低置信/待复核决策/空库不崩/与治理统计一致）", lambda: t_batchB_metacognition(tmp))
+    case("P0-2 时间语义解析（相对/绝对时间词→区间/非时间查询None/fail-open/boost落区间）", lambda: t_time_range_parse(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

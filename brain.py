@@ -831,6 +831,7 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
     bm25_rows = _records_bm25_rank(root, kw, limit=100)
     if not like_rows and not bm25_rows:
         return []
+    trange = _parse_time_range(kw)                       # P0-2 时间语义：每查询解析一次
     scores: dict = {}
     channels: dict = {}
     for rank, r in enumerate(like_rows):
@@ -848,6 +849,10 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
         if b:
             r["_boost"] = b
             s += b
+        tb = _time_boost(r, trange)                       # P0-2 时间语义加法 boost
+        if tb:
+            r["_time_boost"] = tb
+            s += tb
         fused.append((s, mid, r))
     fused.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
@@ -1391,6 +1396,96 @@ _TOKEN_BOOST = 0.025      # 长查询词（≥3 字）在文档连续出现 → 
 _TOKEN_BOOST_LONG = 0.02  # 长标识符（≥6 字，如 external-controller / bilibili）额外加成（BM25 拆 bigram 易低估）
 _TITLE_BOOST = 0.02       # 任一查询词命中标题 → 中等信号
 _BOOST_CAP = 0.12         # 单条 boost 上限，避免子串匹配盖过 BM25 相关性
+_TIME_BOOST = 0.06         # P0-2 时间语义：查询含时间词且候选落在解析区间内 → 统一加法 boost（只重排、不引入新候选）
+
+_CN_MONTH = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5, "六": 6,
+             "七": 7, "八": 8, "九": 9, "十": 10, "十一": 11, "十二": 12}
+
+
+def _month_from_token(t: str) -> int | None:
+    t = (t or "").strip()
+    if t.isdigit():
+        v = int(t)
+        return v if 1 <= v <= 12 else None
+    return _CN_MONTH.get(t)
+
+
+def _parse_time_range(q: str) -> tuple[str, str] | None:
+    """P0-2 时间语义解析：把中文相对/绝对时间词转成 [lo, hi] 日期区间（YYYY-MM-DD）。
+    无时间词 → None（调用方不触发 boost，fail-open，零回归风险）。
+    支持：最近/近[N][天周月年]、今天、昨天、本周、上周、本月、上个月、X月初/X月。
+    口径：以今天为锚；未来月份（如 13 月）回退去年；月初=当月 1~10 日，整月=全月。
+    解析失败/畸形 → None（绝不抛异常、绝不返回错误区间污染排序）。"""
+    q = (q or "").strip()
+    if not q:
+        return None
+    today = datetime.date.today()
+    td = datetime.timedelta
+    # 最近/近（+ 可选 N + 单位），单位可省略（默认 30 天）
+    m = re.search(r"(最近|近)\s*(\d{1,3})?\s*(天|日|周|星期|月|年)?", q)
+    if m:
+        n = int(m.group(2)) if m.group(2) else 30
+        unit = m.group(3) or "天"
+        days = {"天": n, "日": n, "周": n * 7, "星期": n * 7,
+                "月": n * 30, "年": n * 365}[unit]
+        lo = (today - td(days=days)).isoformat()
+        return (lo, today.isoformat())
+    if re.search(r"今天|今日", q):
+        return (today.isoformat(), today.isoformat())
+    if re.search(r"昨天|昨日", q):
+        y = (today - td(days=1)).isoformat()
+        return (y, y)
+    if re.search(r"本(周|星期)|这(周|星期)", q):
+        mon = today - td(days=today.weekday())
+        return (mon.isoformat(), today.isoformat())
+    if re.search(r"上(周|星期)", q):
+        this_mon = today - td(days=today.weekday())
+        last_sun = this_mon - td(days=1)
+        last_mon = last_sun - td(days=6)
+        return (last_mon.isoformat(), last_sun.isoformat())
+    if re.search(r"本(月)|这个月", q):
+        first = today.replace(day=1)
+        return (first.isoformat(), today.isoformat())
+    if re.search(r"上(个)?月", q):
+        first_this = today.replace(day=1)
+        last_end = first_this - td(days=1)
+        last_start = last_end.replace(day=1)
+        return (last_start.isoformat(), last_end.isoformat())
+    # X月初 / X月（阿拉伯或中文数字）
+    m = re.search(r"(十[一二]?|[一二三四五六七八九]|[0-9]{1,2})\s*月(初)?", q)
+    if m:
+        mon = _month_from_token(m.group(1))
+        if mon:
+            year = today.year
+            if mon > today.month:
+                year -= 1
+            first = datetime.date(year, mon, 1)
+            if m.group(2):                       # 月初：当月 1~10 日
+                last = first + td(days=9)
+            else:                                # 整月
+                nxt = datetime.date(year + 1, 1, 1) if mon == 12 else datetime.date(year, mon + 1, 1)
+                last = nxt - td(days=1)
+            return (first.isoformat(), last.isoformat())
+    return None
+
+
+def _row_date(r: dict) -> str:
+    """候选行的日期锚：records 用 date 列；memories 用 created（均 YYYY-MM-DD 前缀）。"""
+    return (r.get("date") or r.get("created") or "")[:10]
+
+
+def _time_boost(r: dict, trange: tuple[str, str] | None) -> float:
+    """P0-2 时间语义加法 boost：仅当查询解析出时间区间、且候选日期落在区间内时加分。
+    只重排、不引入新候选；无区间或日期为空/越界 → 0（fail-open）。"""
+    if not trange:
+        return 0.0
+    d = _row_date(r)
+    if not d:
+        return 0.0
+    lo, hi = trange
+    if lo <= d <= hi:
+        return round(_TIME_BOOST, 4)
+    return 0.0
 
 
 def _phrase_boost(r: dict, kw: str) -> float:
@@ -1434,6 +1529,7 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
     bm25_rows = _bm25_rank(root, query, kind, limit=100)
     if not like_rows and not bm25_rows:
         return []
+    trange = _parse_time_range(query)                     # P0-2 时间语义：每查询解析一次
     scores: dict = {}
     channels: dict = {}
     for rank, r in enumerate(like_rows):
@@ -1453,6 +1549,10 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
         if b:
             r["_boost"] = b
             s += b
+        tb = _time_boost(r, trange)                       # P0-2 时间语义加法 boost
+        if tb:
+            r["_time_boost"] = tb
+            s += tb
         fused.append((s, mid, r))
     fused.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
