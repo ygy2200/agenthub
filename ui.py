@@ -14,15 +14,16 @@ import sys
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QAbstractNativeEventFilter
+from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QAbstractNativeEventFilter
 from PySide6.QtGui import (QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat,
                           QTextCursor, QIcon, QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
                                QDialog, QCheckBox)
-from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, ComboBox, FluentIcon as FIF,
-                            FluentWindow, InfoBar, LineEdit, ListWidget, MessageBoxBase,
+from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox,
+                            FluentIcon as FIF,
+                            FluentWindow, IconWidget, InfoBar, LineEdit, ListWidget, MessageBoxBase,
                             NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
                             ScrollArea, SearchLineEdit, SegmentedWidget, StrongBodyLabel,
                             SubtitleLabel, TextBrowser, TextEdit, TitleLabel, qconfig, setTheme,
@@ -32,6 +33,7 @@ import agentscore
 import brain
 import core
 import ops
+import palette
 import report
 import tokens
 
@@ -39,6 +41,74 @@ import tokens
 def ic(name, fallback="INFO"):
     """图标枚举兜底，防不同版本枚举名缺失导致崩。"""
     return getattr(FIF, name, getattr(FIF, fallback))
+
+
+def _page_head(title: str, desc: str = "") -> QWidget:
+    """统一页头（批次 3B 每页定位）：Title + 一句话说明。
+
+    定位语 = 这页回答什么问题（10-07 提案③）。
+    沿用 qfw 默认色（随主题自适应），不设硬编码。
+    """
+    box = QWidget()
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(2)
+    lay.addWidget(TitleLabel(title))
+    if desc:
+        d = CaptionLabel(desc)
+        d.setWordWrap(True)
+        lay.addWidget(d)
+    return box
+
+
+def empty_state(icon_name: str, title: str, desc: str = "",
+                action_text: str = "", action=None) -> QWidget:
+    """统一空态（批次 3C）：图标 + 标题 + 说明 + 可选动作（shadcn Empty 结构）。
+
+    三类空态文案分开写（学习报告一）：
+      首次空=教（说明+CTA）/ 清空空=确认 / 筛选空=恢复路径。
+    用 qfw 组件默认色，随主题自适应。
+    """
+    box = QWidget()
+    lay = QVBoxLayout(box)
+    lay.setContentsMargins(0, 20, 0, 12)
+    lay.setSpacing(4)
+    try:
+        iw = IconWidget(ic(icon_name), box)
+        iw.setFixedSize(26, 26)
+        lay.addWidget(iw, 0, Qt.AlignHCenter)
+    except Exception:  # noqa: BLE001 图标失败不阻断
+        pass
+    t = StrongBodyLabel(title, box)
+    t.setAlignment(Qt.AlignCenter)
+    lay.addWidget(t)
+    if desc:
+        d = CaptionLabel(desc, box)
+        d.setAlignment(Qt.AlignCenter)
+        d.setWordWrap(True)
+        lay.addWidget(d)
+    if action and action_text:
+        b = PushButton(action_text, box)
+        b.clicked.connect(action)
+        lay.addWidget(b, 0, Qt.AlignHCenter)
+    return box
+
+
+# 可定制导航项（3E+）：设置页勾选控制侧边栏显隐；总览/设置固定不可藏（隐藏页仍可 Ctrl+K 打开）
+NAV_CUSTOMIZABLE = ("项目", "时间线", "Agent 中心", "随记", "大脑",
+                    "流水·对账", "统计", "运营报告", "搜索", "接入", "帮助")
+
+
+def tight_rows(listw, h: int = 36):
+    """列表降噪（批次 3D）：行高统一 36px（Fallback 规格：数据列表行高 36px 级、行是线不是卡）。
+    在列表填充完成后调用；只收紧已有项，不干预后续 addItem。"""
+    try:
+        for i in range(listw.count()):
+            it = listw.item(i)
+            if it is not None and it.sizeHint().height() < h:
+                it.setSizeHint(QSize(0, h))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 # 徽章色统一走 tokens 单一来源（UI 重构·批次1 2026-10-10）：
@@ -615,8 +685,12 @@ class ProjectPage(QWidget):
         self.win = win
         self.snap = None
         self.current = None
-        root = QHBoxLayout(self)
-        root.setContentsMargins(24, 24, 24, 24)
+        _outer = QVBoxLayout(self)
+        _outer.setContentsMargins(24, 24, 24, 24)
+        _outer.setSpacing(12)
+        _outer.addWidget(_page_head("项目", "每个项目的进展与工作记录——左选右看；双击列表项打开目录"))
+        root = QHBoxLayout()
+        _outer.addLayout(root, 1)
 
         left = QVBoxLayout()
         self.filterEdit = SearchLineEdit()
@@ -695,6 +769,7 @@ class ProjectPage(QWidget):
                 n = p.get("n_records", 0)
                 self.listw.addItem(f"{p['name']}   ({n}条)")
         self.listw.blockSignals(False)
+        tight_rows(self.listw)
         if self.listw.count():
             self.listw.setCurrentRow(0)
 
@@ -815,8 +890,8 @@ class TimelinePage(QWidget):
         self.render_limit = 80  # 懒加载：每批渲染条数
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 0)
+        lay.addWidget(_page_head("时间线", "谁在什么时候干了什么——所有 agent 的最近动态"))
         top = QHBoxLayout()
-        top.addWidget(SubtitleLabel("跨项目时间线"))
         top.addStretch(1)
         top.addWidget(CaptionLabel("agent"))
         self.agentFilter = ComboBox()
@@ -940,9 +1015,9 @@ class TimelinePage(QWidget):
             self._cur_card_lay.addLayout(row)
         self.rendered += len(batch)
         if not entries:
-            tip = BodyLabel("暂无符合条件的记录")
-            tip.setAlignment(Qt.AlignCenter)
-            self.box.addWidget(tip)
+            self.box.addWidget(empty_state(
+                "SEARCH", "没有符合条件的记录",
+                "试试放宽筛选：切换 agent / 项目下拉，或清空过滤条件"))
             return
         # 尾部：加载更多按钮 + 统计说明（直接放 box，居中对齐，增量时先移除旧尾部）
         for tw in getattr(self, "_tail", []):
@@ -987,6 +1062,7 @@ class BrainPage(QWidget):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(24, 24, 24, 24)
+        lay.addWidget(_page_head("大脑", "公用记忆的运转状态——唤起排行 / 使用分布 / 待办看板 / 置顶记忆"))
         # 健康读数：纯展示不包卡（卡片语义留给可点区域），大数字+小标题直接排版
         row = QHBoxLayout()
         self.valMem, self.valCrys, self.valPush, self.valTodo = (TitleLabel("0") for _ in range(4))
@@ -1050,8 +1126,9 @@ class BrainPage(QWidget):
         for m in tops:
             self.topBox.addWidget(self._mem_row(f"#{m['id']} ×{m['use_count']}", m))
         if not tops:
-            self.topBox.addWidget(CaptionLabel(
-                "还没有记忆被唤起——agent 开工心跳（hub_heartbeat）时自动推送相关记忆，此处累计记数"))
+            self.topBox.addWidget(empty_state(
+                "HISTORY", "还没有记忆被唤起",
+                "agent 开工心跳（hub_heartbeat）时自动推送相关记忆，此处累计记数"))
 
         # 使用分布（验收①：searches 有跨 agent 真实数据）
         clear(self.useBox)
@@ -1069,7 +1146,9 @@ class BrainPage(QWidget):
             r.addWidget(BodyLabel(str(v)))
             self.useBox.addLayout(r)
         if not merged:
-            self.useBox.addWidget(CaptionLabel("暂无检索/推送记录"))
+            self.useBox.addWidget(empty_state(
+                "TILES", "暂无检索/推送记录",
+                "agent 主动检索或接收开工推送后，这里按家分布累计"))
 
         # 待办看板（验收③：欠账可见 + 勾销闭环）
         clear(self.todoBox)
@@ -1081,7 +1160,9 @@ class BrainPage(QWidget):
             r.addWidget(btn)
             self.todoBox.addLayout(r)
         if not h["todos"]:
-            self.todoBox.addWidget(CaptionLabel("暂无待办（从记录提取：后续/待验证/下一步…句式）"))
+            self.todoBox.addWidget(empty_state(
+                "ACCEPT", "暂无待办",
+                "从记录里自动提取「后续 / 待验证 / 下一步…」句式；在时间线勾销即闭环"))
 
         # 置顶记忆（验收④：置顶位工作知识占比）
         clear(self.pinBox)
@@ -1092,7 +1173,9 @@ class BrainPage(QWidget):
         for m in pins:
             self.pinBox.addWidget(self._mem_row(f"★ #{m['id']}", m))
         if not pins:
-            self.pinBox.addWidget(CaptionLabel("暂无置顶——agent 写记忆时可带 pinned=true 进置顶位"))
+            self.pinBox.addWidget(empty_state(
+                "PIN", "暂无置顶",
+                "agent 写记忆时可带 pinned=true 进置顶位——每次读记忆优先展示"))
 
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:
@@ -1536,12 +1619,12 @@ class NotesPage(QWidget):
         self.scroll.verticalScrollBar().setValue(0)
         clear_layout(self.tlBox)
         if not shown:
-            cap = CaptionLabel("还没有随记——在上面记第一条，或直接对任何 agent 说「记一下：…」")
-            cap.setAlignment(Qt.AlignCenter)
             wrap = QWidget()
             v = QVBoxLayout(wrap)
-            v.setContentsMargins(0, 24, 0, 0)
-            v.addWidget(cap)
+            v.setContentsMargins(0, 12, 0, 0)
+            v.addWidget(empty_state(
+                "EDIT", "还没有随记",
+                "在上面记第一条，或直接对任何 agent 说「记一下：…」"))
             self.tlBox.addWidget(wrap)
             return
         today = date.today().isoformat()
@@ -1577,6 +1660,7 @@ class StatsPage(QWidget):
         outer.addWidget(self.scroll)
         lay = QVBoxLayout(_body)
         lay.setContentsMargins(24, 24, 24, 24)
+        lay.addWidget(_page_head("统计", "数据全貌与大脑体检——项目 / 记录 / 对账 / 停滞 / 检索"))
         # 健康读数：纯展示不包卡，大数字+小标题直接排版
         row = QHBoxLayout()
         self.valProj, self.valRec, self.valIssue, self.valStalled, self.valSearch = \
@@ -1657,7 +1741,8 @@ class StatsPage(QWidget):
             row.addWidget(BodyLabel(str(n)))
             self.agentBox.addLayout(row)
         if not s.get("agent_counts"):
-            self.agentBox.addWidget(CaptionLabel("暂无数据"))
+            self.agentBox.addWidget(empty_state(
+                "PEOPLE", "暂无数据", "agent 写入工作记录后，这里按家分布"))
 
         clear(self.monthBox)
         months = sorted(s.get("monthly_counts", {}).items())[-6:]
@@ -1671,7 +1756,8 @@ class StatsPage(QWidget):
             row.addWidget(BodyLabel(str(n)))
             self.monthBox.addLayout(row)
         if not months:
-            self.monthBox.addWidget(CaptionLabel("暂无数据"))
+            self.monthBox.addWidget(empty_state(
+                "CALENDAR", "暂无数据", "记录产生后，这里显示近 6 个月活跃度"))
 
 
 class SearchPage(QWidget):
@@ -1682,6 +1768,7 @@ class SearchPage(QWidget):
         self.win = win
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
+        lay.addWidget(_page_head("搜索", "全脑检索 + 全盘文件——回车执行，双击打开"))
         top = QHBoxLayout()
         self.edit = SearchLineEdit()
         self.edit.setPlaceholderText("全脑检索：工作记录 / 记忆 / 文件名，回车执行…")
@@ -1811,7 +1898,8 @@ class SearchPage(QWidget):
                 self.result.addItem(f"[文件] {h['project']}\\{h['name']}")
                 self.view_hits.append((k, h))
         if not self.view_hits and self.hits and self.hits[0][0] != "info":
-            self.result.addItem(f"该分类下无结果（全部 {len(self.hits)} 条）")
+            self.result.addItem(f"该分类下无结果（全部 {len(self.hits)} 条）——切「全部」查看其他类型")
+        tight_rows(self.result)
 
     def _current(self):
         row = self.result.currentRow()
@@ -2038,6 +2126,8 @@ class JournalPage(QWidget):
                                + (f"  {str(e['note'])[:70]}" if e["note"] else ""))
         if not self.journal:
             self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
+        tight_rows(self.errList)
+        tight_rows(self.jList)
 
     def set_status(self, status):
         row = self.errList.currentRow()
@@ -2269,8 +2359,8 @@ class OverviewPage(QWidget):
             wrap.setLayout(row)
             self.recentBox.addWidget(wrap)
         if not self.recent:
-            tip = CaptionLabel("暂无记录")
-            self.recentBox.addWidget(tip)
+            self.recentBox.addWidget(empty_state(
+                "HISTORY", "暂无记录", "agent 记一笔工作后，最近动态出现在这里"))
 
     def set_agents(self, agents):
         while self.agentBox.count():
@@ -2292,282 +2382,12 @@ class OverviewPage(QWidget):
             if it.widget():
                 it.widget().deleteLater()
         if not sessions:
-            self.sessionBox.addWidget(CaptionLabel("（暂无——agent 开工调 hub_heartbeat 后显示）"))
+            self.sessionBox.addWidget(empty_state(
+                "PEOPLE", "暂无活跃会话", "agent 开工调 hub_heartbeat 后显示"))
             return
         for s in sessions[:6]:
             self.sessionBox.addWidget(CaptionLabel(
                 f"● {s.get('agent')} → {s.get('project') or '未指定'}  {s.get('note') or ''}"))
-
-
-# 知名 MCP 服务器目录（名称, 简介, 仓库, 标准配置片段；token/key 留占位由用户自填）
-MCP_CATALOG = [
-    ("fetch", "网页抓取：把网页转为 Markdown 供模型阅读", "modelcontextprotocol/servers",
-     '{"mcpServers": {"fetch": {"command": "uvx", "args": ["mcp-server-fetch"]}}}'),
-    ("filesystem", "受控文件系统读写（目录白名单制）", "modelcontextprotocol/servers",
-     '{"mcpServers": {"filesystem": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-filesystem", "C:/允许的目录"]}}}'),
-    ("memory", "知识图谱式长期记忆（跨会话保持）", "modelcontextprotocol/servers",
-     '{"mcpServers": {"memory": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-memory"]}}}'),
-    ("github", "GitHub 官方 API：仓库 / PR / Issue 全套", "modelcontextprotocol/servers",
-     '{"mcpServers": {"github": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-github"], '
-     '"env": {"GITHUB_PERSONAL_ACCESS_TOKEN": "<你的token>"}}}}'),
-    ("playwright", "浏览器自动化：截图 / 点击 / 表单 / 抓取", "microsoft/playwright-mcp",
-     '{"mcpServers": {"playwright": {"command": "npx", "args": ["-y", "@playwright/mcp@latest"]}}}'),
-    ("brave-search", "Brave 联网搜索", "modelcontextprotocol/servers",
-     '{"mcpServers": {"brave-search": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-brave-search"], '
-     '"env": {"BRAVE_API_KEY": "<你的key>"}}}}'),
-    ("sqlite", "SQLite 数据库直查", "modelcontextprotocol/servers",
-     '{"mcpServers": {"sqlite": {"command": "uvx", "args": ["mcp-server-sqlite", "--db-path", "D:/数据/库名.db"]}}}'),
-    ("sequential-thinking", "结构化分步推理（动态思考链）", "modelcontextprotocol/servers",
-     '{"mcpServers": {"sequential-thinking": {"command": "npx", '
-     '"args": ["-y", "@modelcontextprotocol/server-sequential-thinking"]}}}'),
-    ("tavily", "Tavily 联网搜索与网页抽取", "tavily-ai/tavily-mcp",
-     '{"mcpServers": {"tavily": {"command": "npx", "args": ["-y", "tavily-mcp@latest"], '
-     '"env": {"TAVILY_API_KEY": "<你的key>"}}}}'),
-    ("everything", "官方测试服务器：验证 MCP 接入是否连通", "modelcontextprotocol/servers",
-     '{"mcpServers": {"everything": {"command": "npx", "args": ["-y", "@modelcontextprotocol/server-everything"]}}}'),
-]
-
-
-class MarketPage(QWidget):
-    """能力市场：技能双源安装（本地缓存 / 官方实时 + identifier 直装）+ MCP 目录片段复制。"""
-
-    def __init__(self, win, parent=None):
-        super().__init__(parent)
-        self.win = win
-        self.agents: list = []
-        self.market_items: list = []
-        self._mcp_entries: list = []
-        self._market_dirs: list = []
-        self._workers = []
-        lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
-        top = QHBoxLayout()
-        top.addWidget(SubtitleLabel("能力市场"))
-        top.addStretch(1)
-        lay.addLayout(top)
-        lay.addWidget(CaptionLabel(
-            "技能：从索引源安装到任意 agent 技能库，或粘贴 identifier 直装任意 GitHub 仓库技能；"
-            "MCP：知名服务器目录，复制配置片段后自行粘贴到对应 agent 的 MCP 配置（本软件不自动写入，密钥不落库）。"))
-
-        self.seg = SegmentedWidget(self)
-        self.seg.addItem("skill", "技能市场")
-        self.seg.addItem("mcp", "MCP 目录")
-        self.seg.currentItemChanged.connect(
-            lambda key: self.stack.setCurrentIndex({"skill": 0, "mcp": 1}.get(key, 0)))
-        self.stack = QStackedWidget(self)
-        lay.addWidget(self.seg)
-        lay.addWidget(self.stack, 1)
-
-        # ---- 技能市场页
-        sk = QWidget()
-        g = QVBoxLayout(sk)
-        g.setContentsMargins(0, 8, 0, 0)
-        g.setSpacing(8)
-        row = QHBoxLayout()
-        row.addWidget(CaptionLabel("来源"))
-        self.srcCombo = ComboBox()
-        self.srcCombo.addItems(["本地缓存索引（anthropics/skills，离线）", "官方实时索引（GitHub，需网络）"])
-        self.srcCombo.setFixedWidth(300)
-        self.srcCombo.currentIndexChanged.connect(self.reload_market)
-        row.addWidget(self.srcCombo)
-        self.filterEdit = SearchLineEdit()
-        self.filterEdit.setPlaceholderText("过滤技能…")
-        self.filterEdit.setFixedWidth(220)
-        self.filterEdit.textChanged.connect(self.fill_market)
-        row.addWidget(self.filterEdit)
-        row.addStretch(1)
-        refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新索引")
-        refreshBtn.clicked.connect(self.reload_market)
-        row.addWidget(refreshBtn)
-        g.addLayout(row)
-
-        row2 = QHBoxLayout()
-        row2.addWidget(CaptionLabel("安装到"))
-        self.marketTargets = ComboBox()
-        self.marketTargets.setFixedWidth(250)
-        row2.addWidget(self.marketTargets)
-        installBtn = PrimaryPushButton(ic("DOWNLOAD", "INFO"), "安装选中技能")
-        installBtn.clicked.connect(self.install_selected)
-        row2.addWidget(installBtn)
-        self.idEdit = LineEdit()
-        self.idEdit.setPlaceholderText("或粘贴 identifier 直装：仓库/路径/技能名")
-        row2.addWidget(self.idEdit, 1)
-        idBtn = PushButton(ic("DOWNLOAD", "INFO"), "直装")
-        idBtn.clicked.connect(self.install_identifier)
-        row2.addWidget(idBtn)
-        g.addLayout(row2)
-
-        self.marketList = ListWidget()
-        g.addWidget(self.marketList, 1)
-        self.stack.addWidget(sk)
-
-        # ---- MCP 目录页
-        mp = QWidget()
-        m = QVBoxLayout(mp)
-        m.setContentsMargins(0, 8, 0, 0)
-        m.setSpacing(8)
-        mrow = QHBoxLayout()
-        self.mcpFilter = SearchLineEdit()
-        self.mcpFilter.setPlaceholderText("过滤 MCP…")
-        self.mcpFilter.setFixedWidth(220)
-        self.mcpFilter.textChanged.connect(self.fill_mcp_catalog)
-        mrow.addWidget(self.mcpFilter)
-        mrow.addStretch(1)
-        copyBtn = PushButton(ic("COPY", "INFO"), "复制配置片段")
-        copyBtn.clicked.connect(self.copy_mcp_config)
-        mrow.addWidget(copyBtn)
-        m.addLayout(mrow)
-        self.mcpList = ListWidget()
-        m.addWidget(self.mcpList, 1)
-        self.mcpPreview = TextBrowser()
-        self.mcpPreview.setMaximumHeight(150)
-        self.mcpPreview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选上方条目查看配置片段</p>")
-        m.addWidget(self.mcpPreview)
-        self.stack.addWidget(mp)
-
-        self.marketList.itemClicked.connect(self.preview_market)
-        self.mcpList.itemClicked.connect(self.preview_mcp)
-        self.fill_mcp_catalog()
-        QTimer.singleShot(300, self.reload_market)
-
-    # ---- 数据
-    def set_agents(self, agents):
-        """由 Agent 中心探测完成后同步（复用探测结果，不重复扫描）。"""
-        self.agents = agents
-        self._fill_targets()
-
-    def _fill_targets(self):
-        cur = self.marketTargets.currentData()
-        self.marketTargets.clear()
-        self._market_dirs = [
-            ("ZCode 技能库", Path.home() / ".agents" / "skills"),
-            ("Claude 技能库", Path.home() / ".claude" / "skills"),
-        ]
-        for a in self.agents:
-            if a.name == "hermes" and a.home:
-                self._market_dirs.append(("hermes bundled-skills", Path(a.home) / "bundled-skills"))
-        for label, d in self._market_dirs:
-            self.marketTargets.addItem(f"安装到：{label}", str(d))
-        if cur:
-            i = self.marketTargets.findData(cur)
-            if i >= 0:
-                self.marketTargets.setCurrentIndex(i)
-
-    def reload_market(self):
-        self.marketList.clear()
-        self.marketList.addItem("（加载索引中…）")
-        src = self.srcCombo.currentIndex()
-        w = FnWorker(lambda: agentscore.load_local_market() if src == 0
-                     else agentscore.fetch_remote_skills(), self)
-        w.done.connect(self._on_market_loaded)
-        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
-        self._workers.append(w)
-        w.start()
-
-    def _on_market_loaded(self, result):
-        self.marketList.clear()
-        if isinstance(result, Exception):
-            self.marketList.addItem(f"（索引加载失败：{result}）")
-            return
-        self.market_items = result
-        self.fill_market()
-
-    def fill_market(self):
-        kw = self.filterEdit.text().strip().lower()
-        self.marketList.clear()
-        for mitem in self.market_items:
-            if kw and kw not in mitem["name"].lower() and kw not in mitem["desc"].lower():
-                continue
-            self.marketList.addItem(f"{mitem['name']}  ——  {mitem['desc'][:80]}")
-            self.marketList.item(self.marketList.count() - 1).setData(
-                Qt.UserRole, mitem["identifier"])
-        if not self.marketList.count():
-            self.marketList.addItem("（无匹配技能）")
-
-    def fill_mcp_catalog(self):
-        kw = self.mcpFilter.text().strip().lower()
-        self.mcpList.clear()
-        self._mcp_entries = []
-        for entry in MCP_CATALOG:
-            name, desc = entry[0], entry[1]
-            if kw and kw not in name.lower() and kw not in desc.lower():
-                continue
-            self.mcpList.addItem(f"{name}  ——  {desc}")
-            self._mcp_entries.append(entry)
-        if not self.mcpList.count():
-            self.mcpList.addItem("（无匹配）")
-
-    # ---- 交互
-    def preview_market(self, item):
-        row = self.marketList.currentRow()
-        if not (0 <= row < len(self.market_items)):
-            return
-        mitem = self.market_items[row]
-        if mitem["desc"] and mitem["desc"] != "（点选预览详情）":
-            return  # 本地缓存源已带描述
-        item.setText(f"{mitem['name']}  ——  详情加载中…")
-        w = FnWorker(lambda: agentscore.fetch_skill_desc(mitem["identifier"]), self)
-        w.done.connect(lambda d, it=item, mi=mitem: it.setText(
-            f"{mi['name']}  ——  {(str(d) if d and not isinstance(d, Exception) else '（暂无详情）')[:80]}"))
-        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
-        self._workers.append(w)
-        w.start()
-
-    def preview_mcp(self, item):
-        row = self.mcpList.currentRow()
-        if not (0 <= row < len(self._mcp_entries)):
-            return
-        name, desc, repo, cfg = self._mcp_entries[row]
-        self.mcpPreview.setHtml(
-            f"<p><b>{name}</b> — {desc}</p><p style='color:{tokens.C(tokens.TEXT_3)}'>仓库：{repo}</p>"
-            f"<pre style='background:{tokens.C(tokens.BG_L2)};padding:8px'>{html.escape(cfg)}</pre>")
-
-    def copy_mcp_config(self):
-        row = self.mcpList.currentRow()
-        if not (0 <= row < len(self._mcp_entries)):
-            InfoBar.warning("先选择一个 MCP 服务器", "", duration=2000, parent=self.win)
-            return
-        QApplication.clipboard().setText(self._mcp_entries[row][3])
-        InfoBar.success("配置片段已复制", "粘贴到对应 agent 的 MCP 配置文件（本软件不自动写入）",
-                        duration=3000, parent=self.win)
-
-    def install_selected(self):
-        row = self.marketList.currentRow()
-        if row < 0 or row >= len(self.market_items):
-            InfoBar.warning("先在列表中选择一个技能", "", duration=2000, parent=self.win)
-            return
-        mitem = self.market_items[row]
-        self._install(mitem["name"], mitem["identifier"])
-
-    def install_identifier(self):
-        ident = self.idEdit.text().strip().strip("/")
-        if not ident:
-            InfoBar.warning("先粘贴技能 identifier", "", duration=2000, parent=self.win)
-            return
-        if ident.count("/") < 3:
-            InfoBar.warning("格式应为：仓库拥有者/仓库名/路径/技能名", "", duration=3000, parent=self.win)
-            return
-        self._install(ident.split("/")[-1], ident)
-
-    def _install(self, name: str, identifier: str):
-        target = self.marketTargets.currentData()
-        if not target:
-            return
-        InfoBar.info("开始安装", f"{name}（需网络/代理）", duration=2500, parent=self.win)
-        w = FnWorker(lambda: agentscore.install_skill(identifier, target), self)
-        w.done.connect(self._on_installed)
-        w.finished.connect(lambda: self._workers.remove(w) if w in self._workers else None)
-        self._workers.append(w)
-        w.start()
-
-    def _on_installed(self, result):
-        text = str(result)
-        if text.startswith("已安装"):
-            InfoBar.success("安装完成", text, duration=4000, parent=self.win)
-            if getattr(self.win, "hub_page", None):
-                self.win.hub_page.rescan()
-        else:
-            InfoBar.error("安装失败", text[:120], duration=6000, parent=self.win)
 
 
 class HubPage(QWidget):
@@ -2584,7 +2404,7 @@ class HubPage(QWidget):
         lay.setContentsMargins(24, 24, 24, 24)
 
         top = QHBoxLayout()
-        top.addWidget(SubtitleLabel("Agent 中心"))
+        top.addWidget(TitleLabel("Agent 中心"))
         top.addStretch(1)
         addBtn = PushButton(ic("ADD", "INFO"), "添加 agent 目录")
         addBtn.clicked.connect(self.add_agent)
@@ -2990,7 +2810,7 @@ class ConnectPage(QWidget):
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
         top = QHBoxLayout()
-        top.addWidget(SubtitleLabel("接入中心 · 公用大脑"))
+        top.addWidget(TitleLabel("接入中心 · 公用大脑"))
         top.addStretch(1)
         refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新状态")
         refreshBtn.clicked.connect(self.refresh_status)
@@ -3185,6 +3005,7 @@ class ReportPage(QWidget):
         for p in sorted(d.glob("反馈报告-*.html"), reverse=True):
             self.histList.addItem(p.stem)  # 既有模式：addItem(str) 后按行号 setData
             self.histList.item(self.histList.count() - 1).setData(Qt.UserRole, str(p))
+        tight_rows(self.histList)
 
     def generate(self):
         if not self.win.root:
@@ -3228,6 +3049,13 @@ class HelpPage(QWidget):
     <li><b>接入</b>：一键写 MCP 配置 + 注入开工引导到 agent 全局指令文件（均自动备份、可移除）；hermes 等复制配置片段手动粘贴。</li>
     <li><b>对账</b>：揪出 agent 前缀平行目录、重复项目、野目录，杜绝记录分裂。</li>
     </ul>
+    <h2>键盘快捷键</h2>
+    <ul>
+    <li><b>Ctrl+K</b>：命令面板——搜 页面/动作/项目，↑↓ 选择、Enter 执行、Esc 关闭（核心入口）。</li>
+    <li><b>Ctrl+1..9</b>：直达 总览 / 项目 / 时间线 / Agent 中心 / 随记 / 大脑 / 流水·对账 / 统计 / 搜索。</li>
+    <li><b>F5</b>：刷新扫描；<b>Ctrl+F</b>：直达搜索页。</li>
+    <li><b>Ctrl+Alt+N</b>：全局随手记（任何软件里呼出小窗）；<b>Ctrl+Return</b>：随记输入框内快速保存。</li>
+    </ul>
     <h2>agent 怎么接入公用大脑（两步）</h2>
     <p>1. 到「接入」页对某个 agent 点「一键接入」+「注入引导」（ZCode / Claude Code / Codex / DSH 支持）；<br>
     2. 重启对应 agent——它每次开工就会自动读进度和记忆、干完活自动写记录、出错自动登记，无需口头提醒。</p>
@@ -3249,7 +3077,7 @@ class HelpPage(QWidget):
         self.win = win
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
-        lay.addWidget(SubtitleLabel("帮助"))
+        lay.addWidget(_page_head("帮助", "使用说明与快捷键一览"))
         browser = TextBrowser()
         browser.setHtml(self.CONTENT)
         browser.setOpenExternalLinks(False)
@@ -3272,6 +3100,8 @@ class SettingsPage(QWidget):
         outer.addWidget(self.scroll)
         lay = QVBoxLayout(_body)
         lay.setContentsMargins(24, 24, 24, 24)
+        lay.addWidget(_page_head("设置", "根目录 / 数据库 / 规则 / 外观 / 导航"))
+        lay.addSpacing(4)
 
         c0 = CardWidget()
         g0 = QVBoxLayout(c0)
@@ -3290,6 +3120,25 @@ class SettingsPage(QWidget):
                                   "「跟随系统」会随 Windows 深浅色切换自动响应。"))
         lay.addWidget(c0)
         self._sync_theme_btns()
+
+        # 导航显示定制（3E+，Cherry Studio 式）：不重排不删除，用户自行收敛侧边栏
+        cN = CardWidget()
+        gN = QVBoxLayout(cN)
+        gN.setContentsMargins(20, 16, 20, 16)
+        gN.addWidget(StrongBodyLabel("导航显示"))
+        gN.addWidget(CaptionLabel(
+            "取消勾选的页面从侧边栏收起（总览/设置固定显示）；隐藏的页面仍可用 Ctrl+K 命令面板或 Ctrl+数字 打开；重启后生效。"))
+        self._navChecks = {}
+        _hiddenNow = set(core.load_config().get("nav_hidden", []) or [])
+        for _nm in NAV_CUSTOMIZABLE:
+            _cb = CheckBox(_nm)
+            _cb.setChecked(_nm not in _hiddenNow)
+            self._navChecks[_nm] = _cb
+            gN.addWidget(_cb)
+        _saveNav = PushButton(ic("SAVE", "INFO"), "保存导航设置")
+        _saveNav.clicked.connect(self._save_nav)
+        gN.addWidget(_saveNav)
+        lay.addWidget(cN)
 
         c1 = CardWidget()
         g1 = QVBoxLayout(c1)
@@ -3352,6 +3201,16 @@ class SettingsPage(QWidget):
         pickBtn.clicked.connect(self.pick_root)
         self.initBtn.clicked.connect(self.init_struct)
         saveBtn.clicked.connect(self.save_rules)
+
+    def _save_nav(self):
+        """保存导航显隐（3E+，重启生效；隐藏页仍可用 Ctrl+K / Ctrl+数字 打开）。"""
+        hidden = [nm for nm, cb in self._navChecks.items() if not cb.isChecked()]
+        cfg = core.load_config()
+        cfg["nav_hidden"] = hidden
+        core.save_config(cfg)
+        InfoBar.success("导航设置已保存",
+                        "重启 AgentHub 后生效；隐藏的页面仍可用 Ctrl+K 命令面板打开",
+                        duration=3500, parent=self.win)
 
     def _sync_theme_btns(self):
         """外观三键同步：当前主题键禁用（表达"已选中"），其余可点。"""
@@ -3453,8 +3312,21 @@ class AgentHubWindow(FluentWindow):
 
         # Fluent 导航规范：主区只放"地方"，按语义分组（工作区/数据），配置与帮助类沉底，
         # 避免 11 项平铺扫视困难（2026-10-01 参照官方示例与 MS NavigationView 指南重整）
-        self.overview_page.setObjectName("总览")
-        self.addSubInterface(self.overview_page, ic("HOME"), "总览")
+        # 3E+ 导航定制（Cherry Studio 式）：config.nav_hidden 里的页面不入导航，但仍进
+        # stackedWidget——Ctrl+K 命令面板 / Ctrl+数字 依然可达（启动台语义）。
+        _hidden_at_boot = set(core.load_config().get("nav_hidden", []) or [])
+
+        def _add(page, icon, text, pos=None):
+            page.setObjectName(text)
+            if text in _hidden_at_boot:
+                self.stackedWidget.addWidget(page)
+                return
+            if pos is None:
+                self.addSubInterface(page, ic(icon), text)
+            else:
+                self.addSubInterface(page, ic(icon), text, pos)
+
+        _add(self.overview_page, "HOME", "总览")
 
         self.navigationInterface.addItemHeader("工作区")
         for w, icon, text in (
@@ -3462,8 +3334,7 @@ class AgentHubWindow(FluentWindow):
             (self.timeline_page, "HISTORY", "时间线"),
             (self.hub_page, "PEOPLE", "Agent 中心"),
         ):
-            w.setObjectName(text)
-            self.addSubInterface(w, ic(icon), text)
+            _add(w, icon, text)
 
         self.navigationInterface.addItemHeader("数据")
         for w, icon, text in (
@@ -3474,16 +3345,14 @@ class AgentHubWindow(FluentWindow):
             (self.report_page, "REPORT", "运营报告"),
             (self.search_page, "SEARCH", "搜索"),
         ):
-            w.setObjectName(text)
-            self.addSubInterface(w, ic(icon), text)
+            _add(w, icon, text)
 
         for w, icon, text in (
             (self.connect_page, "LINK", "接入"),
             (self.help_page, "INFO", "帮助"),
             (self.settings_page, "SETTING", "设置"),
         ):
-            w.setObjectName(text)
-            self.addSubInterface(w, ic(icon), text, NavigationItemPosition.BOTTOM)
+            _add(w, icon, text, NavigationItemPosition.BOTTOM)
 
         self._narrow_nav()
         # 内容区不透明底色（防"浅色主题透深色壁纸 Mica"错配，2026-10-10 实测像素级定位）：
@@ -3514,6 +3383,17 @@ class AgentHubWindow(FluentWindow):
         f5.activated.connect(self.refresh)
         cf = QShortcut(QKeySequence("Ctrl+F"), self)
         cf.activated.connect(self.goto_search)
+        # 命令面板（Ctrl+K）+ 页面直达（Ctrl+1..9）——批次 3E 快捷键体系（对齐课表已验收方案）
+        self._palette = palette.CommandPalette(self)
+        ck = QShortcut(QKeySequence("Ctrl+K"), self)
+        ck.activated.connect(self._palette.popup)
+        for _i, _attr in enumerate(
+                ("overview_page", "project_page", "timeline_page", "hub_page",
+                 "notes_page", "brain_page", "ledger_page", "stats_page",
+                 "search_page"), start=1):
+            _sc = QShortcut(QKeySequence(f"Ctrl+{_i}"), self)
+            _sc.activated.connect(
+                lambda a=_attr: self.switchTo(getattr(self, a)))
         self._workers = getattr(self, "_workers", [])  # 迁移线程已在 __init__ 挂入
         QTimer.singleShot(200, self.refresh)
         # 开机自检（大脑自己跑，agent 不参与）：启动 5 分钟后后台跑一次 env 环境预检落流水。
