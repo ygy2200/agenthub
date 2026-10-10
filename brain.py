@@ -844,6 +844,10 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
     for mid, s in scores.items():
         r = dict(by_id[mid])
         r["_channels"] = channels[mid]
+        b = _phrase_boost(r, kw)                          # P0-1 精确短语/标题加法 boost
+        if b:
+            r["_boost"] = b
+            s += b
         fused.append((s, mid, r))
     fused.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
@@ -1381,6 +1385,43 @@ def _recency_of(r: dict, now: datetime.datetime) -> float:
     return math.exp(-DECAY_PARAMS["lam"] * days)
 
 
+# P0-1 检索强化：连续子串命中 boost（fail-open；量级经 tools/eval_search.py 标定）
+_PHRASE_BOOST = 0.04      # 整串查询连续出现（CJK 直接子串；拉丁词序敏感）→ 短词查询精准信号
+_TOKEN_BOOST = 0.025      # 长查询词（≥3 字）在文档连续出现 → 弱相关信号
+_TOKEN_BOOST_LONG = 0.02  # 长标识符（≥6 字，如 external-controller / bilibili）额外加成（BM25 拆 bigram 易低估）
+_TITLE_BOOST = 0.02       # 任一查询词命中标题 → 中等信号
+_BOOST_CAP = 0.12         # 单条 boost 上限，避免子串匹配盖过 BM25 相关性
+
+
+def _phrase_boost(r: dict, kw: str) -> float:
+    """融合后加法 boost（两路融合共用）：
+    ① 整串查询折叠空白后连续命中（CJK 直接子串；拉丁词序敏感）——短词查询的精准信号，治「ui 配色」
+       这类连写即相关的查询；② 长查询词（≥3 字）逐词连续命中——专治 BM25 把长拉丁标识符拆 bigram
+       后低估的命中（external-controller / bilibili），短高频词（ui/配色）不触发以免噪声。
+    仅加分、不扣分；零命中面不改动排序。空白折叠兼容「UI配色」vs「ui 配色」空格差异。
+    记忆表无 title 列，标题 boost 仅对 records 生效。"""
+    q = (kw or "").strip().lower()
+    if not q:
+        return 0.0
+    blob = " ".join([r.get("title") or "", r.get("content") or "",
+                     r.get("tags") or "", r.get("project") or ""]).lower()
+    blobc = re.sub(r"\s+", "", blob)
+    words = [re.sub(r"\s+", "", w) for w in re.split(r"\s+", q) if w]
+    boost = 0.0
+    qc = re.sub(r"\s+", "", q)
+    if qc and qc in blobc:                       # ① 整串短语
+        boost += _PHRASE_BOOST
+    for w in words:
+        if len(w) < 3:                           # ② 仅长词，短高频词不触发
+            continue
+        if w in blobc:
+            boost += _TOKEN_BOOST + (_TOKEN_BOOST_LONG if len(w) >= 6 else 0.0)
+    title = (r.get("title") or "").lower()
+    if any(w and w in title for w in words):
+        boost += _TITLE_BOOST
+    return round(min(boost, _BOOST_CAP), 4)
+
+
 def _memories_search_fused(root: str, query: str, words: list, kind: str, limit: int) -> list:
     """P4.3 双路融合：LIKE/计分路（_memories_query）+ BM25 路（_bm25_rank）各自 rank →
     RRF(f)=Σ1/(k+rank) 融合（rank 天然免归一化，这是选 RRF 的理由）。
@@ -1408,6 +1449,10 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
         r = dict(by_id[mid])
         r["_channels"] = channels[mid]
         s *= 1.0 + _RRF_W_RECENCY * _recency_of(r, now)  # P4.4：融合分 recency 加成
+        b = _phrase_boost(r, query)                       # P0-1 精确短语/标题加法 boost
+        if b:
+            r["_boost"] = b
+            s += b
         fused.append((s, mid, r))
     fused.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
