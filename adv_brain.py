@@ -488,6 +488,26 @@ def t_time_range_parse(tmp):
     assert brain._time_boost(in_range, None) == 0.0
 
 
+def t_emb_local_first(tmp):
+    """P0-3 加固：模型缓存已存在时必须纯本地加载成功（防 HF 联网重试风暴 → 语义路静默报废）。
+    2026-10-11 线上实测：无代理时默认联网加载重试 ~5 分钟（304s）后失败；而 fail-open 会把它
+    变成"语义第三路永不生效"，四套回归全绿照样绿（全部被 offline 环境变量掩盖）——所以本用例
+    跑的是默认环境（不设 HF_HUB_OFFLINE），测的正是生产路径。"""
+    import os as _os
+    import time as _t
+    if not brain._HAS_ST:
+        return  # 未装依赖：语义路本就降级，跳过
+    cache = _os.path.join(_os.path.expanduser("~"), ".cache", "huggingface", "hub",
+                          "models--BAAI--bge-small-zh-v1.5")
+    if not _os.path.isdir(cache):
+        return  # 本机无缓存：走联网首装路径，不在此测
+    t0 = _t.time()
+    ok = brain._ensure_emb()
+    dt = _t.time() - t0
+    assert ok, "缓存已存在但语义模型加载失败（语义路会静默降级）"
+    assert dt < 120, f"加载耗时 {dt:.0f}s，疑似未走 local_files_only（联网重试风暴）"
+
+
 
 def t_env_profile(tmp):
     """环境档案：UPSERT/浏览过滤/自动采集幂等。"""
@@ -1784,6 +1804,7 @@ def main():
     case("批次B·问大脑D2（意图识别/证据出处/明确弃权/只读不计唤起/空库不崩）", lambda: t_batchB_ask(tmp))
     case("批次B·元认知D10（覆盖盲区/低置信/待复核决策/空库不崩/与治理统计一致）", lambda: t_batchB_metacognition(tmp))
     case("P0-2 时间语义解析（相对/绝对时间词→区间/非时间查询None/fail-open/boost落区间）", lambda: t_time_range_parse(tmp))
+    case("P0-3 语义模型本地优先加载（缓存存在→纯本地加载/防联网重试风暴）", lambda: t_emb_local_first(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

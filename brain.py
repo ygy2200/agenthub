@@ -16,6 +16,7 @@ import math
 import os
 import re
 import sqlite3
+import sys
 import threading
 from collections import Counter
 from contextlib import contextmanager
@@ -1582,14 +1583,25 @@ def _ensure_emb() -> bool:
             _EMB_READY = False
             return False
         try:
-            _EMB = SentenceTransformer(_EMB_MODEL_NAME)
+            try:
+                # 本地缓存优先（2026-10-11 线上实测教训）：网络不可达且代理关闭时，HF 联网检查
+                # 会重试 ~5 分钟（实测 304s）最终失败 → fail-open 变成"语义路永久静默报废"。
+                # 缓存已在 → local_files_only 纯本地秒载；缓存缺失 → 抛错后走联网下载（首次装配）。
+                _EMB = SentenceTransformer(_EMB_MODEL_NAME, local_files_only=True)
+            except Exception:
+                _EMB = SentenceTransformer(_EMB_MODEL_NAME)
             try:
                 _EMB_DIM = _EMB.get_embedding_dimension()
             except Exception:
                 _EMB_DIM = _EMB.get_sentence_embedding_dimension()
             _EMB_READY = True
-        except Exception:
+        except Exception as _exc:  # noqa: BLE001
             _EMB_READY = False
+            try:  # 失败必须留痕：否则语义路静默降级，没人知道检索少了一路
+                print(f"[agenthub] 语义模型加载失败，检索降级为词法两路：{_exc!r}",
+                      file=sys.stderr, flush=True)
+            except Exception:
+                pass
         return _EMB_READY
 
 
