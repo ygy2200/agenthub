@@ -90,6 +90,9 @@ class ConnectPage(QWidget):
             col = QVBoxLayout()
             mcp_txt = "—（用下方配置片段手动接入）" if r["mcp"] is None else \
                 ("✓ 已接入公用大脑" if r["mcp"] else "○ 未接入")
+            prof = r.get("profile", "")
+            if prof and r["mcp"]:
+                mcp_txt += f"（工具面 {prof}）"
             boot_on = core.bootstrap_status(r["boot_path"])
             col.addWidget(StrongBodyLabel(r["agent"]))
             col.addWidget(CaptionLabel(f"MCP：{mcp_txt}      引导规则：{'✓ 已注入' if boot_on else '○ 未注入'}"))
@@ -105,7 +108,7 @@ class ConnectPage(QWidget):
                 else:
                     btn = PrimaryPushButton(ic("LINK", "INFO"), "一键接入")
                     btn.setEnabled(bool(py and server))
-                    btn.clicked.connect(lambda _, p=r["path"], l=r["layout"], ag=r["agent"]: self.do_connect(p, l, ag))
+                    btn.clicked.connect(lambda _, p=r["path"], l=r["layout"], ag=r["agent"], pf=r.get("profile", ""): self.do_connect(p, l, ag, pf))
                     g.addWidget(btn)
             if boot_on:
                 rb = PushButton("移除引导")
@@ -117,13 +120,15 @@ class ConnectPage(QWidget):
                 g.addWidget(ib)
             self.rows.addWidget(card)
 
-    def do_connect(self, path, layout, agent=""):
+    def do_connect(self, path, layout, agent="", profile=""):
         py, server, _ = self._rows_data()
         if not py or not server:
             InfoBar.error("无法接入", "python 或服务端未就绪", duration=3000, parent=self.win)
             return
         # agent 名写进启动参数（B1）：server 据此锁定身份，忽略工具调用里的自报值
-        err = core.install_mcp_entry(path, layout, py, server, self.win.root, agent=agent)
+        # profile（P3-1）：来自 adapter 配置（config.agents.json），重装时保持工具面切片
+        err = core.install_mcp_entry(path, layout, py, server, self.win.root, agent=agent,
+                                     profile=profile)
         if err:
             InfoBar.error("接入失败", err, duration=5000, parent=self.win)
         else:

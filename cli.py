@@ -67,7 +67,8 @@ def cmd_onboard(root: str, agent: str) -> int:
     if spec:
         path, fmt, _kp = spec
         err = core.install_mcp_entry(path, (a.get("mcp") or {}).get("layout", ""), py, server, root,
-                                     agent=a.get("agent", ""))
+                                     agent=a.get("agent", ""),
+                                     profile=(a.get("mcp") or {}).get("profile", ""))
         if err:
             print(f"  ✗ MCP 写入失败：{err}")
         else:

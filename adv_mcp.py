@@ -435,6 +435,21 @@ def t_mcp_access(tmp):
     f4 = Path(tmp) / "again.json"
     assert core.install_mcp_entry(str(f4), "standard", py, srv, root) == ""
     assert core.install_mcp_entry(str(f4), "standard", py, srv, root) == ""
+    # P3-1 profile（2026-10-11）：--profile 写进启动参数；重装保持（onboard/GUI 场景）；缺省不带
+    f5 = Path(tmp) / "profile.json"
+    assert core.install_mcp_entry(str(f5), "standard", py, srv, root, agent="dsh",
+                                  profile="worker") == ""
+    d = json.loads(f5.read_text(encoding="utf-8"))
+    assert d["mcpServers"]["agenthub"]["args"] == [srv, "--agent", "dsh", "--profile", "worker"], \
+        d["mcpServers"]["agenthub"]["args"]
+    assert core.install_mcp_entry(str(f5), "standard", py, srv, root, agent="dsh",
+                                  profile="worker") == ""
+    d = json.loads(f5.read_text(encoding="utf-8"))
+    assert d["mcpServers"]["agenthub"]["args"] == [srv, "--agent", "dsh", "--profile", "worker"]
+    f6 = Path(tmp) / "noprofile.json"
+    assert core.install_mcp_entry(str(f6), "standard", py, srv, root, agent="zcode") == ""
+    d = json.loads(f6.read_text(encoding="utf-8"))
+    assert d["mcpServers"]["agenthub"]["args"] == [srv, "--agent", "zcode"]
 
 
 # ---------------------------------------------------------------- v1.3 新增对抗用例

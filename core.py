@@ -681,7 +681,7 @@ def init_hub(root: str) -> str:
 BOOTSTRAP_BEGIN = "<!-- agenthub:begin -->"
 BOOTSTRAP_END = "<!-- agenthub:end -->"
 # 引导块格式版本：内容格式变更时 +1，让 bootstrap_version() 识别「注入了但过时」的块
-BOOTSTRAP_VERSION = "1"
+BOOTSTRAP_VERSION = "2"
 
 # 注：引导注入目标已统一到下方 AGENT_ADAPTERS（单一事实来源）。
 # 2026-10-09 清理死代码：此处原有一份 BOOTSTRAP_TARGETS，被文件末尾同名派生版本覆盖，
@@ -707,6 +707,8 @@ def bootstrap_text(root: str) -> str:
   重要决策依据的检索，自行精读 top5（hub_get_record）再下结论（宽容召回按相关度排序，弱相关自行取舍）
 - 新项目先 hub_create_project(name)，命名「对象-问题」结构；不确定项目名先 hub_list_projects
 - 团队规范：hub_get_rules
+- 若某个 hub_ 工具不在你的工具列表里（本接入可能按 profile 精简了工具面）：藏起≠禁用——
+  hub_search_tools 搜全量工具、hub_call_tool 直接调用（写工具同样受 dry_run/confirm/审计约束）
 - 出错/受阻/踩坑：hub_report_error(title, detail, undo) 登记，undo 写回滚方式，方便任何人查询和撤销
 - 长任务开工先 hub_heartbeat(agent, project)：同项目有其他 agent 在干时会收到预警，防止撞车
 - 重复检查别手写：hub_ops_list 有现成检查项（环境预检 env/语法检查 py_compile/回归 regression/
@@ -900,6 +902,7 @@ def agent_bootstrap_status(root: str = "") -> list:
             "boot_stale": exists and bver != BOOTSTRAP_VERSION,  # 注入了但版本不是当前
             "mcp_path": mcp.get("path", "") if mcp else "",
             "layout": layout,
+            "profile": (mcp.get("profile", "") or "") if mcp else "",
             "mcp": mcp_has_agenthub(mcp.get("path", ""), layout) if mcp else None,
         })
     return rows
@@ -938,7 +941,8 @@ def deploy_server() -> tuple:
     return find_python(), str(MCP_SERVER_DIR / "agenthub_mcp.py")
 
 
-def _mcp_entry(python_exe: str, server_py: str, root: str = "", agent: str = "") -> dict:
+def _mcp_entry(python_exe: str, server_py: str, root: str = "", agent: str = "",
+               profile: str = "") -> dict:
     """接入条目。返回 {command, args}。
 
     **不传 root**：v2.2.1 起 server 每请求动态跟随 config（传 argv 位置参数反而锁死 fixed 模式，
@@ -946,11 +950,18 @@ def _mcp_entry(python_exe: str, server_py: str, root: str = "", agent: str = "")
 
     **传 --agent <名>**（B1，2026-10-10）：把身份写进**启动参数**，server 启动时锁定，
     此后所有工具调用以它为准、忽略 agent 自报（过去六家启动参数一模一样、server 不知道
-    自己是谁 → 只能靠自报 → 必然填错）。用**具名参数**正是为了不与上面的 root 位置参数冲突。"""
+    自己是谁 → 只能靠自报 → 必然填错）。用**具名参数**正是为了不与上面的 root 位置参数冲突。
+
+    **传 --profile <名>**（P3-1 减载，2026-10-11）：把 profile 写进启动参数（reader/worker/admin），
+    tools/list 只暴露常用工具面、省 agent 侧每次会话的工具 schema token（藏起≠禁用）。
+    不传=不带该参数=默认 admin 全量（旧接入零影响）。"""
     args = [server_py]
     key = agent_key(agent)
     if key:
         args += ["--agent", key]
+    prof = (profile or "").strip()
+    if prof:
+        args += ["--profile", prof]
     return {"command": python_exe, "args": args}
 
 
@@ -1096,10 +1107,12 @@ def _backup_copy(p: Path) -> str:
 
 
 def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, root: str,
-                      agent: str = "") -> str:
+                      agent: str = "", profile: str = "") -> str:
     """把 agenthub server 写入 agent 的 MCP 配置（**外科式**，格式无关；先备份，失败还原）。
     layout 可以是 "zcode"/"standard"/"toml_codex"/"yaml"，未知则按文件格式探测。
-    agent（B1）：传入则写进启动参数 `--agent <名>`，server 据此锁定身份。返回错误或 ""。"""
+    agent（B1）：传入则写进启动参数 `--agent <名>`，server 据此锁定身份。
+    profile（P3-1）：传入则写进启动参数 `--profile <名>`（reader/worker/admin）——
+    来源为 adapter 的 mcp.profile（config.agents.json），重装/接入时自动保持。返回错误或 ""。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     fmt, key_path = _mcp_spec(layout, str(p))
     if fmt == "bundle":
@@ -1114,7 +1127,8 @@ def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, r
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         bak = _backup_copy(p) if p.is_file() else ""
-        codec.insert_entry(p, "agenthub", _mcp_entry(python_exe, server_py, root, agent), key_path, fmt)
+        codec.insert_entry(p, "agenthub", _mcp_entry(python_exe, server_py, root, agent, profile),
+                           key_path, fmt)
     except OSError as e:
         if bak:
             try:
