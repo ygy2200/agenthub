@@ -440,7 +440,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             # count_hits=False：写入查重是内部调用，计唤起会让刚写的记忆立刻 +1，污染数据
             rows = brain.search_memories(root, content[:80], "", 1, count_hits=False)
             if rows and rows[0]["content"] == content:
-                brain.edit_memory(root, rows[0]["id"], content=content, kind=kind if kind in brain.KINDS else "")
+                brain.edit_memory(root, rows[0]["id"], content=content,
+                                  kind=kind if kind in brain.KINDS else "", agent=agent)
                 core.journal(root, agent, "memory_overwrite", f"brain:memories#{rows[0]['id']}")
                 return f"已更新大脑记忆 #{rows[0]['id']}"
         mid = brain.add_memory(root, content, kind, tags, project, agent, pinned,

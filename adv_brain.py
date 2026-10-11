@@ -508,6 +508,43 @@ def t_emb_local_first(tmp):
     assert dt < 120, f"加载耗时 {dt:.0f}s，疑似未走 local_files_only（联网重试风暴）"
 
 
+def t_memory_revisions(tmp):
+    """P1-1 记忆版本化：编辑/删除落修订（谁/何时/改了啥）；回滚恢复内容且回滚本身留痕（链完整）；
+    records 双时相：撤销 = 软删 + valid_until 落值，检索只认现行有效（失效≠删除，行保留可追溯）。"""
+    import json as _json
+    root = str(Path(tmp) / "hub_rev")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    assert brain.init_db(root) == ""
+    mid = brain.add_memory(root, "旧内容 v1", kind="fact", tags="a", agent="zcode")
+    assert brain.edit_memory(root, mid, content="新内容 v2", tags="b", agent="zcode") == ""
+    revs = brain.memory_revisions(root, mid)
+    assert len(revs) == 1 and revs[0]["action"] == "edit" and revs[0]["agent"] == "zcode", revs
+    b, a = _json.loads(revs[0]["before"]), _json.loads(revs[0]["after"])
+    assert b["content"] == "旧内容 v1" and a["content"] == "新内容 v2" and a["tags"] == "b", (b, a)
+    # 回滚到 v1：内容/标签恢复；回滚本身也留痕（action=rollback）
+    assert brain.memory_rollback(root, mid, revs[0]["id"], agent="dsh") == ""
+    row = next(r for r in brain.search_memories(root, "", "", 50) if r["id"] == mid)
+    assert row["content"] == "旧内容 v1" and row["tags"] == "a", dict(row)
+    revs2 = brain.memory_revisions(root, mid)
+    assert [r["action"] for r in revs2] == ["rollback", "edit"] and revs2[0]["agent"] == "dsh", revs2
+    # 删除留痕 + 坏参不崩
+    assert brain.delete_memory(root, mid, agent="zcode") == ""
+    assert brain.memory_revisions(root, mid)[0]["action"] == "delete"
+    assert "不存在" in brain.memory_rollback(root, mid, 999999)
+    assert "不存在" in brain.memory_rollback(root, 999999, 1)
+    # records 双时相：撤销 = 软删 + valid_until；检索不再返回，行保留可追溯
+    rid = brain.add_record(root, "版本-项目", "zcode", "2026-10-11", "t", "唯一内容xyzq")
+    with brain.db_conn(root) as conn:
+        r0 = conn.execute("SELECT valid_from FROM records WHERE id=?", (rid,)).fetchone()
+    assert r0["valid_from"] == "2026-10-11", dict(r0)
+    err, _info = brain.undo_last_record(root, "zcode")
+    assert err == ""
+    with brain.db_conn(root) as conn:
+        r1 = conn.execute("SELECT status, valid_until FROM records WHERE id=?", (rid,)).fetchone()
+    assert r1["status"] == "deleted" and r1["valid_until"], dict(r1)
+    assert all(x["id"] != rid for x in brain.search_records(root, "唯一内容xyzq"))
+
+
 
 def t_env_profile(tmp):
     """环境档案：UPSERT/浏览过滤/自动采集幂等。"""
@@ -1805,6 +1842,7 @@ def main():
     case("批次B·元认知D10（覆盖盲区/低置信/待复核决策/空库不崩/与治理统计一致）", lambda: t_batchB_metacognition(tmp))
     case("P0-2 时间语义解析（相对/绝对时间词→区间/非时间查询None/fail-open/boost落区间）", lambda: t_time_range_parse(tmp))
     case("P0-3 语义模型本地优先加载（缓存存在→纯本地加载/防联网重试风暴）", lambda: t_emb_local_first(tmp))
+    case("P1-1 记忆版本化（编辑/删除留痕+回滚+records双时相失效不删）", lambda: t_memory_revisions(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

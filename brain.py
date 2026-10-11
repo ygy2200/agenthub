@@ -155,7 +155,10 @@ CREATE TABLE IF NOT EXISTS records (
     content TEXT DEFAULT "",
     source TEXT DEFAULT "hub",
     status TEXT DEFAULT "active",
-    created TEXT DEFAULT ""
+    created TEXT DEFAULT "",
+    valid_from TEXT DEFAULT "",
+    valid_until TEXT DEFAULT "",
+    superseded_by INTEGER DEFAULT 0
 );
 CREATE INDEX IF NOT EXISTS idx_records_proj ON records(project);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(date);
@@ -178,6 +181,16 @@ CREATE TABLE IF NOT EXISTS memories (
     confidence REAL DEFAULT 1.0,
     evidence TEXT DEFAULT ""
 );
+CREATE TABLE IF NOT EXISTS memory_revisions (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    mid INTEGER NOT NULL,
+    action TEXT DEFAULT "",
+    before TEXT DEFAULT "",
+    after TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    created TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_memrev_mid ON memory_revisions(mid);
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, action TEXT, target TEXT, backup TEXT, note TEXT
@@ -567,6 +580,18 @@ def _migrate_columns(root: str) -> None:
                          ("evidence", "TEXT DEFAULT ''")):
             if col not in cols:
                 conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
+        # P1-1（2026-10-11）records 双时相版本列：valid_from/valid_until/superseded_by
+        # 「失效 ≠ 删除」——旧版本行保留可追溯，检索只认现行有效（_rec_live_sql）。
+        rcols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
+        for col, ddl in (("valid_from", "TEXT DEFAULT ''"),
+                         ("valid_until", "TEXT DEFAULT ''"),
+                         ("superseded_by", "INTEGER DEFAULT 0")):
+            if col not in rcols:
+                conn.execute(f"ALTER TABLE records ADD COLUMN {col} {ddl}")
+        if "valid_from" not in rcols:  # 首次迁移才回填（幂等）：老数据取 date，无 date 回退 created 前 10 位
+            conn.execute("UPDATE records SET valid_from="
+                         "COALESCE(NULLIF(date,''), substr(created,1,10)) "
+                         "WHERE valid_from IS NULL OR valid_from=''")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -629,8 +654,9 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
-            "INSERT INTO records(project,agent,date,title,content,source,created) VALUES(?,?,?,?,?,?,?)",
-            (project, agent, date, title, content, source, _now()))
+            "INSERT INTO records(project,agent,date,title,content,source,created,valid_from) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (project, agent, date, title, content, source, _now(), (date or _now()[:10])))
         conn.execute("UPDATE projects SET updated=?, status='active' "
                      "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
         _ensure_emb_for(root, "records", cur.lastrowid, title, content, project, conn=conn)
@@ -646,7 +672,8 @@ def undo_last_record(root: str, agent: str) -> tuple:
             "ORDER BY id DESC LIMIT 1", (agent,)).fetchone()
         if not row:
             return f"没有找到 {agent} 可撤销的 hub 记录", ""
-        conn.execute("UPDATE records SET status='deleted' WHERE id=?", (row["id"],))
+        conn.execute("UPDATE records SET status='deleted', valid_until=? WHERE id=?",
+                     (_now()[:10], row["id"]))
         return "", f"#{row['id']} {row['date']} {row['project']}：{row['title']}"
 
 
@@ -770,7 +797,7 @@ def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
     if not q_set:
         return []
     with db_conn(root) as conn:
-        rows = conn.execute("SELECT * FROM records WHERE status='active'").fetchall()
+        rows = conn.execute("SELECT * FROM records WHERE " + _rec_live_sql()).fetchall()
     if not rows:
         return []
     docs = []
@@ -797,7 +824,7 @@ def _records_query(root: str, words: list, limit: int) -> list:
         args += [like, like, like]
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
-            f"SELECT *, ({score_sql}) AS score FROM records WHERE status='active' AND "
+            f"SELECT *, ({score_sql}) AS score FROM records WHERE " + _rec_live_sql() + " AND "
             f"({' OR '.join([like_cond] * len(words))}) "
             "ORDER BY score DESC, date DESC, id DESC LIMIT ?",
             args + args + [max(1, min(limit, 100))])]
@@ -1020,6 +1047,12 @@ def _live_sql(a: str = "") -> str:
     是最昂贵的错法：agent 照着过期路径干活。"""
     return (f"{a}status='active' AND {a}superseded_by=0 "
             f"AND ({a}valid_until='' OR {a}valid_until>=date('now'))")
+
+
+def _rec_live_sql(a: str = "") -> str:
+    """records 版「现行有效」条件（P1-1）：未软删 + 未失效。撤销 = status 软删 + valid_until 落值，
+    行保留可追溯（双时相"失效≠删除"）；检索/召回路径一律走本过滤。"""
+    return f"{a}status='active' AND ({a}valid_until='' OR {a}valid_until>=date('now'))"
 
 
 def live_version(root: str, mid: int) -> int:
@@ -1667,7 +1700,7 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     if qvec is None:
         return []
     tbl = "records" if entity == "records" else "memories"
-    live = "r.status='active'" if entity == "records" else _live_sql("r.")
+    live = _rec_live_sql("r.") if entity == "records" else _live_sql("r.")
     try:
         import numpy as np
         with db_conn(root) as c:
@@ -1873,8 +1906,9 @@ def metacognition(root: str) -> dict:
 
 
 def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: str = "",
-                pinned: bool | None = None) -> str:
-    """按 id 更新记忆字段（只改传入的）。返回错误或 ""。"""
+                pinned: bool | None = None, agent: str = "") -> str:
+    """按 id 更新记忆字段（只改传入的）。返回错误或 ""。
+    P1-1：改动落 memory_revisions（before/after 快照，可 diff / 可回滚）——此前内容编辑完全无痕。"""
     sets, args = [], []
     if content:
         sets.append("content=?")
@@ -1894,10 +1928,15 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
     if text_changed:
         _ensure_emb()  # 模型懒加载移出写事务（同 add_record/add_memory）
     with db_conn(root) as conn:
-        cur = conn.execute(f"UPDATE memories SET {', '.join(sets)}, updated=? WHERE id=?",
-                           (*args, _now(), mid))
-        if cur.rowcount == 0:
+        before = conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
+                              (mid,)).fetchone()
+        if before is None:
             return f"记忆 #{mid} 不存在"
+        conn.execute(f"UPDATE memories SET {', '.join(sets)}, updated=? WHERE id=?",
+                     (*args, _now(), mid))
+        after = conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
+                             (mid,)).fetchone()
+        _revision(conn, mid, "edit", dict(before), dict(after), agent)
         if text_changed:
             # 文本变更 → 同步语义索引（否则语义路拿着旧文本做相似度，编辑等于没生效）
             row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
@@ -1908,11 +1947,67 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
     return ""
 
 
-def delete_memory(root: str, mid: int) -> str:
+def delete_memory(root: str, mid: int, agent: str = "") -> str:
+    """软删记忆（status='deleted'）。P1-1：删除留痕（before 快照入 memory_revisions，可追溯）。"""
     with db_conn(root) as conn:
-        cur = conn.execute("UPDATE memories SET status='deleted' WHERE id=?", (mid,))
-        if cur.rowcount == 0:
+        before = conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
+                              (mid,)).fetchone()
+        if before is None:
             return f"记忆 #{mid} 不存在"
+        conn.execute("UPDATE memories SET status='deleted', updated=? WHERE id=?", (_now(), mid))
+        _revision(conn, mid, "delete", dict(before), {}, agent)
+    return ""
+
+
+# ---------------------------------------------------------------- P1-1 记忆版本化（可溯源/可回滚）
+
+def _revision(conn, mid: int, action: str, before: dict, after: dict, agent: str = "") -> None:
+    """写一条记忆修订记录（同一事务内写；异常随事务回滚暴露，不吞）。"""
+    conn.execute(
+        "INSERT INTO memory_revisions(mid, action, before, after, agent, created) "
+        "VALUES(?,?,?,?,?,?)",
+        (mid, action, json.dumps(before, ensure_ascii=False),
+         json.dumps(after, ensure_ascii=False), agent or "", _now()))
+
+
+def memory_revisions(root: str, mid: int, limit: int = 50) -> list:
+    """某条记忆的修订历史（新→旧）：谁/何时/改了啥（before/after JSON）。"""
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM memory_revisions WHERE mid=? ORDER BY id DESC LIMIT ?",
+            (mid, max(1, min(int(limit), 500))))]
+
+
+def memory_rollback(root: str, mid: int, rev_id: int, agent: str = "") -> str:
+    """把记忆回滚到某次修订之前的内容（只回滚 before 快照里有的字段：content/kind/tags/pinned）。
+    回滚本身也写一条 revision（action=rollback），可再回滚——版本链完整。返回错误或 ""。"""
+    with db_conn(root) as conn:
+        rev = conn.execute("SELECT * FROM memory_revisions WHERE id=? AND mid=?",
+                           (rev_id, mid)).fetchone()
+        if rev is None:
+            return f"修订 #{rev_id} 不存在（记忆 #{mid}）"
+        cur = conn.execute("SELECT content,kind,tags,pinned,project FROM memories WHERE id=?",
+                           (mid,)).fetchone()
+        if cur is None:
+            return f"记忆 #{mid} 不存在"
+    try:
+        snap = json.loads(rev["before"] or "{}")
+    except Exception:
+        return "修订快照损坏，无法回滚"
+    fields = [k for k in ("content", "kind", "tags", "pinned") if k in snap]
+    if not fields or not isinstance(snap, dict):
+        return "修订无可回滚字段"
+    _ensure_emb()  # 正文可能变化 → 重嵌入；模型懒加载移出写事务
+    with db_conn(root) as conn:
+        before = dict(conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
+                                   (mid,)).fetchone())
+        conn.execute(f"UPDATE memories SET {', '.join(f'{k}=?' for k in fields)}, updated=? WHERE id=?",
+                     (*[snap[k] for k in fields], _now(), mid))
+        after = dict(conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
+                                  (mid,)).fetchone())
+        _revision(conn, mid, "rollback", before, after, agent)
+        _ensure_emb_for(root, "memories", mid, after.get("content", ""), after.get("tags", ""),
+                        cur["project"] or "", conn=conn)
     return ""
 
 
