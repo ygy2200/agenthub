@@ -17,6 +17,7 @@ from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QAbstractItemView, QListWidgetItem, QVBoxLayout, QWidget
 from qfluentwidgets import CaptionLabel, FluentIcon, LineEdit, ListWidget
 
+import actions  # P2-2：页面/动作条目与导航、快捷键同源
 import tokens
 
 
@@ -80,35 +81,25 @@ class CommandPalette(QWidget):
         QTimer.singleShot(30, self.search.setFocus)  # 延迟聚焦：等面板渲染完
 
     def _collect(self):
-        """每次 popup 重新收集（数据动态变化：项目列表/主题）。"""
+        """每次 popup 重新收集（数据动态变化：项目列表/主题）。
+        P2-2：页面项与固定动作来自 actions 注册表（与左侧导航、Ctrl+1..9 同源，杜绝三处漂移）。"""
         w = self.win
         acts = []
-        pages = (
-            ("总览", "home 首页 全局 仪表盘", w.overview_page, "HOME"),
-            ("项目", "project 项目列表 工作记录", w.project_page, "FOLDER"),
-            ("时间线", "timeline 动态 记录 历史", w.timeline_page, "HISTORY"),
-            ("Agent 中心", "hub agent 技能 mcp 记忆 配置", w.hub_page, "PEOPLE"),
-            ("随记", "notes 笔记 想法 顿悟 记录", w.notes_page, "EDIT"),
-            ("大脑", "brain 记忆 检索 待办 推送", w.brain_page, "LIBRARY"),
-            ("流水·对账", "ledger 流水 对账 错误 登记", w.ledger_page, "DICTIONARY"),
-            ("统计", "stats 数据 体检 图表", w.stats_page, "TILES"),
-            ("运营报告", "report 报告 mentor 生成", w.report_page, "REPORT"),
-            ("搜索", "search 全盘 检索 文件", w.search_page, "SEARCH"),
-            ("接入", "connect 接入 mcp 配置 连接", w.connect_page, "LINK"),
-            ("帮助", "help 说明 快捷键 用法", w.help_page, "INFO"),
-            ("设置", "settings 配置 根目录 主题 外观", w.settings_page, "SETTING"),
-        )
-        for name, kw, page, icon in pages:
-            acts.append((icon, f"打开：{name}", kw, (lambda p=page: w.switchTo(p))))
-        acts += [
-            ("SYNC", "动作：刷新数据", "refresh f5 重新扫描 更新", w.refresh),
-            ("EDIT", "动作：新建随记", "note 记一下 写想法 随记", self._focus_note),
-            ("DOCUMENT", "动作：生成运营报告", "report 生成 打开报告", self._gen_report),
-            ("FOLDER", "动作：打开根目录", "open 文件夹 explorer 目录", self._open_root),
-            ("PALETTE", "外观：深色", "dark theme 主题 深色", lambda: self._set_theme("dark")),
-            ("PALETTE", "外观：浅色", "light theme 主题 浅色", lambda: self._set_theme("light")),
-            ("PALETTE", "外观：跟随系统", "auto system 主题 跟随系统", lambda: self._set_theme("auto")),
-        ]
+        for _attr, title, icon, kw, page in actions.page_entries(w):
+            acts.append((icon, f"打开：{title}", kw, (lambda p=page: w.switchTo(p))))
+        handlers = {
+            "refresh": w.refresh,
+            "new_note": self._focus_note,
+            "gen_report": self._gen_report,
+            "open_root": self._open_root,
+            "theme_dark": lambda: self._set_theme("dark"),
+            "theme_light": lambda: self._set_theme("light"),
+            "theme_auto": lambda: self._set_theme("auto"),
+        }
+        for aid, label, icon, kw in actions.ACTIONS:
+            fn = handlers.get(aid)
+            if fn is not None:
+                acts.append((icon, label, kw, fn))
         snap = getattr(getattr(w, "project_page", None), "snap", None)
         if snap is not None:
             for p in list(getattr(snap, "projects", []))[:60]:

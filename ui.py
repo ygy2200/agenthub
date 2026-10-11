@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403  共享基建再导出（旧引用 ui.X 全部兼容）
 from uikit import __all__ as _uikit_all  # noqa: F401
+import actions  # P2-2 动作注册表（导航/快捷键/命令面板同源）
 
 # —— 页面（P2-1 逐页拆到 pages/；此处再导出，外部 ui.X 引用兼容）——
 from pages.project_page import ProjectPage  # noqa: F401
@@ -71,33 +72,18 @@ class AgentHubWindow(FluentWindow):
             else:
                 self.addSubInterface(page, ic(icon), text, pos)
 
-        _add(self.overview_page, "HOME", "总览")
-
-        self.navigationInterface.addItemHeader("工作区")
-        for w, icon, text in (
-            (self.project_page, "FOLDER", "项目"),
-            (self.timeline_page, "HISTORY", "时间线"),
-            (self.hub_page, "PEOPLE", "Agent 中心"),
-        ):
-            _add(w, icon, text)
-
-        self.navigationInterface.addItemHeader("数据")
-        for w, icon, text in (
-            (self.notes_page, "EDIT", "随记"),
-            (self.brain_page, "LIBRARY", "大脑"),
-            (self.ledger_page, "DICTIONARY", "流水·对账"),
-            (self.stats_page, "TILES", "统计"),
-            (self.report_page, "REPORT", "运营报告"),
-            (self.search_page, "SEARCH", "搜索"),
-        ):
-            _add(w, icon, text)
-
-        for w, icon, text in (
-            (self.connect_page, "LINK", "接入"),
-            (self.help_page, "INFO", "帮助"),
-            (self.settings_page, "SETTING", "设置"),
-        ):
-            _add(w, icon, text, NavigationItemPosition.BOTTOM)
+        # 导航（P2-2 同源）：顺序/图标/标题/分组全部来自 actions.PAGES——命令面板与快捷键读同一张表
+        for _attr, _title, _icon, _group, _kw, _ctrl in actions.PAGES:
+            if _group == "top":
+                _add(getattr(self, _attr), _icon, _title)
+        for _gkey, _header in actions.GROUP_HEADERS:
+            self.navigationInterface.addItemHeader(_header)
+            for _attr, _title, _icon, _group, _kw, _ctrl in actions.PAGES:
+                if _group == _gkey:
+                    _add(getattr(self, _attr), _icon, _title)
+        for _attr, _title, _icon, _group, _kw, _ctrl in actions.PAGES:
+            if _group == "bottom":
+                _add(getattr(self, _attr), _icon, _title, NavigationItemPosition.BOTTOM)
 
         self._narrow_nav()
         # 内容区不透明底色（防"浅色主题透深色壁纸 Mica"错配，2026-10-10 实测像素级定位）：
@@ -128,17 +114,14 @@ class AgentHubWindow(FluentWindow):
         f5.activated.connect(self.refresh)
         cf = QShortcut(QKeySequence("Ctrl+F"), self)
         cf.activated.connect(self.goto_search)
-        # 命令面板（Ctrl+K）+ 页面直达（Ctrl+1..9）——批次 3E 快捷键体系（对齐课表已验收方案）
+        # 命令面板（Ctrl+K）+ 页面直达（Ctrl+1..9，序号来自 actions.PAGES）——批次 3E 快捷键体系
         self._palette = palette.CommandPalette(self)
         ck = QShortcut(QKeySequence("Ctrl+K"), self)
         ck.activated.connect(self._palette.popup)
-        for _i, _attr in enumerate(
-                ("overview_page", "project_page", "timeline_page", "hub_page",
-                 "notes_page", "brain_page", "ledger_page", "stats_page",
-                 "search_page"), start=1):
-            _sc = QShortcut(QKeySequence(f"Ctrl+{_i}"), self)
-            _sc.activated.connect(
-                lambda a=_attr: self.switchTo(getattr(self, a)))
+        for _attr, _title, _icon, _group, _kw, _ctrl in actions.PAGES:
+            if _ctrl:
+                _sc = QShortcut(QKeySequence(f"Ctrl+{_ctrl}"), self)
+                _sc.activated.connect(lambda a=_attr: self.switchTo(getattr(self, a)))
         self._workers = getattr(self, "_workers", [])  # 迁移线程已在 __init__ 挂入
         QTimer.singleShot(200, self.refresh)
         # 开机自检（大脑自己跑，agent 不参与）：启动 5 分钟后后台跑一次 env 环境预检落流水。
