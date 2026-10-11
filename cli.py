@@ -49,6 +49,9 @@ def cmd_status(root: str, agent: str = "") -> int:
     print(f"AgentHub 接入状态（当前引导版本 v{core.BOOTSTRAP_VERSION}）")
     for r in rows:
         mcp = "—" if r["mcp"] is None else ("✓" if r["mcp"] else "✗")
+        prof = r.get("profile", "")
+        if mcp == "✓" and prof:  # P3-1：显示工具面切片（缺省 admin=全量不显示）
+            mcp = f"✓({prof})"
         print(f"  {r['agent']:12} [{r['channel']:10}] 引导:{_boot_mark(r):9} MCP:{mcp}  {r['instr_path']}")
     return 0
 
