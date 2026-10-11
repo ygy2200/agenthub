@@ -21,7 +21,7 @@ class BrainPage(QWidget):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(24, 24, 24, 24)
-        lay.addWidget(_page_head("大脑", "公用记忆的运转状态——唤起排行 / 使用分布 / 待办看板 / 置顶记忆"))
+        lay.addWidget(_page_head("大脑", "公用记忆的运转状态——唤起排行 / 使用分布 / 任务看板 / 待办线索 / 事件流 / 置顶记忆"))
         # 健康读数：纯展示不包卡（卡片语义留给可点区域），大数字+小标题直接排版
         row = QHBoxLayout()
         self.valMem, self.valCrys, self.valPush, self.valTodo = (TitleLabel("0") for _ in range(4))
@@ -37,12 +37,17 @@ class BrainPage(QWidget):
 
         self.topBox = QVBoxLayout()
         self.useBox = QVBoxLayout()
+        self.taskBox = QVBoxLayout()
         self.todoBox = QVBoxLayout()
+        self.eventBox = QVBoxLayout()
         self.pinBox = QVBoxLayout()
         # 内容组不包卡：间距+小标题分组（Fluent Layout——分组靠 spacing，不需要每块加框）
         for box, t in ((self.topBox, "记忆唤起 top10（开工推送反射弧记数）"),
                        (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）"),
+                       (self.taskBox, "任务看板（P3-2 状态机：agent 经 hub_task_add 建、hub_claim 认领，"
+                                      "进行中→阻塞→待办→完成）"),
                        (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）"),
+                       (self.eventBox, "事件流（agent 经 hub_event_write 写进展，hub_events 增量订阅）"),
                        (self.pinBox, "置顶记忆（置顶位只放工作知识）")):
             box.setSpacing(8)  # 行距：无间距时唤起/置顶行挤成一片
             lay.addSpacing(16)  # 组间距 > 行距，拉开层级
@@ -109,6 +114,28 @@ class BrainPage(QWidget):
                 "TILES", "暂无检索/推送记录",
                 "agent 主动检索或接收开工推送后，这里按家分布累计"))
 
+        # 任务看板（P3-2 状态机视图）：状态胶囊 + 认领人 + 阻塞信息
+        clear(self.taskBox)
+        try:
+            tasks = brain.task_list(root, limit=12)
+        except Exception:
+            tasks = []
+        chip_key = {"in_progress": "accent", "blocked": "warning", "done": "success"}
+        for t in tasks:
+            r = QHBoxLayout()
+            r.addWidget(status_chip(brain.TASK_CN.get(t["status"], t["status"]),
+                                    chip_key.get(t["status"], "text_secondary")))
+            who = f" @{t['owner']}" if t["owner"] else ""
+            blk = (f"（等待 {t['blocked_by'][:20]}）"
+                   if t["status"] == "blocked" and t["blocked_by"] else "")
+            proj = f"[{t['project']}] " if t["project"] else ""
+            r.addWidget(BodyLabel(f"#{t['id']} {proj}{t['title'][:60]}{who}{blk}"), 1)
+            self.taskBox.addLayout(r)
+        if not tasks:
+            self.taskBox.addWidget(empty_state(
+                "ACCEPT", "暂无任务",
+                "agent 经 hub_task_add 建任务、hub_claim 认领；认领后此处显示持有者与阻塞状态"))
+
         # 待办看板（验收③：欠账可见 + 勾销闭环）
         clear(self.todoBox)
         for t in h["todos"][:8]:
@@ -122,6 +149,21 @@ class BrainPage(QWidget):
             self.todoBox.addWidget(empty_state(
                 "ACCEPT", "暂无待办",
                 "从记录里自动提取「后续 / 待验证 / 下一步…」句式；在时间线勾销即闭环"))
+
+        # 事件流（P3-2）：agent 协作通道的 GUI 可观测面（写进展 / 增量订阅）
+        clear(self.eventBox)
+        try:
+            events = brain.event_list(root, limit=8)
+        except Exception:
+            events = []
+        for e in events:
+            proj = f"·{e['project']}" if e["project"] else ""
+            self.eventBox.addWidget(BodyLabel(
+                f"#{e['id']} {e['ts'][5:16]} [{e['agent'] or '-'}{proj}] {e['content'][:72]}"))
+        if not events:
+            self.eventBox.addWidget(empty_state(
+                "HISTORY", "暂无事件",
+                "agent 用 hub_event_write 写进展，其他 agent 用 hub_events 增量订阅"))
 
         # 置顶记忆（验收④：置顶位工作知识占比）
         clear(self.pinBox)

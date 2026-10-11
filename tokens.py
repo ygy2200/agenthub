@@ -70,11 +70,53 @@ DEFAULT_MODE = "dark"
 MODE_CN = {"dark": "深色", "light": "浅色", "auto": "跟随系统"}
 
 
-def C(spec):
-    """取当前主题下的色值。spec 为 {"light","dark"} dict 或原样字符串。"""
+# ============ 语义 token 表（P2-3b 升级：组件只认语义名，根部统一解析） ============
+# 命名约定：<场景>_<角色>。新组件一律用语义名（tokens.resolve("bg_surface") /
+# tokens.C("text_primary")）；旧常量（BG_L0…）保留为唯一色值来源，语义表只是指向它们。
+SEMANTIC = {
+    "bg_page": BG_L0,              # 页面底
+    "bg_surface": BG_L1,           # 卡片/浮层
+    "bg_inset": BG_L2,             # 内嵌区/hover/代码块
+    "stroke_default": STROKE,      # 1px 分隔/描边
+    "text_primary": TEXT_1,        # 主文字
+    "text_secondary": TEXT_2,      # 次文字
+    "text_tertiary": TEXT_3,       # 弱提示
+    "accent": ACCENT,              # 主色（文字/图标）
+    "accent_soft": ACCENT_SOFT,    # 选中行/胶囊淡底
+    "success": SUCCESS,
+    "warning": WARNING,
+    "danger": DANGER,
+    "info": INFO,
+    "on_accent": WHITE,            # 主色底上的文字（单套常量）
+}
+
+
+def _pick(spec, mode: str = ""):
+    """色值选取：dict → 指定/当前主题；字符串 → 原样。"""
     if isinstance(spec, dict):
+        if mode in ("light", "dark"):
+            return spec.get(mode, "")
         return spec.get("dark" if isDarkTheme() else "light", "")
     return spec
+
+
+def resolve(name: str, mode: str = "") -> str:
+    """语义 token → 色值（根部统一解析）。
+    name 可为语义名（bg_surface/text_primary…）或旧常量名（BG_L0…）；未知返回 ""。
+    mode 传入 "light"/"dark" 时取指定主题（截图/测试用），缺省跟随当前主题。"""
+    spec = SEMANTIC.get(name)
+    if spec is None:
+        spec = globals().get(name)
+    if spec is None:
+        return ""
+    return _pick(spec, mode)
+
+
+def C(spec):
+    """取当前主题下的色值。spec 为 语义名 / {"light","dark"} dict / 原样字符串。"""
+    if isinstance(spec, str) and spec in SEMANTIC:
+        return resolve(spec)
+    return _pick(spec)
 
 
 def agent_badge_color(agent):

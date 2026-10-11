@@ -21,6 +21,7 @@ PAGES = (
     ("search_page", "搜索", "SEARCH", "data", "search 全盘 检索 文件", 9),
     ("connect_page", "接入", "LINK", "bottom", "connect 接入 mcp 配置 连接", 0),
     ("help_page", "帮助", "INFO", "bottom", "help 说明 快捷键 用法", 0),
+    ("components_page", "组件预览", "BRUSH", "bottom", "components 组件 预览 design ui 回归 基线 样式 token", 0),
     ("settings_page", "设置", "SETTING", "bottom", "settings 配置 根目录 主题 外观", 0),
 )
 

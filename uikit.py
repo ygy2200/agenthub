@@ -448,6 +448,19 @@ def mood_badge(mood: str) -> QLabel:
     return lb
 
 
+def status_chip(text: str, color_key: str = "text_secondary") -> QLabel:
+    """状态胶囊（P2-3c 组件预览 / P3-2 待办状态视图共用）：
+    淡底 + 描边 + 语义色文字的小圆角签，随主题自适应。color_key 取 tokens 语义名。"""
+    col = tokens.resolve(color_key) or tokens.C(tokens.TEXT_2)
+    lb = QLabel(text)
+    lb.setStyleSheet(
+        f"color:{col};background:{tokens.C('bg_inset')};"
+        f"border:1px solid {tokens.C('stroke_default')};border-radius:9px;"
+        "padding:1px 8px;font-size:11px;")
+    lb.setFixedHeight(20)
+    return lb
+
+
 def rel_time(ts: str) -> str:
     """memos 式相对时间：刚刚/N 分钟前/今天 HH:MM/昨天 HH:MM/MM-DD HH:MM。"""
     try:

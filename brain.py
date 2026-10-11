@@ -270,6 +270,39 @@ CREATE TABLE IF NOT EXISTS todos_done (
     agent TEXT DEFAULT "",
     ts TEXT
 );
+CREATE TABLE IF NOT EXISTS op_audit (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    tool TEXT DEFAULT "",
+    project TEXT DEFAULT "",
+    summary TEXT DEFAULT "",
+    undo_kind TEXT DEFAULT "",
+    undo_ref TEXT DEFAULT ""
+);
+CREATE TABLE IF NOT EXISTS tasks (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    project TEXT DEFAULT "",
+    title TEXT NOT NULL,
+    detail TEXT DEFAULT "",
+    status TEXT DEFAULT "pending",
+    owner TEXT DEFAULT "",
+    claimed_at TEXT DEFAULT "",
+    blocked_by TEXT DEFAULT "",
+    created TEXT DEFAULT "",
+    updated TEXT DEFAULT "",
+    done_at TEXT DEFAULT "",
+    created_by TEXT DEFAULT ""
+);
+CREATE TABLE IF NOT EXISTS events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    project TEXT DEFAULT "",
+    kind TEXT DEFAULT "progress",
+    content TEXT DEFAULT "",
+    ref TEXT DEFAULT ""
+);
 CREATE TABLE IF NOT EXISTS distill_seen (
     record_id INTEGER PRIMARY KEY,
     ts TEXT
@@ -1017,6 +1050,51 @@ def list_records(root: str, project: str = "", agent: str = "", limit: int = 100
         return [dict(r) for r in conn.execute(q, args)]
 
 
+def records_count(root: str, project: str = "", agent: str = "") -> int:
+    """records 现行有效行数（P2-3 虚拟滚动：阈值判定 + 分页 total）。"""
+    q = "SELECT COUNT(*) FROM records WHERE status='active'"
+    args: list = []
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    if agent:
+        q += " AND agent=?"
+        args.append(agent)
+    with db_conn(root) as conn:
+        return int(conn.execute(q, args).fetchone()[0])
+
+
+def records_page(root: str, offset: int = 0, limit: int = 100,
+                 project: str = "", agent: str = "") -> tuple:
+    """records 分页切片（P2-3 虚拟滚动数据源）：SQL LIMIT/OFFSET → (rows, total)。
+    排序口径与 list_records 完全一致（date DESC, id DESC）——翻页不重不漏。"""
+    where = "status='active'"
+    args: list = []
+    if project:
+        where += " AND project=?"
+        args.append(project)
+    if agent:
+        where += " AND agent=?"
+        args.append(agent)
+    off = max(0, int(offset))
+    lim = max(0, min(int(limit), 500))
+    with db_conn(root) as conn:
+        total = int(conn.execute(
+            f"SELECT COUNT(*) FROM records WHERE {where}", args).fetchone()[0])
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT * FROM records WHERE {where} ORDER BY date DESC, id DESC LIMIT ? OFFSET ?",
+            (*args, lim, off))]
+    return rows, total
+
+
+def records_agents(root: str) -> list:
+    """records 出现过的 agent（小写去重；虚拟滚动模式填过滤器下拉用）。"""
+    with db_conn(root) as conn:
+        return [r[0] for r in conn.execute(
+            "SELECT DISTINCT lower(agent) FROM records "
+            "WHERE status='active' AND agent<>'' ORDER BY 1")]
+
+
 def _like_escape(w: str) -> str:
     """LIKE 通配符转义：查询词里的 % _ 按字面匹配（否则 query='%' 全库命中，"%"
     在 Windows 通配习惯/SQL 注入探测里都会出现）。配套 SQL 里 ESCAPE '\\'。"""
@@ -1217,6 +1295,249 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
         fused.append((s, mid, r))
     fused.sort(key=lambda t: (-t[0], t[1]))
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
+
+
+# ---------------------------------------------------------------- P3 工具契约（审计 / 索引维护）
+
+def audit_add(root: str, agent: str, tool: str, project: str = "", summary: str = "",
+              undo_kind: str = "", undo_ref: str = "") -> None:
+    """写操作审计（P3-1）：MCP 层每次写成功后落一行，带 undo 句柄（kind+ref，可被撤销工具消费）。
+    fail-open：审计失败不影响主流程。"""
+    try:
+        with db_conn(root) as conn:
+            conn.execute(
+                "INSERT INTO op_audit(ts, agent, tool, project, summary, undo_kind, undo_ref) "
+                "VALUES(?,?,?,?,?,?,?)",
+                (_now(), _norm_agent(agent) or "", tool, project, (summary or "")[:300],
+                 undo_kind, undo_ref))
+    except Exception:
+        pass
+
+
+def audit_list(root: str, limit: int = 20) -> list:
+    """最近的写操作审计（倒序）。"""
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM op_audit ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 200)),))]
+
+
+def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:
+    """语义索引维护（P3-1 hub_flush_index）：把缺失（force=True 时全部）向量补进 embeddings。
+    文本口径与写入钩子 _ensure_emb_for、tools/build_embeddings.py 三处一致。
+    fail-open：语义依赖缺失/模型装载失败 → 返回 {"error": ...}，不影响其余功能。"""
+    out = {"records": 0, "memories": 0, "scanned": 0, "dim": None, "model": _EMB_MODEL_NAME}
+    if not _HAS_ST:
+        return {"error": "未安装 sentence-transformers（语义路未启用，其余功能不受影响）"}
+    if not _ensure_emb():
+        return {"error": "语义模型加载失败（stderr 有留痕；本地缓存缺失时需联网首装）"}
+    _init_emb_table(root)
+    with db_conn(root) as conn:
+        have = {(r["entity"], r["eid"]) for r in conn.execute(
+            "SELECT entity, eid FROM embeddings")}
+        recs = [dict(r) for r in conn.execute(
+            "SELECT id, title, content, project FROM records WHERE status='active'")]
+        mems = [dict(r) for r in conn.execute(
+            "SELECT id, content, tags, project FROM memories WHERE status='active'")]
+    pending: list = []
+    for r in recs:
+        if force or ("records", r["id"]) not in have:
+            blob = " ".join(x for x in (r.get("title") or "", r.get("content") or "",
+                                        r.get("project") or "") if x).strip()
+            if blob:
+                pending.append(("records", r["id"], blob))
+    for m in mems:
+        if force or ("memories", m["id"]) not in have:
+            blob = " ".join(x for x in (m.get("content") or "", m.get("tags") or "",
+                                        m.get("project") or "") if x).strip()
+            if blob:
+                pending.append(("memories", m["id"], blob))
+    out["scanned"] = len(pending)
+    step = max(1, min(int(batch), 256))
+    for i in range(0, len(pending), step):
+        chunk = pending[i:i + step]
+        vecs = _encode([t for _, _, t in chunk])
+        if vecs is None:
+            break
+        for (ent, eid, _t), v in zip(chunk, vecs):
+            _store_emb(root, ent, eid, v)
+            out[ent] += 1
+    out["dim"] = _EMB_DIM
+    return out
+
+
+# ---------------------------------------------------------------- P3-2 待办状态机 + 事件流
+
+TASK_STATUSES = ("pending", "in_progress", "blocked", "done")
+TASK_CN = {"pending": "待办", "in_progress": "进行中", "blocked": "阻塞", "done": "完成"}
+CLAIM_TTL_HOURS = 2   # 认领超时自动释放（防死锁）：claimed_at 早于该时长的 in_progress 可被接管
+
+EVENT_KINDS = ("progress", "note", "error", "handoff")
+
+
+def _claim_cutoff() -> str:
+    """认领 TTL 截止时刻（早于它的 claimed_at 视为超时）。"""
+    return (datetime.datetime.now() - datetime.timedelta(hours=CLAIM_TTL_HOURS)) \
+        .isoformat(timespec="seconds")
+
+
+def task_add(root: str, title: str, project: str = "", detail: str = "",
+             blocked_by: str = "", agent: str = "") -> tuple:
+    """新建任务（P3-2 状态机入口）。返回 (错误或 "", 任务 id)。"""
+    title = (title or "").strip()
+    if not title:
+        return "title 必填", 0
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "INSERT INTO tasks(project,title,detail,status,blocked_by,created,updated,created_by) "
+            "VALUES(?,?,?,?,?,?,?,?)",
+            (project.strip(), title[:200], (detail or "").strip()[:2000],
+             "blocked" if (blocked_by or "").strip() else "pending",
+             (blocked_by or "").strip()[:200], _now(), _now(), _norm_agent(agent) or ""))
+        return "", cur.lastrowid
+
+
+def task_list(root: str, status: str = "", owner: str = "", project: str = "",
+              limit: int = 50) -> list:
+    """任务列表（进行中 → 阻塞 → 待办 → 完成 排序，同级按 id 倒序）。"""
+    q = "SELECT * FROM tasks WHERE 1=1"
+    args: list = []
+    if status:
+        q += " AND status=?"
+        args.append(status)
+    if owner:
+        q += " AND owner=?"
+        args.append(_norm_agent(owner) or owner)
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    q += (" ORDER BY CASE status WHEN 'in_progress' THEN 0 WHEN 'blocked' THEN 1 "
+          "WHEN 'pending' THEN 2 ELSE 3 END, id DESC LIMIT ?")
+    args.append(max(1, min(int(limit), 200)))
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(q, args)]
+
+
+def task_claim(root: str, tid, agent: str) -> tuple:
+    """原子认领（P3-2）：pending → in_progress(owner)。
+    并发安全：单条 UPDATE…WHERE（前置条件全写进 SQL）+ rowcount 判胜负（SQLite 写事务天然串行，
+    两家同时 claim 只可能一家 rowcount=1）。超时自动释放：in_progress 且 claimed_at 早于 TTL
+    的可被他人接管（防死锁）。返回 (错误或 "", 任务行 dict)。"""
+    who = _norm_agent(agent) or ""
+    if not who:
+        return "agent 必填（认领必须署名）", {}
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return f"任务 id 非法：{tid!r}", {}
+    now = _now()
+    cutoff = _claim_cutoff()
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "UPDATE tasks SET status='in_progress', owner=?, claimed_at=?, updated=? "
+            "WHERE id=? AND status<>'done' AND ("
+            "  status='pending' "
+            "  OR (status='in_progress' AND owner=?) "
+            "  OR (status='in_progress' AND claimed_at<>'' AND claimed_at < ?))",
+            (who, now, now, tid, who, cutoff))
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            return f"任务 #{tid} 不存在", {}
+        row = dict(row)
+        if cur.rowcount == 1:
+            return "", row
+        if row["status"] == "done":
+            return f"认领失败：任务 #{tid} 已完成（{row['done_at'][:10]}）", row
+        if row["status"] == "in_progress" and row["owner"] != who:
+            return (f"认领失败：任务 #{tid} 已被 {row['owner']} 认领"
+                    f"（{row['claimed_at'][:16]}；超 {CLAIM_TTL_HOURS}h 未更新可自动接管）"), row
+        if row["status"] == "blocked":
+            return (f"认领失败：任务 #{tid} 处于阻塞（等待 {row['blocked_by'] or '未知'}）；"
+                    "解除后用 hub_task_update status=pending"), row
+        return f"认领失败：任务 #{tid} 当前状态 {row['status']}", row
+
+
+def task_update(root: str, tid, status: str = "", agent: str = "",
+                blocked_by: str = "", detail: str = "") -> tuple:
+    """任务状态流转（P3-2）：pending/in_progress/blocked/done。
+    持有者约束：in_progress 任务只有 owner 本人（或空 agent=管理面）可流转；
+    →pending 释放并清 owner；→done 记 done_at；done 后不可再改。返回 (错误或 "", 行 dict)。"""
+    who = _norm_agent(agent) or ""
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return f"任务 id 非法：{tid!r}", {}
+    if status and status not in TASK_STATUSES:
+        return f"status 只能是 {'/'.join(TASK_STATUSES)}", {}
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            return f"任务 #{tid} 不存在", {}
+        row = dict(row)
+        if row["status"] == "done" and status and status != "done":
+            return f"任务 #{tid} 已完成，不能改回 {status}", row
+        if (row["status"] == "in_progress" and row["owner"] and who
+                and row["owner"] != who):
+            return f"任务 #{tid} 由 {row['owner']} 持有，只有持有者（或空传 agent）可流转", row
+        sets: list = []
+        args: list = []
+        if status:
+            sets.append("status=?")
+            args.append(status)
+            if status == "done":
+                sets.append("done_at=?")
+                args.append(_now())
+            if status == "pending":
+                sets.append("owner=''")
+                sets.append("claimed_at=''")
+            if status == "in_progress" and not row["owner"] and who:
+                sets.append("owner=?")
+                args.append(who)
+                sets.append("claimed_at=?")
+                args.append(_now())
+        if (blocked_by or "").strip():
+            sets.append("blocked_by=?")
+            args.append(blocked_by.strip()[:200])
+        if (detail or "").strip():
+            sets.append("detail=?")
+            args.append(detail.strip()[:2000])
+        if not sets:
+            return "没有要更新的字段（status/blocked_by/detail 至少传一个）", row
+        sets.append("updated=?")
+        args.append(_now())
+        conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", (*args, tid))
+        return "", dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+
+
+def event_add(root: str, content: str, kind: str = "progress", project: str = "",
+              agent: str = "", ref: str = "") -> tuple:
+    """写一条事件（P3-2 事件流：agent 写进展/订阅他人）。返回 (错误或 "", 事件 id)。"""
+    content = (content or "").strip()
+    if not content:
+        return "content 必填", 0
+    kind = kind if kind in EVENT_KINDS else "progress"
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "INSERT INTO events(ts, agent, project, kind, content, ref) VALUES(?,?,?,?,?,?)",
+            (_now(), _norm_agent(agent) or "", project.strip(), kind, content[:2000],
+             (ref or "").strip()[:200]))
+        return "", cur.lastrowid
+
+
+def event_list(root: str, since_id: int = 0, limit: int = 30, project: str = "",
+               agent: str = "") -> list:
+    """事件流（倒序）；增量订阅传 since_id=上次最大 id 只取新事件。"""
+    q = "SELECT * FROM events WHERE id>?"
+    args: list = [max(0, int(since_id or 0))]
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    if agent:
+        q += " AND agent=?"
+        args.append(_norm_agent(agent) or agent)
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(max(1, min(int(limit or 30), 200)))
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(q, args)]
 
 
 # ---------------------------------------------------------------- 数据完整性（0.1）

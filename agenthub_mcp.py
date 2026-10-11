@@ -12,6 +12,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -37,7 +38,10 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.23.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.28.0"}
+SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
+SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
+DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -171,6 +175,157 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     # B2 单点派生：把进程锁定身份下发到本次调用（覆盖 agent 参数）。
     # 放在最前，后面所有工具的 arguments.get("agent") 拿到的都是已校验的锁定值。
     arguments = apply_server_agent(name, arguments, root)
+
+    # ---- P3-1 协议 / 发现 / 审计 / 索引维护（不受 profile 藏起影响，可直接调用）----
+
+    if name == "hub_help":
+        vis = visible_tools()
+        lines = [f"AgentHub MCP v{SERVER_INFO['version']} —— profile={SERVER_PROFILE}",
+                 f"可见工具 {len(vis)}/{len(TOOLS)}（profile 只影响 tools/list 可见面；"
+                 "被藏起的工具仍可直接调用）", "", "可见工具："]
+        for t in vis:
+            lines.append(f"- {t['name']}：{t['description'][:56]}")
+        lines += ["", "用法四件事：",
+                  "① 发现：hub_search_tools(关键词) 搜全部工具（含藏起）；hub_call_tool(name, arguments) 调任意工具",
+                  "② 预演：写工具加 dry_run=true——先看将要写什么，不落库",
+                  "③ 确认：写工具传 confirm=false → 返回 input_required（return-and-resume，服务端不阻塞）",
+                  f"④ 预算：结果超 max_chars（默认 {DEFAULT_MAX_CHARS}）截断并标注，完整内容在 structuredContent"]
+        return "\n".join(lines)
+
+    if name == "hub_search_tools":
+        kw = str(arguments.get("keyword", "")).strip().lower()
+        hits = [t for t in TOOLS
+                if (not kw) or kw in t["name"].lower() or kw in t["description"].lower()]
+        visible_names = {t["name"] for t in visible_tools()}
+        lines = [f"工具搜索「{kw or '（全部）'}」：{len(hits)} 个命中（含当前 profile 藏起的）"]
+        for t in hits[:40]:
+            tag = "" if t["name"] in visible_names else " [藏起]"
+            lines.append(f"- {t['name']}{tag}：{t['description'][:64]}")
+        if len(hits) > 40:
+            lines.append(f"…（还有 {len(hits) - 40} 个，收窄关键词再看）")
+        lines.append("调用：hub_call_tool(name, arguments)，或直接 tools/call（藏起≠禁用）。")
+        return "\n".join(lines)
+
+    if name == "hub_call_tool":
+        inner = str(arguments.get("name", "")).strip()
+        iargs = arguments.get("arguments") or {}
+        if not isinstance(iargs, dict):
+            return f"错误：arguments 需为对象（收到 {type(iargs).__name__}）"
+        if not inner or inner == "hub_call_tool":
+            return "错误：name 必填，且不能是 hub_call_tool 本身（防递归）"
+        if inner not in {t["name"] for t in TOOLS}:
+            return f"错误：未知工具 {inner}（用 hub_search_tools 搜索可用工具）"
+        if inner in WRITE_TOOLS and iargs.get("dry_run") is True:
+            return f"dry_run（未执行）：{inner} 预演（经 hub_call_tool）；去掉 dry_run 后正式执行。"
+        out = call_tool(inner, iargs, root)
+        if inner in WRITE_TOOLS:
+            _audit_write(root, inner, iargs, out)
+        return out
+
+    if name == "hub_audit":
+        try:
+            lim = int(arguments.get("limit") or 20)
+        except (TypeError, ValueError):
+            lim = 20
+        rows = brain.audit_list(root, lim)
+        if not rows:
+            return "暂无写操作审计（P3-1 起，每次写成功都会留痕；dry_run 与 confirm 拦截不计入）"
+        lines = [f"最近 {len(rows)} 条写操作审计（倒序）："]
+        for r in rows:
+            undo = f" · undo={r['undo_kind']}#{r['undo_ref']}" if r.get("undo_ref") else ""
+            proj = f" · {r['project']}" if r.get("project") else ""
+            lines.append(f"- #{r['id']} {r['ts'][:19]} [{r['agent'] or '-'}] {r['tool']}"
+                         f"{proj}：{r['summary'][:70]}{undo}")
+        return "\n".join(lines)
+
+    if name == "hub_flush_index":
+        res = brain.flush_index(root, force=bool(arguments.get("force")))
+        if res.get("error"):
+            return "错误：" + res["error"]
+        return (f"语义索引已刷新：records +{res.get('records', 0)} / memories +{res.get('memories', 0)}"
+                f"（扫描 {res.get('scanned', 0)} 条；model={res.get('model')} · dim={res.get('dim')}）")
+
+    # ---- P3-2 待办状态机 + 事件流 ----
+
+    if name == "hub_task_add":
+        err, tid = brain.task_add(root, str(arguments.get("title", "")),
+                                  project=str(arguments.get("project", "")),
+                                  detail=str(arguments.get("detail", "")),
+                                  blocked_by=str(arguments.get("blocked_by", "")),
+                                  agent=str(arguments.get("agent", "")))
+        if err:
+            return "错误：" + err
+        return (f"任务已建 #{tid}：{str(arguments.get('title', ''))[:60]}\n"
+                "认领：hub_claim(task_id, agent)；列表：hub_tasks")
+
+    if name == "hub_claim":
+        err, row = brain.task_claim(root, arguments.get("task_id"),
+                                    str(arguments.get("agent", "")))
+        if err:
+            return err
+        return (f"认领成功：任务 #{row['id']} [{brain.TASK_CN.get(row['status'], row['status'])}] "
+                f"{row['title'][:60]} —— owner={row['owner']}"
+                f"（超 {brain.CLAIM_TTL_HOURS}h 未更新自动可被接管）")
+
+    if name == "hub_task_update":
+        err, row = brain.task_update(root, arguments.get("task_id"),
+                                     status=str(arguments.get("status", "")),
+                                     agent=str(arguments.get("agent", "")),
+                                     blocked_by=str(arguments.get("blocked_by", "")),
+                                     detail=str(arguments.get("detail", "")))
+        if err:
+            return f"错误：{err}"
+        return (f"任务 #{row['id']} 已更新：status={brain.TASK_CN.get(row['status'], row['status'])}"
+                f" owner={row['owner'] or '-'}｜{row['title'][:50]}")
+
+    if name == "hub_tasks":
+        try:
+            lim = int(arguments.get("limit") or 50)
+        except (TypeError, ValueError):
+            lim = 50
+        rows = brain.task_list(root, status=str(arguments.get("status", "")),
+                               owner=str(arguments.get("owner", "")),
+                               project=str(arguments.get("project", "")),
+                               limit=lim)
+        if not rows:
+            return "暂无任务（hub_task_add 新建；状态 pending/in_progress/blocked/done）"
+        lines = [f"任务 {len(rows)} 条（进行中→阻塞→待办→完成 排序）："]
+        for t in rows:
+            who = f" @{t['owner']}" if t["owner"] else ""
+            blk = (f" 等待:{t['blocked_by'][:30]}"
+                   if t["status"] == "blocked" and t["blocked_by"] else "")
+            proj = f"{t['project']}｜" if t["project"] else ""
+            lines.append(f"- #{t['id']} [{brain.TASK_CN.get(t['status'], t['status'])}]{who}{blk} "
+                         f"{proj}{t['title'][:60]}")
+        return "\n".join(lines)
+
+    if name == "hub_event_write":
+        err, eid = brain.event_add(root, str(arguments.get("content", "")),
+                                   kind=str(arguments.get("kind", "progress")),
+                                   project=str(arguments.get("project", "")),
+                                   agent=str(arguments.get("agent", "")),
+                                   ref=str(arguments.get("ref", "")))
+        if err:
+            return "错误：" + err
+        return f"事件已写入 #{eid}（其他 agent 用 hub_events(since_id) 增量订阅）"
+
+    if name == "hub_events":
+        try:
+            since = int(arguments.get("since_id") or 0)
+            lim = int(arguments.get("limit") or 30)
+        except (TypeError, ValueError):
+            since, lim = 0, 30
+        rows = brain.event_list(root, since_id=since, limit=lim,
+                                project=str(arguments.get("project", "")),
+                                agent=str(arguments.get("agent", "")))
+        if not rows:
+            return "暂无事件（hub_event_write 写入；since_id 增量订阅）"
+        lines = [f"事件流 {len(rows)} 条（倒序；增量订阅传 since_id={rows[0]['id']}）："]
+        for e in rows:
+            proj = f" · {e['project']}" if e["project"] else ""
+            lines.append(f"- #{e['id']} {e['ts'][5:16]} [{e['agent'] or '-'}·{e['kind']}]"
+                         f"{proj}：{e['content'][:80]}")
+        return "\n".join(lines)
 
     if name == "hub_list_projects":
         rows = brain.list_projects(root)
@@ -1090,36 +1245,226 @@ TOOLS = [
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
     {"name": "hub_status", "description": "大脑此刻状态（连续性层）：谁在线/活跃项目/今日变更/未关闭错误与待认领交接/置顶记忆与停滞项目/待办线索——历史靠 hub_search，现在看这里",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_help",
+     "description": "起步指北（任何 profile 常驻可见）：当前 profile 与可见工具清单 + 发现/调用/预演/截断四件事的用法",
+     "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_search_tools",
+     "description": "按关键词搜索全部工具（含当前 profile 藏起的；藏起≠禁用）——找不到某个能力时先来这里",
+     "inputSchema": {"type": "object",
+                     "properties": {"keyword": {"type": "string",
+                                                "description": "关键词（匹配工具名/说明子串），缺省列出全部"}}}},
+    {"name": "hub_call_tool",
+     "description": "调用任意工具（含被 profile 藏起的）——name + arguments 透传；写工具同样受 dry_run/confirm/审计约束",
+     "inputSchema": {"type": "object",
+                     "properties": {"name": {"type": "string", "description": "目标工具名"},
+                                    "arguments": {"type": "object", "description": "目标工具的参数对象"}},
+                     "required": ["name"]}},
+    {"name": "hub_audit",
+     "description": "写操作审计（P3-1）：最近的写工具调用记录（谁/何时/写了什么/undo 句柄）",
+     "inputSchema": {"type": "object",
+                     "properties": {"limit": {"type": "integer", "description": "条数，默认 20"}}}},
+    {"name": "hub_flush_index",
+     "description": "语义索引维护：把缺失向量补进 embeddings（force=true 全量重编码）。语义依赖缺失时如实报错（fail-open）",
+     "inputSchema": {"type": "object",
+                     "properties": {"force": {"type": "boolean", "description": "true=全量重编码（默认只补缺失）"}}}},
+    {"name": "hub_task_add",
+     "description": "新建任务（P3-2 状态机）：title 必填；blocked_by 非空则初始为阻塞态。开工前认领（hub_claim）避免与其他 agent 撞车",
+     "inputSchema": {"type": "object",
+                     "properties": {"title": {"type": "string", "description": "任务标题（一句话）"},
+                                    "project": {"type": "string", "description": "所属项目，可空"},
+                                    "detail": {"type": "string", "description": "细节/验收标准，可空"},
+                                    "blocked_by": {"type": "string", "description": "被谁/什么阻塞（非空则初始 status=blocked）"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["title"]}},
+    {"name": "hub_claim",
+     "description": "认领任务（P3-2）：pending → in_progress(owner)。同一任务同时只有一家能认领成功；超 2h 未更新自动可被接管（防死锁）",
+     "inputSchema": {"type": "object",
+                     "properties": {"task_id": {"type": "integer", "description": "任务 id"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（必填）"}},
+                     "required": ["task_id", "agent"]}},
+    {"name": "hub_task_update",
+     "description": "任务状态流转：pending(释放)/in_progress/blocked(写 blocked_by)/done。in_progress 任务只有持有者可流转（空 agent=管理面）",
+     "inputSchema": {"type": "object",
+                     "properties": {"task_id": {"type": "integer", "description": "任务 id"},
+                                    "status": {"type": "string", "enum": ["pending", "in_progress", "blocked", "done"]},
+                                    "blocked_by": {"type": "string", "description": "阻塞原因（status=blocked 时用）"},
+                                    "detail": {"type": "string", "description": "补充细节/进展，可空"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["task_id"]}},
+    {"name": "hub_tasks",
+     "description": "任务列表（P3-2）：进行中→阻塞→待办→完成 排序；可按 status/owner/project 过滤。看谁在干什么、什么被卡住",
+     "inputSchema": {"type": "object",
+                     "properties": {"status": {"type": "string", "enum": ["pending", "in_progress", "blocked", "done"]},
+                                    "owner": {"type": "string", "description": "按认领人过滤"},
+                                    "project": {"type": "string", "description": "按项目过滤"},
+                                    "limit": {"type": "integer", "description": "条数，默认 50"}}}},
+    {"name": "hub_event_write",
+     "description": "写一条事件（P3-2 事件流）：写进展/求助/交接信号，其他 agent 可订阅（hub_events）",
+     "inputSchema": {"type": "object",
+                     "properties": {"content": {"type": "string", "description": "事件内容（一句话进展）"},
+                                    "kind": {"type": "string", "enum": ["progress", "note", "error", "handoff"],
+                                             "description": "事件类型，缺省 progress"},
+                                    "project": {"type": "string", "description": "相关项目，可空"},
+                                    "ref": {"type": "string", "description": "关联引用（记录/任务 id 等），可空"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["content"]}},
+    {"name": "hub_events",
+     "description": "读事件流（倒序）；增量订阅传 since_id=上次最大 id 只取新事件（agent 之间的轻量协作通道）",
+     "inputSchema": {"type": "object",
+                     "properties": {"since_id": {"type": "integer", "description": "只要 id 大于它的新事件"},
+                                    "limit": {"type": "integer", "description": "条数，默认 30"},
+                                    "project": {"type": "string", "description": "按项目过滤"},
+                                    "agent": {"type": "string", "description": "按来源 agent 过滤"}}}},
 ]
 
 
+# ---------------------------------------------------------------- P3-1 profile 切片 / 写工具清单
+
+# 任何 profile 都可见的最小面（hub_help 是发现入口）
+PROFILE_ALWAYS = ("hub_help", "hub_status", "hub_heartbeat")
+# reader：最小只读切片（约 3~8 个：总览/检索/精读/规范/发现）
+PROFILE_READER = PROFILE_ALWAYS + ("hub_get_rules", "hub_search", "hub_get_record",
+                                   "hub_search_tools")
+# worker：日常干活（记录/记忆/待办/认领/事件/审计），管理类工具留给 admin
+PROFILE_WORKER = PROFILE_READER + (
+    "hub_call_tool", "hub_get_progress", "hub_get_project", "hub_list_projects",
+    "hub_memory_read", "hub_memory_write", "hub_log_work", "hub_note", "hub_note_read",
+    "hub_todo_done", "hub_list_todos", "hub_report_error", "hub_distill", "hub_undo",
+    "hub_env_list", "hub_env_set", "hub_handoff", "hub_audit", "hub_flush_index",
+    "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks",
+    "hub_event_write", "hub_events",
+)
+PROFILES = {"reader": PROFILE_READER, "worker": PROFILE_WORKER, "admin": None}  # None=全量
+
+# 写工具清单（P3-1）：dry_run 预演、confirm 闸门、写后审计三者都按它判定
+WRITE_TOOLS = {
+    "hub_log_work", "hub_create_project", "hub_note", "hub_memory_write", "hub_heartbeat",
+    "hub_report_error", "hub_undo", "hub_archive_project", "hub_todo_done", "hub_env_set",
+    "hub_ops_run", "hub_handoff", "hub_report", "hub_flush_index",
+    "hub_task_add", "hub_task_update", "hub_claim", "hub_event_write",
+}
+
+
+def visible_tools() -> list:
+    """当前 profile 下 tools/list 的可见切片（admin=全量；藏起≠禁用，仍可直接调用）。"""
+    allow = PROFILES.get(SERVER_PROFILE)
+    if allow is None:
+        return list(TOOLS)
+    allow = set(allow)
+    return [t for t in TOOLS if t["name"] in allow]
+
+
+# 统一字段注入：所有工具支持 max_chars；写工具额外支持 dry_run / confirm（契约单一来源）
+for _t in TOOLS:
+    _props = _t.setdefault("inputSchema", {}).setdefault("properties", {})
+    _props.setdefault("max_chars", {
+        "type": "integer",
+        "description": f"结果字符预算（默认 {DEFAULT_MAX_CHARS}；0=不截断）。超预算截断并在文末标注，"
+                       "完整内容在 structuredContent"})
+    if _t["name"] in WRITE_TOOLS:
+        _props.setdefault("dry_run", {"type": "boolean",
+                                      "description": "true=只预演不执行（不落库）"})
+        _props.setdefault("confirm", {"type": "boolean",
+                                      "description": "写操作显式确认；传 false 时返回 input_required 且不执行"
+                                                     "（return-and-resume，服务端不阻塞不回调）"})
+
+
 # ---------------------------------------------------------------- MCP 协议层
+
+def _shape_result(text: str, arguments: dict) -> tuple:
+    """结果契约（P3-1）：默认预算内原样返回；超预算 → 截断 + 文末明确标注 + structuredContent。
+    max_chars=0 关闭截断；非法值回落默认（撑不住时自我降级并明确告知，抄 aider 硬预算）。"""
+    try:
+        budget = (int(arguments.get("max_chars"))
+                  if arguments.get("max_chars") is not None else DEFAULT_MAX_CHARS)
+    except (TypeError, ValueError):
+        budget = DEFAULT_MAX_CHARS
+    if budget <= 0 or len(text) <= budget:
+        return text, None
+    meta = {"total": len(text), "shown": budget, "truncated": True, "cursor": budget}
+    foot = (f"\n…（已截断：原文 {len(text)} 字符，此处显示前 {budget}；完整内容见 "
+            "structuredContent.full_text，或传 max_chars=0 关闭截断）")
+    return text[:budget] + foot, {"meta": meta, "full_text": text}
+
+
+def _audit_write(root: str, tname: str, arguments: dict, text: str) -> None:
+    """写操作审计（P3-1）：落一行 op_audit，附 undo 句柄（识别出记录/记忆 id 时带上）。"""
+    try:
+        summary = (text or "").strip().splitlines()[0] if text else ""
+        kind, ref = "", ""
+        m = re.search(r"records#(\d+)", text or "")
+        if m:
+            kind, ref = "record", m.group(1)
+        else:
+            m = re.search(r"记忆 ?#(\d+)", text or "")
+            if m:
+                kind, ref = "memory", m.group(1)
+        brain.audit_add(root, str(arguments.get("agent") or ""), tname,
+                        str(arguments.get("project") or ""), summary, kind, ref)
+    except Exception:  # noqa: BLE001 审计失败不影响主流程
+        pass
+
 
 def handle_message(msg: dict, root: str) -> dict | None:
     """处理一条 JSON-RPC 请求，返回响应；通知返回 None。"""
     method = msg.get("method", "")
     mid = msg.get("id")
     is_notification = mid is None
+    params = msg.get("params") or {}
 
     if method == "initialize":
-        req_ver = (msg.get("params") or {}).get("protocolVersion", PROTOCOL_VERSION)
+        req_ver = params.get("protocolVersion", PROTOCOL_VERSION)
         return {"jsonrpc": "2.0", "id": mid,
                 "result": {"protocolVersion": req_ver, "capabilities": {"tools": {}},
                            "serverInfo": SERVER_INFO}}
+    if method == "server/discover":
+        # P3-1 版本协商：未知版本 → -32022；已知/未传 → 返回能力面（dual-era：initialize 握手保留）
+        pv = params.get("protocolVersion")
+        if pv and pv not in SUPPORTED_PROTOCOL_VERSIONS:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "error": {"code": -32022, "message": "UnsupportedProtocolVersionError",
+                              "data": {"supported": list(SUPPORTED_PROTOCOL_VERSIONS)}}}
+        return {"jsonrpc": "2.0", "id": mid,
+                "result": {"supportedProtocolVersions": list(SUPPORTED_PROTOCOL_VERSIONS),
+                           "serverInfo": SERVER_INFO, "agentId": SERVER_AGENT,
+                           "profile": SERVER_PROFILE,
+                           "visibleToolCount": len(visible_tools()),
+                           "totalToolCount": len(TOOLS)}}
     if method in ("notifications/initialized", "notifications/cancelled"):
         return None
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": TOOLS}}
+        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": visible_tools()}}
     if method == "tools/call":
-        params = msg.get("params") or {}
         tname = params.get("name", "")
         args = params.get("arguments") or {}
+        if not isinstance(args, dict):
+            args = {}
+        # P3-1 人工确认闸门：写操作显式 confirm=false → return-and-resume（不执行、不阻塞、不回调）
+        if tname in WRITE_TOOLS and args.get("confirm") is False:
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"resultType": "input_required", "isError": False,
+                               "content": [{"type": "text", "text": (
+                                   f"调用未执行：{tname} 是写操作。人工确认后重发并传 confirm=true。"
+                                   "（return-and-resume：服务端不阻塞等待，也不会主动回调。）")}]}}
+        # P3-1 dry_run：写操作预演（不落库、不审计）
+        if tname in WRITE_TOOLS and args.get("dry_run") is True:
+            preview = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items()
+                                if k not in ("dry_run", "confirm", "max_chars"))
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"content": [{"type": "text", "text": (
+                        f"dry_run（未执行）：{tname} 预演通过，将写入 → {preview or '(无参数)'}\n"
+                        "未落任何库；去掉 dry_run 后正式执行。")}], "isError": False}}
         try:
             text = call_tool(tname, args, root)
-            return {"jsonrpc": "2.0", "id": mid,
-                    "result": {"content": [{"type": "text", "text": text}], "isError": False}}
+            if tname in WRITE_TOOLS:
+                _audit_write(root, tname, args, text)
+            text, structured = _shape_result(text, args)
+            result = {"content": [{"type": "text", "text": text}], "isError": False}
+            if structured is not None:
+                result["structuredContent"] = structured
+            return {"jsonrpc": "2.0", "id": mid, "result": result}
         except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落库错误登记
             text = f"工具执行失败：{type(e).__name__}: {e}"
             try:
@@ -1137,7 +1482,7 @@ def handle_message(msg: dict, root: str) -> dict | None:
             "error": {"code": -32601, "message": f"method not found: {method}"}}
 
 
-def serve(root: str, fixed: bool = False, agent: str = "") -> int:
+def serve(root: str, fixed: bool = False, agent: str = "", profile: str = "") -> int:
     """stdio 主循环。EOF/键盘中断退出。
 
     fixed=False 时每条请求重读 config 的 root：根目录迁移后旧进程自动跟随，
@@ -1147,8 +1492,15 @@ def serve(root: str, fixed: bool = False, agent: str = "") -> int:
     本进程存活期内不变（stdio 一进程一客户端，身份无歧义）。
     留空=旧接入条目，退回调用参数自报语义（兼容，但会失去防填错能力）。
     """
-    global SERVER_AGENT
+    global SERVER_AGENT, SERVER_PROFILE
     log = lambda s: print(f"[agenthub-mcp] {s}", file=sys.stderr)  # noqa: E731
+    if profile:
+        if profile in PROFILES:
+            SERVER_PROFILE = profile
+            log(f"profile 已设置：{profile}（tools/list 可见 {len(visible_tools())}/{len(TOOLS)}；"
+                "藏起≠禁用，hub_search_tools/hub_call_tool 可及）")
+        else:
+            log(f"⚠ --profile「{profile}」未知（可用 {sorted(PROFILES)}），保持 admin 全量")
     if agent:
         # 归一 + 注册表校验：配错名字要当场说清楚，而不是静默按错的写
         key = core.agent_key(agent)
@@ -1193,20 +1545,22 @@ def serve(root: str, fixed: bool = False, agent: str = "") -> int:
     return 0
 
 
-def parse_argv(argv: list) -> tuple[str, bool, str]:
-    """解析命令行：返回 (root, fixed, agent)。
+def parse_argv(argv: list) -> tuple[str, bool, str, str]:
+    """解析命令行：返回 (root, fixed, agent, profile)。
 
     支持（顺序无关）：
         agenthub_mcp.py                        → 动态跟随 config
         agenthub_mcp.py --agent zcode          → 动态跟随 + 锁定身份（**接入配置的标准形态**）
+        agenthub_mcp.py --profile reader       → P3-1 profile 切片（reader/worker/admin，缺省 admin=全量）
         agenthub_mcp.py <root>                 → 固定根目录（向后兼容）
-        agenthub_mcp.py --agent zcode <root>   → 两者兼有
+        agenthub_mcp.py --agent zcode --profile worker <root> → 三者兼有
 
     ★ `--agent` 必须用**具名参数**，不能复用位置参数：位置参数语义是 root，
       且一旦传入就切"固定模式"（根目录搬家后旧接入会指向失效路径，2026-10-01 踩过）。
-      故只传 --agent 时仍保持动态跟随，两者互不干扰。
+      故只传 --agent 时仍保持动态跟随，两者互不干扰。--profile 同为具名参数。
     """
     agent = ""
+    profile = ""
     rest: list = []
     i = 0
     while i < len(argv):
@@ -1222,16 +1576,27 @@ def parse_argv(argv: list) -> tuple[str, bool, str]:
             agent = a.split("=", 1)[1]
             i += 1
             continue
+        if a == "--profile":
+            if i + 1 < len(argv):
+                profile = argv[i + 1]
+                i += 2
+                continue
+            i += 1
+            continue
+        if a.startswith("--profile="):
+            profile = a.split("=", 1)[1]
+            i += 1
+            continue
         rest.append(a)
         i += 1
     fixed = len(rest) > 0
     root = rest[0] if fixed else core.get_root()
-    return root, fixed, agent
+    return root, fixed, agent, profile
 
 
 def main():
-    root, fixed, agent = parse_argv(sys.argv[1:])
-    sys.exit(serve(root, fixed, agent))
+    root, fixed, agent, profile = parse_argv(sys.argv[1:])
+    sys.exit(serve(root, fixed, agent, profile))
 
 
 if __name__ == "__main__":

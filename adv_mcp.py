@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.23.0"
+    assert r["serverInfo"]["version"] == "2.28.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -72,8 +72,11 @@ def t_protocol(root):
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
             "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report",
             "hub_handoff", "hub_status", "hub_user_profile", "hub_note", "hub_note_read",
-            "hub_ask", "hub_metacognition"} <= names, names
-    assert len(names) == 37
+            "hub_ask", "hub_metacognition",
+            "hub_help", "hub_search_tools", "hub_call_tool", "hub_audit", "hub_flush_index",
+            "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks",
+            "hub_event_write", "hub_events"} <= names, names
+    assert len(names) == 48
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -935,7 +938,7 @@ def t_agent_check(tmp):
 
 
 def t_parse_argv():
-    """B1 启动参数解析：--agent 具名参数不得与 root 位置参数冲突。"""
+    """B1/P3-1 启动参数解析：--agent / --profile 具名参数不得与 root 位置参数冲突。"""
     R = r"D:\some\root"
     cases = [
         ([], (None, False, "")),
@@ -945,15 +948,168 @@ def t_parse_argv():
         (["--agent", "dsh", R], (R, True, "dsh")),
         ([R, "--agent", "hermes"], (R, True, "hermes")),
         (["--agent"], (None, False, "")),          # 缺值不崩
+        (["--profile", "reader"], (None, False, "")),        # profile 具名参数
+        (["--profile=worker", R], (R, True, "")),
+        (["--profile", "reader", "--agent", "zcode", R], (R, True, "zcode")),
     ]
     for argv, (exp_root, exp_fixed, exp_agent) in cases:
-        root, fixed, agent = m.parse_argv(argv)
+        root, fixed, agent, _profile = m.parse_argv(argv)
         assert fixed == exp_fixed and agent == exp_agent, f"{argv} -> {fixed},{agent}"
         if exp_root:
             assert root == exp_root, f"{argv} -> root={root}"
         else:
             # 未传 root → 必须走动态跟随（取 config），不能误当 fixed
             assert root == core.get_root(), f"{argv} 应动态跟随，实际 {root}"
+    # profile 值透传与缺省
+    assert m.parse_argv(["--profile", "reader"])[3] == "reader"
+    assert m.parse_argv(["--profile=worker"])[3] == "worker"
+    assert m.parse_argv([])[3] == ""
+
+
+def t_p3_contract(tmp):
+    """P3-1 契约：profile 切片（藏起≠禁用）/ discover 协商（-32022）/ max_chars 截断
+    / dry_run 不落库 / confirm=false 闸门 / 写后审计与 undo 句柄 / 发现工具。"""
+    root = fresh_hub(tmp, "p3c")
+    rs = str(root)
+
+    # ① profile 切片：reader 3~8 个；藏起的工具仍可直接调用
+    old = m.SERVER_PROFILE
+    try:
+        m.SERVER_PROFILE = "reader"
+        names = {t["name"] for t in resp_ok(m.handle_message(rpc("tools/list"), rs))["tools"]}
+        assert 3 <= len(names) <= 8, f"reader 应只看到 3~8 个：{len(names)}"
+        assert {"hub_help", "hub_status", "hub_heartbeat"} <= names
+        assert "hub_log_work" not in names
+        out = m.call_tool("hub_list_projects", {"max_chars": 0}, rs)
+        assert "共" in out, "藏起的工具仍应可直接调用（藏起≠禁用）"
+        m.SERVER_PROFILE = "worker"
+        wn = {t["name"] for t in resp_ok(m.handle_message(rpc("tools/list"), rs))["tools"]}
+        assert len(wn) < len(m.TOOLS), "worker 应比 admin 小"
+        assert "hub_log_work" in wn and "hub_ops_run" not in wn
+    finally:
+        m.SERVER_PROFILE = old
+
+    # ② server/discover + 未知版本 -32022（initialize 握手保留 = dual-era）
+    d = resp_ok(m.handle_message(rpc("server/discover"), rs))
+    assert d["profile"] == m.SERVER_PROFILE and d["totalToolCount"] == len(m.TOOLS)
+    assert resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), rs))
+    bad = m.handle_message(rpc("server/discover", {"protocolVersion": "0.0"}), rs)
+    assert bad["error"]["code"] == -32022, bad
+
+    # ③ max_chars：截断 + 文末标注 + structuredContent；0=不截断
+    r = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_status",
+                                                    "arguments": {"max_chars": 40}}, 9), rs))
+    assert "已截断" in r["content"][0]["text"]
+    meta = r["structuredContent"]["meta"]
+    assert meta["truncated"] is True and meta["total"] > 40
+    assert "full_text" in r["structuredContent"]
+    r2 = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_status",
+                                                     "arguments": {"max_chars": 0}}, 10), rs))
+    assert "structuredContent" not in r2 and "已截断" not in r2["content"][0]["text"]
+
+    # ④ dry_run 不落库、不审计
+    before = len(brain.list_records(rs, "测试-项目", limit=2000))
+    r3 = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_log_work", "arguments": {
+        "project": "测试-项目", "agent": "zcode", "content": "dry run 样本", "dry_run": True}}, 11), rs))
+    assert "dry_run" in r3["content"][0]["text"] and "未落任何库" in r3["content"][0]["text"]
+    assert len(brain.list_records(rs, "测试-项目", limit=2000)) == before, "dry_run 不得落库"
+    assert not brain.audit_list(rs), "dry_run 不应产生审计"
+
+    # ⑤ confirm=false → input_required 且不执行（return-and-resume）
+    r4 = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_log_work", "arguments": {
+        "project": "测试-项目", "agent": "zcode", "content": "confirm false", "confirm": False}}, 12), rs))
+    assert r4.get("resultType") == "input_required"
+    assert len(brain.list_records(rs, "测试-项目", limit=2000)) == before
+
+    # ⑥ 真写 → 审计落库 + undo 句柄
+    r5 = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_log_work", "arguments": {
+        "project": "测试-项目", "agent": "zcode", "content": "正式写入（P3-1 审计）"}}, 13), rs))
+    assert not r5["isError"]
+    aud = brain.audit_list(rs, 5)
+    assert aud and aud[0]["tool"] == "hub_log_work"
+    assert aud[0]["undo_kind"] == "record" and aud[0]["undo_ref"], aud
+
+    # ⑦ 发现工具：hub_search_tools / hub_call_tool（含防递归）
+    t = m.call_tool("hub_search_tools", {"keyword": "认领"}, rs)
+    assert "hub_claim" in t
+    t2 = m.call_tool("hub_call_tool", {"name": "hub_tasks", "arguments": {}}, rs)
+    assert "任务" in t2
+    assert "错误" in m.call_tool("hub_call_tool", {"name": "hub_call_tool"}, rs), "防递归"
+    assert "错误" in m.call_tool("hub_call_tool", {"name": "hub_不存在"}, rs)
+
+
+def t_p3_tasks_events(tmp):
+    """P3-2 状态机：并发认领只胜一家 / 持有者约束 / 超时自动接管 / 阻塞不可领 / 事件流增量。"""
+    import threading as _th
+    root = fresh_hub(tmp, "p3t")
+    rs = str(root)
+
+    r = m.call_tool("hub_task_add", {"title": "并发认领", "project": "测试-项目", "agent": "zcode"}, rs)
+    tid = int(r.split("#")[1].split("：")[0])
+    wins = []
+
+    def claim(who):
+        err, _row = brain.task_claim(rs, tid, who)
+        if not err:
+            wins.append(who)
+
+    ts = [_th.Thread(target=claim, args=(w,)) for w in ("zcode", "dsh")]
+    [x.start() for x in ts]
+    [x.join() for x in ts]
+    assert len(wins) == 1, f"并发认领应只胜一家：{wins}"
+    owner = wins[0]
+    loser = "dsh" if owner == "zcode" else "zcode"
+
+    err2, _ = brain.task_claim(rs, tid, loser)
+    assert "已被" in err2 and owner in err2
+
+    err3, _ = brain.task_update(rs, tid, status="done", agent=loser)
+    assert "持有" in err3, "非持有者不得流转"
+    err4, row4 = brain.task_update(rs, tid, status="done", agent=owner)
+    assert not err4 and row4["status"] == "done"
+    err5, _ = brain.task_update(rs, tid, status="pending", agent=owner)
+    assert "已完成" in err5
+
+    # 超时自动接管：伪造 claimed_at 为 3 小时前（TTL=2h）
+    r2 = m.call_tool("hub_task_add", {"title": "超时接管", "agent": "zcode"}, rs)
+    tid2 = int(r2.split("#")[1].split("：")[0])
+    assert not brain.task_claim(rs, tid2, "zcode")[0]
+    old_ts = (datetime.datetime.now() - datetime.timedelta(hours=3)).isoformat(timespec="seconds")
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (old_ts, tid2))
+    err6, row6 = brain.task_claim(rs, tid2, "dsh")
+    assert not err6 and row6["owner"] == "dsh", "超时未自动释放接管"
+
+    # 阻塞任务不可认领；解除后可
+    r3 = m.call_tool("hub_task_add", {"title": "阻塞任务", "blocked_by": "外部依赖", "agent": "zcode"}, rs)
+    tid3 = int(r3.split("#")[1].split("：")[0])
+    err7, _ = brain.task_claim(rs, tid3, "dsh")
+    assert "阻塞" in err7
+    err8, _ = brain.task_update(rs, tid3, status="pending", agent="")
+    assert not err8
+    err9, row9 = brain.task_claim(rs, tid3, "dsh")
+    assert not err9 and row9["status"] == "in_progress"
+
+    # 列表排序契约：进行中 → 阻塞 → 待办 → 完成（各类可能缺项，按秩单调性断言）
+    rows = brain.task_list(rs, limit=50)
+    rank = {"in_progress": 0, "blocked": 1, "pending": 2, "done": 3}
+    ranks = [rank[r["status"]] for r in rows]
+    assert ranks == sorted(ranks), f"任务排序不符：{[r['status'] for r in rows]}"
+
+    # 事件流：写入 + 增量订阅只取新事件
+    assert m.call_tool("hub_event_write", {"content": "进展A", "project": "测试-项目",
+                                           "agent": "zcode"}, rs)
+    first = brain.event_list(rs, limit=10)
+    assert first and first[0]["content"] == "进展A"
+    m.call_tool("hub_event_write", {"content": "进展B", "agent": "dsh"}, rs)
+    inc = brain.event_list(rs, since_id=first[0]["id"], limit=10)
+    assert len(inc) == 1 and inc[0]["content"] == "进展B", "增量订阅应只取新事件"
+    assert "进展B" in m.call_tool("hub_events", {"limit": 5}, rs)
+
+    # 坏参不崩
+    assert "不存在" in m.call_tool("hub_claim", {"task_id": 999999, "agent": "zcode"}, rs)
+    assert "错误" in m.call_tool("hub_task_add", {"title": "  ", "agent": "zcode"}, rs)
+    assert "错误" in m.call_tool("hub_task_update", {"task_id": tid, "status": "乱写"}, rs)
 
 
 def main():
@@ -991,6 +1147,10 @@ def main():
     case("B1/B2身份锁定（覆盖自报/兼容旧接入/筛选不下发/不一致留痕/节流）", lambda: t_server_agent_override(tmp))
     case("身份校验（注册表放行/显示名归一/非法拒收/锁定值不校验）", lambda: t_agent_check(tmp))
     case("B1启动参数解析（--agent与root位置参数不冲突）", lambda: t_parse_argv())
+    case("P3-1契约（profile切片/discover协商/max_chars截断/dry_run/confirm闸门/审计undo）",
+         lambda: t_p3_contract(tmp))
+    case("P3-2待办状态机（并发认领只胜一家/持有者约束/超时接管/阻塞/事件流增量）",
+         lambda: t_p3_tasks_events(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

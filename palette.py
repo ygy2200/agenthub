@@ -15,7 +15,7 @@ import os
 from PySide6.QtCore import QEvent, QSize, Qt, QTimer, QUrl
 from PySide6.QtGui import QDesktopServices
 from PySide6.QtWidgets import QAbstractItemView, QListWidgetItem, QVBoxLayout, QWidget
-from qfluentwidgets import CaptionLabel, FluentIcon, LineEdit, ListWidget
+from qfluentwidgets import CaptionLabel, FluentIcon, InfoBar, LineEdit, ListWidget
 
 import actions  # P2-2：页面/动作条目与导航、快捷键同源
 import tokens
@@ -105,6 +105,15 @@ class CommandPalette(QWidget):
             for p in list(getattr(snap, "projects", []))[:60]:
                 acts.append(("FOLDER", f"项目：{p.name}", "proj 打开项目 工作记录",
                              (lambda n=p.name: self._open_project(n))))
+        # P3-1：MCP 工具检索（命令面板搜工具）——清单与 MCP server 同源（import 其 TOOLS 常量）
+        try:
+            import agenthub_mcp
+            for t in agenthub_mcp.TOOLS:
+                acts.append(("CODE", f"工具：{t['name']}",
+                             f"{t['name']} {t['description']}".lower(),
+                             (lambda n=t["name"], d=t["description"]: self._use_tool(n, d))))
+        except Exception:  # noqa: BLE001 工具清单不可用时面板照常
+            pass
         self._acts = acts
 
     # ---------------------------------------------------------------- 样式
@@ -199,6 +208,15 @@ class CommandPalette(QWidget):
             w.project_page.select_project(name)
         except Exception:  # noqa: BLE001
             pass
+
+    def _use_tool(self, name: str, desc: str):
+        """工具条目（P3-1）：复制工具名到剪贴板 + 提示说明——供人工核对/粘贴到 agent 对话。"""
+        try:
+            from PySide6.QtWidgets import QApplication
+            QApplication.clipboard().setText(name)
+        except Exception:  # noqa: BLE001
+            pass
+        InfoBar.success("已复制工具名", f"{name} —— {desc[:88]}", duration=3500, parent=self.win)
 
     # ---------------------------------------------------------------- 键盘
 
