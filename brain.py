@@ -201,6 +201,31 @@ CREATE TABLE IF NOT EXISTS tag_schema (
     first_seen TEXT DEFAULT "",
     last_seen TEXT DEFAULT ""
 );
+-- P1-3 关系 + 属性（双链/引用图底座）：relations=有向边（正文 [[X]] 自动抽 mention 边）；
+-- attrs=节点属性（node_kind∈project/record/memory/note；project 上 is_inheritable=1 的属性被子节点继承）
+CREATE TABLE IF NOT EXISTS relations (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    from_kind TEXT DEFAULT "",
+    from_id INTEGER DEFAULT 0,
+    to_kind TEXT DEFAULT "",
+    to_ref TEXT DEFAULT "",
+    kind TEXT DEFAULT "mention",
+    created TEXT DEFAULT "",
+    UNIQUE(from_kind, from_id, to_kind, to_ref, kind)
+);
+CREATE INDEX IF NOT EXISTS idx_rel_from ON relations(from_kind, from_id);
+CREATE INDEX IF NOT EXISTS idx_rel_to ON relations(to_kind, to_ref);
+CREATE TABLE IF NOT EXISTS attrs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    node_kind TEXT DEFAULT "",
+    node_ref TEXT DEFAULT "",
+    key TEXT DEFAULT "",
+    value TEXT DEFAULT "",
+    is_inheritable INTEGER DEFAULT 0,
+    created TEXT DEFAULT "",
+    UNIQUE(node_kind, node_ref, key)
+);
+CREATE INDEX IF NOT EXISTS idx_attrs_node ON attrs(node_kind, node_ref);
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, action TEXT, target TEXT, backup TEXT, note TEXT
@@ -754,6 +779,188 @@ def tag_list(root: str, limit: int = 100) -> list:
             "ORDER BY use_count DESC, tag LIMIT ?", (max(1, min(int(limit), 500)),))]
 
 
+# ---------------------------------------------------------------- P1-3 关系 + 属性继承（双链/引用图底座）
+
+_REL_TO_KINDS = {"r": ("record", "records"), "m": ("memory", "memories"), "n": ("note", "notes")}
+REL_LINK_RE = re.compile(r"\[\[([^\[\]]{1,80})\]\]")
+
+
+def _link_targets(content: str) -> list:
+    """抽取正文 [[X]] 双链目标（去重保序）。[[r:12]]/[[m:76]]/[[n:3]] = 显式实体引用，其余按项目名。"""
+    out, seen = [], set()
+    for m in REL_LINK_RE.finditer(content or ""):
+        t = m.group(1).strip()
+        if t and t not in seen:
+            seen.add(t)
+            out.append(t)
+    return out
+
+
+def _resolve_link(conn, target: str):
+    """[[X]] → (to_kind, to_ref)。显式实体引用需存在（不存在返回 None）；其余一律按项目名
+    （前向兼容：项目尚未出现也存，等它出现反向链接即生效）。"""
+    m = re.match(r"^([rmn]):(\d+)$", target)
+    if m:
+        kind, tbl = _REL_TO_KINDS[m.group(1)]
+        if not conn.execute(f"SELECT 1 FROM {tbl} WHERE id=?", (int(m.group(2)),)).fetchone():
+            return None
+        return (kind, m.group(2))
+    return ("project", target)
+
+
+def sync_links(conn, from_kind: str, from_id: int, content: str) -> int:
+    """P1-3：重抽 [[双链]] → relations 的 mention 边（先删本源旧边再插，幂等）。返回边数。fail-open。"""
+    try:
+        conn.execute("DELETE FROM relations WHERE from_kind=? AND from_id=? AND kind='mention'",
+                     (from_kind, from_id))
+        n = 0
+        for t in _link_targets(content):
+            r = _resolve_link(conn, t)
+            if not r:
+                continue
+            conn.execute(
+                "INSERT OR IGNORE INTO relations(from_kind,from_id,to_kind,to_ref,kind,created) "
+                "VALUES(?,?,?,?,'mention',?)", (from_kind, int(from_id), r[0], r[1], _now()))
+            n += 1
+        return n
+    except Exception:
+        return 0
+
+
+def relation_add(root: str, from_kind: str, from_id: int, to_kind: str, to_ref: str,
+                 kind: str = "link") -> str:
+    """手工建一条边（kind 默认 link；[[双链]] 自动边用 mention）。"""
+    with db_conn(root) as conn:
+        conn.execute("INSERT OR IGNORE INTO relations(from_kind,from_id,to_kind,to_ref,kind,created) "
+                     "VALUES(?,?,?,?,?,?)",
+                     (from_kind, int(from_id), to_kind, str(to_ref), kind, _now()))
+    return ""
+
+
+def relation_remove(root: str, rel_id: int) -> str:
+    with db_conn(root) as conn:
+        cur = conn.execute("DELETE FROM relations WHERE id=?", (int(rel_id),))
+        if cur.rowcount == 0:
+            return f"关系 #{rel_id} 不存在"
+    return ""
+
+
+def relation_list(root: str, from_kind: str = "", from_id: int = 0, to_kind: str = "",
+                  to_ref: str = "", limit: int = 100) -> list:
+    q, args = "SELECT * FROM relations WHERE 1=1", []
+    if from_kind:
+        q += " AND from_kind=?"; args.append(from_kind)
+    if from_id:
+        q += " AND from_id=?"; args.append(int(from_id))
+    if to_kind:
+        q += " AND to_kind=?"; args.append(to_kind)
+    if to_ref:
+        q += " AND to_ref=?"; args.append(str(to_ref))
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(max(1, min(int(limit), 500)))
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(q, args)]
+
+
+def _src_snippet(conn, kind: str, sid: int, width: int = 60) -> tuple:
+    """来源摘要：(标题或前 N 字, 项目)。找不到（已删）给 ("(已删除)", "")。"""
+    if kind == "record":
+        r = conn.execute("SELECT title,content,project FROM records WHERE id=?", (sid,)).fetchone()
+        return (((r["title"] or r["content"] or "")[:width], r["project"] or "")
+                if r else ("(已删除)", ""))
+    if kind == "memory":
+        r = conn.execute("SELECT content,project FROM memories WHERE id=?", (sid,)).fetchone()
+        return ((r["content"] or "")[:width], r["project"] or "") if r else ("(已删除)", "")
+    if kind == "note":
+        r = conn.execute("SELECT content FROM notes WHERE id=?", (sid,)).fetchone()
+        return ((r["content"] or "")[:width] if r else "(已删除)", "")
+    return ("", "")
+
+
+def backlinks(root: str, to_kind: str, to_ref: str, limit: int = 50) -> list:
+    """谁引用了我（引用图/反链数据源）：连来源摘要一起返回。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM relations WHERE to_kind=? AND to_ref=? ORDER BY id DESC LIMIT ?",
+            (to_kind, str(to_ref), max(1, min(int(limit), 500))))]
+        for r in rows:
+            r["snippet"], r["project"] = _src_snippet(conn, r["from_kind"], r["from_id"])
+        return rows
+
+
+def attr_set(root: str, node_kind: str, node_ref: str, key: str, value: str,
+             inheritable: bool = False) -> str:
+    """设属性（UPSERT）。project 上 inheritable=1 会被其下 record/memory 继承。返回错误或 ""。"""
+    key = (key or "").strip()
+    if not key:
+        return "key 不能为空"
+    if node_kind not in ("project", "record", "memory", "note"):
+        return f"node_kind 非法：{node_kind!r}"
+    with db_conn(root) as conn:
+        conn.execute(
+            "INSERT INTO attrs(node_kind,node_ref,key,value,is_inheritable,created) "
+            "VALUES(?,?,?,?,?,?) ON CONFLICT(node_kind,node_ref,key) DO UPDATE SET "
+            "value=excluded.value, is_inheritable=excluded.is_inheritable",
+            (node_kind, str(node_ref), key, str(value or ""), 1 if inheritable else 0, _now()))
+    return ""
+
+
+def attr_delete(root: str, node_kind: str, node_ref: str, key: str) -> str:
+    with db_conn(root) as conn:
+        cur = conn.execute("DELETE FROM attrs WHERE node_kind=? AND node_ref=? AND key=?",
+                           (node_kind, str(node_ref), (key or "").strip()))
+        if cur.rowcount == 0:
+            return f"属性 {key} 不存在"
+    return ""
+
+
+def _project_of(conn, kind: str, eid: int) -> str:
+    tbl = "records" if kind == "record" else ("memories" if kind == "memory" else "")
+    if not tbl:
+        return ""
+    r = conn.execute(f"SELECT project FROM {tbl} WHERE id=?", (eid,)).fetchone()
+    return (r["project"] or "") if r else ""
+
+
+def attr_effective_all(root: str, node_kind: str, node_ref: str) -> list:
+    """节点全部生效属性（直接 + 从所属 project 继承；直接覆盖继承）。[{'key','value','from'}]"""
+    out: dict = {}
+    with db_conn(root) as conn:
+        if node_kind in ("record", "memory"):
+            try:
+                proj = _project_of(conn, node_kind, int(node_ref))
+            except (TypeError, ValueError):
+                proj = ""
+            if proj:
+                for r in conn.execute("SELECT key,value FROM attrs WHERE node_kind='project' "
+                                      "AND node_ref=? AND is_inheritable=1", (proj,)):
+                    out[r["key"]] = {"key": r["key"], "value": r["value"], "from": "inherited"}
+        for r in conn.execute("SELECT key,value FROM attrs WHERE node_kind=? AND node_ref=?",
+                              (node_kind, str(node_ref))):
+            out[r["key"]] = {"key": r["key"], "value": r["value"], "from": "direct"}
+    return sorted(out.values(), key=lambda x: x["key"])
+
+
+def attr_effective(root: str, node_kind: str, node_ref: str, key: str) -> str:
+    """生效属性：直接优先；record/memory 未直设时从所属 project 继承（仅 is_inheritable=1）。"""
+    with db_conn(root) as conn:
+        r = conn.execute("SELECT value FROM attrs WHERE node_kind=? AND node_ref=? AND key=?",
+                         (node_kind, str(node_ref), key)).fetchone()
+        if r is not None:
+            return r["value"]
+        if node_kind in ("record", "memory"):
+            try:
+                proj = _project_of(conn, node_kind, int(node_ref))
+            except (TypeError, ValueError):
+                proj = ""
+            if proj:
+                r2 = conn.execute("SELECT value FROM attrs WHERE node_kind='project' AND node_ref=? "
+                                  "AND key=? AND is_inheritable=1", (proj, key)).fetchone()
+                if r2 is not None:
+                    return r2["value"]
+    return ""
+
+
 def add_record(root: str, project: str, agent: str, date: str, title: str, content: str,
                source: str = "hub", context: str = "", options: str = "",
                decision: str = "", tradeoffs: str = "", record_type: str = "") -> int:
@@ -776,6 +983,7 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
             (project, agent, date, title, content, source, _now(), (date or _now()[:10]), rtype))
         conn.execute("UPDATE projects SET updated=?, status='active' "
                      "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
+        sync_links(conn, "record", cur.lastrowid, content)  # P1-3：正文 [[双链]] → relations
         _ensure_emb_for(root, "records", cur.lastrowid, title, content, project, conn=conn)
         return cur.lastrowid
 
@@ -1313,6 +1521,7 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
             (kind, content, tags, project, agent, 1 if pinned else 0,
              _now(), _now(), vu, conf, ev))
         nid = cur.lastrowid
+        sync_links(conn, "memory", nid, content)  # P1-3：正文 [[双链]] → relations
         _ensure_emb_for(root, "memories", nid, content, tags, project, conn=conn)
         if old > 0:
             conn.execute("UPDATE memories SET superseded_by=?, updated=? WHERE id=?",
@@ -2061,6 +2270,8 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
             row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
                                (mid,)).fetchone()
             if row:
+                if "content=?" in sets:
+                    sync_links(conn, "memory", mid, row["content"])  # P1-3：双链重抽（幂等）
                 _ensure_emb_for(root, "memories", mid, row["content"], row["tags"],
                                 row["project"], conn=conn)
     return ""
@@ -2401,6 +2612,7 @@ def add_note(root: str, content: str, tags: str = "", link: str = "",
             "VALUES(?,?,?,?,?,?,?,?)",
             (_now(), source, content[:4000], (tags or "").strip(), (link or "").strip(),
              mood, (open_at or "").strip(), (context or "").strip()))
+        sync_links(conn, "note", cur.lastrowid, content)  # P1-3：随记里的 [[双链]] 也建关系
         return cur.lastrowid
 
 

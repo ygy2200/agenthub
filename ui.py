@@ -312,7 +312,8 @@ class ClickBodyLabel(BodyLabel):
 
 
 class RecordDetailDialog(MessageBoxBase):
-    """时间线记录详情：标题 + 元信息 + 段正文渲染（接收 DB records 行 dict）。"""
+    """时间线记录详情：标题 + 元信息 + 段正文渲染（接收 DB records 行 dict）。
+    P1-3：附「引用 / 被引用」区（引用图数据源）。"""
 
     def __init__(self, win, r: dict):
         super().__init__(win)
@@ -331,16 +332,51 @@ class RecordDetailDialog(MessageBoxBase):
         meta.addStretch(1)
         self.browser = TextBrowser()
         self.browser.setHtml(md_to_html(r.get("content") or r.get("title") or ""))
-        self.browser.setMinimumSize(860, 480)
+        self.browser.setMinimumSize(860, 400)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addLayout(meta)
         self.viewLayout.addWidget(self.browser)
+        # P1-3 引用区：本条引用谁（出链）+ 谁引用本条（反链）
+        try:
+            rid = int(r.get("id") or 0)
+            outs = brain.relation_list(win.root, from_kind="record", from_id=rid, limit=30)
+            backs = brain.backlinks(win.root, "record", str(rid), limit=30)
+        except Exception:
+            outs, backs = [], []
+        if outs or backs:
+            linksRow = QHBoxLayout()
+            outBox, backBox = QVBoxLayout(), QVBoxLayout()
+            outBox.addWidget(CaptionLabel(f"→ 本条引用（{len(outs)}）"))
+            backBox.addWidget(CaptionLabel(f"← 引用了本条（{len(backs)}）"))
+            ol, bl = ListWidget(), ListWidget()
+            for x in outs:
+                ol.addItem(_rel_text(x["to_kind"], x["to_ref"]))
+            for x in backs:
+                bl.addItem(f"{_rel_text(x['from_kind'], str(x['from_id']))} · {x['snippet']}")
+            if not outs:
+                ol.addItem("（无）")
+            if not backs:
+                bl.addItem("（无）")
+            ol.setFixedHeight(110)
+            bl.setFixedHeight(110)
+            outBox.addWidget(ol)
+            backBox.addWidget(bl)
+            linksRow.addLayout(outBox, 1)
+            linksRow.addLayout(backBox, 1)
+            self.viewLayout.addLayout(linksRow)
         openBtn = PushButton(ic("FOLDER", "INFO"), "打开项目目录")
         openBtn.clicked.connect(lambda: open_location(str(Path(win.root) / r.get("project", "")), select=False))
         self.viewLayout.addWidget(openBtn, 0, Qt.AlignRight)
         self.yesButton.setText("关闭")
         self.cancelButton.hide()
         self.widget.setMinimumWidth(920)
+
+
+def _rel_text(kind: str, ref: str) -> str:
+    """关系目标的可读文本（项目名 / 记录#id / 记忆#id / 随记#id）。"""
+    if kind == "project":
+        return f"项目「{ref}」"
+    return f"{ {'record': '记录', 'memory': '记忆', 'note': '随记'}.get(kind, kind) }#{ref}"
 
 
 # ---------------------------------------------------------------- 小组件

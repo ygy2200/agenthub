@@ -586,6 +586,52 @@ def t_record_type_and_tags(tmp):
     assert brain._norm_tags(None) == "" and brain._norm_tags("，，, ,") == ""
 
 
+def t_relations_and_attrs(tmp):
+    """P1-3 关系 + 属性继承：[[双链]] 自动成 mention 边（显式 r:/m: 校验存在、项目名前向兼容）、
+    编辑重抽幂等、反链带来源摘要；attrs UPSERT/删除 + project 级可继承属性向 record/memory 下行。"""
+    root = str(Path(tmp) / "hub_p13")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    assert brain.init_db(root) == ""
+    mid = brain.add_memory(root, "被引用记忆", project="目标项目", agent="zcode")
+    rid = brain.add_record(root, "来源项目", "zcode", "2026-10-11", "带双链的记录",
+                           f"见 [[目标项目]] 与 [[m:{mid}]]；无效引用 [[r:99999]] 忽略；重复 [[目标项目]] 只留一条")
+    rels = brain.relation_list(root, from_kind="record", from_id=rid)
+    targets = {(r["to_kind"], r["to_ref"]) for r in rels}
+    assert ("project", "目标项目") in targets and ("memory", str(mid)) in targets, targets
+    assert len(rels) == 2, rels  # 无效引用忽略 + 重复去重
+    # 反链：目标项目 / 被引用记忆都能查到来源（含摘要）
+    bl = brain.backlinks(root, "project", "目标项目")
+    assert bl and bl[0]["from_kind"] == "record" and bl[0]["from_id"] == rid and bl[0]["snippet"], bl
+    blm = brain.backlinks(root, "memory", str(mid))
+    assert blm and blm[0]["from_id"] == rid, blm
+    # 编辑记忆重抽：旧边消失、新边建立（幂等）
+    mid2 = brain.add_memory(root, "初版 [[旧目标]]", agent="zcode")
+    t0 = {r["to_ref"] for r in brain.relation_list(root, from_kind="memory", from_id=mid2)}
+    assert t0 == {"旧目标"}, t0
+    assert brain.edit_memory(root, mid2, content=f"新版 [[新目标]] [[r:{rid}]]", agent="zcode") == ""
+    t1 = {(r["to_kind"], r["to_ref"])
+          for r in brain.relation_list(root, from_kind="memory", from_id=mid2)}
+    assert t1 == {("project", "新目标"), ("record", str(rid))}, t1
+    # 属性：project 级可继承属性下行；不可继承不下行；直接属性覆盖继承
+    assert brain.attr_set(root, "project", "来源项目", "domain", "检索", inheritable=True) == ""
+    assert brain.attr_set(root, "project", "来源项目", "secret", "不继承") == ""
+    assert brain.attr_effective(root, "record", str(rid), "domain") == "检索"
+    assert brain.attr_effective(root, "record", str(rid), "secret") == ""
+    assert brain.attr_set(root, "record", str(rid), "domain", "覆盖值") == ""
+    assert brain.attr_effective(root, "record", str(rid), "domain") == "覆盖值"
+    eff = {a["key"]: (a["value"], a["from"]) for a in brain.attr_effective_all(root, "record", str(rid))}
+    assert eff["domain"] == ("覆盖值", "direct"), eff
+    assert brain.attr_effective(root, "memory", str(mid), "domain") == ""  # 不同项目不继承
+    # 手工边 / 删除 / 坏参
+    assert brain.relation_add(root, "memory", mid, "record", str(rid), "ref") == ""
+    first_id = brain.relation_list(root, from_kind="memory", from_id=mid)[0]["id"]
+    assert brain.relation_remove(root, first_id) == ""
+    assert "不存在" in brain.relation_remove(root, 999999)
+    assert "不能为空" in brain.attr_set(root, "record", str(rid), "  ", "x")
+    assert "非法" in brain.attr_set(root, "bogus", "x", "k", "v")
+    assert "不存在" in brain.attr_delete(root, "record", str(rid), "没有这个键")
+
+
 
 def t_env_profile(tmp):
     """环境档案：UPSERT/浏览过滤/自动采集幂等。"""
@@ -1885,6 +1931,7 @@ def main():
     case("P0-3 语义模型本地优先加载（缓存存在→纯本地加载/防联网重试风暴）", lambda: t_emb_local_first(tmp))
     case("P1-1 记忆版本化（编辑/删除留痕+回滚+records双时相失效不删）", lambda: t_memory_revisions(tmp))
     case("P1-2 schema收口（record_type枚举/标签规约与注册表归一）", lambda: t_record_type_and_tags(tmp))
+    case("P1-3 关系+属性继承（双链抽取/反链/属性下行）", lambda: t_relations_and_attrs(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

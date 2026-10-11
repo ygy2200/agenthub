@@ -168,6 +168,19 @@ def t_record_type_guard(tmp):
     assert rows and rows[0]["record_type"] == "todo", rows[:1]
 
 
+def t_links_extract(tmp):
+    """P1-3：hub_log_work 写入含 [[双链]] 的正文 → relations 自动成边（MCP 生产路径）。"""
+    root = fresh_hub(tmp, "links")
+    rs = str(root)
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "参考 [[测试-项目]] 与 [[r:1]] 的做法"}, rs)
+    assert "已记入大脑" in out, out
+    assert brain.relation_list(rs, from_kind="record", to_kind="project", to_ref="测试-项目"), \
+        "[[项目名]] 未自动成 relation"
+    assert brain.relation_list(rs, from_kind="record", to_kind="record", to_ref="1"), \
+        "[[r:1]] 显式引用未成 relation"
+
+
 def t_concurrent_log_work(tmp, root=None):
     # 独立 hub（2026-10-10）：agent 名改用注册表内取值后，靠名字前缀过滤 journal
     # 不再可靠（会与其他用例同名串味），故用 fresh_hub 隔离。
@@ -954,6 +967,7 @@ def main():
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
     case("record_type枚举校验（非法拒收不落库/合法入库）", lambda: t_record_type_guard(tmp))
+    case("P1-3 双链自动成 relation（MCP 写入路径）", lambda: t_links_extract(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp, fresh_hub(tmp, "conc")))
     case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))
