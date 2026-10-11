@@ -1,0 +1,165 @@
+# -*- coding: utf-8 -*-
+"""ConnectPage（P2-1 自 ui.py 拆出）。"""
+from __future__ import annotations
+
+from uikit import *  # noqa: F401,F403
+import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+class ConnectPage(QWidget):
+    """接入中心：把各 agent 连上 AgentHub 公用大脑（标准 MCP 协议）。"""
+
+    def __init__(self, win, parent=None):
+        super().__init__(parent)
+        self.win = win
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(24, 24, 24, 24)
+        top = QHBoxLayout()
+        top.addWidget(TitleLabel("接入中心 · 公用大脑"))
+        top.addStretch(1)
+        refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新状态")
+        refreshBtn.clicked.connect(self.refresh_status)
+        top.addWidget(refreshBtn)
+        lay.addLayout(top)
+        lay.addWidget(CaptionLabel(
+            "AgentHub 通过标准 MCP 协议向所有 agent 提供 25 个工具：项目登记/新建、工作记录（可撤销）、"
+            "全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、踩坑拦截、归档、技能/MCP 清单、进度对齐。"
+            "「一键接入」写入 MCP 配置，「注入引导」把开工规则写进 agent 的全局指令文件——"
+            "两步都做，agent 才会在每次会话自然使用公用大脑，无需口头提醒。"))
+
+        # 卡片列表装滚动容器（2026-10-09 修：原先直接挂页面布局，窗口一缩小卡片被压扁、
+        # 三行文字被裁掉看不见——用户报「拉大才完整、缩小就缺字」的真凶）。
+        self.scroll = ScrollArea()
+        self.rows = QVBoxLayout()
+        self.scroll.setWidgetResizable(True)
+        self.scroll.enableTransparentBackground()
+        self.rowsHost = QWidget()
+        self.rowsHost.setLayout(self.rows)
+        self.rows.setContentsMargins(0, 0, 8, 0)
+        self.rows.setSpacing(10)
+        self.scroll.setWidget(self.rowsHost)
+        self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
+        # stretch=2 给卡片区，让它拿走富余高度；下方手动接入区固定不参与拉伸
+        lay.addWidget(self.scroll, 2)
+        lay.addWidget(StrongBodyLabel("手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）"))
+        self.snippet = TextBrowser()
+        self.snippet.setMinimumHeight(110)
+        self.snippet.setMaximumHeight(180)
+        lay.addWidget(self.snippet, 1)
+        copyBtn = PushButton(ic("COPY", "INFO"), "复制配置片段")
+        copyBtn.clicked.connect(self.copy_snippet)
+        lay.addWidget(copyBtn, 0, Qt.AlignRight)
+        lay.addWidget(CaptionLabel("所有写入（接入/引导）均先自动备份原文件为 *.bak-agenthub-时间戳，"
+                                   "可随时移除还原；操作全部进「流水」页可查。"))
+        lay.addStretch(1)
+        self.pyLabel = CaptionLabel("")
+        lay.addWidget(self.pyLabel)
+        QTimer.singleShot(400, self.refresh_status)
+
+    def _rows_data(self):
+        py, server = core.deploy_server()
+        rows = []
+        for a in core.load_agent_adapters(self.win.root):
+            boot_path = a.get("instr_path") or a.get("boot") or ""
+            mcp = a.get("mcp") or None
+            if not mcp:
+                rows.append({"agent": a["agent"], "path": "", "layout": "", "mcp": None,
+                             "boot_path": boot_path})
+                continue
+            path, layout = mcp.get("path", ""), mcp.get("layout", "standard")
+            rows.append({"agent": a["agent"], "path": path, "layout": layout,
+                         "mcp": core.mcp_has_agenthub(path, layout),
+                         "boot_path": boot_path})
+        return py, server, rows
+
+    def refresh_status(self):
+        while self.rows.count():
+            it = self.rows.takeAt(0)
+            if it.widget():
+                it.widget().deleteLater()
+        py, server, rows = self._rows_data()
+        if not py:
+            self.pyLabel.setText("⚠ 未找到可用的 python.exe，无法自动接入（MCP server 需要 python 运行）")
+        elif not server:
+            self.pyLabel.setText("⚠ MCP server 部署失败")
+        else:
+            self.pyLabel.setText(f"服务端就绪：{server}")
+        for r in rows:
+            card = CardWidget()
+            card.setMinimumHeight(96)  # 锁最小高度：三行文字不被压扁裁掉
+            g = QHBoxLayout(card)
+            g.setContentsMargins(16, 12, 16, 12)
+            col = QVBoxLayout()
+            mcp_txt = "—（用下方配置片段手动接入）" if r["mcp"] is None else \
+                ("✓ 已接入公用大脑" if r["mcp"] else "○ 未接入")
+            boot_on = core.bootstrap_status(r["boot_path"])
+            col.addWidget(StrongBodyLabel(r["agent"]))
+            col.addWidget(CaptionLabel(f"MCP：{mcp_txt}      引导规则：{'✓ 已注入' if boot_on else '○ 未注入'}"))
+            if r["path"]:
+                col.addWidget(CaptionLabel(f"配置文件：{r['path']}"))
+            col.addWidget(CaptionLabel(f"引导写入：{r['boot_path']}"))
+            g.addLayout(col, 1)
+            if r["mcp"] is not None:
+                if r["mcp"]:
+                    rm = PushButton(ic("CLOSE", "INFO"), "移除接入")
+                    rm.clicked.connect(lambda _, p=r["path"], l=r["layout"]: self.do_remove(p, l))
+                    g.addWidget(rm)
+                else:
+                    btn = PrimaryPushButton(ic("LINK", "INFO"), "一键接入")
+                    btn.setEnabled(bool(py and server))
+                    btn.clicked.connect(lambda _, p=r["path"], l=r["layout"], ag=r["agent"]: self.do_connect(p, l, ag))
+                    g.addWidget(btn)
+            if boot_on:
+                rb = PushButton("移除引导")
+                rb.clicked.connect(lambda _, p=r["boot_path"]: self.do_boot_remove(p))
+                g.addWidget(rb)
+            else:
+                ib = PrimaryPushButton(ic("EDIT", "INFO"), "注入引导")
+                ib.clicked.connect(lambda _, p=r["boot_path"]: self.do_boot_inject(p))
+                g.addWidget(ib)
+            self.rows.addWidget(card)
+
+    def do_connect(self, path, layout, agent=""):
+        py, server, _ = self._rows_data()
+        if not py or not server:
+            InfoBar.error("无法接入", "python 或服务端未就绪", duration=3000, parent=self.win)
+            return
+        # agent 名写进启动参数（B1）：server 据此锁定身份，忽略工具调用里的自报值
+        err = core.install_mcp_entry(path, layout, py, server, self.win.root, agent=agent)
+        if err:
+            InfoBar.error("接入失败", err, duration=5000, parent=self.win)
+        else:
+            core.journal(self.win.root, "user", "mcp_connect", path)
+            InfoBar.success("已接入", f"{path}（原文件已备份）", duration=3000, parent=self.win)
+        self.refresh_status()
+
+    def do_remove(self, path, layout):
+        err = core.remove_mcp_entry(path, layout)
+        if not err:
+            core.journal(self.win.root, "user", "mcp_remove", path)
+        InfoBar.success("已移除" if not err else "移除失败", err, duration=3000, parent=self.win)
+        self.refresh_status()
+
+    def do_boot_inject(self, path):
+        err = core.inject_bootstrap(path, self.win.root)
+        if err:
+            InfoBar.error("注入失败", err, duration=5000, parent=self.win)
+        else:
+            InfoBar.success("引导已注入", f"{path}（原文件已备份，重启该 agent 生效）",
+                            duration=3000, parent=self.win)
+        self.refresh_status()
+
+    def do_boot_remove(self, path):
+        err = core.remove_bootstrap(path, self.win.root)
+        InfoBar.success("引导已移除" if not err else "移除失败", err, duration=3000, parent=self.win)
+        self.refresh_status()
+
+    def _snippet_text(self):
+        py, server, _ = self._rows_data()
+        entry = {"agenthub": {"command": py or "D:/python311/python.exe",
+                              "args": [server or r"C:\\Users\\y\\.agenthub\\mcp_server\\agenthub_mcp.py",
+                                       self.win.root or "D:/AgentHub"]}}
+        return json.dumps({"mcpServers": entry}, ensure_ascii=False, indent=2)
+
+    def copy_snippet(self):
+        QApplication.clipboard().setText(self._snippet_text())
+        InfoBar.success("已复制", "粘贴到 agent 的 MCP 配置里即可", duration=2500, parent=self.win)
+
