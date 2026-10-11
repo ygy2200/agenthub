@@ -1928,15 +1928,12 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
     if text_changed:
         _ensure_emb()  # 模型懒加载移出写事务（同 add_record/add_memory）
     with db_conn(root) as conn:
-        before = conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
-                              (mid,)).fetchone()
-        if before is None:
+        before = _snapshot(conn, mid)
+        if not before:
             return f"记忆 #{mid} 不存在"
         conn.execute(f"UPDATE memories SET {', '.join(sets)}, updated=? WHERE id=?",
                      (*args, _now(), mid))
-        after = conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
-                             (mid,)).fetchone()
-        _revision(conn, mid, "edit", dict(before), dict(after), agent)
+        _revision(conn, mid, "edit", before, _snapshot(conn, mid), agent)
         if text_changed:
             # 文本变更 → 同步语义索引（否则语义路拿着旧文本做相似度，编辑等于没生效）
             row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
@@ -1948,18 +1945,27 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
 
 
 def delete_memory(root: str, mid: int, agent: str = "") -> str:
-    """软删记忆（status='deleted'）。P1-1：删除留痕（before 快照入 memory_revisions，可追溯）。"""
+    """软删记忆（status='deleted'）。P1-1：删除留痕（before 快照入 memory_revisions，可追溯/可复活）。"""
     with db_conn(root) as conn:
-        before = conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
-                              (mid,)).fetchone()
-        if before is None:
+        before = _snapshot(conn, mid)
+        if not before:
             return f"记忆 #{mid} 不存在"
         conn.execute("UPDATE memories SET status='deleted', updated=? WHERE id=?", (_now(), mid))
-        _revision(conn, mid, "delete", dict(before), {}, agent)
+        _revision(conn, mid, "delete", before, _snapshot(conn, mid), agent)
     return ""
 
 
 # ---------------------------------------------------------------- P1-1 记忆版本化（可溯源/可回滚）
+
+_REV_FIELDS = ("content", "kind", "tags", "pinned", "status")  # 可回滚字段全量（status 让"回滚删除"复活）
+
+
+def _snapshot(conn, mid: int) -> dict:
+    """修订快照：可回滚字段的现值。行不存在 → {}。"""
+    r = conn.execute("SELECT content,kind,tags,pinned,status FROM memories WHERE id=?",
+                     (mid,)).fetchone()
+    return dict(r) if r else {}
+
 
 def _revision(conn, mid: int, action: str, before: dict, after: dict, agent: str = "") -> None:
     """写一条记忆修订记录（同一事务内写；异常随事务回滚暴露，不吞）。"""
@@ -1979,8 +1985,9 @@ def memory_revisions(root: str, mid: int, limit: int = 50) -> list:
 
 
 def memory_rollback(root: str, mid: int, rev_id: int, agent: str = "") -> str:
-    """把记忆回滚到某次修订之前的内容（只回滚 before 快照里有的字段：content/kind/tags/pinned）。
-    回滚本身也写一条 revision（action=rollback），可再回滚——版本链完整。返回错误或 ""。"""
+    """把记忆回滚到某次修订之前的状态（回滚 before 快照里有的字段：content/kind/tags/pinned/status
+    ——含 status 所以"回滚删除"能真正复活记忆）。回滚本身也写一条 revision（action=rollback），
+    可再回滚——版本链完整。返回错误或 ""。"""
     with db_conn(root) as conn:
         rev = conn.execute("SELECT * FROM memory_revisions WHERE id=? AND mid=?",
                            (rev_id, mid)).fetchone()
@@ -1994,20 +2001,23 @@ def memory_rollback(root: str, mid: int, rev_id: int, agent: str = "") -> str:
         snap = json.loads(rev["before"] or "{}")
     except Exception:
         return "修订快照损坏，无法回滚"
-    fields = [k for k in ("content", "kind", "tags", "pinned") if k in snap]
-    if not fields or not isinstance(snap, dict):
+    if not isinstance(snap, dict):
         return "修订无可回滚字段"
-    _ensure_emb()  # 正文可能变化 → 重嵌入；模型懒加载移出写事务
+    fields = [k for k in _REV_FIELDS if k in snap]
+    if not fields:
+        return "修订无可回滚字段"
+    text_changed = ("content" in fields) or ("tags" in fields)
+    if text_changed:
+        _ensure_emb()  # 正文可能变化 → 重嵌入；模型懒加载移出写事务
     with db_conn(root) as conn:
-        before = dict(conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
-                                   (mid,)).fetchone())
+        before = _snapshot(conn, mid)
         conn.execute(f"UPDATE memories SET {', '.join(f'{k}=?' for k in fields)}, updated=? WHERE id=?",
                      (*[snap[k] for k in fields], _now(), mid))
-        after = dict(conn.execute("SELECT content,kind,tags,pinned FROM memories WHERE id=?",
-                                  (mid,)).fetchone())
+        after = _snapshot(conn, mid)
         _revision(conn, mid, "rollback", before, after, agent)
-        _ensure_emb_for(root, "memories", mid, after.get("content", ""), after.get("tags", ""),
-                        cur["project"] or "", conn=conn)
+        if text_changed:
+            _ensure_emb_for(root, "memories", mid, after.get("content", ""), after.get("tags", ""),
+                            cur["project"] or "", conn=conn)
     return ""
 
 

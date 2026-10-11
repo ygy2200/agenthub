@@ -530,6 +530,12 @@ def t_memory_revisions(tmp):
     # 删除留痕 + 坏参不崩
     assert brain.delete_memory(root, mid, agent="zcode") == ""
     assert brain.memory_revisions(root, mid)[0]["action"] == "delete"
+    # 回滚「删除」修订 → 记忆复活（status 进快照，P1-1 增量二语义）
+    del_rev = brain.memory_revisions(root, mid)[0]["id"]
+    assert brain.memory_rollback(root, mid, del_rev, agent="user") == ""
+    alive = [r for r in brain.search_memories(root, "", "", 50) if r["id"] == mid]
+    assert alive and alive[0]["content"] == "旧内容 v1", alive
+    assert brain.memory_revisions(root, mid)[0]["action"] == "rollback"
     assert "不存在" in brain.memory_rollback(root, mid, 999999)
     assert "不存在" in brain.memory_rollback(root, 999999, 1)
     # records 双时相：撤销 = 软删 + valid_until；检索不再返回，行保留可追溯

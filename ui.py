@@ -23,7 +23,8 @@ from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMe
                                QDialog, QCheckBox)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox,
                             FluentIcon as FIF,
-                            FluentWindow, IconWidget, InfoBar, LineEdit, ListWidget, MessageBoxBase,
+                            FluentWindow, IconWidget, InfoBar, LineEdit, ListWidget, MessageBox,
+                            MessageBoxBase,
                             NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
                             ScrollArea, SearchLineEdit, SegmentedWidget, StrongBodyLabel,
                             SubtitleLabel, TextBrowser, TextEdit, TitleLabel, qconfig, setTheme,
@@ -708,6 +709,118 @@ class MemoryEditDialog(MessageBoxBase):
 
     def pinned(self):
         return bool(self.pinBox and self.pinBox.isChecked())
+
+
+class MemoryHistoryDialog(MessageBoxBase):
+    """P1-1 版本历史：修订列表（谁/何时/改了啥）+ 内容 diff + 一键回滚。
+    回滚本身也写入一条修订（可再回滚）——版本链完整、只增不改。"""
+
+    _FIELDS_CN = {"content": "内容", "kind": "类型", "tags": "标签", "pinned": "置顶", "status": "状态"}
+
+    def __init__(self, win, mid: int):
+        super().__init__(win)
+        self.win = win
+        self.mid = mid
+        self._sel_rev = None
+        self.titleLabel = SubtitleLabel(f"版本历史 · 记忆 #{mid}")
+        self.revList = ListWidget()
+        self.revList.setFixedWidth(300)
+        self.detail = TextBrowser()
+        row = QHBoxLayout()
+        row.addWidget(self.revList)
+        row.addWidget(self.detail, 1)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addLayout(row)
+        self.yesButton.setText("回滚到此版本")
+        self.cancelButton.setText("关闭")
+        self.widget.setMinimumSize(880, 480)
+        self.revList.itemClicked.connect(self._on_pick)
+        self._reload()
+
+    def _reload(self):
+        self.revList.clear()
+        self._sel_rev = None
+        revs = brain.memory_revisions(self.win.root, self.mid)
+        if not revs:
+            self.revList.addItem("（暂无修订——编辑/删除/回滚后才有）")
+            self.detail.setHtml(
+                f"<p style='color:{tokens.C(tokens.TEXT_3)}'>该记忆还没有修订历史。"
+                "修改内容后回来，这里会有每一次改动的快照与 diff。</p>")
+            return
+        for r in revs:
+            self.revList.addItem(
+                f"{r['created'][5:16].replace('T', ' ')} · {r['action']} · {r['agent'] or '-'}")
+            self.revList.item(self.revList.count() - 1).setData(Qt.UserRole, r["id"])
+        self.detail.setHtml(
+            f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点左侧某条修订查看改动详情；"
+            "选好后点『回滚到此版本』。</p>")
+
+    def _on_pick(self, item):
+        rid = item.data(Qt.UserRole)
+        if rid is None:
+            return
+        rev = next((r for r in brain.memory_revisions(self.win.root, self.mid) if r["id"] == rid), None)
+        if rev:
+            self._sel_rev = rev
+            self.detail.setHtml(self._render(rev))
+
+    def _render(self, rev) -> str:
+        import difflib
+        try:
+            b = json.loads(rev["before"] or "{}")
+            a = json.loads(rev["after"] or "{}")
+        except Exception:
+            return "<p>快照损坏，无法展示</p>"
+        head = (f"<p><b>修订 #{rev['id']}</b> · {html.escape(rev['action'])} · "
+                f"{html.escape(rev['agent'] or '-')} · {html.escape(rev['created'])}</p>")
+        if rev["action"] == "delete":
+            return head + ("<p>删除前内容（点『回滚到此版本』可复活）：</p>"
+                           f"<pre>{html.escape(str(b.get('content', '')))}</pre>")
+        parts = [head]
+        changed = [k for k in ("content", "kind", "tags", "pinned", "status") if b.get(k) != a.get(k)]
+        if "content" in changed:
+            diff = list(difflib.unified_diff(
+                str(b.get("content", "")).splitlines(), str(a.get("content", "")).splitlines(),
+                lineterm="", n=1))
+            body = []
+            for ln in diff:
+                e = html.escape(ln)
+                if ln.startswith("+"):
+                    body.append(f"<span style='color:#3c9a5f'>{e}</span>")
+                elif ln.startswith("-"):
+                    body.append(f"<span style='color:#d9534f'>{e}</span>")
+                else:
+                    body.append(e)
+            parts.append("<p>内容 diff：</p><pre>" + "\n".join(body) + "</pre>")
+        for k in changed:
+            if k == "content":
+                continue
+            parts.append(f"<p>{self._FIELDS_CN.get(k, k)}：{html.escape(str(b.get(k)))} → "
+                         f"{html.escape(str(a.get(k)))}</p>")
+        if not changed:
+            parts.append("<p>（无字段差异）</p>")
+        return "".join(parts)
+
+    def accept(self):
+        """『回滚到此版本』：确认后回滚并原地刷新（不关窗，新修订立即可见）。"""
+        if not self._sel_rev:
+            InfoBar.warning("先选一条修订", "", duration=2000, parent=self.win)
+            return
+        rev = self._sel_rev
+        box = MessageBox("确认回滚？",
+                         f"将记忆 #{self.mid} 回滚到修订 #{rev['id']} 之前的状态；"
+                         "回滚本身也会写入一条修订（可再回滚）。", self.win)
+        if not box.exec():
+            return
+        err = brain.memory_rollback(self.win.root, self.mid, rev["id"], agent="user")
+        if err:
+            InfoBar.error("回滚失败", err, duration=4000, parent=self.win)
+            return
+        core.journal(self.win.root, "user", "memory_rollback", f"brain:memories#{self.mid}",
+                     note=f"rev#{rev['id']}")
+        InfoBar.success("已回滚", f"记忆 #{self.mid} → 修订 #{rev['id']} 之前", duration=2500,
+                        parent=self.win)
+        self._reload()
 
 
 # ---------------------------------------------------------------- 页面
@@ -2514,6 +2627,10 @@ class HubPage(QWidget):
         self.editBtn.setEnabled(False)
         self.editBtn.clicked.connect(self.edit_current)
         editRow.addWidget(self.editBtn)
+        self.histBtn = PushButton(ic("HISTORY", "SYNC"), "版本历史")
+        self.histBtn.setEnabled(False)
+        self.histBtn.clicked.connect(self.show_history)
+        editRow.addWidget(self.histBtn)
         editRow.addStretch(1)
         newMemBtn = PushButton(ic("ADD", "INFO"), "新建记忆")
         newMemBtn.clicked.connect(self.new_memory)
@@ -2709,6 +2826,7 @@ class HubPage(QWidget):
         # 环境档案条目（data = env:category|key）
         if isinstance(path, str) and path.startswith("env:"):
             self.editBtn.setEnabled(False)
+            self.histBtn.setEnabled(False)
             self.editBtn.setText("环境配置项（agent 经 hub_env_set 更新）")
             cat, key = path[4:].split("|", 1)
             rows = brain.env_list(self.win.root, cat, key, 1)
@@ -2721,6 +2839,7 @@ class HubPage(QWidget):
         if isinstance(path, str) and path.startswith("mem:"):
             self.editBtn.setEnabled(True)
             self.editBtn.setText("编辑这条记忆")
+            self.histBtn.setEnabled(True)
             m = next((x for x in self._mem_rows if x["id"] == int(path[4:])), None)
             if m:
                 meta = f"类型 {brain.KIND_CN.get(m['kind'], m['kind'])} · 置顶{'是' if m['pinned'] else '否'}" \
@@ -2731,9 +2850,11 @@ class HubPage(QWidget):
         if self.stack.currentIndex() == 1:  # MCP：只显示来源，不读内容（防密钥外泄到界面日志）
             self.preview.setHtml(f"<p><b>{item.text()}</b></p><p>配置文件：{p}</p>")
             self.editBtn.setEnabled(False)
+            self.histBtn.setEnabled(False)
             self.editBtn.setText("MCP 配置含密钥，请用系统编辑器打开")
             return
         self.editBtn.setEnabled(True)
+        self.histBtn.setEnabled(False)
         self.editBtn.setText("编辑并保存（自动备份）")
         # 市场视图条目不可编辑
         self.cur_editable = self.stack.currentIndex() != 4 and p.is_file()
@@ -2754,7 +2875,8 @@ class HubPage(QWidget):
             dlg = MemoryEditDialog(self.win, m)
             if dlg.exec():
                 err = brain.edit_memory(root=self.win.root, mid=mid, content=dlg.content(),
-                                        kind=dlg.kind(), tags=dlg.tags(), pinned=dlg.pinned())
+                                        kind=dlg.kind(), tags=dlg.tags(), pinned=dlg.pinned(),
+                                        agent="user")
                 if err:
                     InfoBar.error("保存失败", err, duration=4000, parent=self.win)
                 else:
@@ -2789,13 +2911,22 @@ class HubPage(QWidget):
             InfoBar.warning("先在列表中选择一条记忆", "", duration=2500, parent=self.win)
             return
         mid = int(self.cur_path[4:])
-        err = brain.delete_memory(self.win.root, mid)
+        err = brain.delete_memory(self.win.root, mid, agent="user")
         if err:
             InfoBar.error("删除失败", err, duration=4000, parent=self.win)
         else:
             core.journal(self.win.root, "user", "memory_delete", f"brain:memories#{mid}")
-            InfoBar.success("已删除（软删，可整库追溯）", "", duration=2500, parent=self.win)
+            InfoBar.success("已删除（软删，可整库追溯；版本历史里可回滚复活）", "", duration=2500,
+                            parent=self.win)
             self.fill_memories()
+
+    def show_history(self):
+        """P1-1 版本历史：选中记忆 → 修订列表 + diff + 一键回滚（在弹窗内完成，改动进流水）。"""
+        if not self.cur_path or not (isinstance(self.cur_path, str) and self.cur_path.startswith("mem:")):
+            InfoBar.warning("先在记忆列表中选择一条", "", duration=2500, parent=self.win)
+            return
+        MemoryHistoryDialog(self.win, int(self.cur_path[4:])).exec()
+        self.fill_memories()
 
     def on_open(self, item):
         path = item.data(Qt.UserRole)
@@ -2812,8 +2943,10 @@ class HubPage(QWidget):
         menu = QMenu(self)
         act_open = menu.addAction("打开所在目录")
         act_edit = act_del = None
+        act_hist = None
         if isinstance(data, str) and data.startswith("mem:"):
             act_edit = menu.addAction("编辑这条记忆")
+            act_hist = menu.addAction("版本历史…")
             act_del = menu.addAction("删除这条记忆")
         elif (isinstance(data, str) and data and self.stack.currentIndex() != 1
               and Path(data).is_file()):
@@ -2824,6 +2957,9 @@ class HubPage(QWidget):
             self.on_open(item)
         elif chosen is act_edit:
             self.edit_current()
+        elif chosen is act_hist:
+            self.cur_path = data
+            self.show_history()
         elif chosen is act_del:
             self.delete_memory()
         elif chosen is act_copy and data:
