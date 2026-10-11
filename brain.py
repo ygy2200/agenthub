@@ -622,6 +622,7 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
     正文尾部追加「## 决策记录」段；全不传时行为与旧版完全一致。"""
     source = source if source in ("hub", "auto") else "hub"
     content = content + render_decision(context, options, decision, tradeoffs)
+    _ensure_emb()  # 模型懒加载移出写事务：避免 12s 加载期间持有 WAL 写锁拖垮并发写
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
         agent = _norm_agent(agent)
@@ -631,6 +632,7 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
             (project, agent, date, title, content, source, _now()))
         conn.execute("UPDATE projects SET updated=?, status='active' "
                      "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
+        _ensure_emb_for(root, "records", cur.lastrowid, title, content, project, conn=conn)
         return cur.lastrowid
 
 
@@ -840,7 +842,13 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
     for rank, r in enumerate(bm25_rows):
         scores[r["id"]] = scores.get(r["id"], 0.0) + _RRF_W_BM25 / (_RRF_K + rank + 1)
         channels.setdefault(r["id"], {})["bm25"] = rank + 1
+    sem_rows = _semantic_rank(root, kw, "records") if _RRF_W_SEMANTIC > 0 else []  # P0-3 语义第三路
+    for eid, s, _ in sem_rows:
+        scores[eid] = scores.get(eid, 0.0) + _RRF_W_SEMANTIC * s
+        channels.setdefault(eid, {})["semantic"] = round(s, 4)
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
+    for eid, _, r in sem_rows:
+        by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
     fused = []
     for mid, s in scores.items():
         r = dict(by_id[mid])
@@ -1140,6 +1148,7 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
         conf = 1.0
     conf = max(0.0, min(1.0, conf))
     vu, ev = (valid_until or "").strip()[:10], _clean_evidence(evidence)
+    _ensure_emb()  # 模型懒加载移出写事务（同 add_record）
     with db_conn(root) as conn:
         if old > 0 and not conn.execute("SELECT id FROM memories WHERE id=?",
                                         (old,)).fetchone():
@@ -1152,6 +1161,7 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
             (kind, content, tags.strip(), project, agent, 1 if pinned else 0,
              _now(), _now(), vu, conf, ev))
         nid = cur.lastrowid
+        _ensure_emb_for(root, "memories", nid, content, tags, project, conn=conn)
         if old > 0:
             conn.execute("UPDATE memories SET superseded_by=?, updated=? WHERE id=?",
                          (nid, _now(), old))
@@ -1374,6 +1384,7 @@ _RRF_W_RECENCY = 0.0  # recency 加成（P4.4）：评测三档定档 β=0.10→
 # 当前规模（79 条记忆条条常被唤起）recency 与相关性负相关，默认关闭；机制保留（对抗用例验证），
 # 触发重评条件=记忆规模显著增长或唤起分布变化（07 计划 v1.5）
 _RRF_ENABLED = True  # 融合回滚开关：False 即回 LIKE 单路旧行为
+_RRF_W_SEMANTIC = 1.5  # 语义路权重（P0-3 embedding 第三路；eval 标定；0=关闭独立降级到两路）
 
 
 def _recency_of(r: dict, now: datetime.datetime) -> float:
@@ -1517,6 +1528,166 @@ def _phrase_boost(r: dict, kw: str) -> float:
     return round(min(boost, _BOOST_CAP), 4)
 
 
+# ---------------------------------------------------------------- P0-3 语义检索（可选依赖，fail-open）
+# 给 RRF 融合加第三路「语义向量」信号。依赖 sentence_transformers + 本地中文模型
+# （BAAI/bge-small-zh-v1.5，数据不出本机）。零硬依赖：未安装 / 模型缺失 / 编码异常时全部降级——
+# 融合只跑 LIKE+BM25 两路，MCP server 照常零依赖启动（铁律：外部能力用 fail-open 包裹）。
+_EMB_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+_EMB = None          # 懒加载的 SentenceTransformer 实例（进程级缓存）
+_EMB_DIM = None
+_EMB_READY = None    # None=未尝试 / True / False
+_EMB_LOCK = threading.Lock()  # 模型懒加载互斥：防并发写路径重复加载（8线程压测曾现）
+_HAS_ST = False
+# 语义候选准入门槛（2026-10-11 实测标定，见 _semantic_rank）：
+# ① 查询须含中文——bge-small-zh 对 ASCII 标识符/路径/通配符查询的相似度不可信，且这类查询
+#    多为字面查找（"50_off"/"100%"/"max_size"/"a.png"），放模糊召回会破坏 LIKE 精确契约
+#    （实测 "50_off"→"50%_off" 余弦 0.642——纯阈值拦不住，必须按查询语种关断）。
+# ② 余弦 ≥ 0.45——30 条 eval 实测：语义依赖的真匹配最低 0.500（#77），噪声上限 0.402
+#    （"绝不存在的词zzz" 0.342、"100%"×无关记录 0.402）。
+_SEM_MIN_SIM = 0.45
+_SEM_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+try:
+    from sentence_transformers import SentenceTransformer  # 可选依赖（本机可无）
+    _HAS_ST = True
+except Exception:
+    _HAS_ST = False
+
+
+def _init_emb_table(root: str, conn=None) -> None:
+    """语义向量表（fail-open 建表；不存在则语义路自动跳过）。
+    传 conn 时复用调用方已开连接（写事务内建表，避免额外 WAL 写锁竞争）。"""
+    ddl = """CREATE TABLE IF NOT EXISTS embeddings(
+                entity TEXT NOT NULL, eid INTEGER NOT NULL, vec BLOB NOT NULL,
+                model TEXT, dim INTEGER, updated TEXT, PRIMARY KEY(entity, eid))"""
+    try:
+        if conn is not None:
+            conn.execute(ddl)
+        else:
+            with db_conn(root) as c:
+                c.execute(ddl)
+    except Exception:
+        pass
+
+
+def _ensure_emb() -> bool:
+    """懒加载语义模型（进程级只试一次）。任何失败 → False，调用方降级到词法两路。
+    双检锁：并发写路径首调用只加载一次，避免 8 线程压测重复加载 torch 拖垮。"""
+    global _EMB, _EMB_DIM, _EMB_READY
+    if _EMB_READY is not None:
+        return _EMB_READY
+    with _EMB_LOCK:
+        if _EMB_READY is not None:
+            return _EMB_READY
+        if not _HAS_ST:
+            _EMB_READY = False
+            return False
+        try:
+            _EMB = SentenceTransformer(_EMB_MODEL_NAME)
+            try:
+                _EMB_DIM = _EMB.get_embedding_dimension()
+            except Exception:
+                _EMB_DIM = _EMB.get_sentence_embedding_dimension()
+            _EMB_READY = True
+        except Exception:
+            _EMB_READY = False
+        return _EMB_READY
+
+
+def _encode(texts: list) -> object | None:
+    """批量编码（L2 归一化，余弦=点积）。无模型 / 异常 → None。"""
+    if not _ensure_emb():
+        return None
+    try:
+        return _EMB.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+    except Exception:
+        return None
+
+
+def _store_emb(root: str, entity: str, eid: int, vec, conn=None) -> None:
+    """存一条语义向量（fail-open；覆盖写）。vec 为 numpy float32 数组。
+    传 conn 时复用调用方已开连接（写事务内建表+写入，避免额外 WAL 写锁竞争）。"""
+    try:
+        _init_emb_table(root, conn=conn)
+        import datetime as _dt
+        blob = vec.astype("float32").tobytes()
+        sql = ("INSERT OR REPLACE INTO embeddings(entity, eid, vec, model, dim, updated) "
+               "VALUES(?,?,?,?,?,?)")
+        args = (entity, eid, blob, _EMB_MODEL_NAME, int(vec.shape[0]), _dt.datetime.now().isoformat())
+        if conn is not None:
+            conn.execute(sql, args)
+        else:
+            with db_conn(root) as c:
+                c.execute(sql, args)
+    except Exception:
+        pass
+
+
+def _ensure_emb_for(root: str, entity: str, eid: int, *texts, conn=None) -> None:
+    """写入钩子：内容变更后同步语义索引。fail-open（编码失败忽略，该条降级无语义分）。
+    conn 传入时复用外层已开连接（add_record/add_memory 写事务内写入，消除并发锁竞争）。"""
+    if not _HAS_ST:
+        return
+    blob = " ".join((t or "") for t in texts).strip()
+    if not blob:
+        return
+    vec = _encode([blob])
+    if vec is not None:
+        _store_emb(root, entity, eid, vec[0], conn=conn)
+
+
+def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list:
+    """语义第三路：编码 query → 与 embeddings 表余弦 → [(eid, rrf_score, row)]。
+    仅 entity 在表中有向量时生效；否则空（fail-open）。语义独有的候选（词法未召回）也能进融合。
+    准入门槛（2026-10-11 实测标定）：①查询含中文；②余弦 ≥ _SEM_MIN_SIM。见常量区注释。
+    行形态与词法两路完全一致（SELECT * + 同一 live 过滤）：调用方（融合/唤起计数）按
+    普通记忆行读 use_count/last_hit；被取代/过期/软删的行一概不得借语义路复活。"""
+    if not query or not _SEM_CJK_RE.search(query):
+        return []
+    try:
+        with db_conn(root) as c:
+            if c.execute("SELECT COUNT(*) FROM embeddings WHERE entity=?", (entity,)).fetchone()[0] == 0:
+                return []   # 空表短路：无索引时不加载模型（避免无谓开销）
+    except Exception:
+        return []
+    if not _ensure_emb():
+        return []
+    qvec = _encode([query])
+    if qvec is None:
+        return []
+    tbl = "records" if entity == "records" else "memories"
+    live = "r.status='active'" if entity == "records" else _live_sql("r.")
+    try:
+        import numpy as np
+        with db_conn(root) as c:
+            rows = c.execute(
+                f"SELECT e.eid, e.vec, r.* FROM embeddings e JOIN {tbl} r ON e.eid=r.id "
+                f"WHERE e.entity=? AND {live}", (entity,)).fetchall()
+        if not rows:
+            return []
+        q = qvec[0].astype("float32")
+        qn = np.linalg.norm(q) + 1e-9
+        scored = []
+        for row in rows:
+            v = np.frombuffer(row["vec"], dtype="float32")
+            if v.shape[0] != q.shape[0]:
+                continue
+            sim = float(np.dot(q, v) / (qn * (np.linalg.norm(v) + 1e-9)))
+            if sim < _SEM_MIN_SIM:   # 门槛：弱相关的语义候选不得进融合（噪声/误召回治理）
+                continue
+            r = dict(row)
+            r.pop("vec", None)   # 剥掉 BLOB，保持行形态与词法路一致（几百字节/条）
+            r.pop("eid", None)
+            scored.append((row["id"], sim, r))
+        scored.sort(key=lambda t: -t[1])
+        out = []
+        for rank, (eid, sim, r) in enumerate(scored[:limit]):
+            r["_semantic_sim"] = round(sim, 4)
+            out.append((eid, 1.0 / (_RRF_K + rank + 1), r))
+        return out
+    except Exception:
+        return []
+
+
 def _memories_search_fused(root: str, query: str, words: list, kind: str, limit: int) -> list:
     """P4.3 双路融合：LIKE/计分路（_memories_query）+ BM25 路（_bm25_rank）各自 rank →
     RRF(f)=Σ1/(k+rank) 融合（rank 天然免归一化，这是选 RRF 的理由）。
@@ -1538,7 +1709,13 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
     for rank, r in enumerate(bm25_rows):
         scores[r["id"]] = scores.get(r["id"], 0.0) + _RRF_W_BM25 / (_RRF_K + rank + 1)
         channels.setdefault(r["id"], {})["bm25"] = rank + 1
+    sem_rows = _semantic_rank(root, query, "memories") if _RRF_W_SEMANTIC > 0 else []  # P0-3 语义第三路
+    for eid, s, _ in sem_rows:
+        scores[eid] = scores.get(eid, 0.0) + _RRF_W_SEMANTIC * s
+        channels.setdefault(eid, {})["semantic"] = round(s, 4)
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
+    for eid, _, r in sem_rows:
+        by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
     fused = []
     now = datetime.datetime.now()
     for mid, s in scores.items():
@@ -1701,11 +1878,21 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
         args.append(1 if pinned else 0)
     if not sets:
         return "没有要更新的字段"
+    text_changed = ("content=?" in sets) or ("tags=?" in sets)
+    if text_changed:
+        _ensure_emb()  # 模型懒加载移出写事务（同 add_record/add_memory）
     with db_conn(root) as conn:
         cur = conn.execute(f"UPDATE memories SET {', '.join(sets)}, updated=? WHERE id=?",
                            (*args, _now(), mid))
         if cur.rowcount == 0:
             return f"记忆 #{mid} 不存在"
+        if text_changed:
+            # 文本变更 → 同步语义索引（否则语义路拿着旧文本做相似度，编辑等于没生效）
+            row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
+                               (mid,)).fetchone()
+            if row:
+                _ensure_emb_for(root, "memories", mid, row["content"], row["tags"],
+                                row["project"], conn=conn)
     return ""
 
 
