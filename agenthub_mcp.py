@@ -218,8 +218,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         # date 畸形兜底：从参数里提取 YYYY-MM-DD，取不到用今天
         dm = core.DATE_RE.search(str(arguments.get("date") or ""))
         date = dm.group(1) if dm else datetime.date.today().isoformat()
+        # P1-2 record_type：可选枚举，非法当场拒收（其余字段缺省自动推断）
+        rt = str(arguments.get("record_type") or "").strip()
+        if rt and rt not in brain.RECORD_TYPES:
+            return f"错误：record_type 只能是 {'/'.join(brain.RECORD_TYPES)}（收到 {rt!r}）"
         rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
-                                  context=ctx, options=opts, decision=dec, tradeoffs=tro)
+                                  context=ctx, options=opts, decision=dec, tradeoffs=tro,
+                                  record_type=rt)
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
@@ -933,6 +938,7 @@ TOOLS = [
                                               "description": "你的 agent 名（注册表内取值，会被校验；显示名如 WorkBuddy/DSH 也接受并自动归一）。确实无法归属时传 unknown，不要编造"},
                                     "content": {"type": "string", "description": "做了什么/验证结果/如何回滚"},
                                     "date": {"type": "string", "description": "YYYY-MM-DD，缺省今天"},
+                                    "record_type": {"type": "string", "description": "记录类型（可选）：work_log/decision/todo/note；缺省自动推断（含决策段→decision，否则 work_log）"},
                                     "context": {"type": "string", "description": "决策-上下文（AgDR，可选）：当时为什么面临这个选择"},
                                     "options": {"type": "string", "description": "决策-权衡过的选项（可选）：评估了哪些方案、各自为何成/否"},
                                     "decision": {"type": "string", "description": "决策-决策（可选）：最终选了什么"},

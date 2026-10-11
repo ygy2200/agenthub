@@ -20,7 +20,7 @@ from PySide6.QtGui import (QShortcut, QKeySequence, QFont, QCursor, QColor, QTex
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QSizePolicy,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
-                               QDialog, QCheckBox)
+                               QDialog, QCheckBox, QCompleter)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox,
                             FluentIcon as FIF,
                             FluentWindow, IconWidget, InfoBar, LineEdit, ListWidget, MessageBox,
@@ -319,6 +319,14 @@ class RecordDetailDialog(MessageBoxBase):
         self.titleLabel = SubtitleLabel((r.get("title") or "(无标题)")[:60])
         meta = QHBoxLayout()
         meta.addWidget(badge(r.get("agent", ""), ""))
+        rt = (r.get("record_type") or "").strip()
+        if rt in brain.RECORD_TYPE_CN:  # P1-2 类型收口的可观测面
+            lb = QLabel(f"类型 {brain.RECORD_TYPE_CN[rt]}")
+            lb.setStyleSheet(
+                f"color:{tokens.C(tokens.ACCENT)};border:1px solid {tokens.C(tokens.STROKE)};"
+                "border-radius:8px;padding:1px 8px;font-size:11px;")
+            lb.setFixedHeight(20)
+            meta.addWidget(lb)
         meta.addWidget(CaptionLabel(f"{r.get('date') or '日期未标注'} · {r.get('project', '')} · 记录#{r.get('id', '?')}"))
         meta.addStretch(1)
         self.browser = TextBrowser()
@@ -685,6 +693,15 @@ class MemoryEditDialog(MessageBoxBase):
         row.addWidget(CaptionLabel("标签（逗号分隔）"))
         self.tagsEdit = LineEdit()
         self.tagsEdit.setText((m or {}).get("tags", ""))
+        try:  # P1-2 标签收口：已有标签注册表做输入补全（fail-open，取不到就不补全）
+            _tags = [t["tag"] for t in brain.tag_list(win.root, 200)] if getattr(win, "root", "") else []
+            if _tags:
+                _comp = QCompleter(_tags, self.tagsEdit)
+                _comp.setCaseSensitivity(Qt.CaseInsensitive)
+                _comp.setFilterMode(Qt.MatchContains)
+                self.tagsEdit.setCompleter(_comp)
+        except Exception:
+            pass
         row.addWidget(self.tagsEdit, 1)
         self.pinBox = None
         from qfluentwidgets import CheckBox

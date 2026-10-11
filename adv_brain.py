@@ -551,6 +551,41 @@ def t_memory_revisions(tmp):
     assert all(x["id"] != rid for x in brain.search_records(root, "唯一内容xyzq"))
 
 
+def t_record_type_and_tags(tmp):
+    """P1-2 schema 收口：record_type 枚举（显式/决策段推断/非法兜底）+ 标签规约与注册表
+    （全角逗号/空白折叠/去重/超长丢弃；大小写变体归一到已注册形态）。"""
+    root = str(Path(tmp) / "hub_p12")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    assert brain.init_db(root) == ""
+    # record_type：显式合法 / 决策段推断 / 非法兜底为推断值 / auto 捕获默认 work_log
+    r1 = brain.add_record(root, "类型-项目", "zcode", "2026-10-11", "t1", "普通内容", record_type="todo")
+    r2 = brain.add_record(root, "类型-项目", "zcode", "2026-10-11", "t2", "内容", decision="选 A 方案")
+    r3 = brain.add_record(root, "类型-项目", "zcode", "2026-10-11", "t3", "x", record_type="乱写")
+    r4 = brain.add_record(root, "类型-项目", "zcode", "2026-10-11", "t4", "自动捕获", source="auto")
+    with brain.db_conn(root) as conn:
+        rt = {r["id"]: r["record_type"] for r in conn.execute("SELECT id, record_type FROM records")}
+    assert rt[r1] == "todo" and rt[r2] == "decision" and rt[r3] == "work_log" and rt[r4] == "work_log", rt
+    # 标签规约：全角逗号切分 / 去重（大小写不敏感）/ 空白折叠 / 超长丢弃
+    mid = brain.add_memory(root, "标签规约测试",
+                           tags=" 代理 ，代理, DSH ,  a   b ," + "超长" + "x" * 40, agent="zcode")
+    with brain.db_conn(root) as conn:
+        tags1 = conn.execute("SELECT tags FROM memories WHERE id=?", (mid,)).fetchone()["tags"]
+    assert tags1 == "代理,DSH,a b", tags1
+    # 注册表：计数 + 大小写归一（后写的 'dsh' 归一到已注册的 'DSH'）
+    mid2 = brain.add_memory(root, "标签注册测试", tags="dsh,新标签", agent="zcode")
+    with brain.db_conn(root) as conn:
+        tags2 = conn.execute("SELECT tags FROM memories WHERE id=?", (mid2,)).fetchone()["tags"]
+    assert tags2 == "DSH,新标签", tags2
+    tl = {t["tag"]: t["use_count"] for t in brain.tag_list(root)}
+    assert tl.get("代理") == 1 and tl.get("DSH") == 2 and tl.get("新标签") == 1, tl
+    # 编辑路径同样走规约 + 注册
+    assert brain.edit_memory(root, mid2, tags="dsh,再一个", agent="zcode") == ""
+    tl2 = {t["tag"]: t["use_count"] for t in brain.tag_list(root)}
+    assert tl2.get("DSH") == 3 and tl2.get("再一个") == 1, tl2
+    # 坏参不崩
+    assert brain._norm_tags(None) == "" and brain._norm_tags("，，, ,") == ""
+
+
 
 def t_env_profile(tmp):
     """环境档案：UPSERT/浏览过滤/自动采集幂等。"""
@@ -1849,6 +1884,7 @@ def main():
     case("P0-2 时间语义解析（相对/绝对时间词→区间/非时间查询None/fail-open/boost落区间）", lambda: t_time_range_parse(tmp))
     case("P0-3 语义模型本地优先加载（缓存存在→纯本地加载/防联网重试风暴）", lambda: t_emb_local_first(tmp))
     case("P1-1 记忆版本化（编辑/删除留痕+回滚+records双时相失效不删）", lambda: t_memory_revisions(tmp))
+    case("P1-2 schema收口（record_type枚举/标签规约与注册表归一）", lambda: t_record_type_and_tags(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

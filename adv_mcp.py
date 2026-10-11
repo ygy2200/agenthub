@@ -153,6 +153,21 @@ def t_memory_overwrite(tmp):
     assert any(e.get("action") == "memory_append" for e in jl)
 
 
+def t_record_type_guard(tmp):
+    """P1-2：hub_log_work 的 record_type 枚举校验——非法当场拒收（不落库），合法入库。"""
+    root = fresh_hub(tmp, "rtype")
+    rs = str(root)
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "类型校验-非法样本", "record_type": "乱写"}, rs)
+    assert "错误" in out and "record_type" in out, out
+    assert not brain.search_records(rs, "类型校验-非法样本"), "非法类型不应落库"
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "类型校验-合法样本", "record_type": "todo"}, rs)
+    assert "已记入大脑" in out, out
+    rows = brain.search_records(rs, "类型校验-合法样本")
+    assert rows and rows[0]["record_type"] == "todo", rows[:1]
+
+
 def t_concurrent_log_work(tmp, root=None):
     # 独立 hub（2026-10-10）：agent 名改用注册表内取值后，靠名字前缀过滤 journal
     # 不再可靠（会与其他用例同名串味），故用 fresh_hub 隔离。
@@ -938,6 +953,7 @@ def main():
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
+    case("record_type枚举校验（非法拒收不落库/合法入库）", lambda: t_record_type_guard(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp, fresh_hub(tmp, "conc")))
     case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))

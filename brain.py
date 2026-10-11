@@ -30,6 +30,9 @@ BACKUP_KEEP = 30
 KINDS = ("fact", "preference", "lesson", "project", "note")
 KIND_CN = {"fact": "环境事实", "preference": "用户偏好", "lesson": "踩坑经验",
            "project": "项目进展", "note": "随手记", "error": "踩坑登记"}
+# P1-2 记录类型枚举（schema 收口）：写入即校验；含「## 决策记录」段自动推断 decision
+RECORD_TYPES = ("work_log", "decision", "todo", "note")
+RECORD_TYPE_CN = {"work_log": "工作记录", "decision": "决策", "todo": "待办", "note": "随记"}
 SESSION_TTL = 1800     # 会话心跳陈旧阈值（秒）
 SESSION_ACTIVE = 300   # 同项目"正在工作"判定窗口（秒）
 STALL_DAYS = 90        # 项目停滞判定：超过该天数无记录即 stalled
@@ -156,6 +159,7 @@ CREATE TABLE IF NOT EXISTS records (
     source TEXT DEFAULT "hub",
     status TEXT DEFAULT "active",
     created TEXT DEFAULT "",
+    record_type TEXT DEFAULT "",
     valid_from TEXT DEFAULT "",
     valid_until TEXT DEFAULT "",
     superseded_by INTEGER DEFAULT 0
@@ -191,6 +195,12 @@ CREATE TABLE IF NOT EXISTS memory_revisions (
     created TEXT DEFAULT ""
 );
 CREATE INDEX IF NOT EXISTS idx_memrev_mid ON memory_revisions(mid);
+CREATE TABLE IF NOT EXISTS tag_schema (
+    tag TEXT PRIMARY KEY,
+    use_count INTEGER DEFAULT 0,
+    first_seen TEXT DEFAULT "",
+    last_seen TEXT DEFAULT ""
+);
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, action TEXT, target TEXT, backup TEXT, note TEXT
@@ -345,6 +355,7 @@ def ensure_schema(root: str) -> str:
         with db_conn(root) as conn:
             conn.executescript(SCHEMA)
         _migrate_columns(root)
+        _backfill_tag_schema(root)
         return ""
     except sqlite3.Error as e:
         return f"大脑 schema 初始化失败：{e}"
@@ -364,6 +375,7 @@ def init_db(root: str) -> str:
         _backfill_agents(root)
         _normalize_agents(root)
         _migrate_columns(root)
+        _backfill_tag_schema(root)
         return ""
     except sqlite3.Error as e:
         return f"大脑数据库初始化失败：{e}"
@@ -538,6 +550,31 @@ def _backfill_agents(root: str) -> None:
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('agents_backfill','1')")
 
 
+def _backfill_tag_schema(root: str) -> None:
+    """P1-2：用现存记忆标签一次性初始化 tag_schema 注册表（meta 标记防重跑，幂等）。
+    大小写不敏感聚合；显示形态取该标签首次出现的写法；use_count=携带该标签的记忆条数。"""
+    with db_conn(root) as conn:
+        if conn.execute("SELECT value FROM meta WHERE key='tag_schema_backfill'").fetchone():
+            return
+        canon: dict = {}
+        counts: dict = {}
+        for r in conn.execute("SELECT tags FROM memories WHERE tags<>'' ORDER BY id"):
+            seen = set()
+            for raw in re.split(r"[,，]", r["tags"] or ""):
+                t = _norm_tag_one(raw)
+                if not t or len(t) > TAG_MAX:
+                    continue
+                key = t.lower()
+                canon.setdefault(key, t)
+                if key not in seen:
+                    seen.add(key)
+                    counts[key] = counts.get(key, 0) + 1
+        for key, t in canon.items():
+            conn.execute("INSERT OR IGNORE INTO tag_schema(tag, use_count, first_seen, last_seen) "
+                         "VALUES(?,?,?,?)", (t, counts.get(key, 0), "", ""))
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('tag_schema_backfill','1')")
+
+
 def _normalize_agents(root: str) -> None:
     """历史数据 agent 大小写归一（ZCode/zcode 双身份清理，幂等）。
     agents 表主键冲突行合并：计数累加、首见/最近取极值。"""
@@ -592,6 +629,12 @@ def _migrate_columns(root: str) -> None:
             conn.execute("UPDATE records SET valid_from="
                          "COALESCE(NULLIF(date,''), substr(created,1,10)) "
                          "WHERE valid_from IS NULL OR valid_from=''")
+        # P1-2（2026-10-11）记录类型收口：老数据回填（含决策段→decision，其余→work_log）
+        if "record_type" not in rcols:
+            conn.execute("ALTER TABLE records ADD COLUMN record_type TEXT DEFAULT ''")
+            conn.execute("UPDATE records SET record_type=CASE WHEN content LIKE '%## 决策记录%' "
+                         "THEN 'decision' ELSE 'work_log' END "
+                         "WHERE record_type IS NULL OR record_type=''")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -639,24 +682,98 @@ def render_decision(context: str = "", options: str = "", decision: str = "",
     return "\n\n## 决策记录\n" + "\n".join(rows)
 
 
+# ---------------------------------------------------------------- P1-2 schema 收口（类型枚举 + 标签规约）
+
+TAG_MAX = 32     # 单个标签长度上限（超长丢弃——多为误把整句当标签）
+TAG_CAP = 12     # 单条记忆标签数上限
+
+
+def _infer_record_type(content: str, explicit: str = "") -> str:
+    """记录类型校验/推断：显式合法值优先；否则按内容推断（含「## 决策记录」→ decision，
+    其余 → work_log）。非法显式值不硬拒（共享库上因拼写拒写得不偿失）——MCP 层负责拒收提示。"""
+    rt = (explicit or "").strip()
+    if rt in RECORD_TYPES:
+        return rt
+    return "decision" if "## 决策记录" in (content or "") else "work_log"
+
+
+def _norm_tag_one(raw: str) -> str:
+    """单个标签规约：去首尾空白、内部空白折叠为单空格。"""
+    return re.sub(r"\s+", " ", (raw or "").strip())
+
+
+def _norm_tags(tags: str) -> str:
+    """标签串规约（写入即校验的温和版）：全/半角逗号切分，逐项规约、去空、去重（大小写不敏感）、
+    超长丢弃、条数封顶。不硬拒未知标签——收口靠「规约 + 注册表」而非拒绝（见 _register_tags）。"""
+    if not tags:
+        return ""
+    out, seen = [], set()
+    for raw in re.split(r"[,，]", str(tags)):
+        t = _norm_tag_one(raw)
+        if not t or len(t) > TAG_MAX:
+            continue
+        key = t.lower()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(t)
+    return ",".join(out[:TAG_CAP])
+
+
+def _register_tags(conn, tags: str) -> str:
+    """把标签注册进 tag_schema（use_count+1、落 last_seen），大小写变体归一到已注册的显示形态，
+    返回按注册表归一后的标签串（调用方存这个）。fail-open：注册失败照常返回原串（不阻断写入）。"""
+    if not tags:
+        return tags
+    now = _now()
+    try:
+        fixed = []
+        for t in tags.split(","):
+            if not t:
+                continue
+            row = conn.execute("SELECT tag FROM tag_schema WHERE lower(tag)=lower(?)",
+                               (t,)).fetchone()
+            if row:
+                conn.execute("UPDATE tag_schema SET use_count=use_count+1, last_seen=? WHERE tag=?",
+                             (now, row["tag"]))
+                fixed.append(row["tag"])
+            else:
+                conn.execute("INSERT OR IGNORE INTO tag_schema(tag, use_count, first_seen, last_seen) "
+                             "VALUES(?,1,?,?)", (t, now, now))
+                fixed.append(t)
+        return ",".join(fixed)
+    except Exception:
+        return tags
+
+
+def tag_list(root: str, limit: int = 100) -> list:
+    """标签注册表（使用次数倒序）——标签收口的可观测面（供体检/界面/统计）。"""
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT tag, use_count, first_seen, last_seen FROM tag_schema "
+            "ORDER BY use_count DESC, tag LIMIT ?", (max(1, min(int(limit), 500)),))]
+
+
 def add_record(root: str, project: str, agent: str, date: str, title: str, content: str,
                source: str = "hub", context: str = "", options: str = "",
-               decision: str = "", tradeoffs: str = "") -> int:
+               decision: str = "", tradeoffs: str = "", record_type: str = "") -> int:
     """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。
     source：hub=人工经 MCP 写入；auto=会话边界 hook 自动捕获（未经蒸馏，2.1）。
     决策字段（3.2 AgDR，可选）：context/options/decision/tradeoffs 传任意非空值即在
-    正文尾部追加「## 决策记录」段；全不传时行为与旧版完全一致。"""
+    正文尾部追加「## 决策记录」段；全不传时行为与旧版完全一致。
+    record_type（P1-2，可选）：work_log/decision/todo/note；缺省按内容推断（含决策段→decision）。"""
     source = source if source in ("hub", "auto") else "hub"
     content = content + render_decision(context, options, decision, tradeoffs)
+    rtype = _infer_record_type(content, record_type)
     _ensure_emb()  # 模型懒加载移出写事务：避免 12s 加载期间持有 WAL 写锁拖垮并发写
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
-            "INSERT INTO records(project,agent,date,title,content,source,created,valid_from) "
-            "VALUES(?,?,?,?,?,?,?,?)",
-            (project, agent, date, title, content, source, _now(), (date or _now()[:10])))
+            "INSERT INTO records(project,agent,date,title,content,source,created,valid_from,record_type) "
+            "VALUES(?,?,?,?,?,?,?,?,?)",
+            (project, agent, date, title, content, source, _now(), (date or _now()[:10]), rtype))
         conn.execute("UPDATE projects SET updated=?, status='active' "
                      "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
         _ensure_emb_for(root, "records", cur.lastrowid, title, content, project, conn=conn)
@@ -1189,10 +1306,11 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
             raise ValueError(f"被取代的记忆 #{old} 不存在")
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
+        tags = _register_tags(conn, _norm_tags(tags))  # P1-2：标签规约 + 注册（大小写归一）
         cur = conn.execute(
             "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated,"
             "valid_until,confidence,evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
-            (kind, content, tags.strip(), project, agent, 1 if pinned else 0,
+            (kind, content, tags, project, agent, 1 if pinned else 0,
              _now(), _now(), vu, conf, ev))
         nid = cur.lastrowid
         _ensure_emb_for(root, "memories", nid, content, tags, project, conn=conn)
@@ -1910,6 +2028,7 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
     """按 id 更新记忆字段（只改传入的）。返回错误或 ""。
     P1-1：改动落 memory_revisions（before/after 快照，可 diff / 可回滚）——此前内容编辑完全无痕。"""
     sets, args = [], []
+    tag_idx = -1  # tags 在 args 中的位置（规约+注册表归一需在事务内做，先占位）
     if content:
         sets.append("content=?")
         args.append(content)
@@ -1917,8 +2036,9 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
         sets.append("kind=?")
         args.append(kind)
     if tags is not None and tags != "":
+        tag_idx = len(args)
         sets.append("tags=?")
-        args.append(tags.strip())
+        args.append(tags)  # 占位：事务内规约 + 注册后回填
     if pinned is not None:
         sets.append("pinned=?")
         args.append(1 if pinned else 0)
@@ -1931,6 +2051,8 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
         before = _snapshot(conn, mid)
         if not before:
             return f"记忆 #{mid} 不存在"
+        if tag_idx >= 0:
+            args[tag_idx] = _register_tags(conn, _norm_tags(args[tag_idx]))  # P1-2 标签收口
         conn.execute(f"UPDATE memories SET {', '.join(sets)}, updated=? WHERE id=?",
                      (*args, _now(), mid))
         _revision(conn, mid, "edit", before, _snapshot(conn, mid), agent)
