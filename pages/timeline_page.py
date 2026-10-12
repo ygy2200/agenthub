@@ -167,15 +167,19 @@ class TimelinePage(QWidget):
     def _add_row(self, r):
         row = QHBoxLayout()
         row.addWidget(badge(r.get("agent", ""), ""))
-        title = flex_label(ClickBodyLabel(_display_title(r)[:80]))
+        title = flex_label(ClickBodyLabel(_display_title(r)))
         title.setToolTip(f"{r.get('project', '')} · {_display_title(r)}\n点击查看完整记录")
         title.setCursor(Qt.PointingHandCursor)
         title.clicked.connect(lambda _, rr=r: self.show_detail(rr))
-        proj_btn = PushButton(r.get("project", "")[:10] + ("…" if len(r.get("project", "")) > 10 else ""))
+        # 项目名按钮：按像素自适应省略（原先按字符截 10 字+上限 140px，常见 20~27 字项目名
+        # 被砍成「AgentHub-多…」，2026-10-11 修复）——宽度 240px 内完整显示，超出右端省略
+        full = r.get("project", "") or ""
+        proj_btn = PushButton()
+        proj_btn.setText(proj_btn.fontMetrics().elidedText(full, Qt.ElideRight, 240) if full else "")
         proj_btn.setFixedHeight(26)
-        proj_btn.setMaximumWidth(140)  # 长项目名不设上限会把行撑出可视区，按钮被裁成半个
-        proj_btn.setToolTip(r.get("project", ""))
-        proj_btn.clicked.connect(lambda _, n=r.get("project", ""): self.jump(n))
+        proj_btn.setMaximumWidth(280)  # 上限含按钮左右内边距，防长名撑破行
+        proj_btn.setToolTip(full)
+        proj_btn.clicked.connect(lambda _, n=full: self.jump(n))
         row.addWidget(title, 1)
         row.addWidget(proj_btn)
         self._cur_card_lay.addLayout(row)

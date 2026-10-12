@@ -12,6 +12,7 @@ from __future__ import annotations
 import ast
 import datetime
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -39,6 +40,8 @@ CHECKS = {
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
+    "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
+    "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
 }
 
 
@@ -66,6 +69,10 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _compress(root)
     elif name == "agents":
         r = _agents(root)
+    elif name == "ponytail_gate":
+        r = _ponytail_gate(t)
+    elif name == "coverage_gate":
+        r = _coverage_gate(t)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""))
@@ -115,6 +122,162 @@ def _py_compile(target: Path) -> dict:
     return {"ok": not bad,
             "summary": f"编译 {len(files)} 个 .py，{'全部通过' if not bad else f'{len(bad)} 个语法错误'}",
             "detail": bad[:8]}
+
+
+_DEP_MANIFEST = ("package.json", "pyproject.toml", "requirements.txt")
+_SKIP_DIRS = {"__pycache__", "venv", ".git", ".venv", "node_modules", "site-packages", "build", "dist"}
+
+
+def _manifest_deps(p: Path) -> list:
+    """从依赖清单抽包名（够用即可，不解析完整 semver/依赖树）。"""
+    try:
+        txt = p.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return []
+    out: list = []
+    if p.name == "package.json":
+        try:
+            data = json.loads(txt)
+        except ValueError:
+            return []
+        for sec in ("dependencies", "devDependencies"):
+            out.extend((data.get(sec) or {}).keys())
+    elif p.name == "pyproject.toml":
+        for line in txt.splitlines():
+            m = re.match(r'^"?([A-Za-z0-9_.\-]+)"?\s*[><=~!]', line.strip())
+            if m:
+                out.append(m.group(1))
+    else:  # requirements.txt
+        for line in txt.splitlines():
+            s = line.strip()
+            if s and not s.startswith("#"):
+                out.append(re.split(r"[><=~!;\[]", s)[0].strip())
+    return [d for d in out if d]
+
+
+def _ponytail_gate(target: Path) -> dict:
+    """Ponytail 门禁（技能原生化·阶段2）：过度工程信号的静态粗筛——**只提示，不做硬阻断**。
+
+    为什么不硬拦：包名≠导入名（pillow→PIL、pyyaml→yaml）会让「未引用依赖」误报，
+    裸 except 也有正当场景。硬门禁只拦判得准的（见 coverage_gate），判不准的一律降级为提示。
+    """
+    tips: list = []
+    for mf in _DEP_MANIFEST:
+        p = target / mf
+        if not p.is_file():
+            continue
+        deps = _manifest_deps(p)
+        if not deps:
+            continue
+        blob, budget = [], 200
+        for ext in ("*.py", "*.js", "*.ts", "*.tsx", "*.jsx"):
+            try:
+                for f in target.rglob(ext):
+                    if len(blob) >= budget:
+                        break
+                    if any(part in _SKIP_DIRS for part in f.parts):
+                        continue
+                    try:
+                        blob.append(f.read_text(encoding="utf-8", errors="replace"))
+                    except OSError:
+                        pass
+            except OSError:
+                pass
+        text = "\n".join(blob).lower()
+        unused = [d for d in deps if d.lower() not in text]
+        if unused:
+            tips.append(f"{mf}：{len(unused)} 个疑似未引用依赖 {', '.join(unused[:5])}"
+                        f"（注意包名≠导入名，如 pillow→PIL，人工确认后再删）")
+        break
+    bare: list = []
+    try:
+        for f in target.rglob("*.py"):
+            if any(part in _SKIP_DIRS for part in f.parts):
+                continue
+            try:
+                src = f.read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                continue
+            for m in re.finditer(r"except[^\n:]*:\s*\n\s*pass\b", src):
+                line_no = src[:m.start()].count("\n") + 1
+                bare.append(f"{f.name}:{line_no}")
+            if len(bare) >= 8:
+                break
+    except OSError:
+        pass
+    if bare:
+        tips.append(f"裸 except+pass 吞异常 {len(bare)} 处：{', '.join(bare[:5])}")
+    return {"ok": True,
+            "summary": ("Ponytail 粗筛：无过度工程信号" if not tips
+                        else f"Ponytail 粗筛：{len(tips)} 条提示（提示级，不阻断）"),
+            "detail": tips[:8]}
+
+
+def _coverage_gate(target: Path) -> dict:
+    """分片对账门禁（技能原生化·阶段2，移植自 study-abroad-planner v1.4.0 的硬门禁）。
+
+    判得准，所以**可硬阻断**：取项目 output/ 下最近两份同构 .json 快照做条目数对账——
+    任一分片下降 >20% 或清零即命中，要求逐片交代去向（防「少查一片没人发现」）。
+    没有两份基线时返回 ok=True 跳过——没有基线就断言「缩水了」是假门禁。
+    """
+    out_dir = target / "output"
+    if not out_dir.is_dir():
+        return {"ok": True, "summary": "无 output/ 目录，跳过对账（无基线不妄判）", "detail": []}
+    cands = []
+    try:
+        for f in out_dir.rglob("*.json"):
+            if f.stat().st_size > 8 * 1024 * 1024:
+                continue
+            cands.append(f)
+    except OSError:
+        return {"ok": True, "summary": "读取 output/ 失败，跳过", "detail": []}
+    cands.sort(key=lambda p: p.stat().st_mtime, reverse=True)
+    loaded: list = []
+    for f in cands[:12]:
+        try:
+            data = json.loads(f.read_text(encoding="utf-8", errors="replace"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(data, (list, dict)) and data:
+            loaded.append((f, data))
+        if len(loaded) == 2:
+            break
+    if len(loaded) < 2:
+        return {"ok": True, "summary": "基线不足两份同构 json，跳过对账（无基线不妄判）", "detail": []}
+    (f_new, d_new), (f_old, d_old) = loaded
+
+    def split(d) -> dict:
+        if isinstance(d, dict):
+            return {k: (len(v) if isinstance(v, (list, dict)) else 1) for k, v in d.items()}
+        return {"__total__": len(d)}
+
+    if isinstance(d_old, list) != isinstance(d_new, list):
+        return {"ok": True, "summary": "两份基线结构不同（list vs dict），不像同一类产物，跳过对账", "detail": []}
+    a, b = split(d_old), split(d_new)
+    keys = set(a) | set(b)
+    # 同构校验：两份 json 必须是同一类产物才能对账。实测踩坑——把 skills-index.json
+    # 和 software-assets.json（完全不同的结构）拿来对账，4 个「分片」全部判成清零，
+    # 硬门禁当场误拦一次正常工作记录。键重叠 <50% 就认为不是同一类东西。
+    common = set(a) & set(b)
+    if keys and len(common) / len(keys) < 0.5:
+        pct = round(len(common) / len(keys) * 100)
+        return {"ok": True, "summary": f"两份基线键重叠仅 {pct}%，不像同一类产物，跳过对账", "detail": []}
+    hits = []
+    for k in sorted(keys):
+        old_n, new_n = a.get(k, 0), b.get(k, 0)
+        if old_n == 0:
+            continue
+        if new_n == 0:
+            hits.append(f"{k}：{old_n} → 0（清零，必须交代去向）")
+        elif new_n < old_n * 0.8:
+            hits.append(f"{k}：{old_n} → {new_n}（降 {round((1 - new_n / old_n) * 100)}%）")
+    if not hits:
+        return {"ok": True,
+                "summary": f"分片对账通过（{f_old.name} → {f_new.name}，{len(keys)} 个分片无缩水）",
+                "detail": []}
+    return {"ok": False,
+            "summary": f"分片缩水 {len(hits)} 处（基线 {f_old.name} → 本次 {f_new.name}）",
+            "detail": hits[:8]}
 
 
 def _git_status(target: Path) -> dict:

@@ -318,7 +318,8 @@ class AgentHubWindow(FluentWindow):
         self.overview_page.set_snapshot(snap)
         try:
             self.overview_page.set_db(brain.stats(self.root), brain.list_records(self.root, limit=8))
-            self.overview_page.set_sessions(brain.active_sessions(self.root))
+            # 展示窗口 24h（在线判定仍是缺省 30 分钟 TTL；2026-10-11：短窗口下该面板常显空）
+            self.overview_page.set_sessions(brain.active_sessions(self.root, ttl=24 * 3600))
         except Exception:
             self.overview_page.set_sessions([])
         self.journal_page.reload()

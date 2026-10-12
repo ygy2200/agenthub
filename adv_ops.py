@@ -189,7 +189,7 @@ def main():
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
-    check("检查项共 10 个", len(ops.CHECKS) == 10, str(list(ops.CHECKS)))
+    check("检查项共 14 个", len(ops.CHECKS) == 14, str(list(ops.CHECKS)))  # +ponytail_gate / +coverage_gate
 
     print()
     if FAILED:

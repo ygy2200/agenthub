@@ -103,7 +103,8 @@ NAV_CUSTOMIZABLE = ("项目", "时间线", "Agent 中心", "随记", "大脑",
 def flex_label(lb):
     """长文本行标签防撑宽（批次 3 修复）：水平 Ignored = 布局按可用空间分配、超出裁剪
     （全文见 tooltip）。背景：最近动态/时间线标题的无换行 QLabel 把页面最小宽度撑到
-    2000px+，窄窗口下数字卡等被横向挤出（2026-10-10 实机截图像素级定位）。"""
+    2000px+，窄窗口下数字卡等被横向挤出（2026-10-10 实机截图像素级定位）。
+    注：裁剪 = 无省略号的硬切；配合 ElidedLabel/ClickBodyLabel（自适应省略）使用体验最佳。"""
     lb.setSizePolicy(QSizePolicy.Ignored, lb.sizePolicy().verticalPolicy())
     return lb
 
@@ -121,6 +122,10 @@ def guard_overflow(root_widget):
     for lb in root_widget.findChildren(QLabel):
         try:
             if lb.wordWrap() or isinstance(lb, (TitleLabel, SubtitleLabel)):
+                continue
+            if lb.property("keepWidth"):
+                # 行内自适应省略标签自管宽度（已按 maxWidth 限宽，不会撑破页面；
+                # 设 Ignored 会被行内 stretch 项挤到 0 宽——2026-10-11 总览项目名 bug）
                 continue
             if lb.sizePolicy().horizontalPolicy() == QSizePolicy.Ignored:
                 continue
@@ -302,8 +307,93 @@ def open_location(path: str, select: bool = True):
         os.startfile(str(p) if p.is_dir() else str(p.parent))  # noqa: S606
 
 
+class ElidedLabel(CaptionLabel):
+    """按实际宽度右端省略（…）的小字标签（继承 CaptionLabel：样式/主题自动跟随）。
+
+    解决「窄容器里长文本生硬断裂/被完全挤没」：显示层自适应省略、原文保留在 fullText()，
+    tooltip 由使用方决定。sizeHint 恒按全文宽度申报——防布局拿省略后文本反复收缩。
+    与 flex_label 组合使用（flex_label 防撑宽、本类负责裁得好看）。"""
+
+    def __init__(self, text: str = "", parent=None):
+        # 注意：不把 text 传给 super().__init__——qfw label 的 str 分派分支内部会再调
+        # self.__init__(parent)，子类覆盖 __init__ 时双参调用会递归/参数错配（2026-10-11 实锤）。
+        # 统一走 parent 分支 + setText；非 str 第一参数视为 qfw 再入形态（第一参数实为 parent）。
+        if not isinstance(text, str):
+            text, parent = "", text
+        self._full = ""
+        super().__init__(parent)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._full = text or ""
+        self._relayout()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(fm.horizontalAdvance(self._full) + 4, super().sizeHint().height())
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout()
+
+    def _relayout(self):
+        w = self.width()
+        if w <= 12:  # 尚未布局（宽 0）→ 原样，等 resize 收敛
+            if QLabel.text(self) != self._full:
+                QLabel.setText(self, self._full)
+            return
+        fm = self.fontMetrics()
+        # 放得下就全文（elidedText 在「额度=文本宽」边界处仍会截——显式判断避开，2026-10-11）
+        txt = self._full if fm.horizontalAdvance(self._full) <= w - 2 else \
+            fm.elidedText(self._full, Qt.ElideRight, w - 2)
+        if QLabel.text(self) != txt:
+            QLabel.setText(self, txt)
+
+
 class ClickBodyLabel(BodyLabel):
+    """可点击正文标签；长文本按实际宽度自适应省略（右端 …，原文保留在 fullText()）。
+    用于行内长标题：既有省略号体感，又不撑宽（配合 flex_label 使用）。"""
     clicked = Signal()
+
+    def __init__(self, text: str = "", parent=None):
+        # 同 ElidedLabel：不走 qfw 的 str 分派（其内部 self.__init__(parent) 再入会与
+        # 子类覆盖的 __init__ 参数错配）；非 str 第一参数视为再入形态（实为 parent）
+        if not isinstance(text, str):
+            text, parent = "", text
+        self._full = ""
+        super().__init__(parent)
+        self.setText(text)
+
+    def setText(self, text: str):
+        self._full = text or ""
+        self._relayout()
+
+    def fullText(self) -> str:
+        return self._full
+
+    def sizeHint(self):
+        fm = self.fontMetrics()
+        return QSize(fm.horizontalAdvance(self._full) + 4, super().sizeHint().height())
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._relayout()
+
+    def _relayout(self):
+        w = self.width()
+        if w <= 12:  # 尚未布局（宽 0）→ 原样，等 resize 收敛
+            if QLabel.text(self) != self._full:
+                QLabel.setText(self, self._full)
+            return
+        fm = self.fontMetrics()
+        # 放得下就全文（同 ElidedLabel：避开 elidedText 的等宽边界截断）
+        txt = self._full if fm.horizontalAdvance(self._full) <= w - 2 else \
+            fm.elidedText(self._full, Qt.ElideRight, w - 2)
+        if QLabel.text(self) != txt:
+            QLabel.setText(self, txt)
 
     def mousePressEvent(self, e):
         if e.button() == Qt.LeftButton:

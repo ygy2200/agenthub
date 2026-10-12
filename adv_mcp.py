@@ -75,8 +75,9 @@ def t_protocol(root):
             "hub_ask", "hub_metacognition",
             "hub_help", "hub_search_tools", "hub_call_tool", "hub_audit", "hub_flush_index",
             "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks",
-            "hub_event_write", "hub_events"} <= names, names
-    assert len(names) == 48
+            "hub_event_write", "hub_events",
+            "hub_skill_match", "hub_skill_sync"} <= names, names
+    assert len(names) == 51  # 技能原生化（2026-10-11）：+hub_skill_match / +hub_skill_sync / +hub_asset_find
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -1133,7 +1134,7 @@ def main():
     build_hub(root)
     print(f"临时目录：{tmp}\n")
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
-    case("MCP协议（握手/36工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/50工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))

@@ -89,7 +89,7 @@ class OverviewPage(QWidget):
         self.agentBox.setSpacing(4)
         rightCol.addLayout(self.agentBox)
         rightCol.addSpacing(16)
-        rightCol.addWidget(StrongBodyLabel("当前活跃会话（hub_heartbeat 上报）"))
+        rightCol.addWidget(StrongBodyLabel("最近会话（hub_heartbeat 上报 · 近 24 小时）"))
         self.sessionBox = QVBoxLayout()
         self.sessionBox.setSpacing(4)
         rightCol.addLayout(self.sessionBox)
@@ -162,13 +162,19 @@ class OverviewPage(QWidget):
         for r in self.recent:
             row = QHBoxLayout()
             row.addWidget(badge(r.get("agent", ""), ""))
-            t = flex_label(ClickBodyLabel(_display_title(r)[:72]))
-            t.setToolTip(_display_title(r))
+            t = flex_label(ClickBodyLabel(_display_title(r)))
+            t.setToolTip(f"{_display_title(r)}\n点击查看完整记录")
             t.setCursor(Qt.PointingHandCursor)
             t.clicked.connect(lambda _, rr=r: RecordDetailDialog(self.win, rr).exec())
             row.addWidget(t, 1)
-            pn = flex_label(CaptionLabel(r.get("project", "")[:14]))
+            # 项目名：自适应省略 + 宽度上限（原 flex_label 被行内 stretch 挤成 0 宽→完全不可见，
+            # 2026-10-11 修复；keepWidth 防 guard_overflow 再设 Ignored）
+            pn = ElidedLabel(r.get("project", ""))
             pn.setToolTip(r.get("project", ""))
+            pn.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            pn.setMinimumWidth(110)
+            pn.setMaximumWidth(220)
+            pn.setProperty("keepWidth", True)
             row.addWidget(pn)
             wrap = QWidget()
             wrap.setLayout(row)
@@ -198,11 +204,18 @@ class OverviewPage(QWidget):
                 it.widget().deleteLater()
         if not sessions:
             self.sessionBox.addWidget(empty_state(
-                "PEOPLE", "暂无活跃会话", "agent 开工调 hub_heartbeat 后显示"))
+                "PEOPLE", "近 24 小时暂无会话", "agent 开工调 hub_heartbeat 后显示"))
             return
         for s in sessions[:6]:
-            _lb = CaptionLabel(
-                f"● {s.get('agent')} → {s.get('project') or '未指定'}  {s.get('note') or ''}")
-            _lb.setToolTip(f"{s.get('agent')} → {s.get('project') or '未指定'}\n{s.get('note') or ''}")
+            when = rel_time(s.get("ts", ""))
+            txt = f"● {s.get('agent')} → {s.get('project') or '未指定'}"
+            if when:
+                txt += f"（{when}）"
+            note = s.get("note") or ""
+            if note:
+                txt += f"  {note}"
+            _lb = ElidedLabel(txt)
+            _lb.setToolTip(f"{s.get('agent')} → {s.get('project') or '未指定'}\n"
+                           f"最后活跃：{str(s.get('ts') or '')[:19]}\n{note}".strip())
             self.sessionBox.addWidget(flex_label(_lb))
 

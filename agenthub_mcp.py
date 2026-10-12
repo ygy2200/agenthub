@@ -79,7 +79,11 @@ SERVER_AGENT = ""
 _MISMATCH_SEEN: set = set()
 # 只读筛选参数白名单：这些工具的 agent 参数是"查别人"用，**不下发**（保持原语义）。
 # 其余工具一律下发——身份是"我是谁"，不是"我想查谁"。
-_AGENT_FILTER_TOOLS = {"hub_list_skills", "hub_bootstrap_status"}
+# 跨 agent 语义的工具：调用方不传 agent 时意为「全机」，绝不能被进程身份覆盖成只查自己家。
+# 踩坑（2026-10-11 实测）：hub_skill_match 漏登记在此 → 被注入 agent='workbuddy'（归一小写），
+# 而 skills 表存的是显示名 'WorkBuddy' → WHERE agent=? 恒 0 行 → 五种查询变体一律「技能索引无命中」。
+# 新增任何「跨 agent 读取」的工具，都必须同步登记到这里。
+_AGENT_FILTER_TOOLS = {"hub_list_skills", "hub_bootstrap_status", "hub_skill_match"}
 
 
 def apply_server_agent(tname: str, arguments: dict, root: str) -> dict:
@@ -377,6 +381,25 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         rt = str(arguments.get("record_type") or "").strip()
         if rt and rt not in brain.RECORD_TYPES:
             return f"错误：record_type 只能是 {'/'.join(brain.RECORD_TYPES)}（收到 {rt!r}）"
+        # 技能原生化·阶段2：硬门禁（主人拍板「直接阻断」）。只拦判得准的检查项——
+        # Ponytail 粗筛只提示不拦（包名≠导入名会误报），误伤正常开发比漏拦更贵。
+        waive = str(arguments.get("waive", "") or "").strip()
+        pdir = Path(root) / pname
+        if not waive and pdir.is_dir():
+            try:
+                g = ops.run_check("coverage_gate", str(pdir), root)
+            except Exception:  # noqa: BLE001
+                g = {"ok": True, "summary": "", "detail": []}  # 门禁自身故障绝不阻断正常工作
+            if g and not g.get("ok"):
+                detail = "\n".join("  - " + d for d in (g.get("detail") or [])[:8])
+                return ("⛔ 门禁未通过（coverage_gate 分片对账），本次记录未写入：\n"
+                        f"{g.get('summary', '')}\n{detail}\n"
+                        "处理：① 补查/修复后重交 ② 确属正常缩水 → 本次调用带 waive=\"<理由>\" 显式豁免"
+                        "（豁免写进记录正文，事后可查）")
+        if waive:  # 豁免留痕：可追溯的显式动作，比静默失败强
+            tag = f"\n[豁免门禁] {waive[:100]}"
+            room = MAX_CONTENT - len(tag)
+            content = (content[:room] if len(content) > room else content) + tag
         rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
                                   context=ctx, options=opts, decision=dec, tradeoffs=tro,
                                   record_type=rt)
@@ -644,7 +667,31 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 for m in recall:
                     flag = "★" if m["pinned"] else "·"
                     lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}")
+            if recall:  # 先把记忆推送定型，技能建议再追加（顺序反了会被 lines 覆盖掉）
                 out = "\n".join(lines)
+        # 技能原生化·阶段4：开工顺带召回本任务可能用到的技能（跨 agent，只给路径不加载）。
+        # 独立于记忆推送的免推窗口——任务换了（note 变了）就该重新给，不该被记忆的免推连坐。
+        # 硬门槛（主人明确反感元信息占位）：① note 为空或没变不推 ② 最多 3 条
+        # ③ 低于「top1 的 35% 且绝对分 <3」的一律不推——宁缺毋滥，推错比不推更烦。
+        if note:
+            key = (agent or "", project or "")
+            if _LAST_SKILL_NOTE.get(key) != note:  # 进程内去重：同一任务不重复灌
+                _LAST_SKILL_NOTE[key] = note
+                try:
+                    sk = brain.skill_match(root, note, topk=3)
+                except Exception:  # noqa: BLE001
+                    sk = []
+                if sk:
+                    top1 = sk[0].get("_bm25", 0)
+                    sk = [s for s in sk if s.get("_bm25", 0) >= max(3.0, top1 * 0.35)][:3]
+                if sk:
+                    extra = ["", "🧩 本任务可能用得上的技能（大脑召回，未加载，需要再读文件）："]
+                    for s in sk:
+                        extra.append(f"- {s['name']} [{s['agent']}] {(s['desc'] or '')[:60]}")
+                        extra.append(f"    {s['path']}")
+                    for s in sk:
+                        brain.skill_hit(root, s["agent"], s["path"])
+                    out = out + "\n".join(extra)
         # 主人最新随记（开工视野）：agent 开工即看见主人最近在想什么——双向融入
         try:
             latest = brain.latest_notes_for_agent(root, k=2)
@@ -713,6 +760,64 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             if len(a.skills) > 60:
                 lines.append(f"  ...（共 {len(a.skills)} 个）")
         return "\n".join(lines) if lines else f"未找到 agent：{want}"
+
+    if name == "hub_skill_match":
+        q = str(arguments.get("query", "")).strip()
+        if not q:
+            return "错误：query 必填（一句话描述你这次要干什么，如「留学选校」「抓B站字幕」）"
+        try:
+            topk = max(1, min(int(arguments.get("topk", 3) or 3), 20))
+        except (TypeError, ValueError):
+            topk = 3
+        want_agent = str(arguments.get("agent", "")).strip()
+        hits = brain.skill_match(root, q, topk=topk, agent=want_agent)
+        brain.log_search(root, "hub_skill_match", q, len(hits), agent=_guess_agent(root))
+        if not hits:
+            return (f"技能索引无命中：{q}\n"
+                    "（① 索引可能还没导入 → hub_skill_sync ② 换成更短的词 "
+                    "③ hub_list_skills 看全量）")
+        lines = [f"技能召回「{q}」top{len(hits)}（跨 agent）："]
+        for h in hits:
+            lines.append(f"- {h['name']} [{h['agent']}] score={h['_bm25']}")
+            lines.append(f"    {(h['desc'] or '')[:90]}")
+            lines.append(f"    {h['path']}")
+        for h in hits:  # 命中回写（统计用，失败静默）
+            brain.skill_hit(root, h["agent"], h["path"])
+        return "\n".join(lines)
+
+    if name == "hub_skill_sync":
+        rows = arguments.get("rows")
+        if not rows:
+            infos = agentscore.detect_agents(core.load_config().get("extra_agents"))
+            rows = [{"name": s.name, "agent": a.name, "path": s.path, "desc": s.desc}
+                    for a in infos for s in a.skills]
+        only = str(arguments.get("agent", "")).strip().lower()
+        if only:
+            rows = [r for r in rows if only in str(r.get("agent", "")).lower()]
+        stat = brain.skill_sync(root, rows)
+        return (f"技能索引同步：新增 {stat['added']} · 更新 {stat['updated']} · "
+                f"未变 {stat['unchanged']}（本次提交 {len(rows)} 条）")
+
+    if name == "hub_asset_find":
+        kw = str(arguments.get("keyword", "")).strip()
+        if not kw:
+            return "错误：keyword 必填（软件名或用途，如：录屏、远程控制、压缩）"
+        try:
+            lim = max(1, min(int(arguments.get("limit", 8) or 8), 30))
+        except (TypeError, ValueError):
+            lim = 8
+        items = brain.asset_find(root, kw, limit=lim)
+        if not items:
+            return (f"台账无命中：{kw}\n"
+                    "（台账只有已收录的软件；装之前仍应以官方源为准，第三方网盘下载自行校验哈希）")
+        lines = [f"软件台账「{kw}」{len(items)} 条："]
+        for it in items:
+            lic = f" · {it['license']}" if it.get("license") else ""
+            lines.append(f"- {it['name']} [{it.get('category') or '未分类'}]{lic}")
+            lines.append(f"    {(it.get('desc') or '')[:70]}")
+            if it.get("website"):
+                lines.append(f"    {it['website']}")
+        return "\n".join(lines)
 
     if name == "hub_list_mcps":
         infos = agentscore.detect_agents(core.load_config().get("extra_agents"))
@@ -1097,7 +1202,8 @@ TOOLS = [
                                     "context": {"type": "string", "description": "决策-上下文（AgDR，可选）：当时为什么面临这个选择"},
                                     "options": {"type": "string", "description": "决策-权衡过的选项（可选）：评估了哪些方案、各自为何成/否"},
                                     "decision": {"type": "string", "description": "决策-决策（可选）：最终选了什么"},
-                                    "tradeoffs": {"type": "string", "description": "决策-接受的取舍（可选）：选它付出的代价"}},
+                                    "tradeoffs": {"type": "string", "description": "决策-接受的取舍（可选）：选它付出的代价"},
+                                    "waive": {"type": "string", "description": "豁免门禁（可选）：确属误报时填一句话理由，记录照写但留痕可追溯"}},
                      "required": ["project", "agent", "content"]}},
     {"name": "hub_search", "description": "跨项目全文搜索工作记录/记忆/文件名（记录行带 #id，判断不了价值先看片段，精读用 hub_get_record）",
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}},
@@ -1172,6 +1278,24 @@ TOOLS = [
                      "required": ["project"]}},
     {"name": "hub_list_skills", "description": "列出本机各 agent 的技能库（能力对齐：看别的 agent 会什么）",
      "inputSchema": {"type": "object", "properties": {"agent": {"type": "string", "description": "可选，过滤 agent 名"}}}},
+    {"name": "hub_skill_match",
+     "description": "技能按需召回（技能原生化）：用一句话描述本次任务，大脑从全机技能库（跨 agent）回 top-N 最相关的技能「名字+说明+文件路径」，替代「全量技能描述常驻上下文」，大幅省 token。命中别家（如 ZCode）的技能也能借用",
+     "inputSchema": {"type": "object",
+                     "properties": {"query": {"type": "string", "description": "任务描述（如：留学选校、抓B站字幕、Windows批处理、简历改写）"},
+                                    "topk": {"type": "integer", "description": "返回条数，默认 3；不建议 >5，多了就是新的元信息灌水"},
+                                    "agent": {"type": "string", "description": "可选，限定只搜某个 agent 的技能库"}},
+                     "required": ["query"]}},
+    {"name": "hub_skill_sync",
+     "description": "把本机各 agent 的技能元数据导入大脑 skills 索引（UPSERT，不删行）。不传 rows 则自动扫描全机；首次使用或新增技能后跑一次",
+     "inputSchema": {"type": "object",
+                     "properties": {"rows": {"type": "array", "description": "可选：[{name,agent,path,desc}]；不传则自动扫描"},
+                                    "agent": {"type": "string", "description": "可选，只同步某个 agent（如 ZCode）"}}}},
+    {"name": "hub_asset_find",
+     "description": "软件资产台账检索（L3 数据层）：装任何工具前先查这里，返回名称/分类/许可/官方源，避免重复下载与山寨源。首批 21 款来自 tools.accat.top",
+     "inputSchema": {"type": "object",
+                     "properties": {"keyword": {"type": "string", "description": "软件名或用途关键词（如：录屏、远程、压缩、远程控制）"},
+                                    "limit": {"type": "integer", "description": "返回条数，默认 8"}},
+                     "required": ["keyword"]}},
     {"name": "hub_list_mcps", "description": "列出本机各 agent 已配置的 MCP 服务器",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_bootstrap_status",
@@ -1333,8 +1457,14 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_env_list", "hub_env_set", "hub_handoff", "hub_audit", "hub_flush_index",
     "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks",
     "hub_event_write", "hub_events",
+    "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
+    "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
 PROFILES = {"reader": PROFILE_READER, "worker": PROFILE_WORKER, "admin": None}  # None=全量
+
+# 技能原生化·阶段4：心跳附带技能建议的进程内去重键（agent, project）-> 上次的 note。
+# 任务没换就不重复推——主人明确反感元信息占位，同一任务灌两次等于噪音。
+_LAST_SKILL_NOTE: dict = {}
 
 # 写工具清单（P3-1）：dry_run 预演、confirm 闸门、写后审计三者都按它判定
 WRITE_TOOLS = {
@@ -1342,6 +1472,7 @@ WRITE_TOOLS = {
     "hub_report_error", "hub_undo", "hub_archive_project", "hub_todo_done", "hub_env_set",
     "hub_ops_run", "hub_handoff", "hub_report", "hub_flush_index",
     "hub_task_add", "hub_task_update", "hub_claim", "hub_event_write",
+    "hub_skill_sync",  # 技能原生化：写索引（走 dry_run/confirm 闸门）
 }
 
 

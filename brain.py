@@ -33,8 +33,13 @@ KIND_CN = {"fact": "环境事实", "preference": "用户偏好", "lesson": "踩�
 # P1-2 记录类型枚举（schema 收口）：写入即校验；含「## 决策记录」段自动推断 decision
 RECORD_TYPES = ("work_log", "decision", "todo", "note")
 RECORD_TYPE_CN = {"work_log": "工作记录", "decision": "决策", "todo": "待办", "note": "随记"}
-SESSION_TTL = 1800     # 会话心跳陈旧阈值（秒）
+SESSION_TTL = 1800     # 「在线」判定窗口（秒）：active_sessions/hub_status/list_agents 打 live 标用
 SESSION_ACTIVE = 300   # 同项目"正在工作"判定窗口（秒）
+SESSION_RETAIN = 24 * 3600  # sessions 表保留窗口（秒）：**只用于心跳时的陈旧剪枝**，与「在线」解耦
+# 两窗口为何分开（2026-10-11）：剪枝原先用 SESSION_TTL（30 分钟），导致会话记录最多活 30 分钟——
+# GUI 总览「最近会话」即使把展示窗口放宽到 24h 也拿不到更早的数据（每次心跳都把旧行删了）。
+# 在线判定（30 分钟）回答的是「这 agent 还活着吗」；保留窗口回答的是「最近谁在哪干过」——
+# 是展示层的事，不该由在线语义决定。故保留放宽到 24h，在线判定与推送节流均不受影响。
 STALL_DAYS = 90        # 项目停滞判定：超过该天数无记录即 stalled
 MAX_CONTENT = 128 * 1024
 
@@ -323,6 +328,29 @@ CREATE TABLE IF NOT EXISTS files (
     project TEXT, path TEXT, name TEXT, grp TEXT,
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
     PRIMARY KEY (project, path)
+);
+-- 技能原生化（阶段1，2026-10-11）：技能从「agent 侧全量描述常驻」改为「大脑索引按需召回」。
+-- 只存元数据（名字/一句话说明/在哪），文件实体仍在各 agent 目录，不动不删。
+CREATE TABLE IF NOT EXISTS skills (
+    name TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    path TEXT DEFAULT "",
+    desc TEXT DEFAULT "",
+    hits INTEGER DEFAULT 0,
+    last_hit TEXT DEFAULT "",
+    PRIMARY KEY (agent, path)
+);
+-- 软件资产台账（技能原生化·阶段5，L3 数据层）：不是技能，是「本机/可用软件」索引。
+-- agent 要装工具前先查这里，避免重复下载与山寨源；首批来自 tools.accat.top 的 21 款。
+CREATE TABLE IF NOT EXISTS software (
+    name TEXT DEFAULT "",
+    category TEXT DEFAULT "",
+    license TEXT DEFAULT "",
+    website TEXT DEFAULT "",
+    desc TEXT DEFAULT "",
+    source TEXT DEFAULT "",
+    version TEXT DEFAULT "",
+    PRIMARY KEY (name)
 );
 CREATE TABLE IF NOT EXISTS notes (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -708,6 +736,22 @@ def _migrate_columns(root: str) -> None:
             conn.execute(
                 "UPDATE projects SET status='stalled' WHERE status='active' AND updated!='' "
                 "AND julianday('now')-julianday(updated) > ?", (STALL_DAYS,))
+        # 归属回填（2026-10-12）：projects.agent 从未写入过（真实库 138/138 全空 → 一律显示「未知」）。
+        # 从该项目最近一条有署名的记录取 agent；幂等，仅补空值。
+        conn.execute(
+            "UPDATE projects SET agent=(SELECT r.agent FROM records r "
+            "WHERE r.project=projects.name AND r.agent!='' ORDER BY r.id DESC LIMIT 1) "
+            "WHERE (agent='' OR agent IS NULL) AND EXISTS("
+            "SELECT 1 FROM records r WHERE r.project=projects.name AND r.agent!='')")
+        # 无记录可溯源的历史项目（多为已归档的 old-style 目录）——目录名前缀即归属：
+        # 「hermes - 网络切换脚本」→ hermes。与 core 迁移期的归属判定一致。
+        conn.execute(
+            "UPDATE projects SET agent=lower(trim(substr(name,1,instr(name,' - ')-1))) "
+            "WHERE (agent='' OR agent IS NULL) AND instr(name,' - ')>1")
+        # 保留目录（00_Inbox/_archive/…）若被历史版本误登记成项目，清掉（幂等）
+        conn.execute(
+            f"DELETE FROM projects WHERE name IN ({','.join('?' * len(core.RESERVED))})",
+            tuple(core.RESERVED))
         # notes 创意层三列（2026-10-07 批 A）：收藏重温 / 时光胶囊开启日 / 自动上下文
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(notes)")}
         if "starred" not in cols:
@@ -1007,15 +1051,19 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
     rtype = _infer_record_type(content, record_type)
     _ensure_emb()  # 模型懒加载移出写事务：避免 12s 加载期间持有 WAL 写锁拖垮并发写
     with db_conn(root) as conn:
-        conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (project, _now()))
+        # 项目归属随首条记录落地（2026-10-12）：此前只写 name/created，projects.agent 恒空，
+        # 导致 hub_get_project/GUI 一律显示「归属:未知」（真实库实测 138/138 全空）。
         agent = _norm_agent(agent)
+        conn.execute("INSERT OR IGNORE INTO projects(name, created, agent) VALUES(?,?,?)",
+                     (project, _now(), agent))
         _upsert_agent(conn, agent, project, record=True)
         cur = conn.execute(
             "INSERT INTO records(project,agent,date,title,content,source,created,valid_from,record_type) "
             "VALUES(?,?,?,?,?,?,?,?,?)",
             (project, agent, date, title, content, source, _now(), (date or _now()[:10]), rtype))
-        conn.execute("UPDATE projects SET updated=?, status='active' "
-                     "WHERE name=? AND status!='archived'", (date or _now()[:10], project))
+        conn.execute("UPDATE projects SET updated=?, status='active', "
+                     "agent=CASE WHEN agent='' OR agent IS NULL THEN ? ELSE agent END "
+                     "WHERE name=? AND status!='archived'", (date or _now()[:10], agent, project))
         sync_links(conn, "record", cur.lastrowid, content)  # P1-3：正文 [[双链]] → relations
         _ensure_emb_for(root, "records", cur.lastrowid, title, content, project, conn=conn)
         return cur.lastrowid
@@ -2725,6 +2773,150 @@ def search_all(root: str, kw: str, limit: int = 30) -> dict:
             "files": search_files(root, kw, limit)}
 
 
+def skill_sync(root: str, rows: list) -> dict:
+    """技能索引导入（技能原生化·阶段1）。rows=[{name,agent,path,desc}]，按 (agent,path) 主键 UPSERT。
+
+    不删行：技能目录里消失的条目也不删索引——元数据删了无法从库里恢复，而陈旧索引最多是
+    召回一条不存在的技能（agent 读文件时会自己发现）。宁可脏，不可丢。
+    """
+    ensure_schema(root)  # serve 模式不建表（adv_e2e_schema 固化的行为）→ 首次导入前补建，幂等
+    stat = {"added": 0, "updated": 0, "unchanged": 0}
+    with db_conn(root) as conn:
+        for r in (rows or []):
+            path = str(r.get("path") or "")
+            agent = str(r.get("agent") or "")
+            if not path or not agent:
+                continue
+            name = str(r.get("name") or "")
+            desc = str(r.get("desc") or "")
+            old = conn.execute("SELECT desc FROM skills WHERE agent=? AND path=?",
+                               (agent, path)).fetchone()
+            if old is None:
+                conn.execute("INSERT INTO skills(name,agent,path,desc) VALUES(?,?,?,?)",
+                             (name, agent, path, desc))
+                stat["added"] += 1
+            elif (old["desc"] or "") != desc:
+                conn.execute("UPDATE skills SET desc=?,name=? WHERE agent=? AND path=?",
+                             (desc, name, agent, path))
+                stat["updated"] += 1
+            else:
+                stat["unchanged"] += 1
+    return stat
+
+
+def skill_match(root: str, query: str, topk: int = 3, agent: str = "") -> list:
+    """技能按需召回（技能原生化·阶段1 核心）：BM25 过 name+desc+agent，只回 top-N。
+
+    替代「全量技能描述常驻上下文」——ZCode 165 个技能约 16.5k token 常驻，改按需回 3 条约 450 token。
+    rowid AS id 是必需的：_bm25_score 同分排序取 row["id"]，缺了这个键会 KeyError（实测踩点）。
+    """
+    q_set = list(dict.fromkeys(_tokenize(query)))
+    if not q_set:
+        return []
+    sql = "SELECT *, rowid AS id FROM skills"
+    args: list = []
+    if agent:
+        # 大小写不敏感（2026-10-11 踩坑）：skills 表存显示名（WorkBuddy / Claude Code），
+        # 而进程身份与调用方常传归一值（workbuddy / claude）——精确比对会静默返回 0 行，
+        # 表面看就是「索引没导入」，极难排查。
+        sql += " WHERE lower(agent)=lower(?)"
+        args.append(agent)
+    try:
+        with db_conn(root) as conn:
+            rows = conn.execute(sql, args).fetchall()
+    except sqlite3.OperationalError:
+        ensure_schema(root)  # 表还没建（索引从未导入过）：补建后重试一次，再失败则正常抛出
+        with db_conn(root) as conn:
+            rows = conn.execute(sql, args).fetchall()
+    if not rows:
+        return []
+    docs = []
+    for r in rows:
+        # name ×2 加权：技能名信噪比最高（实测「留学选校」靠 name 拿到 13.2 分，desc 反而稀释）。
+        # 不再拼 agent 名——它对同库所有行几乎相同，只会抬高平均文档长度、压低区分度（BM25 的 dl 惩罚）。
+        # 单字母英文 token（如「B站」里的 "B"）是纯噪音——实测它把「抓B站字幕」的 top1
+        # 送给了 weights-and-biases。中文单字要保留（分词后单个汉字是有效信号）。
+        toks = [t for t in (_tokenize(r["name"] or "", max_tokens=200) * 2
+                            + _tokenize(r["desc"] or "", max_tokens=4000))
+                if len(t) >= 2 or _CJK_ALL_RE.search(t)]
+        docs.append((r, Counter(toks), len(toks)))
+    scored = _bm25_score(q_set, docs)
+    # 去重键 = 父技能名（2026-10-11 子文件入索引后改为父级去重）：
+    # ① ZCode 与 DSH 扫到同一批共享目录，同一技能会有多行；
+    # ② 子文件条目 name 形如「父技能 ▸ 子文件名」——不去重的话同一父技能的多个子文件会挤爆 top-N。
+    # 两种情况的键都是「▸」之前的父技能名；scored 已按分降序，天然保留同父里分最高的那条。
+    out, seen = [], set()
+    for s, r in scored:
+        key = (r["name"] or "").split("▸")[0].strip()
+        if key in seen:
+            continue
+        seen.add(key)
+        out.append(dict(r, _bm25=round(s, 4)))
+        if len(out) >= max(0, min(int(topk), 20)):
+            break
+    return out
+
+
+def asset_sync(root: str, items: list) -> dict:
+    """软件资产台账导入（技能原生化·阶段5，L3 数据层）。items=[{name,category,license,website,desc,...}]。
+
+    与 skills 同策略：UPSERT 不删行。用途——agent 要装任何工具前先查大脑，
+    不再每次去爬 accat.top，也不至于装到山寨源。
+    """
+    ensure_schema(root)
+    stat = {"added": 0, "updated": 0, "unchanged": 0}
+    with db_conn(root) as conn:
+        for it in (items or []):
+            name = str(it.get("name") or "").strip()
+            if not name:
+                continue
+            row = (name, str(it.get("category") or ""), str(it.get("license") or ""),
+                   str(it.get("website") or ""), str(it.get("desc") or "")[:400],
+                   str(it.get("source") or ""), str(it.get("version") or ""))
+            old = conn.execute("SELECT desc FROM software WHERE name=?", (name,)).fetchone()
+            if old is None:
+                conn.execute("INSERT INTO software(name,category,license,website,desc,source,version)"
+                             " VALUES(?,?,?,?,?,?,?)", row)
+                stat["added"] += 1
+            elif (old["desc"] or "") != row[4]:
+                conn.execute("UPDATE software SET category=?,license=?,website=?,desc=?,source=?,"
+                             "version=? WHERE name=?", row[1:] + (name,))
+                stat["updated"] += 1
+            else:
+                stat["unchanged"] += 1
+    return stat
+
+
+def asset_find(root: str, kw: str, limit: int = 8) -> list:
+    """软件资产检索（L3）：名字/分类/说明模糊匹配，装工具前先查这里。"""
+    words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:6]
+    if not words:
+        return []
+    conds = " OR ".join(["(name LIKE ? OR category LIKE ? OR desc LIKE ?)"] * len(words))
+    args: list = []
+    for w in words:
+        pat = f"%{w}%"
+        args.extend([pat, pat, pat])
+    try:
+        with db_conn(root) as conn:
+            return [dict(r) for r in conn.execute(
+                f"SELECT name,category,license,website,desc FROM software WHERE ({conds}) LIMIT ?",
+                args + [max(0, min(int(limit), 30))]).fetchall()]
+    except sqlite3.OperationalError:
+        ensure_schema(root)  # 表未建（从未导入）→ 补建后返回空，不抛错
+        return []
+
+
+def skill_hit(root: str, agent: str, path: str) -> None:
+    """命中回写：hits+1 / last_hit，供高频排序与冷技能清理。失败静默——统计不该阻断主流程。"""
+    try:
+        with db_conn(root) as conn:
+            conn.execute("UPDATE skills SET hits=hits+1, last_hit=? WHERE agent=? AND path=?",
+                         (datetime.datetime.now().isoformat(timespec="seconds"), agent, path))
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def search_files(root: str, kw: str, limit: int = 20) -> list:
     words = [w for w in re.split(r"\s+", (kw or "").strip()) if w][:8]
     if not words:
@@ -3222,7 +3414,10 @@ def claim_handoff(root: str, handoff_id, agent: str) -> str:
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:
-    """更新心跳并重建会话表（清掉陈旧条目），返回 (错误或"", 同项目其他活跃会话)。"""
+    """更新心跳并重建会话表（清掉超出 SESSION_RETAIN 的条目），返回 (错误或"", 同项目活跃会话)。
+
+    注意「剪枝窗口 ≠ 在线窗口」：剪枝按 SESSION_RETAIN（24h，服务展示），
+    返回的 active 按 SESSION_ACTIVE（5 分钟，同项目正在工作的并发判定）——两者互不影响。"""
     agent = _norm_agent(agent)
     if not agent:
         return "agent 必填", []
@@ -3237,9 +3432,11 @@ def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") ->
                 ts = datetime.datetime.fromisoformat(s["ts"])
             except (ValueError, TypeError):
                 continue
-            if (now - ts).total_seconds() < SESSION_TTL:
+            # 2026-10-11：此处原用 SESSION_TTL（30 分钟在线窗口）→ 会话记录活不过 30 分钟，
+            # 展示层再放宽也读不到；改用独立的保留窗口 SESSION_RETAIN。
+            if (now - ts).total_seconds() < SESSION_RETAIN:
                 fresh.append(s)
-        conn.execute("DELETE FROM sessions")  # 重建语义：陈旧会话一并清除
+        conn.execute("DELETE FROM sessions")  # 重建语义：超出保留窗口者一并清除
         for s in fresh:
             conn.execute("INSERT INTO sessions(agent,project,note,ts) VALUES(?,?,?,?)",
                          (s["agent"], s["project"], s["note"], s["ts"]))
@@ -3259,13 +3456,16 @@ def _ts_age(ts: str, now: datetime.datetime) -> float:
         return 1e9
 
 
-def active_sessions(root: str) -> list:
+def active_sessions(root: str, ttl: int = SESSION_TTL) -> list:
+    """当前活跃会话（最后一跳心跳在 ttl 秒内）。缺省 SESSION_TTL=「在线」语义（供 hub_status/
+    list_agents 打 live 标）；GUI 总览可传大窗口（24h）展示「最近活动」——只放宽展示，
+    不改在线判定。2026-10-11 修复：GUI 曾用缺省 30 分钟窗口，正常使用中常显空。"""
     now = datetime.datetime.now()
     with db_conn(root) as conn:
         out = []
         for s in conn.execute("SELECT * FROM sessions"):
             d = dict(s)
-            if _ts_age(d.get("ts", ""), now) < SESSION_TTL:
+            if _ts_age(d.get("ts", ""), now) < ttl:
                 out.append(d)
         return sorted(out, key=lambda s: s.get("ts", ""), reverse=True)
 

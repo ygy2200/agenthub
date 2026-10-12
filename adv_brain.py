@@ -189,6 +189,33 @@ def t_heartbeat(tmp):
     assert all(s["agent"] != "beta" for s in brain.active_sessions(root))
 
 
+def t_session_retain(tmp):
+    """剪枝窗口（24h）必须与在线判定（30 分钟）解耦——否则 GUI「最近会话」拿不到更早数据。
+    2026-10-11 修复：剪枝原复用 SESSION_TTL，会话活不过 30 分钟，展示层放宽无效。"""
+    from datetime import datetime, timedelta
+    root = str(Path(tmp) / "hub2")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "alpha", "测试-项目")
+    past = lambda **kw: (datetime.now() - timedelta(**kw)).isoformat(timespec="seconds")
+    # 3 小时前：应在保留窗口内活下来（展示层 24h 窗口能读到）
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE sessions SET ts=? WHERE agent='alpha'", (past(hours=3),))
+    brain.heartbeat_touch(root, "gamma", "别的-项目")
+    keep = {s["agent"] for s in brain.active_sessions(root, ttl=24 * 3600)}
+    assert keep == {"alpha", "gamma"}, \
+        f"3 小时前的会话被误剪（实际保留 {keep}）——剪枝窗口又被在线判定绑架了"
+    # 但同时：在线判定不受影响，3 小时前的不算「在线」
+    assert all(s["agent"] != "alpha" for s in brain.active_sessions(root)), \
+        "放宽保留窗口后，在线判定被污染（应保持 30 分钟 TTL）"
+    # 25 小时前：超出保留窗口，应被剪
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE sessions SET ts=? WHERE agent='alpha'", (past(hours=25),))
+    brain.heartbeat_touch(root, "gamma", "别的-项目")
+    assert all(s["agent"] != "alpha" for s in brain.active_sessions(root, ttl=24 * 3600)), \
+        "25 小时前的会话未被剪——保留窗口失控，表会无限增长"
+
+
 def t_search_all_and_stats(tmp):
     root = Path(str(Path(tmp) / "hub"))
     rs = str(root)
@@ -1716,6 +1743,42 @@ def t_ensure_schema(tmp):
     assert brain.ensure_schema(str(Path(tmp) / "不存在_目录xyz")) != ""  # 拒绝而非凭空建目录
 
 
+def t_project_owner(tmp):
+    """项目归属（2026-10-12 修）：projects.agent 曾恒空 → 所有项目一律显示「归属:未知」。
+    验证：写入即落归属 / 存量按记录署名回填 / old-style 前缀目录回填 / 保留目录不登记 / 幂等。"""
+    root = str(Path(tmp) / "hub_owner")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    # 1) 新记录写入即落归属
+    brain.add_record(root, "甲-问题", "zcode", "2026-10-12", "t", "正文")
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT agent FROM projects WHERE name='甲-问题'").fetchone()[0] == "zcode"
+    # 2) 存量空归属 → 按该项目最近一条有署名的记录回填
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO projects(name, agent) VALUES('乙-问题','')")
+    brain.add_record(root, "乙-问题", "dsh", "2026-10-12", "t", "正文")
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT agent FROM projects WHERE name='乙-问题'").fetchone()[0] == "dsh"
+    # 3) 无记录的 old-style 前缀目录 → 前缀即归属
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO projects(name, agent) VALUES('hermes - 旧目录项目','')")
+        conn.execute("INSERT INTO projects(name, agent) VALUES('_archive','')")  # 保留目录
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT agent FROM projects WHERE name='hermes - 旧目录项目'").fetchone()[0] == "hermes"
+        assert conn.execute("SELECT COUNT(*) FROM projects WHERE name='_archive'").fetchone()[0] == 0
+    # 4) 幂等：重跑不改写已有归属
+    brain.add_record(root, "甲-问题", "claude", "2026-10-12", "t2", "正文2")
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT agent FROM projects WHERE name='甲-问题'").fetchone()[0] == "zcode"
+
+
 def t_batchA_memory_governance(tmp):
     """批次A·可靠性地基：记忆取代链 + 双时相 + 证据链 + 置信度 + 治理统计。
     验证：被取代/过期/作废的记忆退出推送与检索但仍可追溯；latest-write-wins；
@@ -1889,6 +1952,7 @@ def main():
     case("记录写入+栈式软删撤销（不误删迁移/他人）", lambda: t_records_and_undo(tmp))
     case("错误登记流转+操作流水", lambda: t_errors_and_journal(tmp))
     case("心跳（冲突预警/陈旧清理/坏参）", lambda: t_heartbeat(tmp))
+    case("会话保留窗口（24h 剪枝 / 在线判定 30min 不被污染 / 超限必剪）", lambda: t_session_retain(tmp))
     case("agent注册制（写动作登记/计数/保留名过滤/回填幂等/并发登记）", lambda: t_agents_registry(tmp))
     case("反射弧+可塑性（记忆推送/唤起计数/检索日志/项目stalled迁移）", lambda: t_plasticity(tmp))
     case("全脑检索+统计（记录/记忆/文件名）", lambda: t_search_all_and_stats(tmp))
@@ -1932,6 +1996,7 @@ def main():
     case("P1-1 记忆版本化（编辑/删除留痕+回滚+records双时相失效不删）", lambda: t_memory_revisions(tmp))
     case("P1-2 schema收口（record_type枚举/标签规约与注册表归一）", lambda: t_record_type_and_tags(tmp))
     case("P1-3 关系+属性继承（双链抽取/反链/属性下行）", lambda: t_relations_and_attrs(tmp))
+    case("项目归属（写入即落/存量回填/前缀目录/保留目录剔除/幂等，修「归属:未知」）", lambda: t_project_owner(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:
