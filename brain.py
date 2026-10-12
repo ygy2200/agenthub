@@ -28,6 +28,12 @@ DB_NAME = "brain.db"
 BACKUP_DIR = "brain-backups"
 BACKUP_KEEP = 30
 KINDS = ("fact", "preference", "lesson", "project", "note")
+# M6 记忆成熟度（2026-10-12，ByteRover 模式）：记忆不是生来平等——新写入是草稿，
+# 被反复用/人工确认过的才敢依赖。与 salience（显著度权重）互补：那是「多响」，这是「多信」。
+# 晋升只上不下（core 不降级——人工 pinned 的信任不该被低频推翻）。
+MATURITY_LEVELS = ("draft", "validated", "core")
+VALIDATE_AT = 3    # 被唤起/检索命中够这么多次 → validated
+CORE_AT = 10       # pinned 且够这么多次 → core
 KIND_CN = {"fact": "环境事实", "preference": "用户偏好", "lesson": "踩坑经验",
            "project": "项目进展", "note": "随手记", "error": "踩坑登记"}
 # P1-2 记录类型枚举（schema 收口）：写入即校验；含「## 决策记录」段自动推断 decision
@@ -188,7 +194,8 @@ CREATE TABLE IF NOT EXISTS memories (
     superseded_by INTEGER DEFAULT 0,
     valid_until TEXT DEFAULT "",
     confidence REAL DEFAULT 1.0,
-    evidence TEXT DEFAULT ""
+    evidence TEXT DEFAULT "",
+    maturity TEXT DEFAULT "draft"
 );
 CREATE TABLE IF NOT EXISTS memory_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -738,6 +745,14 @@ def _migrate_columns(root: str) -> None:
                          ("evidence", "TEXT DEFAULT ''")):
             if col not in cols:
                 conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
+        # M6 成熟度列（2026-10-12）：存量按历史使用回填——pinned 或 use>=CORE_AT → core；
+        # use>=VALIDATE_AT → validated；其余 draft。只此一次（补列后才跑），幂等靠列存在判断。
+        if "maturity" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN maturity TEXT DEFAULT 'draft'")
+            conn.execute(
+                "UPDATE memories SET maturity=CASE WHEN pinned=1 AND use_count>=? THEN 'core' "
+                "WHEN use_count>=? THEN 'validated' ELSE 'draft' END",
+                (CORE_AT, VALIDATE_AT))
         # P1-1（2026-10-11）records 双时相版本列：valid_from/valid_until/superseded_by
         # 「失效 ≠ 删除」——旧版本行保留可追溯，检索只认现行有效（_rec_live_sql）。
         rcols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
@@ -2124,12 +2139,17 @@ def memory_trace(root: str, mid: int) -> list:
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
                project: str = "", agent: str = "", pinned: bool = False,
                supersedes: int = 0, valid_until: str = "",
-               confidence: float = 1.0, evidence: str = "") -> int:
+               confidence: float = 1.0, evidence: str = "",
+               maturity: str = "draft") -> int:
     """写一条记忆。supersedes=N 表示本条取代 #N（旧的自动退出推送但仍可追溯）。
     valid_until=YYYY-MM-DD 表示有效期止（到期自动退出）。confidence 0~1。
-    evidence 形如 "r:2038,m:76"（支持的记录/记忆 id）。"""
+    evidence 形如 "r:2038,m:76"（支持的记录/记忆 id）。
+    maturity（M6）：draft 草稿（缺省，新记忆生来低信任）/ validated 已验证（写入者
+    已确认过——如跨会话复核过的结论）/ core 核心（慎用，人工 pinned+高频才会自动到）。"""
     if kind not in KINDS:
         kind = "note"
+    if maturity not in MATURITY_LEVELS:
+        maturity = "draft"
     old = int(supersedes or 0)
     if old < 0:
         raise ValueError("supersedes 必须为正整数或 0")
@@ -2149,9 +2169,9 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
         tags = _register_tags(conn, _norm_tags(tags))  # P1-2：标签规约 + 注册（大小写归一）
         cur = conn.execute(
             "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated,"
-            "valid_until,confidence,evidence) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "valid_until,confidence,evidence,maturity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (kind, content, tags, project, agent, 1 if pinned else 0,
-             _now(), _now(), vu, conf, ev))
+             _now(), _now(), vu, conf, ev, maturity))
         nid = cur.lastrowid
         sync_links(conn, "memory", nid, content)  # P1-3：正文 [[双链]] → relations
         _ensure_emb_for(root, "memories", nid, content, tags, project, conn=conn)
@@ -2177,12 +2197,12 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
     with db_conn(root) as conn:
         proj = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE " + _live_sql() + " AND project=? "
-            "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
+            "ORDER BY (use_count=0) DESC, use_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PROJECT))]
         pins = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE " + _live_sql() + " AND pinned=1 "
             "AND (project='' OR project IS NULL OR project!=?) "
-            "ORDER BY (use_count=0) DESC, use_count DESC, id DESC LIMIT ?",
+            "ORDER BY (use_count=0) DESC, use_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
             (project or "", PUSH_LIMIT_PINNED))]
         # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他记忆。
         # 全局记忆（project 空）也入联想池——它们不置顶就三层全捞不到（2026-10-03 实测
@@ -2204,7 +2224,8 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
                 sim = len(cur_toks & ot) / len(cur_toks | ot)
                 if sim >= 0.12:
                     scored.append((sim, om))
-            scored.sort(key=lambda x: -x[0])
+            scored.sort(key=lambda x: (x[0], x[1]["maturity"] != "draft",
+                                       x[1]["use_count"] or 0), reverse=True)
             for sim, om in scored[:PUSH_LIMIT_RELATED]:
                 om["related_project"] = om["project"]
                 related.append(om)
@@ -2219,8 +2240,11 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
             rows.append(r)
         now = _now()
         for r in rows:
-            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
-                         (now, r["id"]))
+            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=?, "
+                         "maturity=CASE WHEN pinned=1 AND use_count+1>=? THEN 'core' "
+                         "WHEN maturity='draft' AND use_count+1>=? THEN 'validated' "
+                         "ELSE maturity END WHERE id=?",
+                         (now, CORE_AT, VALIDATE_AT, r["id"]))
             r["use_count"] = (r["use_count"] or 0) + 1  # 返回值反映本次唤起后的计数
             r["last_hit"] = now
     # 推送落检索日志（tool=recall_push）：推送可观测，"推送 top10 是工作知识"才可验收
@@ -2293,8 +2317,11 @@ def _bump_access(root: str, ids: list, now: str = "") -> None:
     with db_conn(root) as conn:
         conn.execute("INSERT OR IGNORE INTO meta(key, value) VALUES('active_recall_since', ?)", (now,))
         for mid in ids:
-            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
-                         (now, mid))
+            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=?, "
+                         "maturity=CASE WHEN pinned=1 AND use_count+1>=? THEN 'core' "
+                         "WHEN maturity='draft' AND use_count+1>=? THEN 'validated' "
+                         "ELSE maturity END WHERE id=?",
+                         (now, CORE_AT, VALIDATE_AT, mid))
 
 
 def _parse_ts(ts) -> datetime.datetime | None:
@@ -4215,8 +4242,11 @@ def mark_intercept_hit(root: str, agent: str, rec_id: int, hits: list) -> None:
         with db_conn(root) as conn:
             for h in hits:
                 if h["id"] > 0:
-                    conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=? WHERE id=?",
-                                 (_now(), h["id"]))
+                    conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=?, "
+                                 "maturity=CASE WHEN pinned=1 AND use_count+1>=? THEN 'core' "
+                                 "WHEN maturity='draft' AND use_count+1>=? THEN 'validated' "
+                                 "ELSE maturity END WHERE id=?",
+                                 (_now(), CORE_AT, VALIDATE_AT, h["id"]))
     except Exception:  # noqa: BLE001 — 观测失败任何原因都静默，不能打断 log_work 主链路
         pass
 
@@ -4282,6 +4312,11 @@ def health_report(root: str) -> dict:
         pinned_total, pinned_work = conn.execute(
             "SELECT COUNT(*), IFNULL(SUM(CASE WHEN kind IN ('lesson','fact','project') THEN 1 ELSE 0 END),0) "
             "FROM memories WHERE " + _live_sql() + " AND pinned=1").fetchone()
+        # M6 成熟度分布（信任分层）：draft 未验证 / validated 用过或人工确认 / core 核心
+        maturity_dist = {r[0] or "draft": r[1] for r in conn.execute(
+            "SELECT maturity, COUNT(*) FROM memories WHERE " + _live_sql() + " GROUP BY maturity")}
+        for lv in MATURITY_LEVELS:
+            maturity_dist.setdefault(lv, 0)
         # 记忆保鲜：lesson/fact 写入超 90 天且从未唤起/长期未唤起——环境漂移后可能已失真
         cutoff = (datetime.datetime.now() - datetime.timedelta(days=90)).isoformat(timespec="seconds")
         stale_rows = conn.execute(
@@ -4334,6 +4369,7 @@ def health_report(root: str) -> dict:
             "acceptance": {"cross_agent_searches": cross_agents, "intercept_hits": intercept_hits,
                            "stalled_used": stalled_used, "pinned_total": pinned_total,
                            "pinned_work": pinned_work},
+            "maturity_dist": maturity_dist,
             "stale_memories": [dict(r) for r in stale_rows],
             "cold_memories": cold[:10], "cold_count": len(cold),
             "honest": {

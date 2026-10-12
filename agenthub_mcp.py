@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.33.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.34.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -663,6 +663,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         except (TypeError, ValueError):
             confidence = 1.0
         evidence = str(arguments.get("evidence", "")).strip()
+        # M6 成熟度（信任分层）：新记忆生来 draft；写入者已确认过的结论才标 validated
+        maturity = str(arguments.get("maturity", "draft")).strip()
+        if maturity not in brain.MATURITY_LEVELS:
+            maturity = "draft"
         err = _check_content(content, "content")
         if err:
             return err
@@ -687,7 +691,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 return f"已更新大脑记忆 #{rows[0]['id']}"
         mid = brain.add_memory(root, content, kind, tags, project, agent, pinned,
                               supersedes=supersedes, valid_until=valid_until,
-                              confidence=confidence, evidence=evidence)
+                              confidence=confidence, evidence=evidence,
+                              maturity=maturity)
         core.journal(root, agent, "memory_append", f"brain:memories#{mid}", note=kind)
         extra = ""
         if supersedes > 0:
@@ -1412,7 +1417,9 @@ TOOLS = [
                                     "supersedes": {"type": "integer", "description": "取代的目标记忆 id：旧条自动退出推送但仍可追溯（记忆取代链）"},
                                     "valid_until": {"type": "string", "description": "有效期止 YYYY-MM-DD，到期自动退出推送（双时相时效治理）"},
                                     "confidence": {"type": "number", "description": "置信度 0~1，低置信记忆在治理统计中可识别"},
-                                    "evidence": {"type": "string", "description": "证据链，形如 r:2038,m:76（引用记录/记忆 id，provenance 溯源）"}},
+                                    "evidence": {"type": "string", "description": "证据链，形如 r:2038,m:76（引用记录/记忆 id，provenance 溯源）"},
+                                    "maturity": {"type": "string", "enum": list(brain.MATURITY_LEVELS),
+                                                 "description": "M6 成熟度（信任分层）：draft 草稿（缺省）/ validated 已验证（写入者已确认过的结论，慎标）/ core 核心（留给人工 pinned+高频自动晋升，勿手填）"}},
                      "required": ["content"]}},
     {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃时会收到撞车预警，长任务开工前先调用",
      "inputSchema": {"type": "object",

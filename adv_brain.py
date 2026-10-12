@@ -1988,6 +1988,51 @@ def t_sentry(tmp):
     assert sid3 >= 1 and "已广播" in s3, (s3, sid3)
 
 
+def t_maturity(tmp):
+    """M6 记忆成熟度（2026-10-12，ByteRover 模式）：draft 缺省 / 人工标 validated·core /
+    非法值回落 draft / 用 3 次自动晋升 validated / pinned+10 次晋升 core / 只升不降 /
+    推送优先级 / health 分布。"""
+    root = str(Path(tmp) / "hub_maturity")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    m1 = brain.add_memory(root, "新结论甲", "fact", agent="zcode")
+    m2 = brain.add_memory(root, "复核过的结论乙", "fact", agent="zcode", maturity="validated")
+    m3 = brain.add_memory(root, "核心结论丙", "fact", agent="zcode", maturity="core")
+    m4 = brain.add_memory(root, "非法值回落", "fact", agent="zcode", maturity="super")
+    with brain.db_conn(root) as conn:
+        mats = {r["id"]: r["maturity"] for r in
+                conn.execute("SELECT id, maturity FROM memories")}
+    assert mats == {m1: "draft", m2: "validated", m3: "core", m4: "draft"}, mats
+    # 自动晋升：用 3 次 → validated（search_memories 命中即 use_count+1 顺带晋升）
+    for _ in range(3):
+        brain.search_memories(root, "新结论甲")
+    with brain.db_conn(root) as conn:
+        r1 = conn.execute("SELECT maturity, use_count FROM memories WHERE id=?",
+                          (m1,)).fetchone()
+    assert (r1["maturity"], r1["use_count"]) == ("validated", 3), tuple(r1)
+    # pinned + 高频 → core
+    m5 = brain.add_memory(root, "置顶结论丁", "lesson", agent="zcode", pinned=True)
+    for _ in range(10):
+        brain.search_memories(root, "置顶结论丁")
+    with brain.db_conn(root) as conn:
+        r5 = conn.execute("SELECT maturity FROM memories WHERE id=?", (m5,)).fetchone()
+        # 只升不降：core 不被低频推翻
+        r3 = conn.execute("SELECT maturity FROM memories WHERE id=?", (m3,)).fetchone()
+    assert r5["maturity"] == "core", tuple(r5)
+    assert r3["maturity"] == "core", tuple(r3)
+    # 推送优先级：零唤起优先（防马太，10-03 确立）不动；maturity 是**同 use 层级内**的
+    # 次级键——同为零唤起的 validated/core 先于 draft 曝光（信任高的一等公民）
+    order = [r["id"] for r in brain.recall_for(root, "", agent="zcode")]
+    ma = brain.add_memory(root, "同层已验证戊", "fact", agent="zcode", maturity="validated")
+    mb = brain.add_memory(root, "同层草稿己", "fact", agent="zcode")
+    order2 = [r["id"] for r in brain.recall_for(root, "", agent="zcode")]
+    assert order2.index(ma) < order2.index(mb), (ma, mb, order2)
+    # health 成熟度分布
+    h = brain.health_report(root)
+    assert h["maturity_dist"]["core"] >= 2 and h["maturity_dist"]["validated"] >= 3, h["maturity_dist"]
+    assert h["maturity_dist"]["draft"] >= 2, h["maturity_dist"]
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -2254,6 +2299,7 @@ def main():
     case("M3 信号（点对点/广播/收件箱过滤/已读回执幂等/非我勿动/未读计数排自发）", lambda: t_signals(tmp))
     case("M4 检查点（认领自动锚点/时间线/latest/拒空拒幽灵/并发认领不回归）", lambda: t_checkpoints(tmp))
     case("M5 哨兵（全绿不报/造gap广播/同内容冷却/冷却过重发）", lambda: t_sentry(tmp))
+    case("M6 记忆成熟度（draft缺省/人工标/用3次自动validated/pinned+10次core/只升不降/health分布）", lambda: t_maturity(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()
