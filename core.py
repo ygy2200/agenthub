@@ -681,7 +681,7 @@ def init_hub(root: str) -> str:
 BOOTSTRAP_BEGIN = "<!-- agenthub:begin -->"
 BOOTSTRAP_END = "<!-- agenthub:end -->"
 # 引导块格式版本：内容格式变更时 +1，让 bootstrap_version() 识别「注入了但过时」的块
-BOOTSTRAP_VERSION = "4"  # v4（2026-10-12）：移除 Ponytail 编码纪律段（主人要求删掉省流/省代码那套）
+BOOTSTRAP_VERSION = "5"  # v5（2026-10-12）：把「干完活记大脑」升为醒目铁律（软治理 agent 唯一杠杆）
 
 # 注：引导注入目标已统一到下方 AGENT_ADAPTERS（单一事实来源）。
 # 2026-10-09 清理死代码：此处原有一份 BOOTSTRAP_TARGETS，被文件末尾同名派生版本覆盖，
@@ -695,10 +695,10 @@ def bootstrap_text(root: str) -> str:
 
 你已接入 AgentHub 大脑（SQLite 数据库，工具前缀 hub_），数据根目录：{root}
 - 开工先对齐进度：hub_get_progress(limit=15)；相关背景先查 hub_memory_read（带 query 可检索）
-- 干完活记录：hub_log_work(project, agent, content)，content 含 目的/做了什么/验证结果/如何回滚——
-  这就是全局规范「工作记录」要求的动作，记录直接进大脑数据库，不要再手写工作记录.md 文件
-- 有跨会话价值的知识立即沉淀：hub_memory_write(content, kind, tags)——
-  环境事实用 fact、用户偏好用 preference、踩坑用 lesson、项目进展用 project；重要条目加 pinned: true
+- 【铁律·收尾必做】干完活必须落大脑，否则下次的自己接不上、团队看不到你干了啥：
+  ① hub_log_work(project, agent, content)，content 含 目的/做了什么/验证结果/如何回滚——记录直接进大脑数据库，不要再手写工作记录.md 文件
+  ② 有跨会话价值的知识立即 hub_memory_write(content, kind, tags)：环境事实 fact / 用户偏好 preference / 踩坑 lesson / 项目进展 project，重要条目 pinned: true
+  ③ 收尾前跑一次 hub_ops_run 自检。三步做完才算"交付完成"，不是把活干完就算完
 - 干完活顺手 hub_distill 看一眼蒸馏候选：有「目的」结论但还没沉淀成记忆的，
   用自己的判断精炼成一条 hub_memory_write（你刚干完活最懂上下文——日记会膨胀，笔记本只留精华）
 - 修正旧记忆别删：写一条新记忆并在开头标注「取代记忆#N」+错在哪，由全员共同裁决旧条目（免疫协议）
