@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.34.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.35.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -460,7 +460,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             content = (content[:room] if len(content) > room else content) + tag
         rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
                                   context=ctx, options=opts, decision=dec, tradeoffs=tro,
-                                  record_type=rt)
+                                  record_type=rt,
+                                  review_date=str(arguments.get("review_date", "")).strip()[:10])
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
@@ -811,6 +812,18 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 to = f"→{s['to_agent']}" if s["to_agent"] else "→广播"
                 sl.append(f"  ● #{s['id']} {s['ts'][5:16]} 来自 {s['from_agent']}{to}：{s['content'][:60]}")
             out = out + "\n".join(sl)
+        # M11 待验证决策（开工推送第三段）：到期未回顾的决策推出来——决策写了没人回顾=白写
+        try:
+            due = brain.decision_review_due(root, limit=2)
+        except Exception:  # noqa: BLE001
+            due = []
+        if due:
+            dl = ["", f"[待验证决策] {len(due)} 条到期未回顾"
+                       "（hub_decision_review action=list 看全部，review 记结论）："]
+            for d in due:
+                dl.append(f"  ◆ #{d['record_id']} {d['review_date']} 到期｜{d['title'][:36]}"
+                          f"｜当时决策：{d['decision_brief'][:40]}")
+            out = out + "\n".join(dl)
         return out
 
     if name == "hub_report_error":
@@ -1247,6 +1260,62 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         summary, sid = brain.sentry_sweep(root)
         return summary + ("\n（已广播给所有 agent——下次开工即在心跳里可见）" if sid else "")
 
+    if name == "hub_quarantine":
+        action = str(arguments.get("action", "list")).strip()
+        agent = str(arguments.get("agent", "")).strip()
+        target = str(arguments.get("target", "record")).strip()
+        if action in ("quarantine", "release"):
+            if target == "memory":
+                if action == "quarantine":
+                    return brain.quarantine_memory(root, arguments.get("id"), agent,
+                                                   str(arguments.get("reason", "")))
+                return brain.release_memory(root, arguments.get("id"), agent)
+            if action == "quarantine":
+                return brain.quarantine_record(root, arguments.get("id"), agent,
+                                               str(arguments.get("reason", "")))
+            return brain.release_record(root, arguments.get("id"), agent)
+        rows = brain.quarantine_list(root)
+        if not rows:
+            return ("（隔离区空。发现可疑内容：hub_quarantine action=quarantine "
+                    "target=record|memory——退出检索但不删除，可解除）")
+        lines = [f"隔离区 {len(rows)} 条（退出检索与推送，未删除）："]
+        for r in rows:
+            if r["src"] == "record":
+                lines.append(f"- 记录 #{r['id']} [{r['project'] or '无项目'}] {r['title']}")
+            else:
+                lines.append(f"- 记忆 #{r['id']} [{r['kind']}] {r['content']}")
+        lines.append("解除：hub_quarantine action=release target=… id=…")
+        return "\n".join(lines)
+
+    if name == "hub_decision_review":
+        action = str(arguments.get("action", "list")).strip()
+        if action == "review":
+            return brain.decision_review(root, arguments.get("review_id"),
+                                         str(arguments.get("verdict", "")),
+                                         str(arguments.get("note", "")),
+                                         str(arguments.get("agent", "")))
+        if action == "history":
+            rows = brain.decision_review_history(root)
+            if not rows:
+                return "（还没有已回顾的决策。写决策时带 review_date，到期即可回顾）"
+            vcn = {"right": "✔ 对", "wrong": "✘ 错", "partial": "◐ 部分对"}
+            lines = [f"决策回顾史 {len(rows)} 条（新在前，错过的决策比对的更有复盘价值）："]
+            for h in rows:
+                lines.append(f"- #{h['id']} [{vcn.get(h['verdict'], h['verdict'])}] "
+                             f"{h['review_date']}｜{h['title'][:44]}"
+                             + (f"——{h['note'][:50]}" if h["note"] else ""))
+            return "\n".join(lines)
+        rows = brain.decision_review_due(root)
+        if not rows:
+            return ("（无到期待验证的决策。写决策记录时传 review_date=YYYY-MM-DD，"
+                    "到期会自动出现在这里和心跳开工推送里）")
+        lines = [f"到期待验证决策 {len(rows)} 条（到期日在心，回顾用 verdict=right/wrong/partial）："]
+        for d in rows:
+            lines.append(f"- #{d['id']} {d['review_date']} 到期｜{d['title'][:44]}"
+                         f"｜当时决策：{d['decision_brief'][:60]}")
+        lines.append("回顾：hub_decision_review action=review review_id=N verdict=right|wrong|partial")
+        return "\n".join(lines)
+
     if name == "hub_report":
         import report
         path = report.generate_report(root)
@@ -1371,6 +1440,7 @@ TOOLS = [
                                     "options": {"type": "string", "description": "决策-权衡过的选项（可选）：评估了哪些方案、各自为何成/否"},
                                     "decision": {"type": "string", "description": "决策-决策（可选）：最终选了什么"},
                                     "tradeoffs": {"type": "string", "description": "决策-接受的取舍（可选）：选它付出的代价"},
+                                    "review_date": {"type": "string", "description": "M11 决策回路（可选）：YYYY-MM-DD——到期后此决策进「待验证」队列（心跳推送+回顾工具），适合「当时判断、日后验证」的决策（如选型/方案）；不传不建"},
                                     "waive": {"type": "string", "description": "豁免门禁（可选）：确属误报时填一句话理由，记录照写但留痕可追溯"}},
                      "required": ["project", "agent", "content"]}},
     {"name": "hub_search", "description": "跨项目全文搜索工作记录/记忆/文件名（记录行带 #id，判断不了价值先看片段，精读用 hub_get_record）",
@@ -1527,6 +1597,26 @@ TOOLS = [
     {"name": "hub_sentry",
      "description": "M5 哨兵：跑大脑自身健康巡检（闸门/规模/备份/重复记忆/inbox/停滞），把需关注项聚合成广播 alert——所有 agent 下次开工即在心跳里可见，不用各自跑体检。同内容 24h 冷却防刷屏",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_quarantine",
+     "description": "M8 隔离区：把可疑的记录/记忆移出检索与推送（status→quarantine，不删除、可解除）。与软删的分工：deleted=撤销不可见，quarantine=观察区可批量处理",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["list", "quarantine", "release"],
+                                               "description": "list 隔离区清单（缺省）/ quarantine 隔离 / release 解除"},
+                                    "target": {"type": "string", "enum": ["record", "memory"],
+                                               "description": "操作对象类型，缺省 record"},
+                                    "id": {"type": "integer", "description": "目标 id"},
+                                    "reason": {"type": "string", "description": "隔离原因（quarantine 用）"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}}}},
+    {"name": "hub_decision_review",
+     "description": "M11 决策回路：写决策记录时带 review_date，到期进「待验证」队列（心跳开工推送也会提醒），回顾时记 verdict（right 对/wrong 错/partial 部分对）——决策写了没人回顾=白写",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["list", "review", "history"],
+                                               "description": "list 到期待验证（缺省）/ review 记回顾结论 / history 回顾史"},
+                                    "review_id": {"type": "integer", "description": "review：回顾项 id（list 里给出）"},
+                                    "verdict": {"type": "string", "enum": list(brain.REVIEW_VERDICTS),
+                                                "description": "review：right 当时决策对 / wrong 错 / partial 部分对"},
+                                    "note": {"type": "string", "description": "review：结论说明"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}}}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1684,6 +1774,8 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_signal_send", "hub_signals", "hub_signal_read",  # M3 信号：协作总线要给干活的 agent
     "hub_checkpoint",  # M4 检查点：长任务断点续跑
     "hub_sentry",  # M5 哨兵：巡检广播
+    "hub_quarantine",  # M8 隔离区：治理工具要给干活的 agent
+    "hub_decision_review",  # M11 决策回路：到期验证
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
@@ -1703,6 +1795,8 @@ WRITE_TOOLS = {
     "hub_signal_send", "hub_signal_read",  # M3 信号：发消息/标已读
     "hub_checkpoint",  # M4 检查点：写进展快照
     "hub_sentry",  # M5 哨兵：跑巡检并发广播
+    "hub_quarantine",  # M8 隔离区：可疑内容移出检索（不删）
+    "hub_decision_review",  # M11 决策回路：到期验证决策对错
 }
 
 

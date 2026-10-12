@@ -2033,6 +2033,59 @@ def t_maturity(tmp):
     assert h["maturity_dist"]["draft"] >= 2, h["maturity_dist"]
 
 
+def t_quarantine_review(tmp):
+    """M8 隔离区 + M11 决策回路（2026-10-12）：
+    隔离=退出检索不删可解除（记录/记忆两表）/ 清单 src 类型标记不被 memories.kind 覆盖 /
+    到期决策进队列、回顾记结论、坏 verdict 拒、不带 review_date 不建。"""
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_quar")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "zcode", "甲-问题")
+    today = _dt.date.today().isoformat()
+    # —— M8 ——
+    rid = brain.add_record(root, "甲-问题", "zcode", today, "可疑记录", "内容存疑待查")
+    mid = brain.add_memory(root, "可疑记忆条目", "fact", agent="zcode")
+    assert "已隔离" in brain.quarantine_record(root, rid, "zcode", "与事实不符")
+    assert "已隔离" in brain.quarantine_memory(root, mid, "zcode")
+    assert "已在隔离区" in brain.quarantine_record(root, rid, "zcode")  # 幂等
+    # 隔离即退检索（_live_sql/_rec_live_sql 只认 active——零改动接入）
+    assert brain.search_records(root, "可疑记录") == []
+    assert brain.search_memories(root, "可疑记忆") == []
+    # 解除恢复
+    assert "已解除隔离" in brain.release_record(root, rid, "zcode")
+    assert len(brain.search_records(root, "可疑记录")) == 1
+    # 清单：src 类型标记（memories 自带 kind 列，dict 展开曾覆盖类型标记——回归防线）
+    brain.quarantine_memory(root, mid, "zcode")
+    rows = brain.quarantine_list(root)
+    assert len(rows) == 1 and rows[0]["src"] == "memory" and rows[0]["kind"] == "fact", rows
+    brain.release_memory(root, mid, "zcode")
+    # —— M11 ——
+    past = (_dt.date.today() - _dt.timedelta(days=3)).isoformat()
+    future = (_dt.date.today() + _dt.timedelta(days=30)).isoformat()
+    rid2 = brain.add_record(root, "甲-问题", "zcode", today, "选型：SQLite 单文件", "背景…",
+                            decision="选 SQLite 不上 PG", review_date=past)
+    rid3 = brain.add_record(root, "甲-问题", "zcode", today, "远期决策", "背景…",
+                            decision="一年后再看", review_date=future)
+    due = brain.decision_review_due(root)
+    assert len(due) == 1 and due[0]["record_id"] == rid2, due
+    assert "SQLite" in due[0]["decision_brief"], due[0]
+    # 回顾记结论 + 幂等队列
+    assert "已记" in brain.decision_review(root, due[0]["id"], "right", "单文件够用", "zcode")
+    assert brain.decision_review_due(root) == []
+    hist = brain.decision_review_history(root)
+    assert len(hist) == 1 and hist[0]["verdict"] == "right", hist
+    # 坏 verdict 拒
+    assert "verdict 只能是" in brain.decision_review(root, 1, "maybe", "", "zcode")
+    # 不带 review_date 不建 review（rid/rid3 之外普通记录）
+    rid4 = brain.add_record(root, "甲-问题", "zcode", today, "普通记录", "无决策")
+    with brain.db_conn(root) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM decision_reviews").fetchone()[0]
+        recs = conn.execute("SELECT COUNT(*) FROM decision_reviews WHERE record_id=?",
+                            (rid4,)).fetchone()[0]
+    assert n == 2 and recs == 0, (n, recs)
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -2053,6 +2106,7 @@ def t_tool_schema_sync(tmp):
     assert set(enum_of("hub_event_write", "kind")) == set(brain.EVENT_KINDS), "hub_event_write.kind 漂移"
     assert set(enum_of("hub_signal_send", "kind")) == set(brain.SIGNAL_KINDS), "hub_signal_send.kind 漂移"
     assert set(enum_of("hub_checkpoint", "kind")) == set(brain.CHECKPOINT_KINDS), "hub_checkpoint.kind 漂移"
+    assert set(enum_of("hub_decision_review", "verdict")) == set(brain.REVIEW_VERDICTS), "hub_decision_review.verdict 漂移"
 
 
 def t_gap_note(tmp):
@@ -2300,6 +2354,7 @@ def main():
     case("M4 检查点（认领自动锚点/时间线/latest/拒空拒幽灵/并发认领不回归）", lambda: t_checkpoints(tmp))
     case("M5 哨兵（全绿不报/造gap广播/同内容冷却/冷却过重发）", lambda: t_sentry(tmp))
     case("M6 记忆成熟度（draft缺省/人工标/用3次自动validated/pinned+10次core/只升不降/health分布）", lambda: t_maturity(tmp))
+    case("M8+M11 隔离区与决策回路（隔离退检索可解除/到期队列/回顾结论/只记一次）", lambda: t_quarantine_review(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()

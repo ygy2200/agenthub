@@ -330,6 +330,20 @@ CREATE TABLE IF NOT EXISTS signal_reads (
     read_at TEXT DEFAULT "",
     PRIMARY KEY (signal_id, agent)
 );
+-- M11 决策回路（2026-10-12）：决策记录写了没人回顾=白写。写决策时挂 review_date，
+-- 到期进「待验证」队列（心跳开工推送第三段），回顾时记 verdict（right/wrong/partial）。
+-- AgDR 决策本身还是记录尾段（不重构），本表只挂「到期-回顾」闭环。
+CREATE TABLE IF NOT EXISTS decision_reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    record_id INTEGER,
+    review_date TEXT DEFAULT "",
+    status TEXT DEFAULT "pending",
+    verdict TEXT DEFAULT "",
+    note TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    created TEXT DEFAULT "",
+    reviewed_at TEXT DEFAULT ""
+);
 -- M4 检查点（2026-10-12）：任务级断点续跑。长任务/跨会话任务定期存进展快照，
 -- 崩溃、换人接手、隔天续跑时不用从零翻记录。kind：manual=手写 /
 -- auto_claim=认领时自动存的开工资锚点（断点续跑的第一块砖）。
@@ -1105,12 +1119,15 @@ def attr_effective(root: str, node_kind: str, node_ref: str, key: str) -> str:
 
 def add_record(root: str, project: str, agent: str, date: str, title: str, content: str,
                source: str = "hub", context: str = "", options: str = "",
-               decision: str = "", tradeoffs: str = "", record_type: str = "") -> int:
+               decision: str = "", tradeoffs: str = "", record_type: str = "",
+               review_date: str = "") -> int:
     """写一条工作记录（hub 入口）。自动登记项目（历史目录迁移时已登记），并刷新项目活跃状态。
     source：hub=人工经 MCP 写入；auto=会话边界 hook 自动捕获（未经蒸馏，2.1）。
     决策字段（3.2 AgDR，可选）：context/options/decision/tradeoffs 传任意非空值即在
     正文尾部追加「## 决策记录」段；全不传时行为与旧版完全一致。
-    record_type（P1-2，可选）：work_log/decision/todo/note；缺省按内容推断（含决策段→decision）。"""
+    record_type（P1-2，可选）：work_log/decision/todo/note；缺省按内容推断（含决策段→decision）。
+    review_date（M11，可选）：YYYY-MM-DD——到期后此决策进「待验证」队列（心跳推送+回顾工具），
+    传了才建（不传不建，零行为变化）。"""
     source = source if source in ("hub", "auto") else "hub"
     content = content + render_decision(context, options, decision, tradeoffs)
     rtype = _infer_record_type(content, record_type)
@@ -1131,6 +1148,14 @@ def add_record(root: str, project: str, agent: str, date: str, title: str, conte
                      "WHERE name=? AND status!='archived'", (date or _now()[:10], agent, project))
         sync_links(conn, "record", cur.lastrowid, content)  # P1-3：正文 [[双链]] → relations
         _ensure_emb_for(root, "records", cur.lastrowid, title, content, project, conn=conn)
+        # M11：带 review_date 的决策记录挂「待验证」——同一事务同连接（不嵌套开新连接，
+        # 避开 M4 实测的写锁坑）；不传 review_date 行为与旧版完全一致。
+        rd = (review_date or "").strip()[:10]
+        if rd:
+            conn.execute(
+                "INSERT INTO decision_reviews(record_id, review_date, agent, created) "
+                "VALUES(?,?,?,?)",
+                (cur.lastrowid, rd, _norm_agent(agent) or "", _now()))
         return cur.lastrowid
 
 
@@ -3908,6 +3933,168 @@ def sentry_sweep(root: str, cooldown_hours: int = 24) -> tuple:
     if not sid:
         return f"哨兵巡检：{len(gaps)} 处需关注，但广播失败：{tip}", 0
     return f"哨兵巡检：{len(gaps)} 处需关注，已广播 #{sid}（所有 agent 下次开工可见）", sid
+
+
+# ---------------------------------------------------------------- 隔离区（M8）
+
+def _quarantine(root: str, table: str, rid, agent: str, reason: str = "") -> str:
+    """M8 隔离（记录/记忆通用）：status active→quarantine。_live_sql/_rec_live_sql 只认
+    active，隔离即退出检索与推送；但**不删**——可解除、可追溯（隔离区 ≠ 回收站）。
+    与软删（deleted）的分工：deleted=基本不可见的撤销；quarantine=明确列出的观察区，
+    批量处理后批量解除/转删。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填"
+    try:
+        rid = int(rid)
+    except (TypeError, ValueError):
+        return f"id 非法：{rid!r}"
+    cn = "记录" if table == "records" else "记忆"
+    with db_conn(root) as conn:
+        # 摘要列两表不同：records 有 title，memories 只有 content
+        tcol = ("substr(title,1,40) AS t" if table == "records"
+                else "substr(content,1,40) AS t")
+        row = conn.execute(f"SELECT id, status, {tcol} FROM {table} WHERE id=?",
+                           (rid,)).fetchone()
+        if not row:
+            return f"{cn} #{rid} 不存在"
+        if row["status"] == "quarantine":
+            return f"{cn} #{rid} 已在隔离区（无需重复）"
+        if row["status"] != "active":
+            return f"{cn} #{rid} 当前 status={row['status']}，只能隔离 active 的"
+        conn.execute(f"UPDATE {table} SET status='quarantine' WHERE id=?", (rid,))
+    journal_add(root, who, f"隔离{cn}", target=f"{table[:-1]}#{rid}", note=(reason or "")[:120])
+    return (f"{cn} #{rid} 已隔离（{row['t'] or ''}）——退出检索与推送但未删除；"
+            f"hub_quarantine action=release 可解除")
+
+
+def _release(root: str, table: str, rid, agent: str) -> str:
+    """M8 解除隔离：quarantine→active（回到检索/推送视野）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填"
+    try:
+        rid = int(rid)
+    except (TypeError, ValueError):
+        return f"id 非法：{rid!r}"
+    cn = "记录" if table == "records" else "记忆"
+    with db_conn(root) as conn:
+        row = conn.execute(f"SELECT id, status FROM {table} WHERE id=?", (rid,)).fetchone()
+        if not row:
+            return f"{cn} #{rid} 不存在"
+        if row["status"] != "quarantine":
+            return f"{cn} #{rid} 不在隔离区（status={row['status']}）"
+        conn.execute(f"UPDATE {table} SET status='active' WHERE id=?", (rid,))
+    journal_add(root, who, f"解除隔离{cn}", target=f"{table[:-1]}#{rid}")
+    return f"{cn} #{rid} 已解除隔离，回到检索与推送视野"
+
+
+def quarantine_record(root: str, rid, agent: str, reason: str = "") -> str:
+    return _quarantine(root, "records", rid, agent, reason)
+
+
+def release_record(root: str, rid, agent: str) -> str:
+    return _release(root, "records", rid, agent)
+
+
+def quarantine_memory(root: str, mid, agent: str, reason: str = "") -> str:
+    return _quarantine(root, "memories", mid, agent, reason)
+
+
+def release_memory(root: str, mid, agent: str) -> str:
+    return _release(root, "memories", mid, agent)
+
+
+def quarantine_list(root: str, limit: int = 50) -> list:
+    """隔离区清单（记录+记忆合并，新在前）：每行 src=record/memory + id + 摘要。
+    注意用 src 而非 kind 做类型标记——memories 表自带 kind 列（fact/lesson…），
+    同名键会被 dict 展开覆盖（2026-10-12 实测踩坑）。"""
+    out: list = []
+    with db_conn(root) as conn:
+        for r in conn.execute(
+                "SELECT id, substr(title,1,60) AS title, substr(content,1,80) AS content, "
+                "project, agent, created FROM records WHERE status='quarantine' "
+                "ORDER BY id DESC LIMIT ?", (max(1, min(int(limit or 50), 200)),)):
+            out.append({"src": "record", **dict(r)})
+        for r in conn.execute(
+                "SELECT id, kind, substr(content,1,80) AS content, agent, created "
+                "FROM memories WHERE status='quarantine' ORDER BY id DESC LIMIT ?",
+                (max(1, min(int(limit or 50), 200)),)):
+            out.append({"src": "memory", **dict(r)})
+    out.sort(key=lambda x: x["id"], reverse=True)
+    return out[:max(1, min(int(limit or 50), 200))]
+
+
+# ---------------------------------------------------------------- 决策回路（M11）
+
+REVIEW_VERDICTS = ("right", "wrong", "partial")
+
+
+def decision_review_due(root: str, limit: int = 10) -> list:
+    """到期未回顾的决策（M11）：review_date<=today 且 pending，附记录标题与决策段摘要。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM decision_reviews WHERE status='pending' "
+            "AND review_date!='' AND review_date<=date('now') "
+            "ORDER BY review_date ASC, id ASC LIMIT ?",
+            (max(1, min(int(limit or 10), 100)),))]
+        for r in rows:
+            rec = conn.execute("SELECT title, content, project FROM records WHERE id=?",
+                               (r["record_id"],)).fetchone()
+            r["title"] = (rec["title"] if rec else "") or f"记录 #{r['record_id']}"
+            r["project"] = (rec["project"] if rec else "") or ""
+            # 决策段摘要：抓「## 决策记录」后前两行，没有就正文前 60 字
+            body = (rec["content"] if rec else "") or ""
+            dec = ""
+            for i, ln in enumerate(body.splitlines()):
+                if _DECISION_HEAD_RE.match(ln.strip()):
+                    dec = " ".join(l.strip() for l in body.splitlines()[i + 1:i + 3])[:100]
+                    break
+            r["decision_brief"] = dec or body[:60]
+    return rows
+
+
+def decision_review(root: str, review_id, verdict: str, note: str = "",
+                    agent: str = "") -> str:
+    """M11 记决策回顾结论：verdict=right/wrong/partial（对/错/部分对）。
+    幂等：已 done 的再记会覆盖并留 journal（回顾可以改，历史可追溯）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填"
+    try:
+        rid = int(review_id)
+    except (TypeError, ValueError):
+        return f"回顾 id 非法：{review_id!r}"
+    verdict = (verdict or "").strip()
+    if verdict not in REVIEW_VERDICTS:
+        return f"verdict 只能是 {'/'.join(REVIEW_VERDICTS)}"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT id, record_id, status FROM decision_reviews WHERE id=?",
+                           (rid,)).fetchone()
+        if not row:
+            return f"回顾 #{rid} 不存在"
+        conn.execute(
+            "UPDATE decision_reviews SET status='done', verdict=?, note=?, agent=?, reviewed_at=? "
+            "WHERE id=?", (verdict, (note or "")[:500], who, _now(), rid))
+    journal_add(root, who, "决策回顾", target=f"records#{row['record_id']}",
+                note=f"回顾 #{rid}：{verdict}" + (f"（{(note or '')[:60]}）" if note else ""))
+    vcn = {"right": "当时决策正确", "wrong": "当时决策错误", "partial": "部分正确"}.get(verdict, verdict)
+    return (f"决策回顾 #{rid} 已记：{vcn}"
+            + (f"——{note[:80]}" if note else "")
+            + "\n（结论挂在原决策记录上，hub_decision_review action=history 可查全部回顾史）")
+
+
+def decision_review_history(root: str, limit: int = 20) -> list:
+    """已回顾的决策史（新在前）——教训库：错过的决策比对的决策更有复盘价值。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM decision_reviews WHERE status='done' "
+            "ORDER BY reviewed_at DESC, id DESC LIMIT ?",
+            (max(1, min(int(limit or 20), 100)),))]
+        for r in rows:
+            rec = conn.execute("SELECT title FROM records WHERE id=?", (r["record_id"],)).fetchone()
+            r["title"] = (rec["title"] if rec else "") or f"记录 #{r['record_id']}"
+    return rows
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:
