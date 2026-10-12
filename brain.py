@@ -323,6 +323,17 @@ CREATE TABLE IF NOT EXISTS signal_reads (
     read_at TEXT DEFAULT "",
     PRIMARY KEY (signal_id, agent)
 );
+-- M4 检查点（2026-10-12）：任务级断点续跑。长任务/跨会话任务定期存进展快照，
+-- 崩溃、换人接手、隔天续跑时不用从零翻记录。kind：manual=手写 /
+-- auto_claim=认领时自动存的开工资锚点（断点续跑的第一块砖）。
+CREATE TABLE IF NOT EXISTS checkpoints (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER,
+    agent TEXT DEFAULT "",
+    ts TEXT DEFAULT "",
+    kind TEXT DEFAULT "manual",
+    content TEXT DEFAULT ""
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT DEFAULT "",
@@ -1555,16 +1566,29 @@ def task_claim(root: str, tid, agent: str) -> tuple:
             return f"任务 #{tid} 不存在", {}
         row = dict(row)
         if cur.rowcount == 1:
-            return "", row
-        if row["status"] == "done":
+            pass  # 认领成功：M4 开工资锚点移到 conn 事务外补写（见下方）
+        elif row["status"] == "done":
             return f"认领失败：任务 #{tid} 已完成（{row['done_at'][:10]}）", row
-        if row["status"] == "in_progress" and row["owner"] != who:
+        elif row["status"] == "in_progress" and row["owner"] != who:
             return (f"认领失败：任务 #{tid} 已被 {row['owner']} 认领"
                     f"（{row['claimed_at'][:16]}；超 {CLAIM_TTL_HOURS}h 未更新可自动接管）"), row
-        if row["status"] == "blocked":
+        elif row["status"] == "blocked":
             return (f"认领失败：任务 #{tid} 处于阻塞（等待 {row['blocked_by'] or '未知'}）；"
                     "解除后用 hub_task_update status=pending"), row
-        return f"认领失败：任务 #{tid} 当前状态 {row['status']}", row
+        else:
+            return f"认领失败：任务 #{tid} 当前状态 {row['status']}", row
+    # M4：认领成功自动存「开工资锚点」——断点续跑的第一块砖（崩溃/换人/隔天续跑时，
+    # 检查点时间线的起点）。必须在 conn 事务**外**写：嵌套连接会被写锁挡（busy_timeout
+    # 后 OperationalError，被 except 吞了就静默丢失——2026-10-12 实测踩坑）。
+    # 失败只降级，不影响认领结果。
+    try:
+        checkpoint_save(root, tid, who,
+                        f"开工：{row['title']}" + (f"——{row['detail'][:200]}"
+                                                  if row["detail"] else ""),
+                        kind="auto_claim")
+    except Exception:  # noqa: BLE001
+        pass
+    return "", row
 
 
 def task_update(root: str, tid, status: str = "", agent: str = "",
@@ -3751,6 +3775,112 @@ def signal_unread_count(root: str, agent: str) -> int:
             "AND (s.to_agent=? OR s.to_agent='') "
             "AND NOT EXISTS (SELECT 1 FROM signal_reads r "
             "WHERE r.signal_id=s.id AND r.agent=?)", (who, who, who)).fetchone()[0]
+
+
+# ---------------------------------------------------------------- 检查点（M4）
+
+CHECKPOINT_KINDS = ("manual", "auto_claim")
+
+
+def checkpoint_save(root: str, task_id, agent: str, content: str,
+                    kind: str = "manual") -> tuple:
+    """M4 存检查点：任务级进展快照（断点续跑用）。返回 (错误或 "", 检查点 id)。
+
+    kind=auto_claim 由 task_claim 自动存（开工资锚点）；manual 由 agent 在长任务
+    执行中主动存。任务必须存在（防把检查点挂到幽灵任务上）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填", 0
+    content = (content or "").strip()
+    if not content:
+        return "content 必填", 0
+    kind = kind if kind in CHECKPOINT_KINDS else "manual"
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return f"任务 id 非法：{task_id!r}", 0
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT id FROM tasks WHERE id=?", (tid,)).fetchone()
+        if not row:
+            return f"任务 #{tid} 不存在", 0
+        cur = conn.execute(
+            "INSERT INTO checkpoints(task_id,agent,ts,kind,content) VALUES(?,?,?,?,?)",
+            (tid, who, _now(), kind, content[:2000]))
+        return "", cur.lastrowid
+
+
+def checkpoint_list(root: str, task_id, limit: int = 20) -> list:
+    """某任务的检查点时间线（新在前）。"""
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return []
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM checkpoints WHERE task_id=? ORDER BY id DESC LIMIT ?",
+            (tid, max(1, min(int(limit or 20), 100))))]
+
+
+def checkpoint_latest(root: str, task_id):
+    """某任务的最新一条检查点（没有则 None）——心跳 doing 行附它做进展摘要。"""
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return None
+    with db_conn(root) as conn:
+        r = conn.execute(
+            "SELECT * FROM checkpoints WHERE task_id=? ORDER BY id DESC LIMIT 1",
+            (tid,)).fetchone()
+        return dict(r) if r else None
+
+
+# ---------------------------------------------------------------- 哨兵（M5）
+
+# 哨兵巡检项：全部**只读且无需 target 参数**（MCP server 进程里跑，不知道仓库路径）；
+# 要 target 的（py_compile/git_status/deploy_diff/release/regression）由 agent 侧
+# hub_ops_run 显式跑——哨兵只包「大脑自身健康」这类随时随地可判的。
+SENTRY_CHECKS = ("rules_health", "brain", "hygiene", "dup_mem", "inbox", "stalled")
+
+
+def sentry_sweep(root: str, cooldown_hours: int = 24) -> tuple:
+    """M5 哨兵：跑关键体检项，把 gap 聚合成一条**广播 alert 信号**（所有 agent 开工即见，
+    不用各自跑体检才知道大脑有情况）。返回 (摘要文本, 信号 id 或 0——0=无可报/去重跳过)。
+
+    去重：与最近一条 system 广播 alert 内容相同且不足 cooldown_hours 不重复发（防刷屏）。
+    检查项本身炸了（缺依赖等）跳过该项，不拖垮整轮。"""
+    import ops  # noqa: PLC0415  延迟导入：ops 反向依赖 brain，模块级导入会成环
+    gaps: list = []
+    for name in SENTRY_CHECKS:
+        try:
+            r = ops.run_check(name, "", root)
+        except Exception:  # noqa: BLE001  单项炸不拖垮整轮
+            continue
+        if r.get("ok"):
+            continue
+        gaps.append(f"· {name}：{(r.get('summary') or '')[:80]}")
+    if not gaps:
+        return "哨兵巡检：全部通过（无可报项）", 0
+    # content 不带时间戳——时间戳信号表 ts 已有（收件箱会显示），带了反而让
+    # 同 gap 集合的两次广播内容永远不同、冷却去重失效（2026-10-12 实测教训）。
+    body = f"体检发现 {len(gaps)} 处需关注：\n" + "\n".join(gaps)
+    # 去重：最近一条 system 广播 alert 同内容且未超 cooldown → 跳过
+    with db_conn(root) as conn:
+        recent = conn.execute(
+            "SELECT ts, content FROM signals WHERE from_agent='system' "
+            "AND to_agent='' AND kind='alert' ORDER BY id DESC LIMIT 1").fetchone()
+    if recent and recent["content"] == body:
+        try:
+            age_h = (datetime.datetime.now()
+                     - datetime.datetime.fromisoformat(recent["ts"])).total_seconds() / 3600
+        except (TypeError, ValueError):
+            age_h = 999
+        if age_h < cooldown_hours:
+            return (f"哨兵巡检：{len(gaps)} 处需关注，但 {age_h:.1f}h 前已广播过同样内容"
+                    "（冷却中，不重复刷屏）"), 0
+    tip, sid = signal_send(root, "system", body, to_agent="", kind="alert")
+    if not sid:
+        return f"哨兵巡检：{len(gaps)} 处需关注，但广播失败：{tip}", 0
+    return f"哨兵巡检：{len(gaps)} 处需关注，已广播 #{sid}（所有 agent 下次开工可见）", sid
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:

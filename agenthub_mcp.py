@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.31.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.33.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -779,7 +779,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 proj = f"{t['project']}｜" if t["project"] else ""
                 tl.append(f"  ▶ #{t['id']} [P{t['_priority']}] {proj}{t['title'][:50]}")
             for t in nxt["doing"][:2]:
-                tl.append(f"  ● #{t['id']} [P{t['_priority']}] 进行中 @{t['owner'] or '?'} {t['title'][:40]}")
+                line = f"  ● #{t['id']} [P{t['_priority']}] 进行中 @{t['owner'] or '?'} {t['title'][:40]}"
+                try:  # M4：doing 行附最新检查点——进行中的活走到哪了一眼看（断点续跑入口）
+                    cp = brain.checkpoint_latest(root, t["id"])
+                except Exception:  # noqa: BLE001
+                    cp = None
+                if cp:
+                    line += f"（最新进展：{cp['content'][:40]}）"
+                tl.append(line)
             if c["takeover"]:
                 tl.append(f"  ⚑ 可接管 {c['takeover']} 条（超时无人动，hub_tasks 查看）")
             tl.append("  选活 hub_next · 认领 hub_claim · 干完标 done 自动结晶")
@@ -1206,6 +1213,35 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         return brain.signal_mark_read(root, arguments.get("signal_id"),
                                       str(arguments.get("agent", "")))
 
+    if name == "hub_checkpoint":
+        action = str(arguments.get("action", "save")).strip()
+        tid = arguments.get("task_id")
+        if action == "save":
+            tip, cid = brain.checkpoint_save(root, tid, str(arguments.get("agent", "")),
+                                             str(arguments.get("content", "")),
+                                             kind=str(arguments.get("kind", "manual")))
+            if not cid:
+                return f"错误：{tip}"
+            return (f"检查点已存 #{cid}\n"
+                    "长任务建议每完成一小步就存一条——断点续跑/换人接手不用从零翻记录")
+        if action == "list":
+            rows = brain.checkpoint_list(root, tid)
+            if not rows:
+                return f"（任务 #{tid} 还没有检查点。执行中随手 hub_checkpoint(action=save, content=...)）"
+            lines = [f"检查点时间线 {len(rows)} 条（新在上）："]
+            for c in rows:
+                tag = "自动" if c["kind"] == "auto_claim" else "手写"
+                lines.append(f"- #{c['id']} {c['ts'][5:16]} [{tag}] {c['agent']}：{c['content'][:80]}")
+            return "\n".join(lines)
+        cp = brain.checkpoint_latest(root, tid)
+        if not cp:
+            return f"（任务 #{tid} 还没有检查点）"
+        return f"任务 #{tid} 最新检查点（{cp['ts'][5:16]} {cp['agent']}）：{cp['content']}"
+
+    if name == "hub_sentry":
+        summary, sid = brain.sentry_sweep(root)
+        return summary + ("\n（已广播给所有 agent——下次开工即在心跳里可见）" if sid else "")
+
     if name == "hub_report":
         import report
         path = report.generate_report(root)
@@ -1470,6 +1506,20 @@ TOOLS = [
                      "properties": {"signal_id": {"type": "integer", "description": "信号 id"},
                                     "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["signal_id", "agent"]}},
+    {"name": "hub_checkpoint",
+     "description": "M4 检查点：长任务执行中存进展快照（断点续跑/换人接手/隔天续跑不用从零翻记录）。认领时自动存开工资锚点；action=list 看时间线、latest 只看最新一条",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["save", "list", "latest"],
+                                               "description": "save 存（缺省）/ list 时间线 / latest 最新一条"},
+                                    "task_id": {"type": "integer", "description": "任务 id"},
+                                    "content": {"type": "string", "description": "save：进展快照（做完了什么/下一步/卡在哪）"},
+                                    "kind": {"type": "string", "enum": list(brain.CHECKPOINT_KINDS),
+                                             "description": "manual 手写（缺省）/ auto_claim 认领自动"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（save 必填）"}},
+                     "required": ["task_id"]}},
+    {"name": "hub_sentry",
+     "description": "M5 哨兵：跑大脑自身健康巡检（闸门/规模/备份/重复记忆/inbox/停滞），把需关注项聚合成广播 alert——所有 agent 下次开工即在心跳里可见，不用各自跑体检。同内容 24h 冷却防刷屏",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1625,6 +1675,8 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks", "hub_next", "hub_crystallize",
     "hub_event_write", "hub_events",
     "hub_signal_send", "hub_signals", "hub_signal_read",  # M3 信号：协作总线要给干活的 agent
+    "hub_checkpoint",  # M4 检查点：长任务断点续跑
+    "hub_sentry",  # M5 哨兵：巡检广播
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
@@ -1642,6 +1694,8 @@ WRITE_TOOLS = {
     "hub_task_add", "hub_task_update", "hub_claim", "hub_crystallize", "hub_event_write",
     "hub_skill_sync",  # 技能原生化：写索引（走 dry_run/confirm 闸门）
     "hub_signal_send", "hub_signal_read",  # M3 信号：发消息/标已读
+    "hub_checkpoint",  # M4 检查点：写进展快照
+    "hub_sentry",  # M5 哨兵：跑巡检并发广播
 }
 
 

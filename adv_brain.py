@@ -1918,6 +1918,76 @@ def t_signals(tmp):
         assert row["status"] == "read" and row["read_by"] == "dsh"
 
 
+def t_checkpoints(tmp):
+    """M4 检查点（2026-10-12）：认领自动锚点（事务外补写，防嵌套锁）/时间线/latest/
+    拒空拒幽灵任务拒坏 id；并发认领只胜一家不能回归。"""
+    root = str(Path(tmp) / "hub_ckpt")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "zcode", "甲-问题")
+    _, tid = brain.task_add(root, "长任务：迁移 500 条记忆",
+                            project="甲-问题", detail="分三批跑")
+    # 1) 认领自动存开工资锚点（曾在事务内补写被 SQLite 写锁静默吞掉——回归防线）
+    err, row = brain.task_claim(root, tid, "zcode")
+    assert err == "", err
+    tl = brain.checkpoint_list(root, tid)
+    assert len(tl) == 1 and tl[0]["kind"] == "auto_claim", tl
+    assert tl[0]["content"].startswith("开工：长任务：迁移 500 条记忆"), tl[0]["content"]
+    # 2) 手写检查点：入时间线、latest 指向它
+    err, cid = brain.checkpoint_save(root, tid, "zcode", "第一批 200 条完成，校验通过")
+    assert err == "" and cid == 2, (err, cid)
+    tl = brain.checkpoint_list(root, tid)
+    assert [c["kind"] for c in tl] == ["manual", "auto_claim"], tl  # 新在前
+    assert brain.checkpoint_latest(root, tid)["content"] == "第一批 200 条完成，校验通过"
+    # 3) 拒收：空 content / 空 agent / 幽灵任务 / 坏 id
+    e, z = brain.checkpoint_save(root, tid, "zcode", "  ")
+    assert z == 0 and "content" in e, (e, z)
+    e, z = brain.checkpoint_save(root, tid, "", "x")
+    assert z == 0 and "agent" in e, (e, z)
+    e, z = brain.checkpoint_save(root, 999, "zcode", "x")
+    assert z == 0 and "不存在" in e, (e, z)
+    e, z = brain.checkpoint_save(root, "abc", "zcode", "x")
+    assert z == 0 and "非法" in e, (e, z)
+    assert brain.checkpoint_list(root, 999) == []
+    assert brain.checkpoint_latest(root, 999) is None
+    # 4) 并发认领只胜一家（重构 claim 收尾路径后不能破坏 P3-2 原子性）
+    _, tid2 = brain.task_add(root, "抢单任务", project="甲-问题")
+    r1 = brain.task_claim(root, tid2, "zcode")
+    r2 = brain.task_claim(root, tid2, "dsh")
+    assert r1[0] == "" and r2[0].startswith("认领失败"), (r1[0], r2[0])
+    # 抢单胜者也有自动锚点
+    assert len(brain.checkpoint_list(root, tid2)) == 1
+
+
+def t_sentry(tmp):
+    """M5 哨兵（2026-10-12）：基线结构正确 / 造 gap（重复记忆）聚合成广播 alert /
+    同内容 24h 冷却防刷屏 / 冷却期过可重发。
+
+    注：hygiene 项扫**全机 .bak**（与测试库无关，本机真实有堆积）——所以不断言
+    「干净库零 gap」，只断言结构与冷却逻辑；造出的 dup_mem gap 必须出现在广播里。"""
+    root = str(Path(tmp) / "hub_sentry")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    # 1) 基线 sweep：结构正确（有 gap 就发、没 gap 就说全部通过）
+    s, sid = brain.sentry_sweep(root)
+    assert ("全部通过" in s) or ("需关注" in s and sid >= 1), (s, sid)
+    # 2) 造 dup_mem gap：两条逐字重复的记忆（cooldown=0 确保本轮必发）
+    brain.add_memory(root, "哨兵测试重复内容甲乙丙", "fact", "", agent="smoke")
+    brain.add_memory(root, "哨兵测试重复内容甲乙丙", "fact", "", agent="smoke")
+    s, sid = brain.sentry_sweep(root, cooldown_hours=0)
+    assert sid >= 1 and "需关注" in s and "已广播" in s, (s, sid)
+    # 广播落库形态：全员可见（to 空）、system 签发、alert、gap 明细在 content 里
+    box = brain.signal_inbox(root, "zcode")
+    assert box and box[0]["from_agent"] == "system" and box[0]["kind"] == "alert", box[:1]
+    assert "dup_mem" in box[0]["content"], box[0]["content"]
+    # 3) 冷却：同内容立即再 sweep → 跳过不发
+    s2, sid2 = brain.sentry_sweep(root)
+    assert sid2 == 0 and "冷却" in s2, (s2, sid2)
+    # 4) 冷却期过（cooldown_hours=0）→ 重发
+    s3, sid3 = brain.sentry_sweep(root, cooldown_hours=0)
+    assert sid3 >= 1 and "已广播" in s3, (s3, sid3)
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -1937,6 +2007,7 @@ def t_tool_schema_sync(tmp):
         assert set(enum_of(tool, "status")) == set(brain.TASK_STATUSES), f"{tool}.status 漂移"
     assert set(enum_of("hub_event_write", "kind")) == set(brain.EVENT_KINDS), "hub_event_write.kind 漂移"
     assert set(enum_of("hub_signal_send", "kind")) == set(brain.SIGNAL_KINDS), "hub_signal_send.kind 漂移"
+    assert set(enum_of("hub_checkpoint", "kind")) == set(brain.CHECKPOINT_KINDS), "hub_checkpoint.kind 漂移"
 
 
 def t_gap_note(tmp):
@@ -2181,6 +2252,8 @@ def main():
     case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
     case("任务工作图（M1：deps 阻塞/自动解阻/优先级前沿/认领门 + M2：完成自动结晶/幂等/force 重做）", lambda: t_task_graph(tmp))
     case("M3 信号（点对点/广播/收件箱过滤/已读回执幂等/非我勿动/未读计数排自发）", lambda: t_signals(tmp))
+    case("M4 检查点（认领自动锚点/时间线/latest/拒空拒幽灵/并发认领不回归）", lambda: t_checkpoints(tmp))
+    case("M5 哨兵（全绿不报/造gap广播/同内容冷却/冷却过重发）", lambda: t_sentry(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()
