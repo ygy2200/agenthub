@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.36.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.38.0"}  # v2.37=GUI 管理面补全（纯桌面，常量未动）；本版=X3/X4/X5
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -1388,6 +1388,43 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"- {s['name']} [{s['agent']}] {s['path']}")
         return "\n".join(lines)
 
+    if name == "hub_export":
+        action = str(arguments.get("action", "export")).strip()
+        if action == "export":
+            try:
+                lim = int(arguments.get("limit", 5000))
+            except (TypeError, ValueError):
+                lim = 5000
+            err, path = brain.export_all(root, str(arguments.get("fmt", "markdown")), lim)
+            return f"错误：{err}" if err else f"已导出：{path}"
+        if action == "backup":
+            err, path = brain.backup_db(root, str(arguments.get("dest", "")))
+            return f"错误：{err}" if err else f"已备份：{path}（走 sqlite backup API，含 WAL——不是文件复制）"
+        if action == "backups":
+            rows = brain.backup_list(root)
+            if not rows:
+                return "（还没有备份。hub_export action=backup 立即备份一次）"
+            lines = [f"备份 {len(rows)} 份（新在前）："]
+            for b in rows:
+                lines.append(f"- {b['mtime']}  {b['size'] // 1024}KB  {b['path']}")
+            lines.append("校验：hub_export action=verify path=…（只读校验，不恢复）")
+            return "\n".join(lines)
+        err, summary = brain.backup_verify(root, str(arguments.get("path", "")))
+        return f"错误：{err}" if err else summary
+
+    if name == "hub_history":
+        h = brain.history_of(root, str(arguments.get("kind", "record")),
+                             arguments.get("id"))
+        if not h["item"]:
+            return f"（{h['kind']} #{arguments.get('id')} 不存在）"
+        lines = [f"{h['kind']} #{h['id']} 变更史 {len(h['timeline'])} 条（时间升序；"
+                 "来源 journal 流水 / supersede 取代链 / 条目自身时点）："]
+        for t in h["timeline"]:
+            stamp = (t["ts"] or "")[:16] or "—"
+            detail = f"：{t['detail']}" if t["detail"] else ""
+            lines.append(f"- {stamp} [{t['source']}] {t['event']}{detail}")
+        return "\n".join(lines)
+
     if name == "hub_report":
         import report
         path = report.generate_report(root)
@@ -1711,6 +1748,21 @@ TOOLS = [
     {"name": "hub_skill_stats",
      "description": "M12 技能资产统计：哪些技能真被用（命中次数）、哪些零使用（清理或补说明候选）——技能索引进化了，用不用数据说话",
      "inputSchema": {"type": "object", "properties": {}}},
+    {"name": "hub_export",
+     "description": "X3 导出与备份：action=export 全库导出（fmt=markdown 人读 / json 机读，落到 _hub/export）；action=backup 备份数据库（走 sqlite backup API，含 WAL——文件复制会丢数据）；backups 列备份；verify 只读校验备份可读（不恢复）",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["export", "backup", "backups", "verify"],
+                                               "description": "export 导出（缺省）/ backup 备份 / backups 清单 / verify 校验"},
+                                    "fmt": {"type": "string", "enum": ["markdown", "json"], "description": "export：格式，缺省 markdown"},
+                                    "limit": {"type": "integer", "description": "export：导出行上限，默认 5000"},
+                                    "dest": {"type": "string", "description": "backup：目标目录（可空=默认 _hub/backup）"},
+                                    "path": {"type": "string", "description": "verify：备份文件路径"}}}},
+    {"name": "hub_history",
+     "description": "X4 时间机器：某条记录/记忆的完整变更史（journal 流水 + supersede 取代链 + 条目自身时点，三源合并按时间升序）——复盘「这条怎么变成现在这样」",
+     "inputSchema": {"type": "object",
+                     "properties": {"kind": {"type": "string", "enum": ["record", "memory"], "description": "条目类型，缺省 record"},
+                                    "id": {"type": "integer", "description": "条目 id"}},
+                     "required": ["id"]}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1871,6 +1923,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_quarantine",  # M8 隔离区：治理工具要给干活的 agent
     "hub_decision_review",  # M11 决策回路：到期验证
     "hub_consolidate", "hub_view", "hub_skill_stats",  # M7/M9/M12：治理三件套
+    "hub_export", "hub_history",  # X3 导出备份 / X4 时间机器
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
@@ -1895,6 +1948,7 @@ WRITE_TOOLS = {
     "hub_consolidate",  # M7 整合：重复记忆组合并（apply 走闸门）
     "hub_view",  # M9 视角：关注项目/标签
     "hub_skill_stats",  # M12 技能资产统计
+    "hub_export",  # X3：导出/备份（写文件）
 }
 
 

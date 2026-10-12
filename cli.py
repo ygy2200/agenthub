@@ -157,6 +157,51 @@ def cmd_release(root: str) -> int:
     return 0 if r["ok"] else 1
 
 
+def cmd_call(root: str, tool: str, kv: list) -> int:
+    """X5 CLI 客户端：命令行直调任意 MCP 工具——
+    agenthub call hub_health
+    agenthub call hub_search query=SQLite 记忆 limit=5
+    agenthub call hub_signals agent=zcode unread_only=true
+    值自动转型：true/false→bool、整数→int、其余→str；写工具需显式传 confirm=true。"""
+    import agenthub_mcp  # noqa: PLC0415  延迟导入：CLI 发布路径不该被 MCP 模块拖慢
+    args: dict = {}
+    for item in kv or []:
+        if "=" not in item:
+            print(f"参数应为 key=value：{item}")
+            return 2
+        k, v = item.split("=", 1)
+        v = v.strip()
+        low = v.lower()
+        if low in ("true", "false"):
+            args[k] = (low == "true")
+        elif v.lstrip("-").isdigit():
+            args[k] = int(v)
+        else:
+            args[k] = v
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": tool, "arguments": args}}
+    try:
+        r = agenthub_mcp.handle_message(rpc, root)
+    except Exception as e:  # noqa: BLE001
+        print(f"调用失败：{e}")
+        return 1
+    res = r.get("result") or {}
+    if "content" in res:
+        print(res["content"][0]["text"])
+        return 0
+    err = r.get("error") or {}
+    print(err.get("message") or str(r))
+    return 1
+
+
+def cmd_list_tools(root: str) -> int:
+    """X5：列出所有可用 MCP 工具（CLI 场景的「有什么能调」入口）。"""
+    import agenthub_mcp  # noqa: PLC0415
+    for t in agenthub_mcp.TOOLS:
+        print(f"{t['name']:<22} {(t.get('description') or '')[:70]}")
+    return 0
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="agenthub", description="AgentHub 命令行（headless 接入/自查）")
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
@@ -169,6 +214,10 @@ def main(argv=None) -> int:
     sub.add_parser("discover", help="扫描常见位置，找未登记 agent")
     sub.add_parser("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
     sub.add_parser("release", help="发布一致性检查（exe 是否旧 / 桌面副本是否同步）")
+    sub.add_parser("tools", help="X5：列出所有可调用的 MCP 工具")
+    p_call = sub.add_parser("call", help="X5：命令行直调 MCP 工具（call hub_health / call hub_search query=词 limit=5）")
+    p_call.add_argument("tool")
+    p_call.add_argument("kv", nargs="*", help="key=value 形式的参数；写工具需加 confirm=true")
     args = ap.parse_args(argv)
 
     if args.cmd == "release":
@@ -187,6 +236,10 @@ def main(argv=None) -> int:
         return cmd_discover(root)
     if args.cmd == "deploy":
         return cmd_deploy(root)
+    if args.cmd == "tools":
+        return cmd_list_tools(root)
+    if args.cmd == "call":
+        return cmd_call(root, args.tool, args.kv)
     ap.print_help()
     return 0
 

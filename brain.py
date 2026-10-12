@@ -4271,6 +4271,201 @@ def skill_stats(root: str) -> dict:
     return {"total": total, "by_agent": by_agent, "top_used": top, "zero_used": zero}
 
 
+# ---------------------------------------------------------------- 导出/备份（X3）
+
+def export_all(root: str, fmt: str = "markdown", limit: int = 5000) -> tuple:
+    """X3 全库导出：markdown（人读：按项目分组的记录+记忆+任务+信号+决策）或
+    json（机读：关键表全量 dump）。写到 <root>/_hub/export/agenthub-时间戳.{md,json}，
+    返回 (错误或 "", 路径)。只读，不动库。"""
+    import json as _json
+    fmt = (fmt or "markdown").strip().lower()
+    if fmt not in ("markdown", "json"):
+        return "fmt 只能是 markdown/json", ""
+    out_dir = db_path(root).parent / "export"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"导出目录创建失败：{e}", ""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    path = out_dir / f"agenthub-{stamp}.{'md' if fmt == 'markdown' else 'json'}"
+    with db_conn(root) as conn:
+        if fmt == "json":
+            data = {"exported": _now(), "root": root}
+            for tbl in ("records", "memories", "tasks", "signals", "checkpoints",
+                        "decision_reviews", "projects", "agents"):
+                try:
+                    data[tbl] = [dict(r) for r in conn.execute(
+                        f"SELECT * FROM {tbl} ORDER BY id DESC LIMIT ?",
+                        (max(1, min(int(limit or 5000), 50000)),))]
+                except sqlite3.Error:
+                    data[tbl] = []
+            path.write_text(_json.dumps(data, ensure_ascii=False, indent=1),
+                            encoding="utf-8")
+            return "", str(path)
+        lines = [f"# AgentHub 导出（{_now()}）", "", f"根目录：{root}", ""]
+        try:
+            recs = [dict(r) for r in conn.execute(
+                "SELECT * FROM records WHERE " + _rec_live_sql()
+                + " ORDER BY project, id LIMIT ?",
+                (max(1, min(int(limit or 5000), 50000)),))]
+        except sqlite3.Error:
+            recs = []
+        cur_proj = None
+        for r in recs:
+            if r["project"] != cur_proj:
+                cur_proj = r["project"]
+                lines += ["", f"## 项目：{cur_proj}", ""]
+            lines.append(f"### {r['date']} {r['title']}（#{r['id']} · {r['agent'] or '未署名'}）")
+            if r["content"]:
+                lines.append(r["content"])
+            lines.append("")
+        try:
+            mems = [dict(r) for r in conn.execute(
+                "SELECT * FROM memories WHERE " + _live_sql() + " ORDER BY kind, id")]
+        except sqlite3.Error:
+            mems = []
+        lines += ["", "## 记忆", ""]
+        for m in mems:
+            lines.append(f"- [#{m['id']} {m['kind']}/{m['maturity']}] {m['content']}")
+        try:
+            tks = [dict(r) for r in conn.execute(
+                "SELECT * FROM tasks WHERE status!='done' ORDER BY priority, id")]
+        except sqlite3.Error:
+            tks = []
+        lines += ["", "## 未完成任务", ""]
+        for t in tks:
+            lines.append(f"- [#{t['id']} P{t['priority']} {t['status']}] {t['title']}"
+                         f"（{t['project'] or '无项目'}）")
+        path.write_text("\n".join(lines), encoding="utf-8")
+        return "", str(path)
+
+
+def backup_db(root: str, dest: str = "") -> tuple:
+    """X3 备份：走 sqlite3 官方 backup API（**不用 shutil 复制文件**——WAL 模式下
+    主库文件里还没 checkpoint，直接 copy 出来的备份会丢数据：2026-10-12 实测，
+    copy 出的库 records=0 而源库有数据，是「假备份」）。backup API 会把 WAL 一并纳入。
+    只读语义不变（不改动源）。dest 可指定目录（不存在则建）。返回 (错误或 "", 路径)。"""
+    src = db_path(root)
+    if not src.exists():
+        return "源库不存在", ""
+    out_dir = Path(dest).expanduser() if dest else db_path(root).parent / "backup"
+    try:
+        out_dir.mkdir(parents=True, exist_ok=True)
+    except OSError as e:
+        return f"备份目录创建失败：{e}", ""
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    path = out_dir / f"brain-{stamp}.db"
+    s_conn = d_conn = None
+    try:
+        s_conn = sqlite3.connect(str(src), timeout=5)
+        d_conn = sqlite3.connect(str(path), timeout=5)
+        s_conn.backup(d_conn)  # 官方 backup API：含 WAL，原子一致快照
+        d_conn.close()
+        s_conn.close()
+    except sqlite3.Error as e:
+        for c in (d_conn, s_conn):
+            try:
+                if c:
+                    c.close()
+            except sqlite3.Error:
+                pass
+        return f"备份失败：{e}", ""
+    return "", str(path)
+
+
+def backup_list(root: str) -> list:
+    """X3 备份清单（新在前）：路径/大小/修改时间。"""
+    d = db_path(root).parent / "backup"
+    if not d.exists():
+        return []
+    out = []
+    for p in d.glob("brain-*.db"):
+        st = p.stat()
+        out.append({"path": str(p), "size": st.st_size,
+                    "mtime": datetime.datetime.fromtimestamp(
+                        st.st_mtime).strftime("%Y-%m-%d %H:%M")})
+    out.sort(key=lambda x: x["path"], reverse=True)
+    return out
+
+
+def backup_verify(root: str, path: str) -> tuple:
+    """X3 校验备份：只读打开 + 关键表计数（不写、不恢复——恢复是人的手工动作）。
+    返回 (错误或 "", 摘要)。"""
+    p = Path(path).expanduser()
+    if not p.exists():
+        return f"备份文件不存在：{p}", ""
+    try:
+        conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
+    except sqlite3.Error as e:
+        return f"打不开备份：{e}", ""
+    try:
+        got = {}
+        for tbl in ("records", "memories", "projects"):
+            try:
+                got[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            except sqlite3.Error:
+                got[tbl] = -1
+        conn.close()
+    except sqlite3.Error as e:
+        return f"读取备份失败：{e}", ""
+    return "", "备份可读：" + " · ".join(f"{k} {v}" for k, v in got.items())
+
+
+# ---------------------------------------------------------------- 时间机器（X4）
+
+def history_of(root: str, kind: str = "record", oid=0) -> dict:
+    """X4 时间机器：某条记录/记忆的完整变更史（三源合并，按时间升序）。
+    源：①journal（target 含 records#N / memories#N 的动作流水）②supersede 链
+    （前驱/后继：谁取代了它、它取代了谁）③自身关键时点（创建/失效/取代/最后唤起）。
+    返回 {"kind","id","item","timeline":[{"ts","source","event","detail"}]}。"""
+    kind = (kind or "record").strip()
+    if kind not in ("record", "memory"):
+        return {"kind": kind, "id": oid, "item": None, "timeline": []}
+    try:
+        oid = int(oid)
+    except (TypeError, ValueError):
+        return {"kind": kind, "id": oid, "item": None, "timeline": []}
+    table = "records" if kind == "record" else "memories"
+    mark = "records" if kind == "record" else "memories"
+    tl: list = []
+    with db_conn(root) as conn:
+        row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
+        item = dict(row) if row else None
+        if not item:
+            return {"kind": kind, "id": oid, "item": None, "timeline": []}
+        # ① journal 流水（target 两种写法都认：records#N 与 brain:records#N）
+        for r in conn.execute(
+                "SELECT ts, action, agent, target, note FROM journal WHERE target LIKE ? "
+                "ORDER BY id", (f"%{mark}#{oid}",)):
+            tl.append({"ts": r["ts"], "source": "journal",
+                       "event": r["action"], "detail": (r["note"] or "")[:120]})
+        # ② supersede 链
+        if item.get("superseded_by"):
+            tl.append({"ts": item.get("updated") or "", "source": "supersede",
+                       "event": "被取代", "detail": f"→ #{item['superseded_by']}（仍可追溯）"})
+        # 摘要列两表不同（records 有 title；memories 只有 content——同 M8 的坑）
+        tcol = "title" if table == "records" else "substr(content,1,40) AS title"
+        for r in conn.execute(
+                f"SELECT id, {tcol} FROM {table} WHERE superseded_by=?", (oid,)):
+            tl.append({"ts": "", "source": "supersede", "event": "取代了",
+                       "detail": f"→ #{r['id']} {(r['title'] or '')[:40]}"})
+        # ③ 自身关键时点
+        if item.get("created"):
+            tl.append({"ts": item["created"], "source": "item", "event": "创建",
+                       "detail": f"by {item.get('agent') or '未署名'}"})
+        if item.get("valid_until"):
+            tl.append({"ts": item["valid_until"], "source": "item", "event": "失效期止",
+                       "detail": "过期后退出检索（失效≠删除）"})
+        if item.get("last_hit"):
+            tl.append({"ts": item["last_hit"], "source": "item", "event": "最后唤起",
+                       "detail": f"累计 {item.get('use_count') or 0} 次"})
+        if item.get("status") != "active":
+            tl.append({"ts": item.get("updated") or "", "source": "item",
+                       "event": f"状态 {item['status']}", "detail": "非 active=退出检索"})
+    tl.sort(key=lambda x: x["ts"] or "")
+    return {"kind": kind, "id": oid, "item": item, "timeline": tl}
+
+
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:
     """更新心跳并重建会话表（清掉超出 SESSION_RETAIN 的条目），返回 (错误或"", 同项目活跃会话)。
 

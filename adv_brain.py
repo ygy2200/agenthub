@@ -2137,6 +2137,55 @@ def t_consolidate_view_skill(tmp):
     assert [s["name"] for s in st["zero_used"]] == ["unused-skill"], st["zero_used"]
 
 
+def t_export_history(tmp):
+    """X3 导出/备份 + X4 时间机器（2026-10-12）：
+    备份**必须含 WAL**（shutil 复制主库会丢数据——假备份实测防线）/ 校验可读 /
+    markdown+json 双格式导出 / 变更史三源合并（journal+supersede+自身时点）。"""
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_x34")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    today = _dt.date.today().isoformat()
+    rid = brain.add_record(root, "甲-问题", "zcode", today, "一条记录", "内容甲")
+    mid = brain.add_memory(root, "记忆甲", "lesson", agent="zcode")
+    # —— X3 备份 ——
+    err, bpath = brain.backup_db(root)
+    assert err == "" and bpath, (err, bpath)
+    # 关键防线：备份里数据必须在（文件复制会因 WAL 未 checkpoint 而为空库）
+    verr, vmsg = brain.backup_verify(root, bpath)
+    assert verr == "" and "records 1" in vmsg and "memories 1" in vmsg, (verr, vmsg)
+    assert len(brain.backup_list(root)) == 1
+    assert "不存在" in brain.backup_verify(root, str(Path(tmp) / "nope.db"))[0]
+    # —— X3 导出 ——
+    e1, p1 = brain.export_all(root, "markdown")
+    assert e1 == "" and Path(p1).exists(), (e1, p1)
+    txt = Path(p1).read_text(encoding="utf-8")
+    assert "一条记录" in txt and "记忆甲" in txt, txt[:200]
+    e2, p2 = brain.export_all(root, "json")
+    assert e2 == "" and Path(p2).exists()
+    import json as _json
+    data = _json.loads(Path(p2).read_text(encoding="utf-8"))
+    assert len(data["records"]) == 1 and len(data["memories"]) == 1, data.keys()
+    assert "fmt 只能是" in brain.export_all(root, "pdf")[0]
+    # —— X4 时间机器 ——
+    h = brain.history_of(root, "record", rid)
+    assert h["item"] is not None and h["kind"] == "record"
+    assert any(t["event"] == "创建" for t in h["timeline"]), h["timeline"]
+    hm = brain.history_of(root, "memory", mid)
+    assert hm["item"] is not None, hm
+    # 取代链：整合后原条应记「被取代」
+    m2 = brain.add_memory(root, "记忆甲补充运维省心一条", "lesson", agent="zcode")
+    props = brain.consolidate_proposals(root)
+    if props:
+        err, new_id = brain.consolidate_apply(root, props[0]["ids"], "整合结论", "zcode")
+        assert err == "", err
+        h2 = brain.history_of(root, "memory", m2)
+        assert any(t["event"] == "被取代" for t in h2["timeline"]), h2["timeline"]
+    # 不存在 / 坏 kind 都不炸
+    assert brain.history_of(root, "record", 99999)["item"] is None
+    assert brain.history_of(root, "bogus", 1)["timeline"] == []
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -2407,6 +2456,7 @@ def main():
     case("M6 记忆成熟度（draft缺省/人工标/用3次自动validated/pinned+10次core/只升不降/health分布）", lambda: t_maturity(tmp))
     case("M8+M11 隔离区与决策回路（隔离退检索可解除/到期队列/回顾结论/只记一次）", lambda: t_quarantine_review(tmp))
     case("M7+M9+M12 整合/视角/技能资产（提案apply链/关注动态速览/技能hit统计）", lambda: t_consolidate_view_skill(tmp))
+    case("X3+X4 导出备份与时间机器（备份含WAL不丢数据/变更史三源合并）", lambda: t_export_history(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()
