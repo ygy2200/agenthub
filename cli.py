@@ -202,6 +202,12 @@ def cmd_list_tools(root: str) -> int:
     return 0
 
 
+def cmd_serve(root: str, port: int, allow_write: bool, open_browser: bool) -> int:
+    """X2：启动本地 REST 服务 + Web 只读仪表盘（Ctrl+C 停止）。"""
+    import api  # noqa: PLC0415  延迟导入：发布路径不该拉起 http 模块
+    return api.serve_forever(root, port, allow_write, open_browser)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(prog="agenthub", description="AgentHub 命令行（headless 接入/自查）")
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
@@ -218,6 +224,11 @@ def main(argv=None) -> int:
     p_call = sub.add_parser("call", help="X5：命令行直调 MCP 工具（call hub_health / call hub_search query=词 limit=5）")
     p_call.add_argument("tool")
     p_call.add_argument("kv", nargs="*", help="key=value 形式的参数；写工具需加 confirm=true")
+    p_srv = sub.add_parser("serve", help="X2：启动本地 REST 服务 + Web 只读仪表盘（只绑 127.0.0.1）")
+    p_srv.add_argument("--port", type=int, default=8787)
+    p_srv.add_argument("--allow-write", action="store_true",
+                       help="开放写工具（会生成 token，调用时带 token=）")
+    p_srv.add_argument("--open", action="store_true", help="启动后自动开浏览器")
     args = ap.parse_args(argv)
 
     if args.cmd == "release":
@@ -240,6 +251,8 @@ def main(argv=None) -> int:
         return cmd_list_tools(root)
     if args.cmd == "call":
         return cmd_call(root, args.tool, args.kv)
+    if args.cmd == "serve":
+        return cmd_serve(root, args.port, args.allow_write, args.open)
     ap.print_help()
     return 0
 

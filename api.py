@@ -1,0 +1,184 @@
+# -*- coding: utf-8 -*-
+"""api.py（X2·v2.39）：REST API 桥 + Web 只读仪表盘。
+
+非 MCP 客户端（手机/浏览器/curl/脚本）读大脑：
+  GET  /                 内置仪表盘（自包含单页 HTML，暗色）
+  GET  /api/tools        工具清单
+  GET  /api/status       大脑此刻状态（谁在线/活跃项目）
+  GET  /api/health       体检报告
+  GET  /api/next         今天该干什么（前沿队列四段）
+  GET  /api/search?q=…   语义检索
+  GET  /api/signals?agent=…  信号收件箱
+  GET  /api/call?name=hub_x&k=v  任意**只读**工具（写工具默认拒绝）
+
+安全：只绑 127.0.0.1（不对外）；写工具默认关闭，需 --allow-write 且带启动生成的
+token；零第三方依赖（http.server + json）。
+"""
+from __future__ import annotations
+
+import json as _json
+import secrets
+import threading
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+from urllib.parse import parse_qs, urlparse
+
+import agenthub_mcp
+import brain
+
+
+READ_ONLY_OK = ("hub_status", "hub_health", "hub_next", "hub_search", "hub_signals",
+                "hub_tasks", "hub_get_progress", "hub_list_projects", "hub_get_project",
+                "hub_memory_read", "hub_note_read", "hub_list_todos", "hub_history",
+                "hub_env_list", "hub_ops_list", "hub_agents", "hub_tool_index",
+                "hub_skill_match", "hub_asset_find", "hub_user_profile", "hub_skill_stats",
+                "hub_checkpoint")
+
+
+def _call_tool(root: str, name: str, args: dict) -> str:
+    """调一个 MCP 工具，返回文本结果（异常转成错误文本）。"""
+    rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+           "params": {"name": name, "arguments": args}}
+    try:
+        r = agenthub_mcp.handle_message(rpc, root)
+    except Exception as e:  # noqa: BLE001
+        return f"调用异常：{e}"
+    res = r.get("result") or {}
+    if "content" in res:
+        return res["content"][0]["text"]
+    err = r.get("error") or {}
+    return err.get("message") or str(r)
+
+
+def _coerce(v: str):
+    low = v.strip().lower()
+    if low in ("true", "false"):
+        return low == "true"
+    if v.strip().lstrip("-").isdigit():
+        return int(v)
+    return v
+
+
+DASHBOARD = """<!DOCTYPE html><html lang="zh"><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>AgentHub 大脑</title><style>
+body{margin:0;background:#161719;color:#e6e6e6;font:14px/1.6 -apple-system,"Segoe UI",sans-serif}
+.wrap{max-width:920px;margin:0 auto;padding:20px}
+h1{font-size:18px;margin:0 0 4px;color:#fff}
+.sub{color:#8a8f98;font-size:12px;margin-bottom:18px}
+.card{background:#1e2022;border:1px solid #2c2f33;border-radius:10px;padding:14px 16px;margin-bottom:12px}
+h2{font-size:13px;margin:0 0 8px;color:#9aa4b2;font-weight:600;letter-spacing:.4px}
+pre{white-space:pre-wrap;word-break:break-all;margin:0;font:12px/1.7 ui-monospace,Consolas,monospace;color:#cdd3da}
+.row{display:flex;gap:12px;flex-wrap:wrap}
+.row>.card{flex:1 1 300px;margin-bottom:0}
+button{background:#2d7ff9;color:#fff;border:0;border-radius:6px;padding:6px 14px;cursor:pointer;font-size:13px}
+input{flex:1;background:#141517;border:1px solid #33363b;color:#e6e6e6;border-radius:6px;padding:6px 10px}
+.bar{display:flex;gap:8px;margin-bottom:16px}
+.err{color:#ff6b6b}.ok{color:#4ade80}
+</style></head><body><div class="wrap">
+<h1>🧠 AgentHub 大脑</h1><div class="sub" id="sub">加载中…</div>
+<div class="bar"><input id="q" placeholder="搜记忆/记录…（回车检索）"><button onclick="doSearch()">搜索</button>
+<button onclick="load()">刷新</button></div>
+<div class="row"><div class="card"><h2>今天该干什么</h2><pre id="next">—</pre></div>
+<div class="card"><h2>在线与活跃项目</h2><pre id="status">—</pre></div></div>
+<div class="card"><h2>体检</h2><pre id="health">—</pre></div>
+<div class="card"><h2>检索结果</h2><pre id="search">（输入关键词后回车）</pre></div>
+</div><script>
+async function get(u){const r=await fetch(u);return r.ok?await r.text():('['+r.status+'] '+u)}
+async function load(){
+  document.getElementById('sub').textContent='本地只读视图 · '+new Date().toLocaleString();
+  document.getElementById('next').textContent=await get('/api/next');
+  document.getElementById('status').textContent=await get('/api/status');
+  document.getElementById('health').textContent=await get('/api/health');
+}
+async function doSearch(){const q=document.getElementById('q').value.trim();
+  if(!q)return;const el=document.getElementById('search');el.textContent='搜索中…';
+  el.textContent=await get('/api/search?q='+encodeURIComponent(q)+'&limit=8');}
+document.getElementById('q').addEventListener('keydown',e=>{if(e.key==='Enter')doSearch()});
+load();
+</script></body></html>"""
+
+
+class _Handler(BaseHTTPRequestHandler):
+    root = ""
+    allow_write = False
+    token = ""
+
+    def log_message(self, *a):
+        pass  # 静默：别把访问日志刷到控制台
+
+    def _send(self, code: int, body: str, ctype: str = "text/plain; charset=utf-8"):
+        data = body.encode("utf-8")
+        self.send_response(code)
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(data)))
+        self.end_headers()
+        try:
+            self.wfile.write(data)
+        except BrokenPipeError:
+            pass
+
+    def _json(self, obj):
+        self._send(200, _json.dumps(obj, ensure_ascii=False), "application/json; charset=utf-8")
+
+    def do_GET(self):
+        u = urlparse(self.path)
+        q = {k: v[0] for k, v in parse_qs(u.query).items()}
+        if u.path in ("/", "/index.html"):
+            return self._send(200, DASHBOARD, "text/html; charset=utf-8")
+        if u.path == "/api/tools":
+            return self._json([{"name": t["name"],
+                                "desc": (t.get("description") or "")[:120]}
+                               for t in agenthub_mcp.TOOLS])
+        route = {"/api/status": "hub_status", "/api/health": "hub_health",
+                 "/api/next": "hub_next", "/api/search": "hub_search",
+                 "/api/signals": "hub_signals"}.get(u.path)
+        if route:
+            # 便捷别名：网页里习惯写 q=，工具参数叫 query
+            if route == "hub_search" and "q" in q:
+                q["query"] = q.pop("q")
+            return self._send(200, _call_tool(self.root, route, q))
+        if u.path == "/api/call":
+            name = (q.pop("name", "") or "").strip()
+            if not name:
+                return self._send(400, "缺 name 参数")
+            names = {t["name"] for t in agenthub_mcp.TOOLS}
+            if name not in names:
+                return self._send(404, f"没有这个工具：{name}")
+            if name in agenthub_mcp.WRITE_TOOLS and not (
+                    self.allow_write and q.pop("token", "") == self.token):
+                return self._send(403, "写工具默认关闭（启动加 --allow-write 并带 token）")
+            return self._send(200, _call_tool(self.root, name, q))
+        return self._send(404, "未知路由：" + u.path)
+
+
+def serve(root: str, port: int = 8787, allow_write: bool = False,
+          open_browser: bool = False) -> tuple:
+    """启动本地 REST 服务。返回 ( httpd 对象, 实际端口, token)。
+    只绑 127.0.0.1——本机大脑不对外。"""
+    token = secrets.token_hex(8) if allow_write else ""
+    handler = type("H", (_Handler,), {"root": root, "allow_write": allow_write,
+                                      "token": token})
+    httpd = ThreadingHTTPServer(("127.0.0.1", port), handler)
+    if open_browser:
+        import webbrowser  # noqa: PLC0415
+        threading.Timer(0.6, lambda: webbrowser.open(f"http://127.0.0.1:{port}/")).start()
+    return httpd, httpd.server_address[1], token
+
+
+def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
+                  open_browser: bool = False) -> int:
+    """CLI 入口：阻塞运行（Ctrl+C 停止）。返回退出码。"""
+    try:
+        httpd, real_port, token = serve(root, port, allow_write, open_browser)
+    except OSError as e:
+        print(f"启动失败：{e}")
+        return 1
+    print(f"AgentHub REST 服务已启动：http://127.0.0.1:{real_port}/")
+    print("只读为主；写工具" + (f"已开启（token={token}）" if allow_write else "已关闭"))
+    try:
+        httpd.serve_forever()
+    except KeyboardInterrupt:
+        print("\n已停止")
+    finally:
+        httpd.server_close()
+    return 0

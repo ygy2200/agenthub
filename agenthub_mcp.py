@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.38.0"}  # v2.37=GUI 管理面补全（纯桌面，常量未动）；本版=X3/X4/X5
+SERVER_INFO = {"name": "agenthub", "version": "2.39.0"}  # v2.37=GUI 管理面（纯桌面）；v2.38=X3/X4/X5；本版=X2 REST+Web
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
