@@ -1832,6 +1832,26 @@ def t_tool_schema_sync(tmp):
     assert set(enum_of("hub_event_write", "kind")) == set(brain.EVENT_KINDS), "hub_event_write.kind 漂移"
 
 
+def t_gap_note(tmp):
+    """journal 检查摘要的「报缺」判定（2026-10-12 修）：纯关键词匹配会掉进否定陷阱——
+    「分片对账**通过**（…1 个分片**无缩水**）」含"缩水"会被误判为报缺（实测误报）。
+    修法：新行带 [ok]/[gap] 标记精确判定；旧行保守启发式。此用例锁住这些边界。"""
+    import ops  # noqa: PLC0415
+    cases = [
+        ("[gap] 部署漂移 ui.py —— 跑 cli.py deploy", True),
+        ("[ok] 发布一致：exe 不旧于关键源码", False),
+        ("分片对账通过（old.json → new.json，1 个分片无缩水）", False),   # 否定陷阱
+        ("分片缩水 4 处（基线 a → 本次 b）", True),
+        ("8/9 与部署一致（…），差异：ui.py: 不一致（源码与部署不一致）", True),
+        ("6/7 套通过（共 4s），失败：adv_mywork.py", True),
+        ("接入齐备：6 个 agent 引导(当前版)+MCP 均就位", False),
+        ("规则执行体检：6 家闸门在位、脚本齐；其中 3 家尚无触发记录", False),
+    ]
+    for note, want in cases:
+        got = ops._is_gap_note(note)
+        assert got == want, f"判定不符：{note[:40]!r} want={want} got={got}"
+
+
 def t_batchA_memory_governance(tmp):
     """批次A·可靠性地基：记忆取代链 + 双时相 + 证据链 + 置信度 + 治理统计。
     验证：被取代/过期/作废的记忆退出推送与检索但仍可追溯；latest-write-wins；
@@ -2052,6 +2072,7 @@ def main():
     case("项目归属（写入即落/存量回填/前缀目录/保留目录剔除/幂等，修「归属:未知」）", lambda: t_project_owner(tmp))
     case("agent 活跃度回填（存量补 last_seen/不覆盖/不妄填/幂等，修「谁静默了不可判定」）", lambda: t_agents_lastseen(tmp))
     case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
+    case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

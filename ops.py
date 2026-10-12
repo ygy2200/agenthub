@@ -41,6 +41,7 @@ CHECKS = {
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计）——检测规则有没有被真正执行，而非只写在纸面", False),
+    "hygiene": ("整洁体检：备份文件（.bak*）堆积量与最旧年龄 + agents 表零记录冗余行——只报不动手，供你决定清哪些", False),
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
 }
@@ -72,13 +73,15 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _agents(root)
     elif name == "rules_health":
         r = _rules_health(root)
+    elif name == "hygiene":
+        r = _hygiene(root)
     elif name == "ponytail_gate":
         r = _ponytail_gate(t)
     elif name == "coverage_gate":
         r = _coverage_gate(t)
     else:
         r = _brain(root)
-    _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""))
+    _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
     return r
 
 
@@ -477,14 +480,31 @@ def _rules_health(root: str) -> dict:
         (Path.home() / ".workbuddy" / "logs" / "brainlog-guard.log", "workbuddy"),  # WorkBuddy 老守卫，无归因字段
     ]
     # agent -> (配置文件, 期望出现的守卫脚本名)
-    targets = [
-        ("workbuddy", Path.home() / ".workbuddy" / "settings.json", "guard-brainlog.mjs"),
-        ("claude", Path.home() / ".claude" / "settings.json", "agent_guard.mjs"),
-        ("codex", Path.home() / ".codex" / "hooks.json", "agent_guard.mjs"),
-        ("hermes", Path.home() / "AppData" / "Local" / "hermes" / "config.yaml", "agent_guard.mjs"),
-        ("hermes-cn", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"), "agent_guard.mjs"),
-        ("zcode", Path.home() / ".zcode" / "cli" / "config.json", "auto_log.py"),
-    ]
+    # 清单单一事实来源：~/.agenthub/hooks/targets.json（与 WorkBuddy 的 guard-workflow.mjs **同源**，
+    # 避免「两处各手抄一份」——那正是 2026-10-12 审计抓到的漂移家族）。清单缺失时回退内置。
+    def _expand(p):
+        s = str(p or "")
+        return Path(os.path.expanduser(s)) if s.startswith("~") else Path(s)
+
+    targets, scripts = [], [guard_script, brainlog_script]
+    try:
+        _mfd = json.loads((Path.home() / ".agenthub" / "hooks" / "targets.json").read_text(encoding="utf-8"))
+        for _t in (_mfd.get("targets") or []):
+            targets.append((str(_t.get("agent") or "?"), _expand(_t.get("cfg")), str(_t.get("keyword") or "")))
+        if _mfd.get("scripts"):
+            scripts = [_expand(s) for s in _mfd["scripts"]]
+    except (OSError, ValueError):
+        pass
+    if not targets:   # 回退内置清单（清单缺失也不瞎）
+        targets = [
+            ("workbuddy", Path.home() / ".workbuddy" / "settings.json", "guard-brainlog.mjs"),
+            ("claude", Path.home() / ".claude" / "settings.json", "agent_guard.mjs"),
+            ("codex", Path.home() / ".codex" / "hooks.json", "agent_guard.mjs"),
+            ("hermes", Path.home() / "AppData" / "Local" / "hermes" / "config.yaml", "agent_guard.mjs"),
+            ("hermes-cn", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"), "agent_guard.mjs"),
+            ("zcode", Path.home() / ".zcode" / "cli" / "config.json", "auto_log.py"),
+            ("dsh", Path.home() / ".dsh" / "hooks.json", "agent_guard.mjs"),
+        ]
 
     missing, unwired, inplace = [], [], []
     for agent, cfg, keyword in targets:
@@ -523,7 +543,7 @@ def _rules_health(root: str) -> dict:
                 d["mark"] += 1
 
     scripts_ok = []
-    for p in (guard_script, brainlog_script):
+    for p in scripts:
         if not p.is_file():
             scripts_ok.append(p.name)
 
@@ -541,7 +561,6 @@ def _rules_health(root: str) -> dict:
             detail.append(f"{agent}: ✓ 最近触发 {s['last'][5:16]} 拦截{s['block']}/拒绝{s['deny']}/记账{s['mark']}")
         else:
             detail.append(f"{agent}: ⚠ 配置在位但日志零触发（未用过，或钩子没生效）")
-    detail.append("未接入（已知）：dsh（需装 @deepseek-ai/dsh-hooks-* 包）")
 
     gaps = len(missing) + len(unwired) + len(scripts_ok)
     if gaps == 0:
@@ -557,6 +576,61 @@ def _rules_health(root: str) -> dict:
             bits.append("脚本缺失")
         summary = "规则执行缺口：⚠ " + "；".join(bits)
     return {"ok": gaps == 0, "summary": summary, "detail": detail[:8]}
+
+
+def _hygiene(root: str) -> dict:
+    """整洁体检（2026-10-12 新增）：备份文件堆积 + agents 零记录冗余行。**只报不动手**——
+    删哪个由人决定（对齐「删文件前先确认」）。"""
+    dirs = [
+        ("hermes-home", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home")),
+        ("claude", Path.home() / ".claude"),
+        ("codex", Path.home() / ".codex"),
+        ("dsh", Path.home() / ".dsh"),
+        ("zcode-cli", Path.home() / ".zcode" / "cli"),
+        ("workbuddy-bin", Path.home() / ".workbuddy" / "bin"),
+        ("brain-_hub", (Path(root) / "_hub") if root else None),
+        ("agenthub-hooks", Path.home() / ".agenthub" / "hooks"),
+    ]
+    rows, total = [], 0
+    now = time.time()
+    for name, d in dirs:
+        if d is None:
+            continue
+        try:
+            baks = list(d.glob("*.bak*"))
+        except OSError:
+            baks = []
+        if not baks:
+            continue
+        total += len(baks)
+        try:
+            age = int((now - min(b.stat().st_mtime for b in baks)) / 86400)
+        except OSError:
+            age = 0
+        rows.append((len(baks), name, age))
+    rows.sort(key=lambda r: -r[0])
+
+    # agents 零记录冗余行（排除 mcp-server：它是大脑自身身份，有错误登记记录）
+    zero = []
+    try:
+        _brain = _import_brain()
+        with _brain.db_conn(root) as conn:
+            zero = [r["name"] for r in conn.execute(
+                "SELECT name FROM agents WHERE records=0 AND heartbeats=0 AND name!='mcp-server'")]
+    except Exception:  # noqa: BLE001
+        pass
+
+    detail = [f"{n} 个 .bak（{name}，最老 {age} 天）" for n, name, age in rows[:5]]
+    if zero:
+        detail.append("agents 零记录冗余行：" + "、".join(zero) + "（可清）")
+    detail.append("策略建议：按目录保留最近 10 份；超 30 天只列清单、人工确认后再删（不自动删）")
+    if total >= 100:
+        summary = f"整洁体检：备份文件 {total} 个已明显堆积（建议清理）；零记录 agent 行 {len(zero)}"
+    elif total:
+        summary = f"整洁体检：备份文件 {total} 个（{rows[0][1]} 最多 {rows[0][0]} 个），零记录 agent 行 {len(zero)}"
+    else:
+        summary = "整洁体检：无备份堆积、无零记录 agent 行"
+    return {"ok": total < 100 and not zero, "summary": summary, "detail": detail[:8]}
 
 
 def _inbox(root: str) -> dict:
@@ -654,6 +728,48 @@ def _compress(root: str) -> dict:
             "detail": detail}
 
 
+def _is_gap_note(note: str) -> bool:
+    """journal 检查摘要是否「报缺」。新行带 [ok]/[gap] 显式标记（精确，2026-10-12 起）；
+    旧行无标记 → 保守启发式：只认明确报缺措辞，避开「无缩水 / 一致 / 通过」等否定陷阱。"""
+    n = note or ""
+    if n.startswith("[gap]"):
+        return True
+    if n.startswith("[ok]"):
+        return False
+    return any(k in n for k in ("部署漂移", "部署缺", "，失败：", "缺口", "缺失", "不一致（", "⚠", "缩水 "))
+
+
+def _recent_anomalies(root: str, days: int = 7) -> list:
+    """近 N 天异常摘要（journal 消费方，2026-10-12 新增）：
+    此前 journal 只写不读——拦截命中 / 报缺的检查 / 未闭环错误 全躺在库里没人看。
+    这里把它们聚合成几行人话，挂在 brain 检查的 detail 里。失败静默返回空。"""
+    out = []
+    try:
+        _brain = _import_brain()
+        with _brain.db_conn(root) as conn:
+            since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+            rows = [dict(r) for r in conn.execute(
+                "SELECT action, note, target FROM journal WHERE substr(ts,1,10)>=? "
+                "AND (action LIKE '拦截%' OR action LIKE '检查 %') ORDER BY id DESC LIMIT 200",
+                (since,))]
+            hit = [r for r in rows if "拦截" in (r["action"] or "")]
+            bad = [r for r in rows if "检查" in (r["action"] or "") and _is_gap_note(r["note"])]
+            if hit:
+                out.append(f"近{days}天拦截命中 {len(hit)} 次（最近：{(hit[0]['note'] or '')[:36]}）")
+            if bad:
+                out.append(f"近{days}天检查报缺 {len(bad)} 次（最近：{bad[0]['action']}）")
+            try:
+                errs = [dict(r) for r in conn.execute(
+                    "SELECT title FROM errors WHERE status!='fixed' ORDER BY id DESC LIMIT 3")]
+                if errs:
+                    out.append(f"未闭环错误 {len(errs)} 条（最近：{(errs[0]['title'] or '')[:36]}）")
+            except Exception:  # noqa: BLE001
+                pass
+    except Exception:  # noqa: BLE001
+        pass
+    return out
+
+
 def _brain(root: str) -> dict:
     if not root or not Path(root).is_dir():
         return {"ok": False, "summary": "需要有效的大脑根目录（MCP server 启动参数）", "detail": []}
@@ -664,16 +780,18 @@ def _brain(root: str) -> dict:
     return {"ok": True,
             "summary": f"记录{h['records']} 记忆{h['memories']} 结晶率{h['crystallization']}% "
                        f"待办{h['todo_count']} 检索累计{h['searches_total']} 停滞项目{h['projects_stalled']}",
-            "detail": []}
+            "detail": _recent_anomalies(root)[:8]}
 
 
-def _journal(root: str, name: str, summary: str, target_name: str = "") -> None:
-    """检查动作落操作流水（可追溯，target=被检目录名供收尾建议去重）；失败不影响检查本身。"""
+def _journal(root: str, name: str, summary: str, target_name: str = "", ok=None) -> None:
+    """检查动作落操作流水（可追溯，target=被检目录名供收尾建议去重）；失败不影响检查本身。
+    2026-10-12：摘要前加 [ok]/[gap] 标记——供异常摘要在不误读「无缩水/一致」等否定措辞的前提下精确统计。"""
     if not root:
         return
     try:
         brain = _import_brain()
-        brain.journal_add(root, "ops", f"检查 {name}", target=target_name, note=summary[:200])
+        tag = "" if ok is None else ("[ok] " if ok else "[gap] ")
+        brain.journal_add(root, "ops", f"检查 {name}", target=target_name, note=(tag + summary)[:200])
     except Exception:  # noqa: BLE001
         pass
 
