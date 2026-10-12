@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.35.0"
+    assert r["serverInfo"]["version"] == "2.36.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -78,7 +78,7 @@ def t_protocol(root):
             "hub_next", "hub_crystallize",
             "hub_event_write", "hub_events",
             "hub_skill_match", "hub_skill_sync"} <= names, names
-    assert len(names) == 60  # M8+M11（2026-10-12）：58 + hub_quarantine / hub_decision_review = 60
+    assert len(names) == 63  # M7+M9+M12（2026-10-12）：60 + hub_consolidate / hub_view / hub_skill_stats = 63
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601

@@ -344,6 +344,15 @@ CREATE TABLE IF NOT EXISTS decision_reviews (
     created TEXT DEFAULT "",
     reviewed_at TEXT DEFAULT ""
 );
+-- M9 视角（2026-10-12）：agent 关注清单（项目/标签）。多 agent 场景下每个 agent 只关心
+-- 自己的地盘——关注项目有进展时心跳附加一段速览，不开工在那个项目也知道。
+CREATE TABLE IF NOT EXISTS agent_views (
+    agent TEXT,
+    scope_type TEXT DEFAULT "project",
+    scope_value TEXT DEFAULT "",
+    created TEXT DEFAULT "",
+    PRIMARY KEY (agent, scope_type, scope_value)
+);
 -- M4 检查点（2026-10-12）：任务级断点续跑。长任务/跨会话任务定期存进展快照，
 -- 崩溃、换人接手、隔天续跑时不用从零翻记录。kind：manual=手写 /
 -- auto_claim=认领时自动存的开工资锚点（断点续跑的第一块砖）。
@@ -4095,6 +4104,160 @@ def decision_review_history(root: str, limit: int = 20) -> list:
             rec = conn.execute("SELECT title FROM records WHERE id=?", (r["record_id"],)).fetchone()
             r["title"] = (rec["title"] if rec else "") or f"记录 #{r['record_id']}"
     return rows
+
+
+# ---------------------------------------------------------------- 整合（M7）
+
+def consolidate_proposals(root: str, limit: int = 5) -> list:
+    """M7 整合提案：把疑似重复/矛盾记忆组整理成可执行提案（只读）。
+    整合是高危动作（可能丢信息）——系统只提案，执行要 consolidate_apply 显式确认。
+    每组：{ids, kind, sim, verdict, contents}。"""
+    sims = similar_memories(root, limit=limit * 2)
+    props = []
+    seen: set = set()
+    for s in sims:
+        key = (s["a"], s["b"])
+        if key in seen:
+            continue
+        seen.add(key)
+        props.append({"ids": [s["a"], s["b"]], "kind": "", "sim": s["sim"],
+                      "verdict": s["verdict"],
+                      "contents": [s["content_a"], s["content_b"]]})
+        if len(props) >= limit:
+            break
+    return props
+
+
+def consolidate_apply(root: str, ids, merged_content: str, agent: str) -> tuple:
+    """M7 执行整合：写一条整合记忆（maturity=validated——整合即人工确认过的结论，
+    evidence 挂原条目 id），原条目全部 superseded_by 指向新条（退出推送但可追溯）。
+    返回 (错误或 "", 新记忆 id)。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填", 0
+    merged = (merged_content or "").strip()
+    if not merged:
+        return "merged_content 必填（整合后的完整内容，不是摘要）", 0
+    try:
+        id_list = sorted({int(x) for x in (ids or [])})
+    except (TypeError, ValueError):
+        return "ids 必须为整数列表", 0
+    if len(id_list) < 2:
+        return "至少 2 条才需要整合", 0
+    with db_conn(root) as conn:
+        ph = ",".join("?" * len(id_list))
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT * FROM memories WHERE id IN ({ph})", id_list)]
+        if len(rows) != len(id_list):
+            return f"有 id 不存在（传入 {len(id_list)}，库中命中 {len(rows)}）", 0
+        live = [r for r in rows if r["superseded_by"] == 0]
+        if len(live) < 2:
+            return "现存条目不足 2 条（可能已被取代——先看提案）", 0
+        kinds = {r["kind"] for r in live}
+        kind = kinds.pop() if len(kinds) == 1 else "note"
+        tags = ",".join(sorted({t.strip() for r in live
+                                for t in (r["tags"] or "").split(",") if t.strip()}))[:200]
+        project = live[0]["project"] or ""
+    mid = add_memory(root, merged, kind, tags, project, who, maturity="validated",
+                     evidence=",".join(f"m:{i}" for i in id_list))
+    with db_conn(root) as conn:
+        for i in id_list:
+            conn.execute("UPDATE memories SET superseded_by=? WHERE id=?", (mid, i))
+    journal_add(root, who, "整合记忆", target=f"brain:memories#{mid}",
+                note="合并 " + ",".join(f"#{i}" for i in id_list))
+    return "", mid
+
+
+# ---------------------------------------------------------------- 视角（M9）
+
+def view_follow(root: str, agent: str, scope_type: str = "project",
+                scope_value: str = "") -> str:
+    """M9 关注一个项目/标签（幂等 UPSERT）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填"
+    st = (scope_type or "project").strip()
+    sv = (scope_value or "").strip()
+    if st not in ("project", "tag"):
+        return "scope_type 只能是 project/tag"
+    if not sv:
+        return "scope_value 必填（项目名或标签）"
+    with db_conn(root) as conn:
+        conn.execute("INSERT OR IGNORE INTO agent_views(agent,scope_type,scope_value,created) "
+                     "VALUES(?,?,?,?)", (who, st, sv, _now()))
+    return f"已关注（{st}）：{sv}——该项目有进展会出现在你的心跳「[关注项目动态]」里"
+
+
+def view_unfollow(root: str, agent: str, scope_type: str = "project",
+                  scope_value: str = "") -> str:
+    """M9 取消关注。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填"
+    st = (scope_type or "project").strip()
+    sv = (scope_value or "").strip()
+    with db_conn(root) as conn:
+        cur = conn.execute("DELETE FROM agent_views WHERE agent=? AND scope_type=? "
+                           "AND scope_value=?", (who, st, sv))
+    return (f"已取消关注（{st}）：{sv}" if cur.rowcount
+            else f"你本来就没关注（{st}）：{sv}")
+
+
+def view_list(root: str, agent: str) -> list:
+    """M9 我的关注清单。"""
+    who = _norm_agent(agent)
+    if not who:
+        return []
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT scope_type, scope_value, created FROM agent_views WHERE agent=? "
+            "ORDER BY created, scope_value", (who,))]
+
+
+def view_recent(root: str, agent: str, exclude_project: str = "",
+                limit: int = 3, days: int = 7) -> list:
+    """M9 关注项目的最近进展（心跳附加段用）：关注的项目近 days 天有记录就返回，
+    排除当前项目（避免与「今日任务」重复刷）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return []
+    with db_conn(root) as conn:
+        views = [r["scope_value"] for r in conn.execute(
+            "SELECT scope_value FROM agent_views WHERE agent=? AND scope_type='project'",
+            (who,))]
+    if not views:
+        return []
+    views = [v for v in views if v != (exclude_project or "")]
+    if not views:
+        return []
+    cutoff = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    out: list = []
+    with db_conn(root) as conn:
+        for v in views:
+            r = conn.execute(
+                "SELECT id, project, title, date, agent FROM records WHERE " + _rec_live_sql()
+                + " AND project=? AND date>=? ORDER BY id DESC LIMIT 1", (v, cutoff)).fetchone()
+            if r:
+                out.append(dict(r))
+    out.sort(key=lambda x: x["date"], reverse=True)
+    return out[:max(1, min(int(limit or 3), 10))]
+
+
+# ---------------------------------------------------------------- 技能资产化（M12）
+
+def skill_stats(root: str) -> dict:
+    """M12 技能资产化·统计：哪些技能真被用（hits）、哪些零使用（清理候选）。
+    返回 {total, by_agent, top_used, zero_used}——零使用清单供人决定清理还是补说明。"""
+    with db_conn(root) as conn:
+        total = conn.execute("SELECT COUNT(*) FROM skills").fetchone()[0]
+        by_agent = {r[0] or "未知": r[1] for r in conn.execute(
+            "SELECT agent, COUNT(*) FROM skills GROUP BY agent ORDER BY 2 DESC")}
+        top = [dict(r) for r in conn.execute(
+            "SELECT name, agent, hits, last_hit FROM skills WHERE hits>0 "
+            "ORDER BY hits DESC, last_hit DESC LIMIT 10")]
+        zero = [dict(r) for r in conn.execute(
+            "SELECT name, agent, path FROM skills WHERE hits=0 ORDER BY agent, name LIMIT 30")]
+    return {"total": total, "by_agent": by_agent, "top_used": top, "zero_used": zero}
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:

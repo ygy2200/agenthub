@@ -2086,6 +2086,57 @@ def t_quarantine_review(tmp):
     assert n == 2 and recs == 0, (n, recs)
 
 
+def t_consolidate_view_skill(tmp):
+    """M7 整合 + M9 视角 + M12 技能资产（2026-10-12）：
+    提案只读 / apply 写 validated+supersede 原条目+证据链 / 拒不足 2 条 /
+    关注幂等 / recent 排除当前项目 / unfollow 幂等 / skill_stats top 与 zero。"""
+    root = str(Path(tmp) / "hub_cvs")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "zcode", "甲-问题")
+    # —— M7 ——
+    a = brain.add_memory(root, "SQLite 单文件足够，不要上 PostgreSQL，部署简单",
+                         "lesson", agent="zcode")
+    b = brain.add_memory(root, "SQLite 单文件足够，不要上 PostgreSQL，部署简单运维省心",
+                         "lesson", agent="zcode")
+    props = brain.consolidate_proposals(root)
+    assert len(props) == 1 and set(props[0]["ids"]) == {a, b}, props
+    # 拒：不足 2 条 / 空内容
+    e, z = brain.consolidate_apply(root, [a], "x", "zcode")
+    assert z == 0 and "至少 2 条" in e, (e, z)
+    e, z = brain.consolidate_apply(root, [a, b], "  ", "zcode")
+    assert z == 0 and "merged_content" in e, (e, z)
+    # apply：新条 validated + 原条目 supersede + 退出检索
+    err, mid = brain.consolidate_apply(root, [a, b],
+                                       "SQLite 单文件足够（WAL+timeout），不要上 PG", "zcode")
+    assert err == "" and mid > a, (err, mid)
+    with brain.db_conn(root) as conn:
+        ra = conn.execute("SELECT superseded_by, maturity FROM memories WHERE id=?", (a,)).fetchone()
+        rm = conn.execute("SELECT maturity, evidence FROM memories WHERE id=?", (mid,)).fetchone()
+    assert ra["superseded_by"] == mid and rm["maturity"] == "validated", (tuple(ra), tuple(rm))
+    assert f"m:{a}" in rm["evidence"] and f"m:{b}" in rm["evidence"], rm["evidence"]
+    assert len(brain.search_memories(root, "PostgreSQL")) == 0, "原条目应退出检索"
+    # —— M9 ——
+    assert "已关注" in brain.view_follow(root, "zcode", "project", "乙-问题")
+    assert "已关注" in brain.view_follow(root, "zcode", "project", "乙-问题")  # 幂等
+    assert "scope_type" in brain.view_follow(root, "zcode", "xxx", "乙")  # 坏类型拒
+    assert len(brain.view_list(root, "zcode")) == 1
+    brain.add_record(root, "乙-问题", "hermes", "2026-10-12", "乙项目新进展", "X")
+    recent = brain.view_recent(root, "zcode", exclude_project="甲-问题")
+    assert len(recent) == 1 and recent[0]["project"] == "乙-问题", recent
+    assert brain.view_recent(root, "zcode", exclude_project="乙-问题") == []  # 排除当前
+    assert "已取消关注" in brain.view_unfollow(root, "zcode", "project", "乙-问题")
+    assert "本来就没关注" in brain.view_unfollow(root, "zcode", "project", "乙-问题")
+    # —— M12 ——
+    brain.skill_sync(root, [{"name": "used-skill", "agent": "workbuddy", "path": "/a", "desc": "d"},
+                            {"name": "unused-skill", "agent": "zcode", "path": "/b", "desc": "d"}])
+    brain.skill_hit(root, "workbuddy", "/a")
+    st = brain.skill_stats(root)
+    assert st["total"] == 2 and st["by_agent"]["workbuddy"] == 1, st
+    assert [s["name"] for s in st["top_used"]] == ["used-skill"], st["top_used"]
+    assert [s["name"] for s in st["zero_used"]] == ["unused-skill"], st["zero_used"]
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -2355,6 +2406,7 @@ def main():
     case("M5 哨兵（全绿不报/造gap广播/同内容冷却/冷却过重发）", lambda: t_sentry(tmp))
     case("M6 记忆成熟度（draft缺省/人工标/用3次自动validated/pinned+10次core/只升不降/health分布）", lambda: t_maturity(tmp))
     case("M8+M11 隔离区与决策回路（隔离退检索可解除/到期队列/回顾结论/只记一次）", lambda: t_quarantine_review(tmp))
+    case("M7+M9+M12 整合/视角/技能资产（提案apply链/关注动态速览/技能hit统计）", lambda: t_consolidate_view_skill(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()

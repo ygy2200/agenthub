@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.35.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.36.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -824,6 +824,19 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 dl.append(f"  ◆ #{d['record_id']} {d['review_date']} 到期｜{d['title'][:36]}"
                           f"｜当时决策：{d['decision_brief'][:40]}")
             out = out + "\n".join(dl)
+        # M9 关注项目动态（开工推送第四段）：关注的其他项目近 7 天有进展就速览一条——
+        # 不开工在那个项目也知道；排除当前项目（避免与「今日任务」重复刷）
+        try:
+            vr = brain.view_recent(root, agent, exclude_project=project, limit=2)
+        except Exception:  # noqa: BLE001
+            vr = []
+        if vr:
+            vl = ["", "[关注项目动态] 你关注的其他项目最近有进展："]
+            for r in vr:
+                vl.append(f"  ○ [{r['project']}] {r['title'][:36]}"
+                          f"（{r['date']} {r['agent'] or '?'}）")
+            vl.append("  管理关注：hub_view action=follow/unfollow/list")
+            out = out + "\n".join(vl)
         return out
 
     if name == "hub_report_error":
@@ -1316,6 +1329,65 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         lines.append("回顾：hub_decision_review action=review review_id=N verdict=right|wrong|partial")
         return "\n".join(lines)
 
+    if name == "hub_consolidate":
+        action = str(arguments.get("action", "proposals")).strip()
+        if action == "apply":
+            raw = arguments.get("ids", [])
+            if isinstance(raw, str):
+                raw = [x for x in raw.replace("，", ",").split(",") if x.strip()]
+            err, mid = brain.consolidate_apply(root, raw,
+                                               str(arguments.get("merged_content", "")),
+                                               str(arguments.get("agent", "")))
+            if err:
+                return f"错误：{err}"
+            return (f"已整合为新记忆 #{mid}（validated，证据链挂原条目）——"
+                    "原条目退出推送但可追溯；hub_search 仍能按 id 翻到旧条")
+        props = brain.consolidate_proposals(root)
+        if not props:
+            return "（无整合提案——没有疑似重复/矛盾的记忆组）"
+        lines = [f"整合提案 {len(props)} 组（只读，执行需确认）："]
+        for p in props:
+            lines.append(f"- ids={p['ids']} 相似度 {p['sim']}｜{p['verdict']}")
+            for c in p["contents"]:
+                lines.append(f"    · {c}")
+        lines.append("执行：hub_consolidate action=apply ids=[…] merged_content=整合后完整内容")
+        return "\n".join(lines)
+
+    if name == "hub_view":
+        action = str(arguments.get("action", "list")).strip()
+        agent = str(arguments.get("agent", "")).strip()
+        if action == "follow":
+            return brain.view_follow(root, agent,
+                                     str(arguments.get("scope_type", "project")),
+                                     str(arguments.get("scope_value", "")))
+        if action == "unfollow":
+            return brain.view_unfollow(root, agent,
+                                       str(arguments.get("scope_type", "project")),
+                                       str(arguments.get("scope_value", "")))
+        rows = brain.view_list(root, agent)
+        if not rows:
+            return ("（关注清单空。hub_view action=follow scope_type=project scope_value=项目名"
+                    "——关注项目有进展会出现在你的心跳「[关注项目动态]」）")
+        lines = [f"关注清单 {len(rows)} 项："]
+        for v in rows:
+            lines.append(f"- [{v['scope_type']}] {v['scope_value']}（{v['created'][:10]} 关注）")
+        return "\n".join(lines)
+
+    if name == "hub_skill_stats":
+        st = brain.skill_stats(root)
+        lines = [f"技能资产统计：共 {st['total']} 条索引"
+                 f"（分布：{' / '.join(f'{k} {v}' for k, v in st['by_agent'].items()) or '无'}）"]
+        if st["top_used"]:
+            lines.append("真被用的（top）：")
+            for s in st["top_used"]:
+                lines.append(f"- {s['name']} [{s['agent']}] 命中 {s['hits']} 次"
+                             f"（最近 {s['last_hit'][:10] or '从未'}）")
+        if st["zero_used"]:
+            lines.append(f"零使用 {len(st['zero_used'])} 条（清理或补说明候选，未动作）：")
+            for s in st["zero_used"][:15]:
+                lines.append(f"- {s['name']} [{s['agent']}] {s['path']}")
+        return "\n".join(lines)
+
     if name == "hub_report":
         import report
         path = report.generate_report(root)
@@ -1617,6 +1689,28 @@ TOOLS = [
                                                 "description": "review：right 当时决策对 / wrong 错 / partial 部分对"},
                                     "note": {"type": "string", "description": "review：结论说明"},
                                     "agent": {"type": "string", "description": "你的 agent 名"}}}},
+    {"name": "hub_consolidate",
+     "description": "M7 记忆整合：action=proposals 看疑似重复/矛盾记忆组的整合提案（只读）；action=apply 执行——写一条整合记忆（validated），原条目 superseded_by 退出推送但可追溯。整合是高危动作，执行需显式确认",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["proposals", "apply"],
+                                               "description": "proposals 提案（缺省）/ apply 执行整合"},
+                                    "ids": {"type": "array", "items": {"type": "integer"},
+                                            "description": "apply：要整合的记忆 id 列表（至少 2 条，取 proposals 给出的）"},
+                                    "merged_content": {"type": "string",
+                                                       "description": "apply：整合后的完整内容（不是摘要，要能独立读懂）"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（apply 必填）"}}}},
+    {"name": "hub_view",
+     "description": "M9 视角：关注项目/标签（follow/unfollow/list）。关注的项目近 7 天有进展，会出现在你的心跳「[关注项目动态]」——多 agent 场景各看各的地盘，不开工也知道进展",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["list", "follow", "unfollow"],
+                                               "description": "list 我的关注（缺省）/ follow 关注 / unfollow 取消"},
+                                    "scope_type": {"type": "string", "enum": ["project", "tag"],
+                                                   "description": "关注类型，缺省 project"},
+                                    "scope_value": {"type": "string", "description": "项目名或标签"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}}}},
+    {"name": "hub_skill_stats",
+     "description": "M12 技能资产统计：哪些技能真被用（命中次数）、哪些零使用（清理或补说明候选）——技能索引进化了，用不用数据说话",
+     "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1776,6 +1870,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_sentry",  # M5 哨兵：巡检广播
     "hub_quarantine",  # M8 隔离区：治理工具要给干活的 agent
     "hub_decision_review",  # M11 决策回路：到期验证
+    "hub_consolidate", "hub_view", "hub_skill_stats",  # M7/M9/M12：治理三件套
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
@@ -1797,6 +1892,9 @@ WRITE_TOOLS = {
     "hub_sentry",  # M5 哨兵：跑巡检并发广播
     "hub_quarantine",  # M8 隔离区：可疑内容移出检索（不删）
     "hub_decision_review",  # M11 决策回路：到期验证决策对错
+    "hub_consolidate",  # M7 整合：重复记忆组合并（apply 走闸门）
+    "hub_view",  # M9 视角：关注项目/标签
+    "hub_skill_stats",  # M12 技能资产统计
 }
 
 
