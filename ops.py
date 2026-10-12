@@ -40,6 +40,7 @@ CHECKS = {
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
+    "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计）——检测规则有没有被真正执行，而非只写在纸面", False),
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
 }
@@ -69,6 +70,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _compress(root)
     elif name == "agents":
         r = _agents(root)
+    elif name == "rules_health":
+        r = _rules_health(root)
     elif name == "ponytail_gate":
         r = _ponytail_gate(t)
     elif name == "coverage_gate":
@@ -456,6 +459,104 @@ def _agents(root: str) -> dict:
             bits.append(f"缺MCP {'/'.join(miss_mcp)}")
         summary = "接入缺口：" + "；".join(bits)
     return {"ok": not (miss_boot or stale or miss_mcp), "summary": summary, "detail": detail[:8]}
+
+
+def _rules_health(root: str) -> dict:
+    """规则执行体检（2026-10-12 新增）：逐家核对「干完活记大脑」闸门是否真在位、真在跑。
+
+    三类核对（全只读）：
+      1) 闸门配置在位：各家配置文件里必须出现守卫脚本名（缺=被删/被覆盖）
+      2) 守卫脚本存在：agent_guard.mjs / guard-brainlog.mjs 在盘
+      3) 近期真触发：读守卫日志，按 agent= 归因统计最近触发与拦截/拒绝次数
+         （配置在但日志零触发 = 最危险的一类——「装了但没跑」，此前完全不可见）
+    """
+    guard_script = Path.home() / ".agenthub" / "hooks" / "agent_guard.mjs"
+    brainlog_script = Path.home() / ".workbuddy" / "bin" / "guard-brainlog.mjs"
+    logs = [
+        (Path.home() / ".workbuddy" / "logs" / "agent-guard.log", None),        # 有 agent= 归因
+        (Path.home() / ".workbuddy" / "logs" / "brainlog-guard.log", "workbuddy"),  # WorkBuddy 老守卫，无归因字段
+    ]
+    # agent -> (配置文件, 期望出现的守卫脚本名)
+    targets = [
+        ("workbuddy", Path.home() / ".workbuddy" / "settings.json", "guard-brainlog.mjs"),
+        ("claude", Path.home() / ".claude" / "settings.json", "agent_guard.mjs"),
+        ("codex", Path.home() / ".codex" / "hooks.json", "agent_guard.mjs"),
+        ("hermes", Path.home() / "AppData" / "Local" / "hermes" / "config.yaml", "agent_guard.mjs"),
+        ("hermes-cn", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"), "agent_guard.mjs"),
+        ("zcode", Path.home() / ".zcode" / "cli" / "config.json", "auto_log.py"),
+    ]
+
+    missing, unwired, inplace = [], [], []
+    for agent, cfg, keyword in targets:
+        try:
+            txt = cfg.read_text(encoding="utf-8", errors="replace") if cfg.is_file() else ""
+        except OSError:
+            txt = ""
+        if not txt:
+            missing.append(agent)
+        elif keyword not in txt:
+            unwired.append(agent)
+        else:
+            inplace.append(agent)
+
+    # 近期触发统计（各取日志尾 400 行）
+    stat = {}
+    for logp, default_agent in logs:
+        try:
+            lines = logp.read_text(encoding="utf-8", errors="replace").splitlines()[-400:]
+        except OSError:
+            continue
+        for ln in lines:
+            m = re.search(r"agent=(\S+)", ln)
+            ag = m.group(1) if m else default_agent
+            if not ag:
+                continue
+            d = stat.setdefault(ag, {"last": "", "block": 0, "deny": 0, "mark": 0})
+            ts = ln[:19]
+            if ts > d["last"]:
+                d["last"] = ts
+            if "BLOCK@" in ln:
+                d["block"] += 1
+            elif "DENY" in ln:
+                d["deny"] += 1
+            elif "marked logged" in ln:
+                d["mark"] += 1
+
+    scripts_ok = []
+    for p in (guard_script, brainlog_script):
+        if not p.is_file():
+            scripts_ok.append(p.name)
+
+    silent = [a for a in inplace if a not in stat]
+    detail = []
+    if scripts_ok:
+        detail.append("守卫脚本缺失：" + "、".join(scripts_ok))
+    for agent, _cfg, _kw in targets:
+        s = stat.get(agent)
+        if agent in missing:
+            detail.append(f"{agent}: ✗ 闸门配置缺失（被删/被覆盖？）")
+        elif agent in unwired:
+            detail.append(f"{agent}: ✗ 配置在但未含守卫（被改动？）")
+        elif s:
+            detail.append(f"{agent}: ✓ 最近触发 {s['last'][5:16]} 拦截{s['block']}/拒绝{s['deny']}/记账{s['mark']}")
+        else:
+            detail.append(f"{agent}: ⚠ 配置在位但日志零触发（未用过，或钩子没生效）")
+    detail.append("未接入（已知）：dsh（需装 @deepseek-ai/dsh-hooks-* 包）")
+
+    gaps = len(missing) + len(unwired) + len(scripts_ok)
+    if gaps == 0:
+        summary = (f"规则执行体检：{len(inplace)} 家闸门在位、脚本齐；"
+                   + (f"其中 {len(silent)} 家尚无触发记录（{ '/'.join(silent) }）" if silent else "且均有触发记录"))
+    else:
+        bits = []
+        if missing:
+            bits.append(f"缺配置 {'/'.join(missing)}")
+        if unwired:
+            bits.append(f"未含守卫 {'/'.join(unwired)}")
+        if scripts_ok:
+            bits.append("脚本缺失")
+        summary = "规则执行缺口：⚠ " + "；".join(bits)
+    return {"ok": gaps == 0, "summary": summary, "detail": detail[:8]}
 
 
 def _inbox(root: str) -> dict:

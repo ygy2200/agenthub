@@ -1779,6 +1779,59 @@ def t_project_owner(tmp):
             "SELECT agent FROM projects WHERE name='甲-问题'").fetchone()[0] == "zcode"
 
 
+def t_agents_lastseen(tmp):
+    """agent 活跃度回填（2026-10-12 修）：初版 _backfill_agents 只写 first_seen/records，
+    last_seen 恒空 → claude/hermes 等历史 agent「最后活跃时间」未知，「谁静默了」不可判定。
+    验证：存量补 MAX(date) / 已有值不覆盖 / 无记录行不妄填 / 幂等。"""
+    root = str(Path(tmp) / "hub_lastseen")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    # 1) 造「有记录但 last_seen 空」的存量 agent（复现初版回填缺失）
+    brain.add_record(root, "甲-问题", "zcode", "2026-10-11", "t", "正文")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE agents SET last_seen='' WHERE name='zcode'")
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT last_seen FROM agents WHERE name='zcode'").fetchone()[0] == "2026-10-11"
+    # 2) 已有非空值不被覆盖（幂等，且不倒退）
+    brain.add_record(root, "甲-问题", "dsh", "2026-10-12", "t", "正文")
+    with brain.db_conn(root) as conn:
+        before = conn.execute("SELECT last_seen FROM agents WHERE name='dsh'").fetchone()[0]
+        assert before != ""
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT last_seen FROM agents WHERE name='dsh'").fetchone()[0] == before
+    # 3) 无记录的行不妄填（避免造假活跃）
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO agents(name, last_seen) VALUES('ghost','')")
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        assert conn.execute(
+            "SELECT last_seen FROM agents WHERE name='ghost'").fetchone()[0] == ""
+
+
+def t_tool_schema_sync(tmp):
+    """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
+    而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
+    「列得出但跑不了」（hub_ops_list 动态列全量、hub_ops_run 却传不进去）。
+    此用例把「enum 必须等于源头」变成可回归断言，防同类手抄再漂移。"""
+    import ops  # noqa: PLC0415
+    import agenthub_mcp as mcp  # noqa: PLC0415
+    tools = {t["name"]: t for t in mcp.TOOLS}
+
+    def enum_of(tool, field):
+        return tools[tool]["inputSchema"]["properties"][field].get("enum")
+
+    assert enum_of("hub_ops_run", "name") == sorted(ops.CHECKS), "hub_ops_run.name 与 ops.CHECKS 漂移"
+    for tool in ("hub_memory_read", "hub_memory_write"):
+        assert set(enum_of(tool, "kind")) == set(brain.KINDS), f"{tool}.kind 与 brain.KINDS 漂移"
+    for tool in ("hub_task_update", "hub_tasks"):
+        assert set(enum_of(tool, "status")) == set(brain.TASK_STATUSES), f"{tool}.status 漂移"
+    assert set(enum_of("hub_event_write", "kind")) == set(brain.EVENT_KINDS), "hub_event_write.kind 漂移"
+
+
 def t_batchA_memory_governance(tmp):
     """批次A·可靠性地基：记忆取代链 + 双时相 + 证据链 + 置信度 + 治理统计。
     验证：被取代/过期/作废的记忆退出推送与检索但仍可追溯；latest-write-wins；
@@ -1997,6 +2050,8 @@ def main():
     case("P1-2 schema收口（record_type枚举/标签规约与注册表归一）", lambda: t_record_type_and_tags(tmp))
     case("P1-3 关系+属性继承（双链抽取/反链/属性下行）", lambda: t_relations_and_attrs(tmp))
     case("项目归属（写入即落/存量回填/前缀目录/保留目录剔除/幂等，修「归属:未知」）", lambda: t_project_owner(tmp))
+    case("agent 活跃度回填（存量补 last_seen/不覆盖/不妄填/幂等，修「谁静默了不可判定」）", lambda: t_agents_lastseen(tmp))
+    case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

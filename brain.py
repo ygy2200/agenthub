@@ -743,6 +743,14 @@ def _migrate_columns(root: str) -> None:
             "WHERE r.project=projects.name AND r.agent!='' ORDER BY r.id DESC LIMIT 1) "
             "WHERE (agent='' OR agent IS NULL) AND EXISTS("
             "SELECT 1 FROM records r WHERE r.project=projects.name AND r.agent!='')")
+        # agents.last_seen 回填（2026-10-12）：初版 _backfill_agents 只写了 first_seen/records，
+        # last_seen 留空 → claude/hermes 等历史 agent「最后活跃时间」未知，导致「谁静默了」不可判定
+        # （同类盲区：字段只在 INSERT 里加、没有存量回填路径）。从 records 的 MAX(date) 补；幂等，仅补空值。
+        conn.execute(
+            "UPDATE agents SET last_seen=(SELECT MAX(r.date) FROM records r "
+            "WHERE r.agent=agents.name AND r.date!='') "
+            "WHERE (last_seen='' OR last_seen IS NULL) AND EXISTS("
+            "SELECT 1 FROM records r WHERE r.agent=agents.name AND r.date!='')")
         # 无记录可溯源的历史项目（多为已归档的 old-style 目录）——目录名前缀即归属：
         # 「hermes - 网络切换脚本」→ hermes。与 core 迁移期的归属判定一致。
         conn.execute(

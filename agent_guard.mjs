@@ -33,8 +33,14 @@ const MAX_SESSIONS = 50;
 const SESSION_TTL_MS = 48 * 3600 * 1000;
 const MAX_BLOCKS = 2;              // 单会话最多阻断次数，防死循环
 
+// 身份：由各家 hook 配置以 `--agent <name>` 传入（也支持 env AGENTHUB_AGENT）。
+// 目的：让守卫的判定能按 agent 归因，供大脑 ops 检查「规则执行」健康度。
+const _argv = process.argv.slice(2);
+const _ai = _argv.indexOf('--agent');
+const AGENT = (_ai >= 0 && _argv[_ai + 1]) || process.env.AGENTHUB_AGENT || 'unknown';
+
 function logLine(m) {
-  try { mkdirSync(path.dirname(LOG), { recursive: true }); appendFileSync(LOG, `${new Date().toISOString()}  ${m}\n`, 'utf8'); } catch { /* ignore */ }
+  try { mkdirSync(path.dirname(LOG), { recursive: true }); appendFileSync(LOG, `${new Date().toISOString()}  agent=${AGENT}  ${m}\n`, 'utf8'); } catch { /* ignore */ }
 }
 function readState() {
   try {
