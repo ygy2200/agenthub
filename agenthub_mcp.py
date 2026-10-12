@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.29.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.30.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -761,6 +761,29 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 mood = f"（{n['mood']}）" if n["mood"] else ""
                 nl.append(f"· #{n['id']} {n['ts'][:10]}{mood} {n['content'][:80]}")
             out = out + "\n".join(nl)
+        # M10 工作台：开工即见「下一步该干什么」——前沿队列摘要（hub_next / GUI 工作台同源）。
+        # 按本项目过滤；本项目四段全空则回退全局（不漏别处的活）。只在有 ready/doing/takeover
+        # 时追加（全空=没有可干的事，不刷噪音）；异常降级不打断心跳。
+        try:
+            nxt = brain.task_next(root, project=project, limit=3)
+            if not any(nxt["counts"][k] for k in ("ready", "doing", "takeover")):
+                nxt = brain.task_next(root, limit=3)
+        except Exception:
+            nxt = None
+        if nxt and any(nxt["counts"][k] for k in ("ready", "doing", "takeover")):
+            c = nxt["counts"]
+            tl = ["", "[今日任务] " + " · ".join(
+                f"{brain.TASK_GROUP_CN[k]} {c[k]}"
+                for k in ("ready", "doing", "takeover", "waiting") if c[k])]
+            for t in nxt["ready"][:3]:
+                proj = f"{t['project']}｜" if t["project"] else ""
+                tl.append(f"  ▶ #{t['id']} [P{t['_priority']}] {proj}{t['title'][:50]}")
+            for t in nxt["doing"][:2]:
+                tl.append(f"  ● #{t['id']} [P{t['_priority']}] 进行中 @{t['owner'] or '?'} {t['title'][:40]}")
+            if c["takeover"]:
+                tl.append(f"  ⚑ 可接管 {c['takeover']} 条（超时无人动，hub_tasks 查看）")
+            tl.append("  选活 hub_next · 认领 hub_claim · 干完标 done 自动结晶")
+            out = out + "\n".join(tl)
         return out
 
     if name == "hub_report_error":

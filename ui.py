@@ -14,6 +14,7 @@ from uikit import __all__ as _uikit_all  # noqa: F401
 import actions  # noqa: F401
 
 from pages.project_page import ProjectPage  # noqa: F401
+from pages.today_page import TodayPage  # noqa: F401
 from pages.timeline_page import TimelinePage, VIRTUAL_THRESHOLD  # noqa: F401
 from pages.brain_page import BrainPage  # noqa: F401
 from pages.notes_page import NotesPage  # noqa: F401
@@ -30,7 +31,7 @@ from pages.help_page import HelpPage  # noqa: F401
 from pages.components_page import ComponentsPage  # noqa: F401
 from pages.settings_page import SettingsPage  # noqa: F401
 
-from window import AgentHubWindow, run_gui  # noqa: F401
+from window import AgentHubWindow, run_gui, _hard_exit  # noqa: F401
 
 
 if __name__ == "__main__":

@@ -1438,6 +1438,8 @@ TASK_CN = {"pending": "待办", "in_progress": "进行中", "blocked": "阻塞",
 CLAIM_TTL_HOURS = 2   # 认领超时自动释放（防死锁）：claimed_at 早于该时长的 in_progress 可被接管
 DEFAULT_PRIORITY = 2  # M1（2026-10-12）：任务缺省优先级（0急 1高 2中 3低）
 CRYSTAL_PREFIX = "结晶 #"  # M2：完成链结晶记录的标题前缀（幂等识别用）
+# M10：前沿队列四段中文名（hub_next / GUI 工作台 / 心跳开工推送同源，防文案漂移）
+TASK_GROUP_CN = {"ready": "可认领", "doing": "进行中", "takeover": "可接管", "waiting": "等待依赖"}
 
 EVENT_KINDS = ("progress", "note", "error", "handoff")
 

@@ -11,6 +11,7 @@
 PAGES = (
     ("overview_page", "总览", "HOME", "top", "home 首页 全局 仪表盘", 1),
     ("project_page", "项目", "FOLDER", "work", "project 项目列表 工作记录", 2),
+    ("today_page", "工作台", "DATE_TIME", "work", "today 工作台 今日 任务 前沿 待办 干活 该干什么", 0),
     ("timeline_page", "时间线", "HISTORY", "work", "timeline 动态 记录 历史", 3),
     ("hub_page", "Agent 中心", "PEOPLE", "work", "hub agent 技能 mcp 记忆 配置", 4),
     ("notes_page", "随记", "EDIT", "data", "notes 笔记 想法 顿悟 记录", 5),

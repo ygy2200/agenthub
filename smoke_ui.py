@@ -173,6 +173,35 @@ def main():
               len(w.brain_page.findChildren(QLabel)))
         check("大脑页重复reload无残留（进度条/按钮/标签数不变）",
               n1 == n2 and n1[0] >= 3 and n1[1] >= 1, f"{n1} -> {n2}")
+        # M10 工作台冒烟（v2.30）：前沿队列四段渲染 + 管理通道标记完成（done 触发 M2 自动结晶）
+        brain.task_add(str(tmp), "冒烟任务A", project="红色沙漠-存档备份", priority=0)
+        brain.task_add(str(tmp), "冒烟任务B", project="红色沙漠-存档备份", priority=1)
+        tid_c = brain.task_add(str(tmp), "冒烟任务C", project="红色沙漠-存档备份", priority=1)[1]
+        brain.task_claim(str(tmp), tid_c, "smoke")
+        w.today_page.reload()
+        check("工作台汇总含可认领/进行中",
+              "可认领 2" in w.today_page.sumLabel.text()
+              and "进行中 1" in w.today_page.sumLabel.text(), w.today_page.sumLabel.text())
+        check("工作台列表有分组标题+任务行", w.today_page.listw.count() >= 5,
+              str(w.today_page.listw.count()))
+        check("工作台任务行带优先级徽标",
+              any("[P0]" in w.today_page.listw.item(i).text()
+                  for i in range(w.today_page.listw.count())))
+        # 选中 doing 任务 → 点标记完成 → 状态 done + 自动结晶落库
+        for i in range(w.today_page.listw.count()):
+            it = w.today_page.listw.item(i)
+            t = w.today_page._item2task.get(id(it))
+            if t and t["id"] == tid_c:
+                w.today_page.listw.setCurrentItem(it)
+                break
+        w.today_page.mark_done()
+        with brain.db_conn(str(tmp)) as conn:
+            st = conn.execute("SELECT status FROM tasks WHERE id=?", (tid_c,)).fetchone()[0]
+            ncr = conn.execute("SELECT COUNT(*) FROM records WHERE record_type='crystal'").fetchone()[0]
+        check("工作台标记完成→任务done", st == "done", st)
+        check("工作台标记完成→自动结晶落库", ncr >= 1, str(ncr))
+        check("工作台完成后自动刷新（进行中清零）", "进行中 0" in w.today_page.sumLabel.text(),
+              w.today_page.sumLabel.text())
         # 统计页同类残留回归：set_db 两次后标签数不变（agentBox 行布局同 bug 的第二实例）
         w.stats_page.set_db(brain.stats(str(tmp)))
         m1 = len(w.stats_page.findChildren(QLabel))

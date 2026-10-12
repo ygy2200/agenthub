@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.29.0"
+    assert r["serverInfo"]["version"] == "2.30.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -238,6 +238,29 @@ def t_heartbeat_conflict(root):
     # agent 必填
     out = m.call_tool("hub_heartbeat", {"agent": "  "}, root)
     assert "必填" in out
+
+
+def t_heartbeat_today(root):
+    """M10：心跳开工推送「今日任务」段（hub_next 同源）——空库不刷/项目过滤/回退全局/排序。"""
+    root = str(root)
+    # 空库：四段全空 → 不追加（不刷噪音）
+    out = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "甲-问题"}, root)
+    assert "今日任务" not in out, out
+    brain.task_add(root, "修发布管线", project="甲-问题", priority=1)
+    brain.task_add(root, "补文档", project="甲-问题", priority=0)
+    brain.task_add(root, "别的项目的活", project="乙-问题", priority=0)
+    brain.task_claim(root, 2, "zcode")
+    # 按项目过滤：只见甲项目（1 ready P1 + 1 doing），不见乙项目
+    out = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "甲-问题"}, root)
+    assert "今日任务" in out and "可认领 1" in out and "进行中 1" in out, out
+    assert "▶ #1 [P1] 甲-问题｜修发布管线" in out, out
+    assert "● #2 [P0] 进行中 @zcode 补文档" in out, out
+    assert "乙-问题" not in out, "项目过滤失效"
+    # 无任务项目回退全局：丙-问题四段全空 → 回退看到甲乙全部
+    out = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "丙-问题"}, root)
+    assert "可认领 2" in out and "乙-问题" in out, out
+    # ready 排序：P0 的乙项目活排在 P1 前面
+    assert out.index("▶ #3 [P0]") < out.index("▶ #1 [P1]"), out
 
 
 def t_handoff_tool(root):
@@ -1143,6 +1166,7 @@ def main():
     case("P1-3 双链自动成 relation（MCP 写入路径）", lambda: t_links_extract(tmp))
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp, fresh_hub(tmp, "conc")))
     case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
+    case("M10 心跳开工推送今日任务（空库不刷/项目过滤/回退全局/P排序）", lambda: t_heartbeat_today(fresh_hub(tmp, "hbt")))
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))
     case("撤销（只切自己最新段/误伤检查/栈式撤销）", lambda: t_undo_log(fresh_hub(tmp, "undo")))
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
