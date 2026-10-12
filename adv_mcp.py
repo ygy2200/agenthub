@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.30.0"
+    assert r["serverInfo"]["version"] == "2.31.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -78,7 +78,7 @@ def t_protocol(root):
             "hub_next", "hub_crystallize",
             "hub_event_write", "hub_events",
             "hub_skill_match", "hub_skill_sync"} <= names, names
-    assert len(names) == 53  # M1+M2（2026-10-12）：51 + hub_next / hub_crystallize = 53
+    assert len(names) == 56  # M3 信号（2026-10-12）：53 + hub_signal_send / hub_signals / hub_signal_read = 56
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -261,6 +261,23 @@ def t_heartbeat_today(root):
     assert "可认领 2" in out and "乙-问题" in out, out
     # ready 排序：P0 的乙项目活排在 P1 前面
     assert out.index("▶ #3 [P0]") < out.index("▶ #1 [P1]"), out
+    # M3 未读信号联动（开工推送第二段）：发两条 → dsh 心跳见 2 条 → 标一条 → 剩 1 条
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "甲-问题"}, root)
+    assert "未读信号" not in out, out
+    m.call_tool("hub_signal_send", {"agent": "zcode", "to_agent": "dsh",
+                                    "content": "来验收", "project": "甲-问题"}, root)
+    m.call_tool("hub_signal_send", {"agent": "zcode", "content": "广播：exe 更新",
+                                    "kind": "alert"}, root)
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "甲-问题"}, root)
+    assert "[未读信号] 2 条" in out and "来验收" in out and "广播：exe 更新" in out, out
+    box = brain.signal_inbox(root, "dsh", unread_only=True)
+    assert len(box) == 2, box
+    m.call_tool("hub_signal_read", {"signal_id": box[0]["id"], "agent": "dsh"}, root)
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "甲-问题"}, root)
+    assert "[未读信号] 1 条" in out, out
+    # 自发广播不进发件人自己的未读（收件箱仍显示，留痕用）
+    out2 = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "甲-问题"}, root)
+    assert "未读信号" not in out2, out2
 
 
 def t_handoff_tool(root):

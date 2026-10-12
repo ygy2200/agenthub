@@ -302,6 +302,27 @@ CREATE TABLE IF NOT EXISTS tasks (
     done_at TEXT DEFAULT "",
     created_by TEXT DEFAULT ""
 );
+-- M3 信号（2026-10-12）：agent 间直接消息 + 已读回执。to_agent 空=广播。
+-- 已读按收件人逐人记（signal_reads），广播才有「全员回执」语义；signals.status 是
+-- 冗余的汇总态（unread→read，供列表一眼看），权威在 signal_reads。
+CREATE TABLE IF NOT EXISTS signals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT "",
+    from_agent TEXT DEFAULT "",
+    to_agent TEXT DEFAULT "",
+    project TEXT DEFAULT "",
+    kind TEXT DEFAULT "msg",
+    content TEXT DEFAULT "",
+    status TEXT DEFAULT "unread",
+    read_at TEXT DEFAULT "",
+    read_by TEXT DEFAULT ""
+);
+CREATE TABLE IF NOT EXISTS signal_reads (
+    signal_id INTEGER,
+    agent TEXT,
+    read_at TEXT DEFAULT "",
+    PRIMARY KEY (signal_id, agent)
+);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT DEFAULT "",
@@ -3629,6 +3650,107 @@ def claim_handoff(root: str, handoff_id, agent: str) -> str:
             return f"交接 #{handoff_id} 已被 {row['claimed_by'] or '他人'} 认领（status={row['status']}），不可重复认领"
     journal_add(root, agent, "认领交接", target=f"handoffs#{handoff_id}")
     return f"已认领交接 #{handoff_id}（接手人：{agent}）"
+
+
+# ---------------------------------------------------------------- 信号（M3）
+
+SIGNAL_KINDS = ("msg", "ack_request", "alert")
+
+
+def signal_send(root: str, from_agent: str, content: str, to_agent: str = "",
+                kind: str = "msg", project: str = "") -> tuple:
+    """M3 发信号：from → to（to 空=广播，全员可见）。返回 (提示或错误, 信号 id)。
+
+    与 handoff 的分工：handoff 是「项目移交」（挂项目、typed 字段、待认领），
+    signal 是「agent 间直接消息」（点对点/广播、已读回执、心跳提醒）。
+    to 不在册不拒（新 agent 首秀可能还没心跳过），但返回里带拼写提醒。"""
+    who = _norm_agent(from_agent)
+    if not who:
+        return "from_agent 必填", 0
+    content = (content or "").strip()
+    if not content:
+        return "content 必填", 0
+    kind = kind if kind in SIGNAL_KINDS else "msg"
+    to = _norm_agent(to_agent) or ""
+    if to == who:
+        return "不能给自己发信号（收件箱里你自己的广播也能看到）", 0
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "INSERT INTO signals(ts,from_agent,to_agent,project,kind,content) VALUES(?,?,?,?,?,?)",
+            (_now(), who, to, (project or "").strip(), kind, content[:2000]))
+        sid = cur.lastrowid
+        known = bool(to) and bool(conn.execute(
+            "SELECT 1 FROM agents WHERE name=?", (to,)).fetchone())
+    note = f"{'→' + to if to else '→广播'}（{kind}）"
+    if project.strip():
+        note += f" [{project.strip()}]"
+    journal_add(root, who, "发送信号", target=f"signals#{sid}", note=note)
+    tip = f"已发送信号 #{sid}"
+    if to and not known:
+        tip += f"（提醒：{to} 未在册，可能拼错——hub_agents 可查在册名单）"
+    return tip, sid
+
+
+def signal_inbox(root: str, agent: str, unread_only: bool = False,
+                 limit: int = 30) -> list:
+    """收件箱：发给我的 + 广播（to 空），新的在前；每行附 _read（我是否已读）。
+    unread_only=True 只要未读。自己发的广播也在（群里自己发的也显示）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return []
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM signals WHERE to_agent=? OR to_agent='' "
+            "ORDER BY id DESC LIMIT ?", (who, max(1, min(int(limit or 30), 200))))]
+        for r in rows:
+            r["_read"] = bool(conn.execute(
+                "SELECT 1 FROM signal_reads WHERE signal_id=? AND agent=?",
+                (r["id"], who)).fetchone())
+        if unread_only:
+            rows = [r for r in rows if not r["_read"]]
+    return rows
+
+
+def signal_mark_read(root: str, signal_id, agent: str) -> str:
+    """标记已读（幂等：signal_reads 按 (signal, agent) 主键 UPSERT，广播按人各记一次）。
+    只能标自己的（点对点非我勿动；广播谁都能标）。返回提示或错误。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填"
+    try:
+        sid = int(signal_id)
+    except (TypeError, ValueError):
+        return f"信号 id 非法：{signal_id!r}"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT id, to_agent FROM signals WHERE id=?", (sid,)).fetchone()
+        if not row:
+            return f"信号 #{sid} 不存在"
+        if row["to_agent"] and row["to_agent"] != who:
+            return f"信号 #{sid} 是发给 {row['to_agent']} 的，你不能标已读"
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO signal_reads(signal_id,agent,read_at) VALUES(?,?,?)",
+            (sid, who, _now()))
+        if cur.rowcount == 0:
+            return f"信号 #{sid} 你已读过（幂等，不重复记）"
+        # 汇总态刷新（冗余字段；权威在 signal_reads）
+        conn.execute("UPDATE signals SET status='read', read_at=?, read_by=? WHERE id=?",
+                     (_now(), who, sid))
+    journal_add(root, who, "已读信号", target=f"signals#{sid}")
+    return f"信号 #{sid} 已标已读"
+
+
+def signal_unread_count(root: str, agent: str) -> int:
+    """未读数（心跳开工推送用）：发给我的 + 广播里我没读的。
+    排除自己发的广播——提醒自己去读自己发的消息没有意义（收件箱仍显示，留痕用）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return 0
+    with db_conn(root) as conn:
+        return conn.execute(
+            "SELECT COUNT(*) FROM signals s WHERE s.from_agent!=? "
+            "AND (s.to_agent=? OR s.to_agent='') "
+            "AND NOT EXISTS (SELECT 1 FROM signal_reads r "
+            "WHERE r.signal_id=s.id AND r.agent=?)", (who, who, who)).fetchone()[0]
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:

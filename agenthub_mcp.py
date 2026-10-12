@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.30.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.31.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -784,6 +784,21 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 tl.append(f"  ⚑ 可接管 {c['takeover']} 条（超时无人动，hub_tasks 查看）")
             tl.append("  选活 hub_next · 认领 hub_claim · 干完标 done 自动结晶")
             out = out + "\n".join(tl)
+        # M3 未读信号（开工即见别人@你的消息）：有未读才追加，top2 摘要；异常降级不打断心跳
+        try:
+            n_un = brain.signal_unread_count(root, agent)
+        except Exception:
+            n_un = 0
+        if n_un:
+            try:
+                inbox = brain.signal_inbox(root, agent, unread_only=True, limit=2)
+            except Exception:
+                inbox = []
+            sl = ["", f"[未读信号] {n_un} 条（hub_signals 查收 · hub_signal_read 标已读）："]
+            for s in inbox:
+                to = f"→{s['to_agent']}" if s["to_agent"] else "→广播"
+                sl.append(f"  ● #{s['id']} {s['ts'][5:16]} 来自 {s['from_agent']}{to}：{s['content'][:60]}")
+            out = out + "\n".join(sl)
         return out
 
     if name == "hub_report_error":
@@ -1160,6 +1175,37 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"  已排除：{r['excluded'][:80]}")
         return "\n".join(lines)
 
+    if name == "hub_signal_send":
+        tip, sid = brain.signal_send(root, str(arguments.get("agent", "")),
+                                     str(arguments.get("content", "")),
+                                     to_agent=str(arguments.get("to_agent", "")),
+                                     kind=str(arguments.get("kind", "msg")),
+                                     project=str(arguments.get("project", "")))
+        if not sid:
+            return f"错误：{tip}"
+        return tip + "\n对方用 hub_signals 查收；未读时其下次心跳会自动提醒"
+
+    if name == "hub_signals":
+        rows = brain.signal_inbox(root, str(arguments.get("agent", "")),
+                                  bool(arguments.get("unread_only", False)))
+        if not rows:
+            return ("（无未读信号）" if arguments.get("unread_only")
+                    else "（收件箱空。hub_signal_send 给其他 agent 发消息；to_agent 留空=广播）")
+        n_unread = sum(1 for r in rows if not r["_read"])
+        lines = [f"信号 {len(rows)} 条（未读 {n_unread}，新在上）："]
+        for r in rows:
+            to = f"→{r['to_agent']}" if r["to_agent"] else "→广播"
+            dot = "·" if r["_read"] else "●"
+            proj = f" [{r['project']}]" if r["project"] else ""
+            lines.append(f"{dot} #{r['id']} {r['ts'][5:16]} {r['from_agent']}{to}{proj}"
+                         f"（{r['kind']}）{r['content'][:80]}")
+        lines.append("标已读：hub_signal_read(signal_id, agent)")
+        return "\n".join(lines)
+
+    if name == "hub_signal_read":
+        return brain.signal_mark_read(root, arguments.get("signal_id"),
+                                      str(arguments.get("agent", "")))
+
     if name == "hub_report":
         import report
         path = report.generate_report(root)
@@ -1402,6 +1448,28 @@ TOOLS = [
                                     "excluded": {"type": "string", "description": "create：哪些路已排除（防接手方重蹈）"},
                                     "handoff_id": {"type": "integer", "description": "claim：交接 id"},
                                     "include_claimed": {"type": "boolean", "description": "list：含已认领"}}}},
+    {"name": "hub_signal_send",
+     "description": "M3 发信号：给指定 agent 发消息（to_agent），或留空广播给全员。对方下次心跳自动收到未读提醒；已读有回执。与 hub_handoff 分工：signal=agent 间直接消息，handoff=项目移交（typed 上下文+认领）",
+     "inputSchema": {"type": "object",
+                     "properties": {"agent": {"type": "string", "description": "你的 agent 名（发件人）"},
+                                    "to_agent": {"type": "string", "description": "收件人 agent 名；留空=广播（全员可见）"},
+                                    "content": {"type": "string", "description": "消息内容（必填）"},
+                                    "kind": {"type": "string", "enum": list(brain.SIGNAL_KINDS),
+                                             "description": "msg 普通消息 / ack_request 需回执 / alert 告警"},
+                                    "project": {"type": "string", "description": "关联项目，可空"}},
+                     "required": ["agent", "content"]}},
+    {"name": "hub_signals",
+     "description": "M3 信号收件箱：发给我的 + 广播，未读（●）置顶标；unread_only=1 只要未读。与 hub_events 分工：signal=需消费的消息（已读回执），events=只增事件流（订阅式）",
+     "inputSchema": {"type": "object",
+                     "properties": {"agent": {"type": "string", "description": "你的 agent 名"},
+                                    "unread_only": {"type": "boolean", "description": "只要未读"},
+                                    "limit": {"type": "integer", "description": "条数，默认 30"}}}},
+    {"name": "hub_signal_read",
+     "description": "M3 标记信号已读（回执）：幂等，广播按人各记一次；只能标发给自己的（或广播）",
+     "inputSchema": {"type": "object",
+                     "properties": {"signal_id": {"type": "integer", "description": "信号 id"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"}},
+                     "required": ["signal_id", "agent"]}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1556,6 +1624,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_env_list", "hub_env_set", "hub_handoff", "hub_audit", "hub_flush_index",
     "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks", "hub_next", "hub_crystallize",
     "hub_event_write", "hub_events",
+    "hub_signal_send", "hub_signals", "hub_signal_read",  # M3 信号：协作总线要给干活的 agent
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
@@ -1572,6 +1641,7 @@ WRITE_TOOLS = {
     "hub_ops_run", "hub_handoff", "hub_report", "hub_flush_index",
     "hub_task_add", "hub_task_update", "hub_claim", "hub_crystallize", "hub_event_write",
     "hub_skill_sync",  # 技能原生化：写索引（走 dry_run/confirm 闸门）
+    "hub_signal_send", "hub_signal_read",  # M3 信号：发消息/标已读
 }
 
 

@@ -1867,6 +1867,57 @@ def t_task_graph(tmp):
     assert (live, dead, ttl) == (2, 1, 3), (live, dead, ttl, s5)
 
 
+def t_signals(tmp):
+    """M3 信号（2026-10-12）：点对点/广播/收件箱过滤/已读回执（幂等+非我勿动）/未读计数。
+
+    与 handoff 的分工验证：handoff=项目移交（typed+认领），signal=agent 间直接消息（回执）。"""
+    root = str(Path(tmp) / "hub_signals")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "zcode", "甲-问题")
+    brain.heartbeat_touch(root, "dsh", "甲-问题")
+    # 1) 发送：点对点 / 广播 / 拒收三连（自发/空 content/空 from）
+    tip, sid = brain.signal_send(root, "zcode", "发布管线修好了，来验",
+                                 to_agent="dsh", project="甲-问题")
+    assert tip.startswith("已发送") and sid == 1, (tip, sid)
+    tip2, sid2 = brain.signal_send(root, "zcode", "大家注意：exe 已更新", kind="alert")
+    assert sid2 == 2, tip2
+    e, z = brain.signal_send(root, "zcode", "备忘", to_agent="zcode")
+    assert z == 0 and "自己" in e, (e, z)
+    e, z = brain.signal_send(root, "zcode", "   ")
+    assert z == 0 and "content" in e, (e, z)
+    e, z = brain.signal_send(root, "", "x", to_agent="dsh")
+    assert z == 0 and "from_agent" in e, (e, z)
+    # 2) 拼错名：允许发（新 agent 可能没心跳过），但带在册提醒
+    tip3, sid3 = brain.signal_send(root, "zcode", "在吗", to_agent="zsode")
+    assert sid3 == 3 and "未在册" in tip3, tip3
+    # 3) 收件箱过滤：dsh 只见 #2 广播 + #1 点对点（#3 是 zsode 的看不到）；
+    #    zcode 只见自己的广播 #2（自己发的点对点不进自己箱）
+    assert [s["id"] for s in brain.signal_inbox(root, "dsh")] == [2, 1]
+    assert [s["id"] for s in brain.signal_inbox(root, "zcode")] == [2]
+    # 4) 未读计数：dsh=2；zcode 自发广播不计（提醒自己读自己发的没意义）
+    assert brain.signal_unread_count(root, "dsh") == 2
+    assert brain.signal_unread_count(root, "zcode") == 0
+    # 5) 已读回执：幂等 + 未读数只减一次
+    assert "已标已读" in brain.signal_mark_read(root, 1, "dsh")
+    assert "已读过" in brain.signal_mark_read(root, 1, "dsh")
+    assert brain.signal_unread_count(root, "dsh") == 1
+    # 6) 非我勿动：zcode 不能标 dsh 的点对点；广播谁都能标（按人各记一次）
+    assert "不能标已读" in brain.signal_mark_read(root, 1, "zcode")
+    assert "已标已读" in brain.signal_mark_read(root, 2, "dsh")
+    assert "已标已读" in brain.signal_mark_read(root, 2, "zcode")
+    assert brain.signal_unread_count(root, "dsh") == 0
+    # 7) unread_only 过滤 + 非法/不存在 id
+    assert brain.signal_inbox(root, "dsh", unread_only=True) == []
+    assert "非法" in brain.signal_mark_read(root, "abc", "dsh")
+    assert "不存在" in brain.signal_mark_read(root, 999, "dsh")
+    # 8) 落库形态：signal_reads 三条（#1 dsh / #2 dsh / #2 zcode），汇总态刷新
+    with brain.db_conn(root) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM signal_reads").fetchone()[0] == 3
+        row = conn.execute("SELECT status, read_by FROM signals WHERE id=1").fetchone()
+        assert row["status"] == "read" and row["read_by"] == "dsh"
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -1885,6 +1936,7 @@ def t_tool_schema_sync(tmp):
     for tool in ("hub_task_update", "hub_tasks"):
         assert set(enum_of(tool, "status")) == set(brain.TASK_STATUSES), f"{tool}.status 漂移"
     assert set(enum_of("hub_event_write", "kind")) == set(brain.EVENT_KINDS), "hub_event_write.kind 漂移"
+    assert set(enum_of("hub_signal_send", "kind")) == set(brain.SIGNAL_KINDS), "hub_signal_send.kind 漂移"
 
 
 def t_gap_note(tmp):
@@ -2128,6 +2180,7 @@ def main():
     case("agent 活跃度回填（存量补 last_seen/不覆盖/不妄填/幂等，修「谁静默了不可判定」）", lambda: t_agents_lastseen(tmp))
     case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
     case("任务工作图（M1：deps 阻塞/自动解阻/优先级前沿/认领门 + M2：完成自动结晶/幂等/force 重做）", lambda: t_task_graph(tmp))
+    case("M3 信号（点对点/广播/收件箱过滤/已读回执幂等/非我勿动/未读计数排自发）", lambda: t_signals(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()
