@@ -1812,6 +1812,61 @@ def t_agents_lastseen(tmp):
             "SELECT last_seen FROM agents WHERE name='ghost'").fetchone()[0] == ""
 
 
+def t_task_graph(tmp):
+    """M1 任务工作图 + M2 完成结晶（2026-10-12）：
+    deps 阻塞与自动解阻 / 认领门（前置未完成拒认领）/ 优先级前沿排序 /
+    完成自动结晶（含关联记录计数、幂等、force 重做软删旧结晶）。"""
+    root = str(Path(tmp) / "hub_taskgraph")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    # 1) 依赖门：B 依赖 A → A 未完成前 B 不进前沿、不可认领
+    _, a = brain.task_add(root, "地基", project="甲-问题", agent="zcode", priority=2)
+    _, b = brain.task_add(root, "上梁", project="甲-问题", agent="zcode", priority=1, deps=str(a))
+    nxt = brain.task_next(root)
+    assert [t["id"] for t in nxt["ready"]] == [a], nxt
+    assert [t["id"] for t in nxt["waiting"]] == [b], nxt
+    err, _ = brain.task_claim(root, b, "zcode")
+    assert "前置未完成" in err, err
+    # 2) A 完成 → 自动结晶（M2）+ B 自动解阻进前沿
+    err, row = brain.task_update(root, a, status="done", agent="zcode")
+    assert not err and row["status"] == "done"
+    assert "结晶完成" in (row.get("crystal") or ""), row.get("crystal")
+    nxt = brain.task_next(root)
+    assert [t["id"] for t in nxt["ready"]] == [b], nxt
+    # 3) 优先级排序：P3 后建也要排在 P1 后面
+    _, c = brain.task_add(root, "顺手活", project="甲-问题", agent="zcode", priority=3)
+    nxt = brain.task_next(root)
+    assert [t["id"] for t in nxt["ready"]] == [b, c], nxt
+    # 4) 未完成拒结晶 / 完成后自动结晶且只收同项目非结晶记录（A 的结晶不算进 B 的链）
+    err2, _ = brain.task_crystallize(root, b)
+    assert "尚未完成" in err2, err2
+    err, _ = brain.task_claim(root, b, "zcode")
+    assert not err, err
+    brain.add_record(root, "甲-问题", "zcode", "2026-10-12", "干活记录", "正文")
+    err3, row3 = brain.task_update(root, b, status="done", agent="zcode")
+    assert not err3 and "结晶完成" in (row3.get("crystal") or ""), row3.get("crystal")
+    with brain.db_conn(root) as conn:
+        n1 = conn.execute("SELECT COUNT(*) FROM records WHERE record_type='crystal'").fetchone()[0]
+        bc = conn.execute("SELECT content FROM records WHERE record_type='crystal' AND title LIKE ?",
+                          (f"结晶 #{b}：%",)).fetchone()[0]
+    assert n1 == 2, n1  # A、B 各一条
+    assert "关联记录 1 条" in bc, bc[:200]
+    # 5) 幂等：重复调用不新增
+    _, s4 = brain.task_crystallize(root, b)
+    with brain.db_conn(root) as conn:
+        n2 = conn.execute("SELECT COUNT(*) FROM records WHERE record_type='crystal'").fetchone()[0]
+    assert n2 == n1 and "已存在" in s4, (n2, s4)
+    # 6) force 重做：旧结晶软删（可追溯），现行仍只有 A、B 各一条
+    _, s5 = brain.task_crystallize(root, b, force=True)
+    with brain.db_conn(root) as conn:
+        live = conn.execute("SELECT COUNT(*) FROM records WHERE record_type='crystal' "
+                            "AND status='active'").fetchone()[0]
+        dead = conn.execute("SELECT COUNT(*) FROM records WHERE record_type='crystal' "
+                            "AND status='deleted'").fetchone()[0]
+        ttl = conn.execute("SELECT COUNT(*) FROM records WHERE record_type='crystal'").fetchone()[0]
+    assert (live, dead, ttl) == (2, 1, 3), (live, dead, ttl, s5)
+
+
 def t_tool_schema_sync(tmp):
     """工具 schema 与源头常量同步（2026-10-12 修）：hub_ops_run.name 的 enum 曾是**手抄的 10 项**，
     而 ops.CHECKS 已 15 项 → release/agents/ponytail_gate/coverage_gate/rules_health
@@ -2072,6 +2127,7 @@ def main():
     case("项目归属（写入即落/存量回填/前缀目录/保留目录剔除/幂等，修「归属:未知」）", lambda: t_project_owner(tmp))
     case("agent 活跃度回填（存量补 last_seen/不覆盖/不妄填/幂等，修「谁静默了不可判定」）", lambda: t_agents_lastseen(tmp))
     case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
+    case("任务工作图（M1：deps 阻塞/自动解阻/优先级前沿/认领门 + M2：完成自动结晶/幂等/force 重做）", lambda: t_task_graph(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     shutil_rmtree(tmp)
     print()

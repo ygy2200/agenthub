@@ -31,7 +31,7 @@ KINDS = ("fact", "preference", "lesson", "project", "note")
 KIND_CN = {"fact": "环境事实", "preference": "用户偏好", "lesson": "踩坑经验",
            "project": "项目进展", "note": "随手记", "error": "踩坑登记"}
 # P1-2 记录类型枚举（schema 收口）：写入即校验；含「## 决策记录」段自动推断 decision
-RECORD_TYPES = ("work_log", "decision", "todo", "note")
+RECORD_TYPES = ("work_log", "decision", "todo", "note", "crystal")
 RECORD_TYPE_CN = {"work_log": "工作记录", "decision": "决策", "todo": "待办", "note": "随记"}
 SESSION_TTL = 1800     # 「在线」判定窗口（秒）：active_sessions/hub_status/list_agents 打 live 标用
 SESSION_ACTIVE = 300   # 同项目"正在工作"判定窗口（秒）
@@ -294,6 +294,9 @@ CREATE TABLE IF NOT EXISTS tasks (
     owner TEXT DEFAULT "",
     claimed_at TEXT DEFAULT "",
     blocked_by TEXT DEFAULT "",
+    priority INTEGER DEFAULT 2,
+    deps TEXT DEFAULT "",
+    due TEXT DEFAULT "",
     created TEXT DEFAULT "",
     updated TEXT DEFAULT "",
     done_at TEXT DEFAULT "",
@@ -721,6 +724,13 @@ def _migrate_columns(root: str) -> None:
             conn.execute("UPDATE records SET record_type=CASE WHEN content LIKE '%## 决策记录%' "
                          "THEN 'decision' ELSE 'work_log' END "
                          "WHERE record_type IS NULL OR record_type=''")
+        # M1（2026-10-12）任务工作图：priority(0急~3低,默认2) / deps(前置任务 id,逗号分隔) / due(截止日)
+        tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        for col, ddl in (("priority", "INTEGER DEFAULT 2"),
+                         ("deps", "TEXT DEFAULT ''"),
+                         ("due", "TEXT DEFAULT ''")):
+            if col not in tcols:
+                conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -1426,6 +1436,8 @@ def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:
 TASK_STATUSES = ("pending", "in_progress", "blocked", "done")
 TASK_CN = {"pending": "待办", "in_progress": "进行中", "blocked": "阻塞", "done": "完成"}
 CLAIM_TTL_HOURS = 2   # 认领超时自动释放（防死锁）：claimed_at 早于该时长的 in_progress 可被接管
+DEFAULT_PRIORITY = 2  # M1（2026-10-12）：任务缺省优先级（0急 1高 2中 3低）
+CRYSTAL_PREFIX = "结晶 #"  # M2：完成链结晶记录的标题前缀（幂等识别用）
 
 EVENT_KINDS = ("progress", "note", "error", "handoff")
 
@@ -1437,18 +1449,27 @@ def _claim_cutoff() -> str:
 
 
 def task_add(root: str, title: str, project: str = "", detail: str = "",
-             blocked_by: str = "", agent: str = "") -> tuple:
-    """新建任务（P3-2 状态机入口）。返回 (错误或 "", 任务 id)。"""
+             blocked_by: str = "", agent: str = "", priority=2,
+             deps: str = "", due: str = "") -> tuple:
+    """新建任务（P3-2 状态机入口；M1 加工作图字段）。
+    priority：0急~3低（缺省 2）；deps：前置任务 id 逗号分隔（未完成前不会被 hub_next
+    推荐、不可认领）；due：截止日（可空）。返回 (错误或 "", 任务 id)。"""
     title = (title or "").strip()
     if not title:
         return "title 必填", 0
+    try:
+        pr = max(0, min(int(priority), 3))
+    except (TypeError, ValueError):
+        pr = DEFAULT_PRIORITY
+    deps_norm = ",".join(str(x) for x in _parse_task_deps(deps))[:200]
     with db_conn(root) as conn:
         cur = conn.execute(
-            "INSERT INTO tasks(project,title,detail,status,blocked_by,created,updated,created_by) "
-            "VALUES(?,?,?,?,?,?,?,?)",
+            "INSERT INTO tasks(project,title,detail,status,blocked_by,priority,deps,due,"
+            "created,updated,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
             (project.strip(), title[:200], (detail or "").strip()[:2000],
              "blocked" if (blocked_by or "").strip() else "pending",
-             (blocked_by or "").strip()[:200], _now(), _now(), _norm_agent(agent) or ""))
+             (blocked_by or "").strip()[:200], pr, deps_norm, (due or "").strip()[:20],
+             _now(), _now(), _norm_agent(agent) or ""))
         return "", cur.lastrowid
 
 
@@ -1474,7 +1495,7 @@ def task_list(root: str, status: str = "", owner: str = "", project: str = "",
 
 
 def task_claim(root: str, tid, agent: str) -> tuple:
-    """原子认领（P3-2）：pending → in_progress(owner)。
+    """原子认领（P3-2）：pending → in_progress(owner)。M1：前置（deps）未全部完成时拒绝认领。
     并发安全：单条 UPDATE…WHERE（前置条件全写进 SQL）+ rowcount 判胜负（SQLite 写事务天然串行，
     两家同时 claim 只可能一家 rowcount=1）。超时自动释放：in_progress 且 claimed_at 早于 TTL
     的可被他人接管（防死锁）。返回 (错误或 "", 任务行 dict)。"""
@@ -1488,6 +1509,17 @@ def task_claim(root: str, tid, agent: str) -> tuple:
     now = _now()
     cutoff = _claim_cutoff()
     with db_conn(root) as conn:
+        pre = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if pre is None:
+            return f"任务 #{tid} 不存在", {}
+        pre = dict(pre)
+        waiting = _task_deps_waiting(conn, pre)
+        if waiting:
+            names = "、".join(
+                f"#{w['id']} {w['title'][:20]}（{TASK_CN.get(w['status'], w['status'])}）"
+                for w in waiting[:4])
+            more = " 等" if len(waiting) > 4 else ""
+            return f"认领失败：任务 #{tid} 前置未完成——等待 {names}{more}", pre
         cur = conn.execute(
             "UPDATE tasks SET status='in_progress', owner=?, claimed_at=?, updated=? "
             "WHERE id=? AND status<>'done' AND ("
@@ -1513,10 +1545,14 @@ def task_claim(root: str, tid, agent: str) -> tuple:
 
 
 def task_update(root: str, tid, status: str = "", agent: str = "",
-                blocked_by: str = "", detail: str = "") -> tuple:
-    """任务状态流转（P3-2）：pending/in_progress/blocked/done。
+                blocked_by: str = "", detail: str = "", priority=None,
+                deps: str = "", due: str = "") -> tuple:
+    """任务状态流转（P3-2 + M1）：pending/in_progress/blocked/done。
     持有者约束：in_progress 任务只有 owner 本人（或空 agent=管理面）可流转；
-    →pending 释放并清 owner；→done 记 done_at；done 后不可再改。返回 (错误或 "", 行 dict)。"""
+    →pending 释放并清 owner；→done 记 done_at 并**自动结晶**（M2：独立事务，失败只降级为
+    提示、不影响状态流转，结果附在返回行的 crystal 键）；done 后不可再改。
+    M1 新字段：priority(0~3) / deps(前置 id，传 "-" 清除) / due(截止日，传 "-" 清除)。
+    返回 (错误或 "", 行 dict)。"""
     who = _norm_agent(agent) or ""
     try:
         tid = int(tid)
@@ -1524,6 +1560,7 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
         return f"任务 id 非法：{tid!r}", {}
     if status and status not in TASK_STATUSES:
         return f"status 只能是 {'/'.join(TASK_STATUSES)}", {}
+    became_done = False
     with db_conn(root) as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
         if row is None:
@@ -1534,6 +1571,7 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
         if (row["status"] == "in_progress" and row["owner"] and who
                 and row["owner"] != who):
             return f"任务 #{tid} 由 {row['owner']} 持有，只有持有者（或空传 agent）可流转", row
+        became_done = bool(status == "done" and row["status"] != "done")
         sets: list = []
         args: list = []
         if status:
@@ -1556,12 +1594,182 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
         if (detail or "").strip():
             sets.append("detail=?")
             args.append(detail.strip()[:2000])
+        if priority is not None and str(priority).strip() != "":
+            try:
+                sets.append("priority=?")
+                args.append(max(0, min(int(priority), 3)))
+            except (TypeError, ValueError):
+                pass
+        ds = (deps or "").strip()
+        if ds:
+            if ds == "-":
+                sets.append("deps=''")
+            else:
+                sets.append("deps=?")
+                args.append(",".join(str(x) for x in _parse_task_deps(ds))[:200])
+        du = (due or "").strip()
+        if du:
+            if du == "-":
+                sets.append("due=''")
+            else:
+                sets.append("due=?")
+                args.append(du[:20])
         if not sets:
-            return "没有要更新的字段（status/blocked_by/detail 至少传一个）", row
+            return ("没有要更新的字段（status/blocked_by/detail/priority/deps/due "
+                    "至少传一个）", row)
         sets.append("updated=?")
         args.append(_now())
         conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", (*args, tid))
-        return "", dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+        out = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+    if became_done:
+        # M2 完成链自动结晶：独立事务，失败只降级为提示、不影响状态流转
+        try:
+            cerr, csum = task_crystallize(root, tid)
+            out["crystal"] = csum if not cerr else f"未结晶（{cerr}）"
+        except Exception as e:  # noqa: BLE001
+            out["crystal"] = f"结晶异常（{type(e).__name__}: {str(e)[:80]}）"
+    return "", out
+
+
+def _parse_task_deps(deps) -> list:
+    """'12, 15 #20' → [12, 15, 20]（全/半角逗号、空白、# 前缀都认；去重保序；非法项丢弃）。"""
+    out: list = []
+    for part in re.split(r"[,\s，、;；]+", str(deps or "")):
+        part = part.strip().lstrip("#")
+        if not part:
+            continue
+        try:
+            n = int(part)
+        except ValueError:
+            continue
+        if n > 0 and n not in out:
+            out.append(n)
+    return out
+
+
+def _task_deps_waiting(conn, row: dict) -> list:
+    """任务的未完成前置清单 [{'id','title','status'}]；全完成 → []。
+    前置 id 不存在也算等待（拼写错误要可见——静默放行比卡住更坏）。"""
+    deps = _parse_task_deps(row.get("deps"))
+    if not deps:
+        return []
+    marks = ",".join("?" * len(deps))
+    rows = {r["id"]: dict(r) for r in conn.execute(
+        f"SELECT id,title,status FROM tasks WHERE id IN ({marks})", deps)}
+    waiting = []
+    for d in deps:
+        r = rows.get(d)
+        if r is None:
+            waiting.append({"id": d, "title": "(不存在)", "status": "missing"})
+        elif r["status"] != "done":
+            waiting.append(r)
+    return waiting
+
+
+def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> dict:
+    """M1 前沿队列（Frontier）：依赖已满足、可直接开工的待办推荐；附进行中/可接管/等待。
+    排序：priority（0 急 → 3 低）→ id（先来先做）。纯只读。返回结构化 dict 供 MCP 层排版。"""
+    try:
+        lim = max(1, min(int(limit or 5), 20))
+    except (TypeError, ValueError):
+        lim = 5
+    q = "SELECT * FROM tasks WHERE status IN ('pending','in_progress','blocked')"
+    args: list = []
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(q, args)]
+        cutoff = _claim_cutoff()
+        me = _norm_agent(owner) or ""
+        ready, doing, takeover, waiting = [], [], [], []
+        for r in rows:
+            try:
+                r["_priority"] = int(r.get("priority"))
+            except (TypeError, ValueError):
+                r["_priority"] = DEFAULT_PRIORITY
+            if r["status"] == "in_progress":
+                expired = bool(r["claimed_at"]) and r["claimed_at"] < cutoff
+                if expired and r["owner"] != me:
+                    takeover.append(r)
+                elif (not me) or r["owner"] == me:
+                    doing.append(r)
+                continue
+            wait = _task_deps_waiting(conn, r)
+            if r["status"] == "blocked" or wait or (r["blocked_by"] or "").strip():
+                r["_wait"] = wait
+                waiting.append(r)
+            else:
+                ready.append(r)
+    ready.sort(key=lambda t: (t["_priority"], t["id"]))
+    doing.sort(key=lambda t: (t["_priority"], t["id"]))
+    waiting.sort(key=lambda t: (t["_priority"], t["id"]))
+    return {"ready": ready[:lim], "doing": doing[:lim], "takeover": takeover[:lim],
+            "waiting": waiting[:lim],
+            "counts": {"ready": len(ready), "doing": len(doing),
+                       "takeover": len(takeover), "waiting": len(waiting)}}
+
+
+def task_crystallize(root: str, tid, force: bool = False) -> tuple:
+    """M2 完成链结晶：把已完成任务的完成过程（任务本身 + 完成期间的同项目记录）
+    聚合为一条 record_type='crystal' 的工作记录——「做过什么、结果是什么」可回顾。
+    原记录不删（可追溯）；幂等：同任务已有结晶则复用（force=true 软删旧结晶后重做）。
+    返回 (错误或 "", 摘要文本)。"""
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return f"任务 id 非法：{tid!r}", ""
+    olds: list = []
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            return f"任务 #{tid} 不存在", ""
+        row = dict(row)
+        if row["status"] != "done":
+            return (f"任务 #{tid} 尚未完成（{TASK_CN.get(row['status'], row['status'])}），"
+                    "完成后再结晶"), ""
+        if not (row["project"] or "").strip():
+            return f"任务 #{tid} 无项目归属，无法结晶（先给任务补 project）", ""
+        olds = [int(r["id"]) for r in conn.execute(
+            "SELECT id FROM records WHERE record_type='crystal' AND status='active' "
+            "AND title LIKE ?", (CRYSTAL_PREFIX + f"{tid}：%",))]
+        if olds and not force:
+            return "", f"已存在结晶（记录 #{olds[0]}；force=true 可重做）"
+        rec_sql = ("SELECT id, agent, date, title FROM records WHERE project=? "
+                   "AND status='active' AND record_type!='crystal' AND created>=?")
+        rec_args: list = [row["project"], row["created"] or ""]
+        if row.get("done_at"):
+            rec_sql += " AND created<=?"
+            rec_args.append(row["done_at"])
+        rec_sql += " ORDER BY id ASC LIMIT 50"
+        recs = [dict(r) for r in conn.execute(rec_sql, rec_args)]
+    # 组装正文（事务外）：任务卡 + 关联记录清单
+    owner = (row.get("owner") or "").strip()
+    span = f"{(row['created'] or '')[:10]} → {(row.get('done_at') or row.get('updated') or '')[:10]}"
+    lines = [f"> 自动结晶（M2）· 任务 #{tid}「{row['title'][:80]}」 · 完成 · "
+             f"owner={owner or '未认领'} · {span}"]
+    if (row.get("detail") or "").strip():
+        lines.append(f"> 任务细节：{row['detail'].strip()[:200]}")
+    if (row.get("deps") or "").strip():
+        lines.append(f"> 前置链：{row['deps']}")
+    lines.append("")
+    if recs:
+        lines.append(f"关联记录 {len(recs)} 条（同项目、任务创建后；原条目不删，可追溯）：")
+        lines.append("")
+        for r in recs:
+            who = f"[{r['agent']}] " if r.get("agent") else ""
+            lines.append(f"- #{r['id']} {who}{(r.get('date') or '')[:10]} "
+                         f"{(r.get('title') or '')[:70]}")
+    else:
+        lines.append("关联记录 0 条（任务本身即最小结晶）。")
+    rid = add_record(root, row["project"], owner, (row.get("done_at") or _now())[:10],
+                     f"{CRYSTAL_PREFIX}{tid}：{row['title'][:60]}", "\n".join(lines),
+                     source="hub", record_type="crystal")
+    for oid in olds:  # force 重做：软删旧结晶（新结晶已落库；add 失败时旧结晶保留）
+        with db_conn(root) as conn2:
+            conn2.execute("UPDATE records SET status='deleted', valid_until=? WHERE id=?",
+                          (_now()[:10], oid))
+    return "", f"结晶完成：记录 #{rid}（关联 {len(recs)} 条）｜任务 #{tid}「{row['title'][:40]}」"
 
 
 def event_add(root: str, content: str, kind: str = "progress", project: str = "",

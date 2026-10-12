@@ -23,7 +23,7 @@
 
 ## 公用大脑（MCP）
 
-AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **37 个工具**：
+AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **53 个工具**：
 
 **核心读写**：`hub_log_work`（写工作记录）、`hub_get_project` / `hub_list_projects` / `hub_create_project`、`hub_get_record`（单条精读）、`hub_get_progress`（进度对齐）
 
@@ -32,6 +32,8 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 **检索**：`hub_search`（全脑检索：记录+记忆+文件名，带命中片段与 `#id` 精读链路）、`hub_memory_read`（0 命中自动兜底搜记录）、`hub_search_files`（Everything 集成）；连续中文长串零命中时自动按 2-gram 放宽召回
 
 **智能层**：`hub_health`（体检：结晶率/推送 top10/使用分布）、`hub_list_todos` / `hub_todo_done`（待办提取与勾销闭环）、`hub_distill`（记忆蒸馏候选——记录→记忆的结晶流水线）、`hub_archive_project`（项目归档）
+
+**工作管理**（v2.29）：`hub_task_add` / `hub_claim`（原子认领，2h TTL 超时自动可接管）/ `hub_task_update` / `hub_tasks`——任务带 `priority`（0急~3低）/ `deps`（前置任务链）/ `due`（截止）；**`hub_next`** 回答「下一步干什么」——前沿队列（依赖满足、可直接认领，按优先级排序）+ 进行中 / 可接管 / 等待依赖三段；任务完成自动**结晶**（`hub_crystallize`：把「任务+完成期间记录」聚合成一条 crystal 记录，幂等、原条目不删、force 可重做）
 
 **协作安全**：`hub_heartbeat`（同项目撞车预警）、`hub_undo`（撤销自己最近一条记录）、`hub_report_error` / `hub_list_errors`（错误登记流转）、`hub_list_skills` / `hub_list_mcps` / `hub_list_agents`（能力对齐）、`hub_env_set` / `hub_env_list`（环境档案）
 
@@ -76,6 +78,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 | v2.23 | **身份治理 A+B**（2026-10-09~10，workbuddy）：①**A·agent 归属**——白名单从适配器+config **动态派生**（原硬编码漏 dsh/workbuddy）、写入枚举校验（`hub_log_work`/`hub_memory_write` 拒收不在册名字并给可用名单）、存量归属重扫修正（父段继承）；②**B·身份由 server 派生**——接入条目带 `--agent <名>`（六家落地，DSH 走 profile patch 层），server 启动**锁定身份**、调用参数被单点覆盖失效（`call_tool` 入口下发，15 个消费点零改动）、自报不符写 journal 留痕；③迁移去重键改**稳定身份**（source+title+content，修「派生字段进幂等键」致重复插入事故）、UI 徽章/过滤/显示名全走注册表 |
 | v2.24 | **UI 重构·批次1+2**（2026-10-10，workbuddy）：①**配色地基**——新增 `tokens.py` 配色单一来源（中性色阶浅深双套 / accent 图标靛蓝 / 语义色 / 徽章色，**全部色值经 WCAG 对比度验算**；修正 dsh/claude 白字不达标色、补 workbuddy 徽章、tertiary 修正为达标值）；②**主题系统**——默认深色、设置页三选（深/浅/跟随系统）、**两段式切换**（`qconfig.theme` 直设 + `setTheme` 刷新，修 qfw「值相同即短路」）、`SystemThemeListener` 系统联动、持久化走自身 config（不污染 qfw 全局文件）；③**消灭硬编码**——31 处色值/色表/HTML 内联全部走 tokens；④**可读性体检**——真实数据+最小窗（920×600）逐页布局压力测试，设置/总览/统计三页补 ScrollArea 滚动保护（#2055 压扁根因的修复模式） |
 | v2.25 | **UI 重构·批次3（逻辑层）**（2026-10-10，workbuddy）：①**命令面板（Ctrl+K）**——搜 页面/动作/项目/外观四类，↑↓ 循环、Enter 执行、Esc 关闭、无结果空态，搜索框恒聚焦（规格取自 antigravity-clone 源码 + 课表已验证蓝本）；②**每页一句话定位**——统一页头（Title+定位语）铺 9 页；③**空态组件化**——`empty_state`（图标+标题+说明+可选动作，shadcn Empty 结构）替换 10 处散落灰字，三类空态文案分写（首次教/清空确认/筛选恢复路径）；④**列表降噪**——`tight_rows` 行高统一 36px（Fallback 设计文档规格）；⑤**快捷键体系**——Ctrl+K 面板 / Ctrl+1..9 切页，帮助页补快捷键一览；⑥**侧边栏定制**——设置页「导航显示」卡，隐藏页仍可用 Ctrl+K 打开（Cherry Studio 式；重启生效）；⑦**死代码清理**——MarketPage + MCP_CATALOG（~280 行） |
+| v2.29 | **管理能力·M1+M2：任务工作图 + 完成结晶**（2026-10-12，workbuddy）：①**任务工作图**——tasks 新增 `priority`(0急~3低)/`deps`(前置任务 id，逗号分隔；未全部完成前不进前沿、不可认领)/`due`(截止)；②**`hub_next` 前沿队列**——「下一步干什么」按优先级排序推荐，附进行中/可超时接管/等待依赖三段；③**完成链自动结晶（M2）**——任务 done 自动把「任务+完成期间同项目记录」聚合为 `record_type=crystal` 的结晶记录（幂等、原条目不删、force 可重做）；④工具数 51→53，adv_brain 新增任务工作图回归用例（deps 阻塞/自动解阻/优先级/认领门/结晶幂等）。 |
 
 ## 设计原则
 

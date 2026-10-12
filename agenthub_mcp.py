@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.28.0"}
+SERVER_INFO = {"name": "agenthub", "version": "2.29.0"}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -256,11 +256,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                   project=str(arguments.get("project", "")),
                                   detail=str(arguments.get("detail", "")),
                                   blocked_by=str(arguments.get("blocked_by", "")),
-                                  agent=str(arguments.get("agent", "")))
+                                  agent=str(arguments.get("agent", "")),
+                                  priority=arguments.get("priority", brain.DEFAULT_PRIORITY),
+                                  deps=str(arguments.get("deps", "")),
+                                  due=str(arguments.get("due", "")))
         if err:
             return "错误：" + err
         return (f"任务已建 #{tid}：{str(arguments.get('title', ''))[:60]}\n"
-                "认领：hub_claim(task_id, agent)；列表：hub_tasks")
+                "认领：hub_claim；下一步推荐：hub_next；列表：hub_tasks")
 
     if name == "hub_claim":
         err, row = brain.task_claim(root, arguments.get("task_id"),
@@ -276,11 +279,17 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                      status=str(arguments.get("status", "")),
                                      agent=str(arguments.get("agent", "")),
                                      blocked_by=str(arguments.get("blocked_by", "")),
-                                     detail=str(arguments.get("detail", "")))
+                                     detail=str(arguments.get("detail", "")),
+                                     priority=arguments.get("priority"),
+                                     deps=str(arguments.get("deps", "")),
+                                     due=str(arguments.get("due", "")))
         if err:
             return f"错误：{err}"
-        return (f"任务 #{row['id']} 已更新：status={brain.TASK_CN.get(row['status'], row['status'])}"
-                f" owner={row['owner'] or '-'}｜{row['title'][:50]}")
+        msg = (f"任务 #{row['id']} 已更新：status={brain.TASK_CN.get(row['status'], row['status'])}"
+               f" owner={row['owner'] or '-'}｜{row['title'][:50]}")
+        if row.get("crystal"):
+            msg += f"\n{row['crystal']}"
+        return msg
 
     if name == "hub_tasks":
         try:
@@ -299,9 +308,58 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             blk = (f" 等待:{t['blocked_by'][:30]}"
                    if t["status"] == "blocked" and t["blocked_by"] else "")
             proj = f"{t['project']}｜" if t["project"] else ""
-            lines.append(f"- #{t['id']} [{brain.TASK_CN.get(t['status'], t['status'])}]{who}{blk} "
-                         f"{proj}{t['title'][:60]}")
+            pri = t.get("priority")
+            pri = brain.DEFAULT_PRIORITY if pri is None else int(pri)
+            lines.append(f"- #{t['id']} [{brain.TASK_CN.get(t['status'], t['status'])}][P{pri}]"
+                         f"{who}{blk} {proj}{t['title'][:60]}")
+        lines.append("（下一步推荐：hub_next；认领：hub_claim）")
         return "\n".join(lines)
+
+    if name == "hub_next":
+        try:
+            lim = int(arguments.get("limit") or 5)
+        except (TypeError, ValueError):
+            lim = 5
+        res = brain.task_next(root, project=str(arguments.get("project", "")),
+                              owner=str(arguments.get("agent", "")), limit=lim)
+        c = res["counts"]
+        if not any(c.values()):
+            return ("前沿队列为空（没有待办/在办任务）。\n"
+                    "不知道从哪下手时：hub_list_todos 看待办线索，hub_list_projects 看停滞项目。")
+        lines = [f"下一步推荐（前沿队列：依赖已满足、可直接认领）共 {c['ready']} 条："]
+        for i, t in enumerate(res["ready"], 1):
+            proj = f"{t['project']}｜" if t["project"] else ""
+            due = f"（截止 {(t.get('due') or '')[:10]}）" if (t.get("due") or "").strip() else ""
+            lines.append(f"{i}. #{t['id']} [P{t['_priority']}] {proj}{t['title'][:60]}{due}")
+        if res["doing"]:
+            items = "；".join(
+                f"#{t['id']}[P{t['_priority']}]@{t['owner'] or '-'} {t['title'][:28]}"
+                for t in res["doing"][:4])
+            lines.append(f"进行中 {c['doing']} 条：{items}")
+        if res["takeover"]:
+            items = "；".join(
+                f"#{t['id']}@{t['owner'] or '-'} {t['title'][:28]}" for t in res["takeover"][:3])
+            lines.append(f"可接管（超 {brain.CLAIM_TTL_HOURS}h 未更新）：{items}")
+        if res["waiting"]:
+            lines.append(f"等待中 {c['waiting']} 条：")
+            for t in res["waiting"][:4]:
+                w = t.get("_wait") or []
+                if w:
+                    why = "前置未完成：等 " + "、".join(
+                        f"#{x['id']}（{brain.TASK_CN.get(x['status'], x['status'])}）"
+                        for x in w[:3])
+                else:
+                    why = f"阻塞：{(t.get('blocked_by') or '见详情')[:30]}"
+                lines.append(f"  - #{t['id']} [P{t['_priority']}] {t['title'][:40]} —— {why}")
+        lines.append("（认领开干：hub_claim；全部任务：hub_tasks；任务完成会自动结晶）")
+        return "\n".join(lines)
+
+    if name == "hub_crystallize":
+        err, summary = brain.task_crystallize(root, arguments.get("task_id"),
+                                              force=bool(arguments.get("force")))
+        if err:
+            return "错误：" + err
+        return summary
 
     if name == "hub_event_write":
         err, eid = brain.event_add(root, str(arguments.get("content", "")),
@@ -1198,7 +1256,7 @@ TOOLS = [
                                               "description": "你的 agent 名（注册表内取值，会被校验；显示名如 WorkBuddy/DSH 也接受并自动归一）。确实无法归属时传 unknown，不要编造"},
                                     "content": {"type": "string", "description": "做了什么/验证结果/如何回滚"},
                                     "date": {"type": "string", "description": "YYYY-MM-DD，缺省今天"},
-                                    "record_type": {"type": "string", "description": "记录类型（可选）：work_log/decision/todo/note；缺省自动推断（含决策段→decision，否则 work_log）"},
+                                    "record_type": {"type": "string", "description": "记录类型（可选）：work_log/decision/todo/note/crystal（结晶一般由任务完成自动生成）；缺省自动推断（含决策段→decision，否则 work_log）"},
                                     "context": {"type": "string", "description": "决策-上下文（AgDR，可选）：当时为什么面临这个选择"},
                                     "options": {"type": "string", "description": "决策-权衡过的选项（可选）：评估了哪些方案、各自为何成/否"},
                                     "decision": {"type": "string", "description": "决策-决策（可选）：最终选了什么"},
@@ -1392,12 +1450,15 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"force": {"type": "boolean", "description": "true=全量重编码（默认只补缺失）"}}}},
     {"name": "hub_task_add",
-     "description": "新建任务（P3-2 状态机）：title 必填；blocked_by 非空则初始为阻塞态。开工前认领（hub_claim）避免与其他 agent 撞车",
+     "description": "新建任务（P3-2 状态机 + M1 工作图）：title 必填；blocked_by 非空则初始为阻塞态；priority/deps/due 见字段说明。开工前认领（hub_claim），选活先看 hub_next",
      "inputSchema": {"type": "object",
                      "properties": {"title": {"type": "string", "description": "任务标题（一句话）"},
                                     "project": {"type": "string", "description": "所属项目，可空"},
                                     "detail": {"type": "string", "description": "细节/验收标准，可空"},
                                     "blocked_by": {"type": "string", "description": "被谁/什么阻塞（非空则初始 status=blocked）"},
+                                    "priority": {"type": "integer", "description": "优先级 0=急(P0)/1=高/2=中(默认)/3=低"},
+                                    "deps": {"type": "string", "description": "前置任务 id，逗号分隔（如 '12,15'）；未全部完成前不被 hub_next 推荐、不可认领"},
+                                    "due": {"type": "string", "description": "截止日（如 2026-10-20），可空"},
                                     "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["title"]}},
     {"name": "hub_claim",
@@ -1407,12 +1468,15 @@ TOOLS = [
                                     "agent": {"type": "string", "description": "你的 agent 名（必填）"}},
                      "required": ["task_id", "agent"]}},
     {"name": "hub_task_update",
-     "description": "任务状态流转：pending(释放)/in_progress/blocked(写 blocked_by)/done。in_progress 任务只有持有者可流转（空 agent=管理面）",
+     "description": "任务状态流转：pending(释放)/in_progress/blocked(写 blocked_by)/done。done 会自动结晶成 crystal 记录（M2）。in_progress 任务只有持有者可流转（空 agent=管理面）。deps/due 传 '-' 可清除",
      "inputSchema": {"type": "object",
                      "properties": {"task_id": {"type": "integer", "description": "任务 id"},
                                     "status": {"type": "string", "enum": list(brain.TASK_STATUSES)},
                                     "blocked_by": {"type": "string", "description": "阻塞原因（status=blocked 时用）"},
                                     "detail": {"type": "string", "description": "补充细节/进展，可空"},
+                                    "priority": {"type": "integer", "description": "优先级 0~3（可改）"},
+                                    "deps": {"type": "string", "description": "前置任务 id（逗号分隔；'-' 清除）"},
+                                    "due": {"type": "string", "description": "截止日（'-' 清除）"},
                                     "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["task_id"]}},
     {"name": "hub_tasks",
@@ -1422,6 +1486,18 @@ TOOLS = [
                                     "owner": {"type": "string", "description": "按认领人过滤"},
                                     "project": {"type": "string", "description": "按项目过滤"},
                                     "limit": {"type": "integer", "description": "条数，默认 50"}}}},
+    {"name": "hub_next",
+     "description": "下一步推荐（M1 前沿队列）：依赖已满足、可直接认领的任务，按优先级排序；附进行中/可接管/等待依赖三段。开工前先问它「我该干什么」",
+     "inputSchema": {"type": "object",
+                     "properties": {"project": {"type": "string", "description": "只看某项目，可空"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（标出你手上的活与可接管项）"},
+                                    "limit": {"type": "integer", "description": "推荐条数，默认 5"}}}},
+    {"name": "hub_crystallize",
+     "description": "任务结晶（M2）：把已完成任务的完成链（任务 + 完成期间同项目记录）聚合为一条 crystal 记录便于回顾；幂等（已有则复用，force=true 软删旧结晶重做）。任务 done 时已自动结晶，本工具用于补做/重做",
+     "inputSchema": {"type": "object",
+                     "properties": {"task_id": {"type": "integer", "description": "任务 id"},
+                                    "force": {"type": "boolean", "description": "true=软删旧结晶后重做"}},
+                     "required": ["task_id"]}},
     {"name": "hub_event_write",
      "description": "写一条事件（P3-2 事件流）：写进展/求助/交接信号，其他 agent 可订阅（hub_events）",
      "inputSchema": {"type": "object",
@@ -1455,7 +1531,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_memory_read", "hub_memory_write", "hub_log_work", "hub_note", "hub_note_read",
     "hub_todo_done", "hub_list_todos", "hub_report_error", "hub_distill", "hub_undo",
     "hub_env_list", "hub_env_set", "hub_handoff", "hub_audit", "hub_flush_index",
-    "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks",
+    "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks", "hub_next", "hub_crystallize",
     "hub_event_write", "hub_events",
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
@@ -1471,7 +1547,7 @@ WRITE_TOOLS = {
     "hub_log_work", "hub_create_project", "hub_note", "hub_memory_write", "hub_heartbeat",
     "hub_report_error", "hub_undo", "hub_archive_project", "hub_todo_done", "hub_env_set",
     "hub_ops_run", "hub_handoff", "hub_report", "hub_flush_index",
-    "hub_task_add", "hub_task_update", "hub_claim", "hub_event_write",
+    "hub_task_add", "hub_task_update", "hub_claim", "hub_crystallize", "hub_event_write",
     "hub_skill_sync",  # 技能原生化：写索引（走 dry_run/confirm 闸门）
 }
 
