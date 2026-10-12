@@ -202,6 +202,24 @@ def main():
         check("工作台标记完成→自动结晶落库", ncr >= 1, str(ncr))
         check("工作台完成后自动刷新（进行中清零）", "进行中 0" in w.today_page.sumLabel.text(),
               w.today_page.sumLabel.text())
+        # GUI 管理面补全（v2.37）：信号中心 + 治理中心五段（M3/M7/M8/M9/M11/M12 桌面端）
+        brain.signal_send(str(tmp), "zcode", "GUI 冒烟测试消息", to_agent="smoke")
+        w.signal_page.reload()
+        check("信号中心收件箱有消息", w.signal_page.listw.count() >= 1,
+              str(w.signal_page.listw.count()))
+        check("信号中心发送区控件在位",
+              w.signal_page.meCombo.count() >= 1 and w.signal_page.toCombo.count() >= 1)
+        # 切「已发送」tab 不崩（currentItem() 返 item 对象非 key——断言 reload 被触发）
+        w.signal_page.seg.setCurrentItem("sent")
+        check("信号中心已发送 tab 可切", w.signal_page.listw.count() >= 1,
+              str(w.signal_page.listw.count()))
+        w.signal_page.seg.setCurrentItem("inbox")
+        # 治理中心五段逐个 reload 不崩
+        for key in ("quarantine", "consolidate", "decision", "view", "skill"):
+            w.governance_page.seg.setCurrentItem(key)
+        w.governance_page.reload()
+        check("治理中心五段可切且 reload 不崩", w.governance_page.stack.count() == 5)
+        check("治理中心隔离区子页就位", w.governance_page.subs[0].listw.count() >= 0)
         # 统计页同类残留回归：set_db 两次后标签数不变（agentBox 行布局同 bug 的第二实例）
         w.stats_page.set_db(brain.stats(str(tmp)))
         m1 = len(w.stats_page.findChildren(QLabel))

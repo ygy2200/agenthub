@@ -9,6 +9,8 @@ import actions  # P2-2 动作注册表（导航/快捷键/命令面板同源）
 # —— 页面（P2-1 拆到 pages/）——
 from pages.project_page import ProjectPage  # noqa: F401
 from pages.today_page import TodayPage  # noqa: F401
+from pages.signal_page import SignalPage  # noqa: F401
+from pages.governance_page import GovernancePage  # noqa: F401
 from pages.timeline_page import TimelinePage, VIRTUAL_THRESHOLD  # noqa: F401
 from pages.brain_page import BrainPage  # noqa: F401
 from pages.notes_page import NotesPage  # noqa: F401
@@ -45,6 +47,8 @@ class AgentHubWindow(FluentWindow):
 
         self.overview_page = OverviewPage(self)
         self.today_page = TodayPage(self)
+        self.signal_page = SignalPage(self)
+        self.governance_page = GovernancePage(self)
         self.project_page = ProjectPage(self)
         self.timeline_page = TimelinePage(self)
         self.stats_page = StatsPage(self)
@@ -315,6 +319,8 @@ class AgentHubWindow(FluentWindow):
             self.stats_page.set_db(brain.stats(self.root))
             self.brain_page.reload()
             self.today_page.reload()
+            self.signal_page.reload()
+            self.governance_page.reload()
         except Exception:
             pass
         self.audit_page.set_snapshot(snap)
@@ -328,7 +334,8 @@ class AgentHubWindow(FluentWindow):
         self.journal_page.reload()
         self.report_page.reload_reports()  # agent 侧 hub_report 可能生成了新报告，F5 后列表跟上
         # 防横向溢出守卫（批次 3 修复）：刷新后对全页统一巡检（幂等、无视觉副作用）
-        for _pg in (self.overview_page, self.today_page, self.project_page, self.timeline_page,
+        for _pg in (self.overview_page, self.today_page, self.signal_page,
+                    self.governance_page, self.project_page, self.timeline_page,
                     self.hub_page, self.notes_page, self.brain_page,
                     self.ledger_page, self.stats_page, self.report_page,
                     self.search_page, self.connect_page, self.help_page,

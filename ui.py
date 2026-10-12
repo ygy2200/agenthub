@@ -15,6 +15,8 @@ import actions  # noqa: F401
 
 from pages.project_page import ProjectPage  # noqa: F401
 from pages.today_page import TodayPage  # noqa: F401
+from pages.signal_page import SignalPage  # noqa: F401
+from pages.governance_page import GovernancePage  # noqa: F401
 from pages.timeline_page import TimelinePage, VIRTUAL_THRESHOLD  # noqa: F401
 from pages.brain_page import BrainPage  # noqa: F401
 from pages.notes_page import NotesPage  # noqa: F401

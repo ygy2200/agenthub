@@ -3824,6 +3824,17 @@ def signal_mark_read(root: str, signal_id, agent: str) -> str:
     return f"信号 #{sid} 已标已读"
 
 
+def signal_sent(root: str, agent: str, limit: int = 30) -> list:
+    """我发出的信号（GUI 信号中心「已发送」tab 用）：from_agent=我 的点对点+广播，新在前。"""
+    who = _norm_agent(agent)
+    if not who:
+        return []
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT * FROM signals WHERE from_agent=? ORDER BY id DESC LIMIT ?",
+            (who, max(1, min(int(limit or 30), 200))))]
+
+
 def signal_unread_count(root: str, agent: str) -> int:
     """未读数（心跳开工推送用）：发给我的 + 广播里我没读的。
     排除自己发的广播——提醒自己去读自己发的消息没有意义（收件箱仍显示，留痕用）。"""
