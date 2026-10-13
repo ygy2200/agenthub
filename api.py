@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""api.py（X2·v2.39）：REST API 桥 + Web 只读仪表盘。
+"""api.py（X2·v2.40）：REST API 桥 + Web 只读仪表盘。
 
 非 MCP 客户端（手机/浏览器/curl/脚本）读大脑：
   GET  /                 内置仪表盘（自包含单页 HTML，暗色）
@@ -9,6 +9,7 @@
   GET  /api/next         今天该干什么（前沿队列四段）
   GET  /api/search?q=…   语义检索
   GET  /api/signals?agent=…  信号收件箱
+  GET  /api/orchestration 编排概览（最近流程执行/触发器/图谱体检，Y1-Y3 只读视图）
   GET  /api/call?name=hub_x&k=v  任意**只读**工具（写工具默认拒绝）
 
 安全：只绑 127.0.0.1（不对外）；写工具默认关闭，需 --allow-write 且带启动生成的
@@ -81,6 +82,7 @@ input{flex:1;background:#141517;border:1px solid #33363b;color:#e6e6e6;border-ra
 <div class="row"><div class="card"><h2>今天该干什么</h2><pre id="next">—</pre></div>
 <div class="card"><h2>在线与活跃项目</h2><pre id="status">—</pre></div></div>
 <div class="card"><h2>体检</h2><pre id="health">—</pre></div>
+<div class="card"><h2>编排（流程/触发器/图谱）</h2><pre id="orch">—</pre></div>
 <div class="card"><h2>检索结果</h2><pre id="search">（输入关键词后回车）</pre></div>
 </div><script>
 async function get(u){const r=await fetch(u);return r.ok?await r.text():('['+r.status+'] '+u)}
@@ -89,6 +91,7 @@ async function load(){
   document.getElementById('next').textContent=await get('/api/next');
   document.getElementById('status').textContent=await get('/api/status');
   document.getElementById('health').textContent=await get('/api/health');
+  document.getElementById('orch').textContent=await get('/api/orchestration');
 }
 async function doSearch(){const q=document.getElementById('q').value.trim();
   if(!q)return;const el=document.getElementById('search');el.textContent='搜索中…';
@@ -137,6 +140,30 @@ class _Handler(BaseHTTPRequestHandler):
             if route == "hub_search" and "q" in q:
                 q["query"] = q.pop("q")
             return self._send(200, _call_tool(self.root, route, q))
+        if u.path == "/api/orchestration":
+            # Y1-Y3 只读概览：直接走 brain 只读函数，不经 MCP 写工具通道
+            # （hub_playbook/hub_graph 都属写工具，走 /api/call 会被 403——这里只读，安全）
+            try:
+                runs = brain.playbook_runs(self.root, limit=5)
+                trig = brain.trigger_list(self.root)
+                g = brain.graph_stats(self.root, build=False)
+            except Exception as e:  # noqa: BLE001
+                return self._send(500, f"编排概览读取失败：{e}")
+            lines = [f"最近执行 {len(runs)} 次："]
+            for r in runs:
+                lines.append(f"  #{r['id']} {r['playbook']} [{r['status']}] {r['summary']}"
+                             f"（{r['started'][:16]}）")
+            if not runs:
+                lines.append("  （还没跑过流程）")
+            n_on = sum(1 for t in trig if int(t.get("enabled") or 0))
+            lines.append(f"触发器 {len(trig)} 条（启用 {n_on}）：")
+            for t in trig[:5]:
+                st = "启用" if int(t.get("enabled") or 0) else "停用"
+                lines.append(f"  #{t['id']} [{st}] {t['name']}：{t['on_event']} → {t['action_type']}"
+                             f"（已触发 {t['fire_count']} 次）")
+            lines.append(f"图谱：边 {g.get('edges', 0)}｜已连条目 {g.get('linked', 0)}"
+                         f"｜孤岛 {g.get('isolated', 0)}｜最大簇 {g.get('largest_cluster', 0)}")
+            return self._send(200, "\n".join(lines))
         if u.path == "/api/call":
             name = (q.pop("name", "") or "").strip()
             if not name:

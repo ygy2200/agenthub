@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.39.0"
+    assert r["serverInfo"]["version"] == "2.40.0"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -78,7 +78,7 @@ def t_protocol(root):
             "hub_next", "hub_crystallize",
             "hub_event_write", "hub_events",
             "hub_skill_match", "hub_skill_sync"} <= names, names
-    assert len(names) == 65  # X3+X4（2026-10-12）：63 + hub_export / hub_history = 65（X5 走 CLI 不加工具）
+    assert len(names) == 68  # X3+X4=65，Y1+Y2+Y3（2026-10-13）+playbook/trigger/graph=68（X5 走 CLI 不加工具）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -1169,6 +1169,161 @@ def t_p3_tasks_events(tmp):
     assert "错误" in m.call_tool("hub_task_update", {"task_id": tid, "status": "乱写"}, rs)
 
 
+def t_playbook(tmp):
+    """Y1 编排层（协议级）：模板清单/show/计划不落库/自建与拒收/真跑到 manual 停/断点续跑/失败即停/中止/坏参。"""
+    root = fresh_hub(tmp, "pb")
+    rs = str(root)
+
+    out = m.call_tool("hub_playbook", {"action": "list"}, rs)
+    assert "release" in out and "daily" in out and "内置" in out, f"内置模板缺失：{out[:200]}"
+    assert "ops_check" in m.call_tool("hub_playbook", {"action": "show", "name": "release"}, rs)
+
+    # plan 只列计划，不产生执行记录
+    m.call_tool("hub_playbook", {"action": "run", "name": "release", "plan": True}, rs)
+    assert not brain.playbook_runs(rs), "plan 预演不应产生执行记录"
+
+    steps = [{"key": "a", "title": "打点", "action": "noop", "args": {"text": "hello {{project}}"}},
+             {"key": "b", "title": "人工步骤", "action": "manual", "note": "去干活"},
+             {"key": "c", "title": "收尾", "action": "noop", "args": {"text": "after {{out.a}}"}}]
+    assert "已保存" in m.call_tool("hub_playbook", {"action": "create", "name": "myflow",
+                                                   "title": "我的流程", "steps": steps}, rs)
+    assert "不可覆盖" in m.call_tool("hub_playbook", {"action": "create", "name": "release",
+                                                     "steps": [{"action": "noop"}]}, rs)
+    assert "不在注册表" in m.call_tool("hub_playbook", {"action": "create", "name": "bad",
+                                                       "steps": [{"action": "rm_rf"}]}, rs)
+    assert "steps 必填" in m.call_tool("hub_playbook", {"action": "create", "name": "bad2"}, rs)
+
+    # 真跑：第 1 步 done，第 2 步 manual 停住，第 3 步不跑
+    r1 = m.call_tool("hub_playbook", {"action": "run", "name": "myflow",
+                                      "project": "测试-项目", "agent": "zcode"}, rs)
+    assert "[待人工]" in r1 and "hello 测试-项目" in r1, f"变量替换或等待态异常：{r1[:300]}"
+    rid = int(r1.split("run #")[1].split("：")[0])
+    with brain.db_conn(rs) as conn:
+        st = [dict(x) for x in conn.execute(
+            "SELECT seq,status FROM playbook_run_steps WHERE run_id=? ORDER BY seq", (rid,))]
+    assert [x["status"] for x in st] == ["done", "manual", "pending"], f"步骤状态错：{st}"
+
+    # 续跑：manual 视为人已做完，第 3 步引用 {{out.a}}
+    r2 = m.call_tool("hub_playbook", {"action": "resume", "run_id": rid}, rs)
+    assert "[完成]" in r2 and "after hello 测试-项目" in r2, f"续跑或变量引用异常：{r2[:300]}"
+    assert "无需续跑" in m.call_tool("hub_playbook", {"action": "resume", "run_id": rid}, rs)
+    assert f"#{rid}" in m.call_tool("hub_playbook", {"action": "runs"}, rs)
+
+    # 失败即停：第 2 步失败，第 3 步不该跑
+    m.call_tool("hub_playbook", {"action": "create", "name": "failflow", "steps": [
+        {"key": "x", "title": "打点", "action": "noop", "args": {"text": "ok"}},
+        {"key": "y", "title": "缺 project 的写记录", "action": "log_work", "args": {"content": "x"}},
+        {"key": "z", "title": "不该跑到", "action": "noop", "args": {"text": "never"}}]}, rs)
+    r3 = m.call_tool("hub_playbook", {"action": "run", "name": "failflow"}, rs)
+    assert "[失败]" in r3 and "never" not in r3, f"失败未即停：{r3[:300]}"
+    rid3 = int(r3.split("run #")[1].split("：")[0])
+    assert "[失败]" in m.call_tool("hub_playbook", {"action": "resume", "run_id": rid3}, rs)
+    assert "已中止" in m.call_tool("hub_playbook", {"action": "abort", "run_id": rid3}, rs)
+
+    # 坏参不崩
+    assert "不存在" in m.call_tool("hub_playbook", {"action": "run", "name": "nope"}, rs)
+    assert "不存在" in m.call_tool("hub_playbook", {"action": "show", "name": "nope"}, rs)
+    assert "不存在" in m.call_tool("hub_playbook", {"action": "resume", "run_id": 999999}, rs)
+    assert "不存在" in m.call_tool("hub_playbook", {"action": "abort", "run_id": 999999}, rs)
+    assert "只支持" in m.call_tool("hub_playbook", {"action": "bogus"}, rs)
+
+
+def t_trigger(tmp):
+    """Y2 自动化层：建/校验/默认停用/条件匹配/冷却/强制试跑/心跳可见/playbook 动作/停用删除/坏参。"""
+    root = fresh_hub(tmp, "trg")
+    rs = str(root)
+
+    assert "on_event 必须" in m.call_tool("hub_trigger", {"action": "add", "name": "x",
+                                                          "on_event": "bogus"}, rs)
+    assert "action_type 必须" in m.call_tool("hub_trigger", {"action": "add", "name": "x",
+                                                             "action_type": "rm_rf"}, rs)
+    assert "必须在 action_args" in m.call_tool("hub_trigger", {"action": "add", "name": "x",
+                                                               "action_type": "playbook"}, rs)
+    assert "name 必填" in m.call_tool("hub_trigger", {"action": "add"}, rs)
+
+    r = m.call_tool("hub_trigger", {"action": "add", "name": "开工提醒", "on_event": "heartbeat",
+                                    "action_type": "notify", "action_args": {"text": "记得先跑体检"},
+                                    "condition": {"project": "测试-项目"}, "agent": "zcode"}, rs)
+    assert "停用" in r, f"新建应默认停用：{r}"
+    tid = int(r.split("#")[1].split("（")[0])
+
+    # 未启用 → 不触发；启用后条件不匹配 → 也不触发
+    assert brain.trigger_eval(rs, "heartbeat", {"agent": "zcode", "project": "测试-项目"}) == []
+    assert "启用" in m.call_tool("hub_trigger", {"action": "enable", "id": tid}, rs)
+    assert brain.trigger_eval(rs, "heartbeat", {"agent": "zcode", "project": "别的项目"}) == []
+
+    # 匹配 → 触发；再触发 → 冷却
+    res = brain.trigger_eval(rs, "heartbeat", {"agent": "zcode", "project": "测试-项目"})
+    assert res and res[0]["status"] == "fired" and "体检" in res[0]["text"], f"未触发：{res}"
+    assert brain.trigger_eval(rs, "heartbeat", {"agent": "zcode", "project": "测试-项目"})[0]["status"] == "cooled"
+    assert "冷却中" in m.call_tool("hub_trigger", {"action": "fire", "id": tid}, rs)
+    assert "√" in m.call_tool("hub_trigger", {"action": "fire", "id": tid, "force": True}, rs)
+
+    # cooldown=0 的触发器：心跳输出里应出现 [自动化] 段
+    r2 = m.call_tool("hub_trigger", {"action": "add", "name": "每次提醒", "on_event": "heartbeat",
+                                     "action_type": "notify", "action_args": {"text": "hi-marker"},
+                                     "cooldown_min": 0}, rs)
+    tid2 = int(r2.split("#")[1].split("（")[0])
+    m.call_tool("hub_trigger", {"action": "enable", "id": tid2}, rs)
+    hb = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "测试-项目"}, rs)
+    assert "[自动化]" in hb and "hi-marker" in hb, f"心跳未见自动化段：{hb[:400]}"
+
+    # playbook 动作（真跑 onboard）
+    r3 = m.call_tool("hub_trigger", {"action": "add", "name": "自动体检", "on_event": "record",
+                                     "action_type": "playbook",
+                                     "action_args": {"name": "onboard", "project": "测试-项目"}}, rs)
+    tid3 = int(r3.split("#")[1].split("（")[0])
+    fired = m.call_tool("hub_trigger", {"action": "fire", "id": tid3, "force": True}, rs)
+    assert "√" in fired and "onboard" in fired, f"playbook 动作未跑起来：{fired[:200]}"
+
+    assert "触发器" in m.call_tool("hub_trigger", {"action": "list"}, rs)
+    assert "停用" in m.call_tool("hub_trigger", {"action": "disable", "id": tid2}, rs)
+    assert "删除" in m.call_tool("hub_trigger", {"action": "del", "id": tid2}, rs)
+    assert "不存在" in m.call_tool("hub_trigger", {"action": "enable", "id": 999999}, rs)
+    assert "不存在" in m.call_tool("hub_trigger", {"action": "fire", "id": 999999, "force": True}, rs)
+    assert "只支持" in m.call_tool("hub_trigger", {"action": "bogus"}, rs)
+
+
+def t_graph(tmp):
+    """Y3 知识图谱：结构边物化/体检/邻居/相关条目/最短路径/知识簇/坏参。"""
+    root = fresh_hub(tmp, "graph")
+    rs = str(root)
+    r1 = brain.add_record(rs, "测试-图谱", "zcode", "2026-10-13", "记录A", "内容A")
+    r2 = brain.add_record(rs, "测试-图谱", "zcode", "2026-10-13", "记录B", "内容B")
+    brain.add_record(rs, "别的-项目", "zcode", "2026-10-13", "记录C", "内容C")
+    m1 = brain.add_memory(rs, "记忆甲", tags="图谱,测试", project="测试-图谱", agent="zcode")
+    brain.add_memory(rs, "记忆乙", tags="图谱", project="测试-图谱", agent="zcode")
+
+    st = brain.graph_build(rs)
+    assert st["in"] >= 3 and st["tag"] >= 3, f"结构边未物化：{st}"
+    st2 = brain.graph_stats(rs, build=False)
+    assert st2["linked"] >= 4 and st2["edges"] >= 6, f"体检数据异常：{st2}"
+    assert st2["isolated"] >= 0 and st2["largest_cluster"] >= 2
+
+    nb = brain.graph_neighbors(rs, "tag:图谱")
+    assert len(nb["in"]) >= 2, f"标签节点应有入边：{nb}"
+    assert "error" in brain.graph_neighbors(rs, "瞎写")
+
+    rel = brain.graph_related(rs, f"record:{r1}")
+    assert any(x["node"] == f"record:{r2}" for x in rel), f"同项目记录未关联：{rel}"
+    assert brain.graph_related(rs, "瞎写:1") == []
+
+    p = brain.graph_path(rs, f"record:{r1}", f"memory:{m1}", max_depth=4)
+    assert p["found"] and p["depth"] == 2, f"两点应经项目节点相连：{p}"
+    assert not brain.graph_path(rs, "record:999999", "memory:999999")["found"]
+    assert "error" in brain.graph_path(rs, "record:1", "bogus:2")
+
+    cl = brain.graph_clusters(rs, build=False)
+    assert cl and cl[0]["size"] >= 2, f"未成簇：{cl}"
+
+    assert "结构边已重建" in m.call_tool("hub_graph", {"action": "build"}, rs)
+    assert "知识图谱体检" in m.call_tool("hub_graph", {"action": "stats"}, rs)
+    assert "路径（2 跳）" in m.call_tool("hub_graph", {"action": "path", "from_node": f"record:{r1}",
+                                                      "to_node": f"memory:{m1}"}, rs)
+    assert "知识簇" in m.call_tool("hub_graph", {"action": "clusters"}, rs)
+    assert "邻居" in m.call_tool("hub_graph", {"action": "neighbors", "node": "tag:图谱"}, rs)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -1209,6 +1364,12 @@ def main():
          lambda: t_p3_contract(tmp))
     case("P3-2待办状态机（并发认领只胜一家/持有者约束/超时接管/阻塞/事件流增量）",
          lambda: t_p3_tasks_events(tmp))
+    case("Y1 编排层（模板清单/计划不落库/自建拒收/真跑停人工/断点续跑/失败即停/中止/坏参）",
+         lambda: t_playbook(tmp))
+    case("Y2 自动化（默认停用/条件匹配/冷却/强制试跑/心跳可见/playbook动作/停用删除/坏参）",
+         lambda: t_trigger(tmp))
+    case("Y3 知识图谱（结构边物化/体检/邻居/相关条目/最短路径/知识簇/坏参）",
+         lambda: t_graph(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

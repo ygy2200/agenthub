@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.39.0"}  # v2.37=GUI 管理面（纯桌面）；v2.38=X3/X4/X5；本版=X2 REST+Web
+SERVER_INFO = {"name": "agenthub", "version": "2.40.0"}  # v2.37=GUI 管理面；v2.38=X3/X4/X5；v2.39=X2 REST+Web；本版=Y1 编排层（Playbook 引擎）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -483,6 +483,18 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             out += ops.wakeups(root, pname)  # 收尾建议：py_compile/git_status/蒸馏候选，当天已办即静默
         except Exception:  # noqa: BLE001
             pass
+        # Y2：写了记录即评估 record 触发器（keyword 走内容包含匹配）
+        try:
+            fired = brain.trigger_eval(root, "record",
+                                       {"agent": agent, "project": pname, "content": content,
+                                        "keyword": content, "record_id": rec_id}, budget_sec=20)
+        except Exception:  # noqa: BLE001  自动化绝不阻断正常记录
+            fired = []
+        for f in fired:
+            if f.get("status") == "cooled":
+                continue
+            mark = "√" if f["status"] == "fired" else "×"
+            out += f"\n[自动化] {mark} #{f['id']} {f['name']}：{(f.get('text') or '')[:90]}"
         return out
 
     if name == "hub_create_project":
@@ -837,7 +849,72 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                           f"（{r['date']} {r['agent'] or '?'}）")
             vl.append("  管理关注：hub_view action=follow/unfollow/list")
             out = out + "\n".join(vl)
+        # Y2 自动化（开工推送第五段）：启用的 heartbeat 触发器在这里自动跑——
+        # 「每次开工顺手检查一遍」这类事不该依赖每个 agent 自觉，交给大脑记着。
+        # 三道防线：enabled 默认关 / 冷却默认 12h / 单个动作时间预算 20s（超时丢弃不阻塞心跳）。
+        try:
+            fired = brain.trigger_eval(root, "heartbeat",
+                                       {"agent": agent, "project": project, "note": note},
+                                       budget_sec=20)
+        except Exception:  # noqa: BLE001  自动化绝不能把心跳搞挂
+            fired = []
+        fired = [f for f in fired if f.get("status") in ("fired", "failed")]  # 冷却中的不报，免噪音
+        if fired:
+            al = ["", "[自动化] 本轮心跳触发的动作："]
+            for f in fired:
+                mark = "√" if f["status"] == "fired" else "×"
+                al.append(f"  {mark} #{f['id']} {f['name']}：{(f.get('text') or '')[:90]}")
+            al.append("  管理：hub_trigger action=list/fire/enable/disable")
+            out = out + "\n".join(al)
         return out
+
+    if name == "hub_trigger":
+        action = str(arguments.get("action", "list")).strip()
+        if action == "list":
+            rows = brain.trigger_list(root, str(arguments.get("on_event", "")).strip())
+            if not rows:
+                return ("（还没有触发器。建一条：hub_trigger action=add name=… on_event=heartbeat "
+                        "action_type=playbook action_args={name:onboard}——注意建完默认关闭，"
+                        "确认无误再 action=enable id=…）")
+            lines = [f"触发器 {len(rows)} 条（启用的在前）："]
+            for t in rows:
+                state = "启用" if int(t.get("enabled") or 0) else "停用"
+                cond = json.dumps(t.get("condition") or {}, ensure_ascii=False)
+                aargs = json.dumps(t.get("action_args") or {}, ensure_ascii=False)
+                lines.append(f"- #{t['id']} [{state}] {t['name']}：{t['on_event']} → {t['action_type']}"
+                             f"（冷却 {t['cooldown_min']} 分钟 · 已触发 {t['fire_count']} 次"
+                             f" · 上次 {(t.get('last_fired') or '从未')[:16]}）")
+                if cond != "{}":
+                    lines.append(f"    条件 {cond}")
+                if aargs != "{}":
+                    lines.append(f"    动作 {aargs}")
+            return "\n".join(lines)
+        if action == "add":
+            err, tid = brain.trigger_add(
+                root, str(arguments.get("name", "")).strip(),
+                str(arguments.get("on_event", "heartbeat")).strip() or "heartbeat",
+                str(arguments.get("action_type", "notify")).strip() or "notify",
+                arguments.get("action_args") if isinstance(arguments.get("action_args"), dict) else {},
+                arguments.get("condition") if isinstance(arguments.get("condition"), dict) else {},
+                arguments.get("cooldown_min"), str(arguments.get("agent", "")).strip())
+            if err:
+                return "错误：" + err
+            return (f"触发器已建 #{tid}（默认**停用**——确认无误后 action=enable id={tid} 才生效）。"
+                    f"先试跑：hub_trigger action=fire id={tid} force=true")
+        if action in ("enable", "disable"):
+            return brain.trigger_set_enabled(root, arguments.get("id"), action == "enable")
+        if action == "del":
+            return brain.trigger_del(root, arguments.get("id"))
+        if action == "fire":
+            res = brain.trigger_fire(root, arguments.get("id"),
+                                     {"agent": str(arguments.get("agent", "")).strip(),
+                                      "project": str(arguments.get("project", "")).strip()},
+                                     force=bool(arguments.get("force")))
+            if res.get("error"):
+                return "错误：" + res["error"]
+            mark = "√" if res["status"] == "fired" else "×"
+            return f"{mark} 触发器 #{res['id']} {res['name']}：{res['text']}"
+        return "错误：action 只支持 list/add/enable/disable/del/fire"
 
     if name == "hub_report_error":
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
@@ -1221,7 +1298,23 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                      project=str(arguments.get("project", "")))
         if not sid:
             return f"错误：{tip}"
-        return tip + "\n对方用 hub_signals 查收；未读时其下次心跳会自动提醒"
+        out = tip + "\n对方用 hub_signals 查收；未读时其下次心跳会自动提醒"
+        # Y2：发信号即评估 signal 触发器（例如「有人提到发布就自动播一下」）
+        try:
+            fired = brain.trigger_eval(root, "signal",
+                                       {"agent": str(arguments.get("to_agent", "")),
+                                        "from_agent": str(arguments.get("agent", "")),
+                                        "project": str(arguments.get("project", "")),
+                                        "content": str(arguments.get("content", "")),
+                                        "keyword": str(arguments.get("content", ""))}, budget_sec=20)
+        except Exception:  # noqa: BLE001
+            fired = []
+        for f in fired:
+            if f.get("status") == "cooled":
+                continue
+            mark = "√" if f["status"] == "fired" else "×"
+            out += f"\n[自动化] {mark} #{f['id']} {f['name']}：{(f.get('text') or '')[:90]}"
+        return out
 
     if name == "hub_signals":
         rows = brain.signal_inbox(root, str(arguments.get("agent", "")),
@@ -1424,6 +1517,144 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             detail = f"：{t['detail']}" if t["detail"] else ""
             lines.append(f"- {stamp} [{t['source']}] {t['event']}{detail}")
         return "\n".join(lines)
+
+    if name == "hub_playbook":
+        action = str(arguments.get("action", "list")).strip()
+        if action == "list":
+            rows = brain.playbook_list(root)
+            if not rows:
+                return "（还没有流程模板。内置模板首次调用会自动补种；也可 action=create 自建）"
+            lines = [f"流程 {len(rows)} 套（跑：hub_playbook action=run name=… project=…）："]
+            for p in rows:
+                tag = "内置" if int(p.get("builtin") or 0) else "自定义"
+                last = p.get("last_status") or "未跑过"
+                lines.append(f"- [{tag}] {p['name']} — {p['title']}"
+                             f"（{p['n_steps']} 步 · 成功跑过 {p['n_done']} 次 · 最近：{last}）")
+                if p.get("desc"):
+                    lines.append(f"    {p['desc']}")
+            lines.append("先看步骤：action=show name=…；先看计划：action=run name=… plan=true")
+            return "\n".join(lines)
+        if action == "show":
+            nm = str(arguments.get("name", "")).strip()
+            pb = brain.playbook_get(root, nm)
+            if not pb:
+                return f"（流程「{nm}」不存在。hub_playbook action=list 看清单）"
+            m = pb["meta"]
+            lines = [f"流程 {m['name']} — {m['title']}（{'内置模板' if m.get('builtin') else '自定义'}）"]
+            if m.get("desc"):
+                lines.append(m["desc"])
+            for s in pb["steps"]:
+                a = json.dumps(s.get("args") or {}, ensure_ascii=False)
+                a = a if a != "{}" else ""
+                note = f"｜{s['note']}" if s.get("note") else ""
+                lines.append(f"  {s['seq']}. {s['title']}  [{s['action']}]  {a}{note}")
+            lines.append("跑：hub_playbook action=run name=" + m["name"] + " project=…（建议先 plan=true）")
+            return "\n".join(lines)
+        if action == "create":
+            nm = str(arguments.get("name", "")).strip()
+            steps = arguments.get("steps")
+            if not isinstance(steps, list):
+                return "错误：steps 必填且为数组（[{key,title,action,args,note}]，action 见 action=list 说明）"
+            err, n = brain.playbook_upsert(root, nm, str(arguments.get("title", "")),
+                                           str(arguments.get("desc", "")), steps,
+                                           str(arguments.get("agent", "")))
+            return f"错误：{err}" if err else \
+                f"流程已保存：{nm}（{n} 步）。跑：hub_playbook action=run name={nm}"
+        if action == "run":
+            res = brain.playbook_run(root, str(arguments.get("name", "")).strip(),
+                                     str(arguments.get("project", "")).strip(),
+                                     str(arguments.get("agent", "")).strip(),
+                                     str(arguments.get("target", "")).strip(),
+                                     dry_run=bool(arguments.get("plan")))
+            if res.get("error"):
+                return "错误：" + res["error"]
+            if res.get("dry_run"):
+                lines = [f"预演（未执行）：{res['playbook']} — {res['title']}"]
+                for s in res["steps"]:
+                    a = json.dumps(s.get("args") or {}, ensure_ascii=False)
+                    lines.append(f"  {s['seq']}. {s['title']}  [{s['action']}]  {'' if a == '{}' else a}")
+                lines.append("真跑：去掉 plan（建议带 project/agent 便于留痕）")
+                return "\n".join(lines)
+            return _fmt_playbook_run(res)
+        if action == "resume":
+            res = brain.playbook_resume(root, arguments.get("run_id"),
+                                        str(arguments.get("agent", "")).strip(),
+                                        str(arguments.get("target", "")).strip())
+            return "错误：" + res["error"] if res.get("error") else _fmt_playbook_run(res)
+        if action == "runs":
+            rows = brain.playbook_runs(root, str(arguments.get("name", "")).strip(),
+                                       int(arguments.get("limit", 10) or 10))
+            if not rows:
+                return "（还没有执行记录。hub_playbook action=run name=… 跑一次）"
+            lines = [f"执行历史 {len(rows)} 条（新在前）："]
+            for r in rows:
+                lines.append(f"- #{r['id']} {r['playbook']} [{r['status']}] {r['summary']}"
+                             f"（{r['project'] or '无项目'} · {r['agent'] or '无'} · {r['started'][:16]}）")
+            lines.append("看分步：action=resume run_id=…（继续跑）／action=abort run_id=…（中止）")
+            return "\n".join(lines)
+        if action == "abort":
+            return brain.playbook_abort(root, arguments.get("run_id"))
+        return "错误：action 只支持 list/show/create/run/resume/runs/abort"
+
+    if name == "hub_graph":
+        action = str(arguments.get("action", "stats")).strip()
+        if action == "build":
+            s = brain.graph_build(root)
+            return (f"结构边已重建：标签边 {s['tag']} 条（覆盖 {s['memories']} 条记忆）· "
+                    f"项目边 {s['in']} 条（覆盖 {s['records']} 条记录）。"
+                    "（双链 mention 与手工 link 边由写入侧维护，本次不动）")
+        if action == "neighbors":
+            res = brain.graph_neighbors(root, str(arguments.get("node", "")),
+                                        int(arguments.get("limit", 30) or 30))
+            if res.get("error"):
+                return "错误：" + res["error"]
+            lines = [f"节点 {res['node']} 的邻居：出边 {len(res['out'])} · 入边 {len(res['in'])}"]
+            for r in res["out"][:12]:
+                lines.append(f"  → {r['to_kind']}:{r['to_ref']} [{r['kind']}]"
+                             + (f"｜{r['snippet']}" if r.get("snippet") else ""))
+            for r in res["in"][:12]:
+                lines.append(f"  ← 来自 {r['from_kind']}:{r['from_id']} [{r['kind']}]"
+                             + (f"｜{r['snippet']}" if r.get("snippet") else ""))
+            if not res["out"] and not res["in"]:
+                lines.append("  （孤立节点：没跟任何东西相连——要么先 action=build，要么它真的是孤岛）")
+            return "\n".join(lines)
+        if action == "related":
+            rows = brain.graph_related(root, str(arguments.get("node", "")),
+                                       int(arguments.get("limit", 10) or 10))
+            if not rows:
+                return ("（图上没有关联条目。可能该节点本身孤立——先 action=build 重建结构边；"
+                        "或换条记录试）")
+            lines = ["图上最相关的条目（二跳内，显式双链加权）："]
+            for r in rows:
+                proj = f"[{r['project']}] " if r.get("project") else ""
+                lines.append(f"- {r['node']}（相关度 {r['score']}）{proj}{r['snippet']}")
+            return "\n".join(lines)
+        if action == "path":
+            res = brain.graph_path(root, str(arguments.get("from_node", "")),
+                                   str(arguments.get("to_node", "")),
+                                   int(arguments.get("max_depth", 4) or 4))
+            if res.get("error"):
+                return "错误：" + res["error"]
+            if not res.get("found"):
+                return f"未找到路径：{res.get('hint', '')}"
+            return f"路径（{res['depth']} 跳）：" + " → ".join(res["path"])
+        if action == "clusters":
+            rows = brain.graph_clusters(root, int(arguments.get("limit", 8) or 8))
+            if not rows:
+                return "（还没有成规模的簇。先 action=build 重建结构边，或库里条目还太少）"
+            lines = [f"知识簇 {len(rows)} 个（按规模；≥2 个条目才算簇）："]
+            for g in rows:
+                lines.append(f"- {g['size']} 个条目：" + "；".join(g["sample"][:2]))
+            lines.append("孤岛=没进任何簇的条目，检索最难顺带唤起它们（action=stats 看数量）")
+            return "\n".join(lines)
+        st = brain.graph_stats(root)
+        if st.get("error"):
+            return "错误：" + st["error"]
+        bk = "、".join(f"{k} {v}" for k, v in st["by_kind"].items()) or "无"
+        return (f"知识图谱体检：边 {st['edges']} 条（{bk}）｜节点 记录 {st['nodes']['record']} · "
+                f"记忆 {st['nodes']['memory']}｜已连条目 {st['linked']} · 孤岛 {st['isolated']} · "
+                f"最大簇 {st['largest_cluster']}\n"
+                "看关联：action=neighbors/related/path；看簇：action=clusters；重建结构边：action=build")
 
     if name == "hub_report":
         import report
@@ -1763,6 +1994,62 @@ TOOLS = [
                      "properties": {"kind": {"type": "string", "enum": ["record", "memory"], "description": "条目类型，缺省 record"},
                                     "id": {"type": "integer", "description": "条目 id"}},
                      "required": ["id"]}},
+    {"name": "hub_trigger",
+     "description": "Y2 自动化层：事件驱动——把「每次开工顺手检查一遍」「有人发信号就通知我」这类**本该自动的事**交给大脑，不再依赖每个 agent 自觉。on_event=heartbeat（每次心跳，受冷却约束）/signal（收到信号）/record（写了记录）；action_type=notify（心跳里提示一行）/signal（发信号）/playbook（自动跑流程）。三道防线：建完默认**停用**、冷却默认 12 小时、单个动作时间预算 20 秒（超时丢弃，绝不阻塞心跳）",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string",
+                                               "enum": ["list", "add", "enable", "disable", "del", "fire"],
+                                               "description": "list 清单（缺省）/ add 新建 / enable 启用 / disable 停用 / del 删除 / fire 手动触发一次"},
+                                    "name": {"type": "string", "description": "add：触发器名（写清触发什么）"},
+                                    "on_event": {"type": "string", "enum": ["heartbeat", "signal", "record"],
+                                                 "description": "add/list：监听什么事件，缺省 heartbeat"},
+                                    "action_type": {"type": "string", "enum": ["notify", "signal", "playbook"],
+                                                    "description": "add：触发后做什么，缺省 notify"},
+                                    "action_args": {"type": "object",
+                                                    "description": "add：动作参数。playbook 需 {name:流程名, project?}；signal 需 {content, to_agent?, kind?}；notify 需 {text}"},
+                                    "condition": {"type": "object",
+                                                  "description": "add：触发条件 {project?, agent?, keyword?}——等值匹配，keyword 走包含；不传=不限制"},
+                                    "cooldown_min": {"type": "integer",
+                                                     "description": "add：冷却分钟数，默认 720（12 小时），上限 10080"},
+                                    "id": {"type": "integer", "description": "enable/disable/del/fire：触发器 id"},
+                                    "force": {"type": "boolean",
+                                              "description": "fire：true=忽略冷却与启用状态强制试跑（调试用）"},
+                                    "agent": {"type": "string", "description": "你的 agent 名"},
+                                    "project": {"type": "string", "description": "fire：提供 {{project}} 变量"}}}},
+    {"name": "hub_graph",
+     "description": "Y3 知识图谱（关联检索）：检索按「词像不像」，图谱按「图上近不近」——一条没提到关键词但同项目同标签的记录，检索找不到，图谱能。action=stats 体检（边/节点/孤岛/最大簇）、neighbors 某节点一跳邻居、related 二跳内最相关条目（显式双链加权）、path 两节点最短路径、clusters 知识簇与孤岛、build 重建结构边（记忆→标签、记录→项目，幂等）",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string",
+                                               "enum": ["stats", "neighbors", "related", "path", "clusters", "build"],
+                                               "description": "stats 体检（缺省）/ neighbors 邻居 / related 相关条目 / path 最短路径 / clusters 知识簇 / build 重建结构边"},
+                                    "node": {"type": "string",
+                                             "description": "neighbors/related：节点，格式 record:12 / memory:3 / tag:踩坑 / project:项目名"},
+                                    "from_node": {"type": "string", "description": "path：起点节点"},
+                                    "to_node": {"type": "string", "description": "path：终点节点"},
+                                    "max_depth": {"type": "integer", "description": "path：最大跳数，默认 4（上限 6）"},
+                                    "limit": {"type": "integer", "description": "返回条数上限"}}}},
+    {"name": "hub_playbook",
+     "description": "Y1 编排层：把每次都要手工重走的流程固化成**可执行**的 playbook——步骤落库、逐步真跑、失败即停、断点续跑（不再靠 agent 记忆重走，换会话也不丢进度）。内置模板：release 发布全流程 / new_project 新项目开工 / daily 每日巡检 / deliver 交付收尾 / onboard 接入体检。action=list 看清单、show 看步骤、run 真跑（先 plan=true 看计划）、resume 断点续跑、runs 历史、abort 中止、create 自建",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string",
+                                               "enum": ["list", "show", "create", "run", "resume", "runs", "abort"],
+                                               "description": "list 清单（缺省）/ show 看步骤 / create 自建 / run 跑一次 / resume 断点续跑 / runs 执行历史 / abort 中止"},
+                                    "name": {"type": "string",
+                                             "description": "流程名（show/create/run 必填；runs 可按名过滤）"},
+                                    "project": {"type": "string",
+                                                "description": "run：项目名（流程里的 {{project}}；需要留痕的流程必填）"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（留痕用）"},
+                                    "target": {"type": "string",
+                                               "description": "run：ops 类步骤的目标目录，缺省 AgentHub 源码目录"},
+                                    "plan": {"type": "boolean",
+                                             "description": "run：true=只列步骤计划（渲染后的 args）不真跑。注意与工具级 dry_run 不同——dry_run 是「不落库预演」，plan 是「看流程打算做什么」"},
+                                    "run_id": {"type": "integer", "description": "resume/abort：执行 id"},
+                                    "limit": {"type": "integer", "description": "runs：条数，默认 10"},
+                                    "title": {"type": "string", "description": "create：流程标题"},
+                                    "desc": {"type": "string", "description": "create：流程说明"},
+                                    "steps": {"type": "array",
+                                              "description": "create：步骤数组 [{key,title,action,args,note}]；action 可用 ops_check/backup/export/log_work/memory/signal/create_project/view_follow/checkpoint/sentry/noop/manual（manual=人工步骤，跑到会停下等你 resume）",
+                                              "items": {"type": "object"}}}}},
     {"name": "hub_report",
      "description": "生成反馈报告（单文件 HTML 双击即开）：mentor 式九章节——你在做什么/时间分布/做对了什么/摩擦点（每条带修复）/规则修改提案。提案需人确认，系统不自动改",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -1902,6 +2189,28 @@ TOOLS = [
 ]
 
 
+def _fmt_playbook_run(res: dict) -> str:
+    """playbook 执行结果排版（run/resume 共用）。
+
+    用纯文本状态标记不用 emoji：状态要能被日志/终端/其他 agent 无损复制，
+    emoji 在不同终端渲染成方框会丢语义。
+    """
+    head = {"done": "[完成]", "failed": "[失败]", "waiting": "[待人工]", "aborted": "[已中止]"}.get(
+        res.get("status", ""), "[执行]")
+    lines = [f"{head} playbook {res.get('playbook')} run #{res.get('run_id')}：{res.get('summary', '')}"]
+    mark = {"done": "√", "failed": "×", "manual": "手", "pending": "·", "skipped": "-"}
+    for s in res.get("steps", []):
+        out = f"  → {s['output']}" if s.get("output") else ""
+        lines.append(f"  [{mark.get(s['status'], '·')}] {s['seq']}. {s['title']}{out}")
+    if res.get("status") == "waiting":
+        lines.append("下一步：人工完成该步后 hub_playbook action=resume run_id="
+                     f"{res.get('run_id')}（该步被标为已做，从后续步骤继续）")
+    elif res.get("status") == "failed":
+        lines.append("下一步：修掉失败项后 hub_playbook action=resume run_id="
+                     f"{res.get('run_id')}（已完成的步骤不重跑，从失败那一步继续）")
+    return "\n".join(lines)
+
+
 # ---------------------------------------------------------------- P3-1 profile 切片 / 写工具清单
 
 # 任何 profile 都可见的最小面（hub_help 是发现入口）
@@ -1924,6 +2233,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_decision_review",  # M11 决策回路：到期验证
     "hub_consolidate", "hub_view", "hub_skill_stats",  # M7/M9/M12：治理三件套
     "hub_export", "hub_history",  # X3 导出备份 / X4 时间机器
+    "hub_playbook", "hub_trigger", "hub_graph",  # Y1/Y2/Y3 编排、自动化、图谱：都是干活的日常
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
 )
@@ -1949,6 +2259,9 @@ WRITE_TOOLS = {
     "hub_view",  # M9 视角：关注项目/标签
     "hub_skill_stats",  # M12 技能资产统计
     "hub_export",  # X3：导出/备份（写文件）
+    "hub_playbook",  # Y1：跑流程会真执行动作（备份/写记录/发信号/建项目），必须过 dry_run+confirm
+    "hub_trigger",  # Y2：触发器会自行发信号/跑流程，未经确认的自动化=事故源
+    "hub_graph",  # Y3：build 会重写结构边（幂等派生数据），仍过闸门保持一致性
 }
 
 

@@ -429,6 +429,71 @@ CREATE TABLE IF NOT EXISTS notes (
     open_at TEXT DEFAULT "",
     context TEXT DEFAULT ""
 );
+-- Y1 编排层：把「每次都要手工重走的流程」固化成可执行的 playbook。
+-- playbooks=流程定义（builtin=1 为内置模板，同名 upsert 只改自定义）；
+-- playbook_steps=步骤（action 指向 ACTIONS 注册表，manual=需人确认）；
+-- playbook_runs=一次执行（cursor 指向下一个待跑 seq，失败即停可 resume）；
+-- playbook_run_steps=每步的执行结果（断点续跑的事实依据，不重写历史）。
+CREATE TABLE IF NOT EXISTS playbooks (
+    name TEXT PRIMARY KEY,
+    title TEXT DEFAULT "",
+    desc TEXT DEFAULT "",
+    builtin INTEGER DEFAULT 0,
+    created TEXT DEFAULT "",
+    updated TEXT DEFAULT ""
+);
+CREATE TABLE IF NOT EXISTS playbook_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    playbook TEXT NOT NULL,
+    seq INTEGER DEFAULT 0,
+    key TEXT DEFAULT "",
+    title TEXT DEFAULT "",
+    action TEXT DEFAULT "manual",
+    args TEXT DEFAULT "",
+    note TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_pbstep_pb ON playbook_steps(playbook, seq);
+CREATE TABLE IF NOT EXISTS playbook_runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    playbook TEXT NOT NULL,
+    project TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    status TEXT DEFAULT "running",
+    started TEXT DEFAULT "",
+    finished TEXT DEFAULT "",
+    cursor INTEGER DEFAULT 0,
+    summary TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_pbrun_pb ON playbook_runs(playbook);
+CREATE TABLE IF NOT EXISTS playbook_run_steps (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    run_id INTEGER NOT NULL,
+    seq INTEGER DEFAULT 0,
+    key TEXT DEFAULT "",
+    title TEXT DEFAULT "",
+    action TEXT DEFAULT "",
+    status TEXT DEFAULT "pending",
+    output TEXT DEFAULT "",
+    finished TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_pbrunstep_run ON playbook_run_steps(run_id, seq);
+-- Y2 自动化：事件驱动。enabled 默认 0——触发器是大脑的**主动行为**，
+-- 配错就是刷屏/误动作，宁可让人显式开，不可默认替人做主。
+CREATE TABLE IF NOT EXISTS triggers (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    name TEXT DEFAULT "",
+    on_event TEXT DEFAULT "heartbeat",
+    condition TEXT DEFAULT "",
+    action_type TEXT DEFAULT "notify",
+    action_args TEXT DEFAULT "",
+    enabled INTEGER DEFAULT 0,
+    cooldown_min INTEGER DEFAULT 720,
+    last_fired TEXT DEFAULT "",
+    fire_count INTEGER DEFAULT 0,
+    agent TEXT DEFAULT "",
+    created TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_trig_event ON triggers(on_event, enabled);
 """
 
 
@@ -498,7 +563,8 @@ def ensure_schema(root: str) -> str:
     真实库无任何新进程跑过 init_db，hub_distill 直接 no such table（2026-10-02 实锤）；
     v2.10.0 的 salience 列再实锤一次（serve 只建表不补列，部署版反馈通道直接
     no such column，2026-10-04 协议级实测抓到）。补列/回填均幂等且毫秒级。
-    返回错误或 ""。根目录不存在时报错（与 init_db 一致，不凭空建目录）。"""
+    返回错误或 ""。根目录不存在时报错（与 init_db 一致，不凭空建目录）。
+    Y1：末尾补种内置 playbook 模板——真实库建表后必须有模板，否则 hub_playbook 空手而回。"""
     if not root or not os.path.isdir(root):
         return "根目录不存在"
     try:
@@ -507,6 +573,7 @@ def ensure_schema(root: str) -> str:
             conn.executescript(SCHEMA)
         _migrate_columns(root)
         _backfill_tag_schema(root)
+        _pb_seed(root)  # 只补缺失 + 进程内只查一次（ensure_schema 被高频调用，不能每次扫库）
         return ""
     except sqlite3.Error as e:
         return f"大脑 schema 初始化失败：{e}"
@@ -5142,3 +5209,1009 @@ def mark_distill_shown(root: str, record_ids: list) -> int:
             "INSERT OR IGNORE INTO distill_seen(record_id, ts) VALUES (?, ?)",
             [(int(i), _now()) for i in record_ids])
         return cur.rowcount
+
+
+# ==================================================================== Y1 编排层（Playbook 引擎）
+# 由来（真实痛点）：发布、新项目开工、每日巡检、交付收尾这类流程，每次都由 agent 凭记忆
+# 手工重走一遍——步骤散落在各家提示词里，走没走全、走到第几步崩了无人知晓，换个会话就断。
+# 这里把流程固化成**可执行**的 playbook：步骤落库、逐步真跑、失败即停、断点续跑。
+# 大脑从「记流程」进化到「跑流程」——这是编排层，不是又一个待办清单。
+
+PB_VAR_RE = re.compile(r"\{\{\s*([\w.]+)\s*\}\}")
+
+# 内置模板：{{project}}/{{agent}}/{{today}} 运行时替换，{{out.步骤key}} 引用前序步骤输出
+_BUILTIN_PLAYBOOKS = [
+    {"name": "release", "title": "发布全流程",
+     "desc": "改完 AgentHub 源码后跑：环境预检→语法检查→部署一致性→exe 新旧→备份→留痕。失败即停，修完 resume 接着跑",
+     "steps": [
+         {"key": "env", "title": "环境预检", "action": "ops_check", "args": {"name": "env"}},
+         {"key": "syntax", "title": "语法检查", "action": "ops_check", "args": {"name": "py_compile"}},
+         {"key": "deploy", "title": "部署一致性（源码 vs ~/.agenthub）", "action": "ops_check",
+          "args": {"name": "deploy_diff"}},
+         {"key": "exe", "title": "exe 是否比源码旧", "action": "ops_check", "args": {"name": "release"}},
+         {"key": "backup", "title": "备份数据库", "action": "backup", "args": {}},
+         {"key": "log", "title": "落一条发布记录", "action": "log_work",
+          "args": {"title": "发布流程自动执行",
+                   "content": "playbook release 执行结果：语法={{out.syntax}}｜部署={{out.deploy}}｜exe={{out.exe}}｜备份={{out.backup}}"}},
+     ]},
+    {"name": "new_project", "title": "新项目开工",
+     "desc": "建目录→拉开工记录→关注该项目。项目名用 {{project}}，运行时传入",
+     "steps": [
+         {"key": "create", "title": "创建项目目录", "action": "create_project", "args": {"name": "{{project}}"}},
+         {"key": "kickoff", "title": "写开工记录", "action": "log_work",
+          "args": {"title": "项目开工", "content": "项目 {{project}} 开工（{{today}}，执行者 {{agent}}）"}},
+         {"key": "follow", "title": "关注该项目动态", "action": "view_follow", "args": {"scope_value": "{{project}}"}},
+     ]},
+    {"name": "daily", "title": "每日巡检",
+     "desc": "只读体检套餐：大脑健康→哨兵巡检→停滞项目→整洁度→Inbox 积压。全通过则安静",
+     "steps": [
+         {"key": "health", "title": "大脑体检", "action": "ops_check", "args": {"name": "brain"}},
+         {"key": "sentry", "title": "哨兵巡检（gap 自动广播）", "action": "sentry", "args": {}},
+         {"key": "stalled", "title": "停滞项目", "action": "ops_check", "args": {"name": "stalled"}},
+         {"key": "hygiene", "title": "整洁体检", "action": "ops_check", "args": {"name": "hygiene"}},
+         {"key": "inbox", "title": "Inbox 待分拣", "action": "ops_check", "args": {"name": "inbox"}},
+     ]},
+    {"name": "deliver", "title": "交付收尾",
+     "desc": "干完活收尾：语法检查→部署一致性→备份→人工看蒸馏候选→落交付记录",
+     "steps": [
+         {"key": "syntax", "title": "语法检查", "action": "ops_check", "args": {"name": "py_compile"}},
+         {"key": "deploy", "title": "部署一致性", "action": "ops_check", "args": {"name": "deploy_diff"}},
+         {"key": "backup", "title": "备份数据库", "action": "backup", "args": {}},
+         {"key": "distill", "title": "看一眼蒸馏候选并决定是否沉淀", "action": "manual",
+          "note": "跑 hub_distill，有「目的」结论的用 hub_memory_write 沉淀（系统不替你判断价值）"},
+         {"key": "log", "title": "落交付记录", "action": "log_work",
+          "args": {"title": "交付收尾", "content": "{{project}} 收尾：语法={{out.syntax}}｜部署={{out.deploy}}"}},
+     ]},
+    {"name": "onboard", "title": "新 agent 接入体检",
+     "desc": "核对谁还没接上大脑：接入状态→规则执行体检→备份",
+     "steps": [
+         {"key": "agents", "title": "各 agent 接入状态", "action": "ops_check", "args": {"name": "agents"}},
+         {"key": "rules", "title": "规则执行体检（闸门是否真跑）", "action": "ops_check",
+          "args": {"name": "rules_health"}},
+         {"key": "backup", "title": "备份数据库", "action": "backup", "args": {}},
+     ]},
+]
+
+
+def _default_src_dir() -> str:
+    """需要 target 的 ops 步骤默认目录：brain.py 所在目录（= AgentHub 源码目录）。
+    部署版（~/.agenthub/mcp_server）缺 adv_*.py 时回归步骤会明确报「不是源码目录」——宁可明说，不猜路径。"""
+    return os.path.dirname(os.path.abspath(__file__))
+
+
+def _pb_render(text, ctx) -> str:
+    """{{var}} 替换；支持 {{out.步骤key}} 引用前序输出。未知变量原样保留（不静默吞成空串）。"""
+    def _rep(m):
+        key = m.group(1)
+        if key.startswith("out."):
+            return str((ctx.get("out") or {}).get(key[4:], ""))
+        return str(ctx.get(key, m.group(0)))
+    return PB_VAR_RE.sub(_rep, text or "")
+
+
+def _pb_args(step: dict, ctx: dict) -> dict:
+    """步骤 args → 渲染后的 dict（库里存 JSON 串，也容忍调用方直接传 dict）。"""
+    raw = step.get("args")
+    if isinstance(raw, str):
+        try:
+            raw = json.loads(raw) if raw.strip() else {}
+        except (ValueError, TypeError):
+            raw = {}
+    if not isinstance(raw, dict):
+        return {}
+    return {k: (_pb_render(v, ctx) if isinstance(v, str) else v) for k, v in raw.items()}
+
+
+# ---------------------------------------------------------------- 动作注册表
+# 每个动作 fn(root, args, ctx) -> (ok: bool, output: str)。全部本地执行、可失败、不吞异常。
+def _act_ops_check(root, args, ctx):
+    import ops  # noqa: PLC0415  延迟导入：ops 反向依赖 brain，模块级导入会成环
+    name = str(args.get("name") or "env")
+    target = str(args.get("target") or ctx.get("target") or "")
+    try:
+        r = ops.run_check(name, target, root)
+    except Exception as _e:  # noqa: BLE001  单个动作炸了不能拖垮整轮，但要留痕
+        return False, f"ops.run_check 异常：{type(_e).__name__}: {_e}"
+    out = str(r.get("summary") or "")
+    det = [str(d) for d in (r.get("detail") or [])[:2]]
+    if det:
+        out += " ｜ " + " / ".join(det)
+    return bool(r.get("ok")), out[:500]
+
+
+def _act_backup(root, args, ctx):
+    err, path = backup_db(root, str(args.get("dest") or ""))
+    return (not err), (str(path) if not err else f"备份失败：{err}")
+
+
+def _act_export(root, args, ctx):
+    try:
+        lim = int(args.get("limit") or 5000)
+    except (TypeError, ValueError):
+        lim = 5000
+    err, path = export_all(root, str(args.get("fmt") or "markdown"), lim)
+    return (not err), (str(path) if not err else f"导出失败：{err}")
+
+
+def _act_log_work(root, args, ctx):
+    proj = str(args.get("project") or ctx.get("project") or "")
+    if not proj:
+        return False, "缺 project：playbook 运行时传 project，或在步骤 args 里写死"
+    rid = add_record(root, proj, str(args.get("agent") or ctx.get("agent") or "unknown"),
+                     ctx.get("today", ""), str(args.get("title") or "playbook 自动记录"),
+                     _pb_render(str(args.get("content") or ""), ctx), source="auto")
+    return True, f"已写工作记录 #{rid}"
+
+
+def _act_memory(root, args, ctx):
+    content = _pb_render(str(args.get("content") or ""), ctx)
+    if not content.strip():
+        return False, "memory 步骤缺 content"
+    mid = add_memory(root, content, str(args.get("kind") or "note"), str(args.get("tags") or ""),
+                     str(args.get("project") or ctx.get("project") or ""),
+                     str(args.get("agent") or ctx.get("agent") or ""))
+    return True, f"已写记忆 #{mid}"
+
+
+def _act_signal(root, args, ctx):
+    tip, sid = signal_send(root, str(args.get("from_agent") or ctx.get("agent") or "unknown"),
+                           _pb_render(str(args.get("content") or ""), ctx),
+                           str(args.get("to_agent") or ""), str(args.get("kind") or "msg"),
+                           str(args.get("project") or ctx.get("project") or ""))
+    return (sid > 0), str(tip)
+
+
+def _act_create_project(root, args, ctx):
+    import core  # noqa: PLC0415
+    name = _pb_render(str(args.get("name") or ""), ctx)
+    err = core.create_project(root, name)
+    if err:
+        return False, str(err)
+    with db_conn(root) as conn:
+        conn.execute("INSERT OR IGNORE INTO projects(name, created) VALUES(?,?)", (name, _now()))
+    return True, f"项目已创建：{name}"
+
+
+def _act_view_follow(root, args, ctx):
+    err = view_follow(root, str(args.get("agent") or ctx.get("agent") or ""),
+                      str(args.get("scope_type") or "project"),
+                      _pb_render(str(args.get("scope_value") or ""), ctx))
+    return (not err), (err or "已关注")
+
+
+def _act_checkpoint(root, args, ctx):
+    err, cid = checkpoint_save(root, args.get("task_id"),
+                               str(args.get("agent") or ctx.get("agent") or ""),
+                               _pb_render(str(args.get("content") or ""), ctx),
+                               str(args.get("kind") or "manual"))
+    return (not err), (f"检查点 #{cid}" if not err else str(err))
+
+
+def _act_sentry(root, args, ctx):
+    try:
+        cooldown = int(args.get("cooldown_hours") or 24)
+    except (TypeError, ValueError):
+        cooldown = 24
+    try:
+        summary, sid = sentry_sweep(root, cooldown)
+    except Exception as _e:  # noqa: BLE001
+        return False, f"sentry 异常：{type(_e).__name__}: {_e}"
+    return True, f"{summary}（信号 #{sid}）" if sid else str(summary)
+
+
+def _act_noop(root, args, ctx):
+    return True, _pb_render(str(args.get("text") or "（打点，无副作用）"), ctx)
+
+
+PB_ACTIONS = {
+    "ops_check": _act_ops_check, "backup": _act_backup, "export": _act_export,
+    "log_work": _act_log_work, "memory": _act_memory, "signal": _act_signal,
+    "create_project": _act_create_project, "view_follow": _act_view_follow,
+    "checkpoint": _act_checkpoint, "sentry": _act_sentry, "noop": _act_noop,
+}
+
+
+# ---------------------------------------------------------------- 模板入库 / 查询
+# 按 root 记，不是进程级布尔：进程内切换根目录（测试多库、MCP 换根）时，
+# 进程级 flag 会让第二个库永远不种模板（2026-10-13 回归实测抓到）。
+_PB_SEEDED: set = set()
+
+
+def _pb_seed(root) -> int:
+    """内置模板入库（builtin=1）。只补缺失，已存在的一律不动——
+    用户改过的流程不能被下次升级冲掉（宁可缺新模板，不可覆盖人的改动）。"""
+    if root in _PB_SEEDED:
+        return 0
+    n = 0
+    try:
+        with db_conn(root) as conn:
+            for pb in _BUILTIN_PLAYBOOKS:
+                if conn.execute("SELECT 1 FROM playbooks WHERE name=?", (pb["name"],)).fetchone():
+                    continue
+                conn.execute("INSERT INTO playbooks(name,title,desc,builtin,created,updated) "
+                             "VALUES(?,?,?,1,?,?)",
+                             (pb["name"], pb["title"], pb["desc"], _now(), _now()))
+                for i, s in enumerate(pb["steps"]):
+                    conn.execute("INSERT INTO playbook_steps(playbook,seq,key,title,action,args,note) "
+                                 "VALUES(?,?,?,?,?,?,?)",
+                                 (pb["name"], i + 1, s.get("key") or f"s{i + 1}",
+                                  s.get("title") or "", s.get("action") or "manual",
+                                  json.dumps(s.get("args") or {}, ensure_ascii=False),
+                                  s.get("note") or ""))
+                n += 1
+    except sqlite3.Error:
+        return 0
+    _PB_SEEDED.add(root)
+    return n
+
+
+def _pb_step_view(row) -> dict:
+    d = dict(row)
+    try:
+        d["args"] = json.loads(d.get("args") or "{}")
+    except (ValueError, TypeError):
+        d["args"] = {}
+    return d
+
+
+def playbook_list(root: str) -> list:
+    """流程清单（内置在前）：含步骤数、成功跑过几次、最近一次状态。"""
+    _pb_seed(root)
+    try:
+        with db_conn(root) as conn:
+            rows = conn.execute(
+                "SELECT p.*, (SELECT COUNT(*) FROM playbook_steps s WHERE s.playbook=p.name) AS n_steps,"
+                " (SELECT COUNT(*) FROM playbook_runs r WHERE r.playbook=p.name AND r.status='done') AS n_done,"
+                " (SELECT r.status FROM playbook_runs r WHERE r.playbook=p.name ORDER BY r.id DESC LIMIT 1) AS last_status"
+                " FROM playbooks p ORDER BY p.builtin DESC, p.name").fetchall()
+    except sqlite3.Error:
+        return []
+    return [dict(r) for r in rows]
+
+
+def playbook_get(root: str, name: str):
+    """单流程定义（含步骤）。不存在返回 None。"""
+    _pb_seed(root)
+    try:
+        with db_conn(root) as conn:
+            pb = conn.execute("SELECT * FROM playbooks WHERE name=?", (name,)).fetchone()
+            if not pb:
+                return None
+            steps = conn.execute("SELECT * FROM playbook_steps WHERE playbook=? ORDER BY seq",
+                                 (name,)).fetchall()
+    except sqlite3.Error:
+        return None
+    return {"meta": dict(pb), "steps": [_pb_step_view(s) for s in steps]}
+
+
+def playbook_upsert(root: str, name: str, title: str = "", desc: str = "",
+                    steps: list = None, agent: str = "") -> tuple:
+    """新建/覆盖**自定义**流程。返回 (错误或 "", 步骤数)。
+
+    内置模板（builtin=1）不可覆盖——要改就换个名字另存，否则下次升级模板会和你的改动打架。
+    步骤 action 必须在 PB_ACTIONS 或 manual，写错当场拒（跑的时候才发现=白跑一轮）。
+    """
+    _pb_seed(root)
+    name = (name or "").strip()
+    if not re.match(r"^[A-Za-z0-9_\-]{1,40}$", name or ""):
+        return "流程名非法：只允许字母/数字/下划线/短横线，1-40 字符", 0
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT builtin FROM playbooks WHERE name=?", (name,)).fetchone()
+        if row and int(row["builtin"] or 0) == 1:
+            return f"「{name}」是内置模板，不可覆盖（换个名字另存，如 {name}_mine）", 0
+    steps = steps or []
+    if not steps:
+        return "steps 不能为空（至少一步）", 0
+    norm = []
+    for i, s in enumerate(steps[:30]):
+        if not isinstance(s, dict):
+            return f"第 {i + 1} 步不是对象", 0
+        act = str(s.get("action") or "manual").strip() or "manual"
+        if act != "manual" and act not in PB_ACTIONS:
+            return f"第 {i + 1} 步动作「{act}」不在注册表内（可用：{'、'.join(sorted(PB_ACTIONS))}、manual）", 0
+        norm.append((i + 1, str(s.get("key") or f"s{i + 1}"), str(s.get("title") or act)[:120], act,
+                     json.dumps(s.get("args") or {}, ensure_ascii=False),
+                     str(s.get("note") or "")[:400]))
+    with db_conn(root) as conn:
+        conn.execute("INSERT INTO playbooks(name,title,desc,builtin,created,updated) VALUES(?,?,?,0,?,?) "
+                     "ON CONFLICT(name) DO UPDATE SET title=excluded.title, desc=excluded.desc, updated=excluded.updated",
+                     (name, title or name, desc or "", _now(), _now()))
+        conn.execute("DELETE FROM playbook_steps WHERE playbook=?", (name,))
+        conn.executemany("INSERT INTO playbook_steps(playbook,seq,key,title,action,args,note) "
+                         "VALUES(?,?,?,?,?,?,?)", [(name, *s) for s in norm])
+    return "", len(norm)
+
+
+# ---------------------------------------------------------------- 执行器
+def _pb_step_finish(root, run_id, seq, status, output) -> None:
+    with db_conn(root) as conn:
+        conn.execute("UPDATE playbook_run_steps SET status=?, output=?, finished=? "
+                     "WHERE run_id=? AND seq=?",
+                     (status, str(output or "")[:600], _now(), run_id, seq))
+
+
+def _pb_execute(root: str, run_id: int, steps: list, ctx: dict) -> dict:
+    """按 seq 逐步执行：已完成跳过、manual 停下等人、其余真跑。
+
+    失败即停（step.on_fail=continue 除外）——不停的话后面步骤建立在坏基础上，
+    报错会离根因越来越远。停在哪一步就是断点，修完 resume 从那一步继续。
+    """
+    try:
+        with db_conn(root) as conn:
+            rs = [dict(r) for r in conn.execute(
+                "SELECT * FROM playbook_run_steps WHERE run_id=? ORDER BY seq", (run_id,)).fetchall()]
+    except sqlite3.Error as e:
+        return {"status": "failed", "steps": [], "error": f"读执行状态失败：{e}"}
+    by_seq = {int(s["seq"]): s for s in steps}
+    status, outs = "done", []
+    for r in rs:
+        seq = int(r["seq"])
+        if r["status"] == "done":
+            ctx["out"][r["key"]] = r.get("output") or ""
+            outs.append({"seq": seq, "key": r["key"], "title": r["title"],
+                         "status": "done", "output": r.get("output") or ""})
+            continue
+        step = by_seq.get(seq, {})
+        action = str(step.get("action") or "manual").strip() or "manual"
+        title = step.get("title") or action
+        if action == "manual":
+            note = step.get("note") or "需人工完成（做完后 hub_playbook action=resume 继续）"
+            _pb_step_finish(root, run_id, seq, "manual", note)
+            outs.append({"seq": seq, "key": r["key"], "title": title, "status": "manual", "output": note})
+            status = "waiting"
+            break
+        fn = PB_ACTIONS.get(action)
+        if fn is None:
+            _pb_step_finish(root, run_id, seq, "failed", f"未知动作：{action}")
+            outs.append({"seq": seq, "key": r["key"], "title": title, "status": "failed",
+                         "output": f"未知动作：{action}"})
+            status = "failed"
+            break
+        try:
+            ok, out = fn(root, _pb_args(step, ctx), ctx)
+        except Exception as _e:  # noqa: BLE001  动作内部异常=该步失败，不炸整个 run
+            ok, out = False, f"{type(_e).__name__}: {_e}"
+        out = str(out)[:600]
+        _pb_step_finish(root, run_id, seq, "done" if ok else "failed", out)
+        ctx["out"][r["key"]] = out
+        outs.append({"seq": seq, "key": r["key"], "title": title,
+                     "status": "done" if ok else "failed", "output": out})
+        if not ok and str(step.get("on_fail") or "stop") != "continue":
+            status = "failed"
+            break
+    # 未跑到的步骤也要出现在清单里，否则「1/2 步完成」这种摘要会让人误以为流程只有 2 步
+    seen = {o["seq"] for o in outs}
+    for r in rs:
+        if int(r["seq"]) not in seen:
+            outs.append({"seq": int(r["seq"]), "key": r["key"], "title": r["title"],
+                         "status": "pending", "output": ""})
+    outs.sort(key=lambda o: o["seq"])
+    return {"status": status, "steps": outs}
+
+
+def _pb_run_ctx(name: str, project: str, agent: str, target: str) -> dict:
+    return {"project": project or "", "agent": agent or "", "today": _now()[:10],
+            "name": name, "target": target or _default_src_dir(), "out": {}}
+
+
+def _pb_close_run(root, run_id, status, steps) -> str:
+    done = sum(1 for s in steps if s["status"] == "done")
+    total = len(steps)
+    summary = f"{done}/{total} 步完成"
+    if status == "waiting":
+        summary += "（停在需人工的步骤）"
+    elif status == "failed":
+        summary += "（有步骤失败，已停在第 " + str(
+            next((s["seq"] for s in steps if s["status"] == "failed"), total)) + " 步）"
+    with db_conn(root) as conn:
+        conn.execute("UPDATE playbook_runs SET status=?, finished=?, cursor=?, summary=? WHERE id=?",
+                     (status, _now(),
+                      next((s["seq"] for s in steps if s["status"] != "done"), 0), summary, run_id))
+    return summary
+
+
+def playbook_run(root: str, name: str, project: str = "", agent: str = "", target: str = "",
+                 dry_run: bool = False) -> dict:
+    """跑一次流程。dry_run=True 只列计划不执行（不落 run）。
+    返回 {run_id, playbook, status, summary, steps:[{seq,title,status,output}]}。"""
+    _pb_seed(root)
+    pb = playbook_get(root, name)
+    if not pb:
+        return {"error": f"流程「{name}」不存在（hub_playbook action=list 看清单）"}
+    steps = pb["steps"]
+    if not steps:
+        return {"error": f"流程「{name}」没有步骤"}
+    if dry_run:
+        return {"dry_run": True, "playbook": name, "title": pb["meta"]["title"],
+                "steps": [{"seq": s["seq"], "title": s["title"], "action": s["action"],
+                           "args": _pb_args(s, _pb_run_ctx(name, project, agent, target))}
+                          for s in steps]}
+    ctx = _pb_run_ctx(name, project, agent, target)
+    with db_conn(root) as conn:
+        cur = conn.execute("INSERT INTO playbook_runs(playbook,project,agent,status,started,cursor,summary)"
+                           " VALUES(?,?,?,'running',?,0,'')", (name, project or "", agent or "", _now()))
+        run_id = cur.lastrowid
+        conn.executemany("INSERT INTO playbook_run_steps(run_id,seq,key,title,action,status) "
+                         "VALUES(?,?,?,?,?,'pending')",
+                         [(run_id, s["seq"], s.get("key") or "", s.get("title") or "",
+                           s.get("action") or "manual") for s in steps])
+    res = _pb_execute(root, run_id, steps, ctx)
+    summary = _pb_close_run(root, run_id, res["status"], res["steps"])
+    return {"run_id": run_id, "playbook": name, "title": pb["meta"]["title"],
+            "status": res["status"], "summary": summary, "steps": res["steps"]}
+
+
+def playbook_resume(root: str, run_id, agent: str = "", target: str = "") -> dict:
+    """断点续跑：manual 步骤视为人已做完（标 done），从第一个未完成步骤继续。
+    全流程已完成/已中止的 run 不会被重跑。"""
+    try:
+        rid = int(run_id)
+    except (TypeError, ValueError):
+        return {"error": f"run_id 非法：{run_id!r}"}
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT * FROM playbook_runs WHERE id=?", (rid,)).fetchone()
+        if not row:
+            return {"error": f"run #{rid} 不存在（hub_playbook action=runs 看历史）"}
+        run = dict(row)
+        if run["status"] in ("done", "aborted"):
+            return {"error": f"run #{rid} 已是 {run['status']}，无需续跑（要重跑请新开一次 run）"}
+        conn.execute("UPDATE playbook_run_steps SET status='done', finished=?, "
+                     "output=COALESCE(NULLIF(output,''), '（人工确认完成）') "
+                     "WHERE run_id=? AND status='manual'", (_now(), rid))
+        conn.execute("UPDATE playbook_runs SET status='running' WHERE id=?", (rid,))
+    pb = playbook_get(root, run["playbook"])
+    if not pb:
+        return {"error": f"流程「{run['playbook']}」已不存在，无法续跑"}
+    ctx = _pb_run_ctx(run["playbook"], run["project"], agent or run["agent"], target)
+    res = _pb_execute(root, rid, pb["steps"], ctx)
+    summary = _pb_close_run(root, rid, res["status"], res["steps"])
+    return {"run_id": rid, "playbook": run["playbook"], "status": res["status"],
+            "summary": summary, "steps": res["steps"]}
+
+
+def playbook_runs(root: str, playbook: str = "", limit: int = 10) -> list:
+    """执行历史（新在前）。"""
+    sql = "SELECT * FROM playbook_runs"
+    args: list = []
+    if playbook:
+        sql += " WHERE playbook=?"
+        args.append(playbook)
+    sql += " ORDER BY id DESC LIMIT ?"
+    args.append(max(1, min(int(limit or 10), 100)))
+    try:
+        with db_conn(root) as conn:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return []
+
+
+def playbook_run_steps(root: str, run_id) -> list:
+    """某次执行的分步结果（顺序）。"""
+    try:
+        with db_conn(root) as conn:
+            return [dict(r) for r in conn.execute(
+                "SELECT * FROM playbook_run_steps WHERE run_id=? ORDER BY seq", (int(run_id),)).fetchall()]
+    except (sqlite3.Error, TypeError, ValueError):
+        return []
+
+
+def playbook_abort(root: str, run_id) -> str:
+    """中止一次执行：未完成步骤标 skipped，run 标 aborted（不删——跑过的事实要留着复盘）。"""
+    try:
+        rid = int(run_id)
+    except (TypeError, ValueError):
+        return f"run_id 非法：{run_id!r}"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT status FROM playbook_runs WHERE id=?", (rid,)).fetchone()
+        if not row:
+            return f"run #{rid} 不存在"
+        if row["status"] in ("done", "aborted"):
+            return f"run #{rid} 已是 {row['status']}，无需中止"
+        conn.execute("UPDATE playbook_run_steps SET status='skipped', finished=? "
+                     "WHERE run_id=? AND status IN ('pending','failed','manual')", (_now(), rid))
+        conn.execute("UPDATE playbook_runs SET status='aborted', finished=?, summary='已中止' WHERE id=?",
+                     (_now(), rid))
+    return f"run #{rid} 已中止（未完成步骤标 skipped，可 hub_playbook action=runs 复盘）"
+
+
+# ==================================================================== Y2 自动化层（触发器）
+# Y1 解决了「流程怎么跑」，Y2 解决「什么时候自动跑」：把「每次心跳顺手检查一遍」
+# 「有人发信号就通知我」这类**本该自动的事**交给大脑，不再依赖每个 agent 自觉。
+#
+# 三条防线，缺一个就是事故：
+#   ① enabled 默认 0——触发器是主动行为，配错即刷屏/误动作，必须人显式开；
+#   ② 冷却（默认 12h）——心跳一天好几次，不冷却同一件事会反复推；
+#   ③ 时间预算——playbook 可能耗时（回归几分钟），心跳里跑必须有上限，超时丢弃不阻塞。
+
+TRIGGER_EVENTS = ("heartbeat", "signal", "record")
+TRIGGER_ACTIONS = ("notify", "signal", "playbook")
+_TRIGGER_DEFAULT_COOLDOWN = 720  # 分钟（12h）
+
+
+def _jload(s) -> dict:
+    """JSON 字段容错读取：脏数据/空串一律当空 dict，不让一条坏配置炸掉整轮评估。"""
+    if isinstance(s, dict):
+        return s
+    try:
+        return json.loads(s) if (s or "").strip() else {}
+    except (ValueError, TypeError):
+        return {}
+
+
+def _trig_match(cond: dict, ctx: dict) -> bool:
+    """条件匹配：等值比对；keyword 走包含（大小写不敏感）。无条件=全匹配。"""
+    if not cond:
+        return True
+    for k, v in cond.items():
+        if v in ("", None):
+            continue
+        got = str(ctx.get(k) or "")
+        if k == "keyword":
+            if str(v).lower() not in got.lower():
+                return False
+        elif str(v) != got:
+            return False
+    return True
+
+
+def _trig_cooled(last_fired: str, cooldown_min: int) -> bool:
+    if not last_fired or not cooldown_min:
+        return False
+    try:
+        dt = datetime.datetime.now() - datetime.datetime.fromisoformat(last_fired)
+    except (TypeError, ValueError):
+        return False
+    return dt.total_seconds() < cooldown_min * 60
+
+
+def _run_budget(fn, budget: float):
+    """带时间预算执行：超时就丢弃结果（不阻塞调用方，典型场景=心跳里跑 playbook）。
+
+    为什么用线程而不是 signal.alarm：Windows 没有 alarm；且超时后无法真杀线程，
+    所以只保证「调用方不被拖住」，后台线程仍在跑完（daemon，进程退出即收）。
+    """
+    import threading  # noqa: PLC0415  只有触发器路径需要
+    box: dict = {}
+
+    def _w():
+        try:
+            box["r"] = fn()
+        except Exception as _e:  # noqa: BLE001
+            box["e"] = _e
+
+    th = threading.Thread(target=_w, daemon=True)
+    th.start()
+    th.join(budget)
+    if "r" in box:
+        return True, box["r"]
+    if "e" in box:
+        return False, f"{type(box['e']).__name__}: {box['e']}"
+    return False, f"超过时间预算 {budget:.0f}s（动作仍在后台跑完，本次结果不计入）"
+
+
+def trigger_add(root: str, name: str, on_event: str = "heartbeat", action_type: str = "notify",
+                action_args: dict = None, condition: dict = None, cooldown_min: int = None,
+                agent: str = "") -> tuple:
+    """建触发器。返回 (错误或 "", id)。默认 enabled=0——建完要显式开。"""
+    name = (name or "").strip()
+    if not name:
+        return "name 必填（给自己看的，写清触发什么）", 0
+    if on_event not in TRIGGER_EVENTS:
+        return f"on_event 必须是 {'、'.join(TRIGGER_EVENTS)}", 0
+    if action_type not in TRIGGER_ACTIONS:
+        return f"action_type 必须是 {'、'.join(TRIGGER_ACTIONS)}", 0
+    args = action_args or {}
+    if not isinstance(args, dict):
+        return "action_args 必须是对象", 0
+    if action_type == "playbook" and not str(args.get("name") or "").strip():
+        return "playbook 动作必须在 action_args 里给 name（要跑哪个流程）", 0
+    if action_type == "signal" and not str(args.get("content") or "").strip():
+        return "signal 动作必须在 action_args 里给 content", 0
+    try:
+        cd = _TRIGGER_DEFAULT_COOLDOWN if cooldown_min is None else int(cooldown_min)
+    except (TypeError, ValueError):
+        return "cooldown_min 必须是整数（分钟）", 0
+    cd = max(0, min(cd, 10080))  # 上限一周：更长不如改成手动
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "INSERT INTO triggers(name,on_event,condition,action_type,action_args,enabled,"
+            "cooldown_min,last_fired,fire_count,agent,created) VALUES(?,?,?,?,?,0,?,'',0,?,?)",
+            (name[:80], on_event, json.dumps(condition or {}, ensure_ascii=False), action_type,
+             json.dumps(args, ensure_ascii=False), cd, (agent or "").strip(), _now()))
+        return "", cur.lastrowid
+
+
+def trigger_list(root: str, on_event: str = "") -> list:
+    sql = "SELECT * FROM triggers"
+    args: list = []
+    if on_event:
+        sql += " WHERE on_event=?"
+        args.append(on_event)
+    sql += " ORDER BY enabled DESC, id"
+    try:
+        with db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(sql, args).fetchall()]
+    except sqlite3.Error:
+        return []
+    for r in rows:
+        r["condition"] = _jload(r.get("condition"))
+        r["action_args"] = _jload(r.get("action_args"))
+    return rows
+
+
+def trigger_set_enabled(root: str, tid, enabled: bool) -> str:
+    try:
+        i = int(tid)
+    except (TypeError, ValueError):
+        return f"触发器 id 非法：{tid!r}"
+    with db_conn(root) as conn:
+        if not conn.execute("SELECT 1 FROM triggers WHERE id=?", (i,)).fetchone():
+            return f"触发器 #{i} 不存在"
+        conn.execute("UPDATE triggers SET enabled=? WHERE id=?", (1 if enabled else 0, i))
+    return f"触发器 #{i} 已{'启用' if enabled else '停用'}"
+
+
+def trigger_del(root: str, tid) -> str:
+    try:
+        i = int(tid)
+    except (TypeError, ValueError):
+        return f"触发器 id 非法：{tid!r}"
+    with db_conn(root) as conn:
+        cur = conn.execute("DELETE FROM triggers WHERE id=?", (i,))
+    return f"触发器 #{i} 已删除" if cur.rowcount else f"触发器 #{i} 不存在"
+
+
+def _trig_stamp(root: str, tid: int) -> None:
+    """记录触发时刻并计数（冷却判断的事实依据）。"""
+    with db_conn(root) as conn:
+        conn.execute("UPDATE triggers SET last_fired=?, fire_count=fire_count+1 WHERE id=?",
+                     (_now(), tid))
+
+
+def _trig_act(root: str, t: dict, ctx: dict, budget: float):
+    """执行一次触发动作。返回 (ok, text)。"""
+    atype = t.get("action_type") or "notify"
+    raw = t.get("action_args") or {}
+    args = {k: (_pb_render(v, ctx) if isinstance(v, str) else v) for k, v in raw.items()}
+    if atype == "notify":
+        return True, args.get("text") or t.get("name") or "（触发）"
+    if atype == "signal":
+        ok, out = _run_budget(
+            lambda: signal_send(root, args.get("from_agent") or t.get("agent") or "system",
+                                args.get("content") or "", args.get("to_agent") or "",
+                                args.get("kind") or "msg",
+                                args.get("project") or ctx.get("project") or ""), budget)
+        if not ok:
+            return False, out
+        tip, sid = out
+        return (sid > 0), str(tip)
+    if atype == "playbook":
+        nm = str(args.get("name") or "").strip()
+        if not nm:
+            return False, "playbook 动作缺 name"
+        ok, res = _run_budget(
+            lambda: playbook_run(root, nm, args.get("project") or ctx.get("project") or "",
+                                 args.get("agent") or t.get("agent") or "",
+                                 args.get("target") or ""), budget)
+        if not ok:
+            return False, res
+        if res.get("error"):
+            return False, str(res["error"])
+        return True, f"playbook {nm} → {res['status']}（{res['summary']}）"
+    return False, f"未知动作类型：{atype}"
+
+
+def trigger_eval(root: str, event: str, ctx: dict = None, budget_sec: float = 20) -> list:
+    """评估某事件下的触发器并执行（内部调用点：心跳/发信号/写记录）。
+
+    只跑 enabled=1 且条件匹配且不在冷却内的。返回 [{id,name,status,text}]，
+    status: fired / failed / cooled。任何一项炸都不影响其他项、不影响调用方。
+    """
+    ctx = dict(ctx or {})
+    ctx.setdefault("event", event)
+    if event not in TRIGGER_EVENTS:
+        return []
+    try:
+        with db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM triggers WHERE on_event=? AND enabled=1 ORDER BY id",
+                (event,)).fetchall()]
+    except sqlite3.Error:
+        return []
+    out = []
+    for t in rows:
+        t["condition"] = _jload(t.get("condition"))
+        t["action_args"] = _jload(t.get("action_args"))
+        if not _trig_match(t["condition"], ctx):
+            continue
+        if _trig_cooled(t.get("last_fired"), int(t.get("cooldown_min") or 0)):
+            out.append({"id": t["id"], "name": t["name"], "status": "cooled", "text": ""})
+            continue
+        try:
+            ok, text = _trig_act(root, t, ctx, budget_sec)
+        except Exception as _e:  # noqa: BLE001  单个触发器炸了不能拖垮心跳
+            ok, text = False, f"{type(_e).__name__}: {_e}"
+        _trig_stamp(root, t["id"])
+        out.append({"id": t["id"], "name": t["name"], "status": "fired" if ok else "failed",
+                    "text": str(text)[:400]})
+    return out
+
+
+def trigger_fire(root: str, tid, ctx: dict = None, force: bool = False) -> dict:
+    """手动触发一次（测试/立即执行）。force=True 忽略冷却与 enabled（调试用）。"""
+    try:
+        i = int(tid)
+    except (TypeError, ValueError):
+        return {"error": f"触发器 id 非法：{tid!r}"}
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT * FROM triggers WHERE id=?", (i,)).fetchone()
+    if not row:
+        return {"error": f"触发器 #{i} 不存在"}
+    t = dict(row)
+    if not force:
+        if not int(t.get("enabled") or 0):
+            return {"error": f"触发器 #{i} 未启用（先 action=enable，或 force=true 强制试跑）"}
+        if _trig_cooled(t.get("last_fired"), int(t.get("cooldown_min") or 0)):
+            return {"error": f"触发器 #{i} 在冷却中（上次 {t.get('last_fired', '')[:16]}，"
+                             f"冷却 {t.get('cooldown_min')} 分钟）"}
+    t["condition"] = _jload(t.get("condition"))
+    t["action_args"] = _jload(t.get("action_args"))
+    ctx = dict(ctx or {})
+    ctx.setdefault("event", t.get("on_event") or "manual")
+    try:
+        ok, text = _trig_act(root, t, ctx, 120)
+    except Exception as _e:  # noqa: BLE001
+        ok, text = False, f"{type(_e).__name__}: {_e}"
+    _trig_stamp(root, i)
+    return {"id": i, "name": t.get("name"), "status": "fired" if ok else "failed",
+            "text": str(text)[:600]}
+
+
+# ==================================================================== Y3 知识图谱（关联检索）
+# 检索解决「能不能找到」，图谱解决「找到了但不知道它跟什么有关」。
+# 边分四类：mention（[[双链]]，写入侧自动）/ link（手工）/ tag（记忆→标签）/ in（记录→项目）。
+# 后两类由 graph_build 物化（幂等重建，随时可重跑）；前两类写入侧维护，重跑不动。
+# 只做查询与统计，**不自动改数据**——图谱的用途是让人看见关联，不是替人重构知识。
+
+GRAPH_NODE_KINDS = ("record", "memory", "note", "project", "tag")
+
+
+def _node(ref: str) -> tuple:
+    """节点串 → (kind, id)。支持 record:12 / memory:3 / tag:踩坑 / project:项目名。"""
+    ref = (ref or "").strip()
+    if ":" in ref:
+        k, v = ref.split(":", 1)
+        k, v = k.strip().lower(), v.strip()
+        if k in GRAPH_NODE_KINDS and v:
+            return k, v
+    return "", ""
+
+
+def graph_build(root: str) -> dict:
+    """物化结构边（幂等：先删同类旧边再插）。返回统计。
+
+    tag 边让「同标签的记忆」在图上相连，in 边让「同项目的记录」相连——
+    这两类边不是人写的，是数据本身的结构，不物化就永远看不到。
+    """
+    stat = {"tag": 0, "in": 0, "memories": 0, "records": 0}
+    now = _now()
+    with db_conn(root) as conn:
+        conn.execute("DELETE FROM relations WHERE kind IN ('tag','in')")
+        try:
+            mems = conn.execute("SELECT id, tags, project FROM memories WHERE " + _live_sql()).fetchall()
+        except sqlite3.Error:
+            mems = []
+        for r in mems:
+            stat["memories"] += 1
+            for t in re.split(r"[,，]", r["tags"] or ""):
+                t = t.strip()
+                if not t:
+                    continue
+                conn.execute("INSERT OR IGNORE INTO relations"
+                             "(from_kind,from_id,to_kind,to_ref,kind,created) VALUES('memory',?,'tag',?,'tag',?)",
+                             (int(r["id"]), t, now))
+                stat["tag"] += 1
+            # 记忆归属项目也成边：否则「同项目的记录与记忆」在图上永不相交（实测路径查询全断）
+            if (r["project"] or "").strip():
+                conn.execute("INSERT OR IGNORE INTO relations"
+                             "(from_kind,from_id,to_kind,to_ref,kind,created) VALUES('memory',?,'project',?,'in',?)",
+                             (int(r["id"]), r["project"].strip(), now))
+                stat["in"] += 1
+        try:
+            recs = conn.execute("SELECT id, project FROM records WHERE " + _rec_live_sql()).fetchall()
+        except sqlite3.Error:
+            recs = []
+        for r in recs:
+            p = (r["project"] or "").strip()
+            if not p:
+                continue
+            stat["records"] += 1
+            conn.execute("INSERT OR IGNORE INTO relations"
+                         "(from_kind,from_id,to_kind,to_ref,kind,created) VALUES('record',?,'project',?,'in',?)",
+                         (int(r["id"]), p, now))
+            stat["in"] += 1
+    return stat
+
+
+def _graph_adj(conn) -> dict:
+    """全表邻接表（无向）：(kind,ref) -> [(邻居, 边类型)]。库规模下全量加载最省心。"""
+    try:
+        rows = conn.execute("SELECT from_kind,from_id,to_kind,to_ref,kind FROM relations").fetchall()
+    except sqlite3.Error:
+        return {}
+    adj: dict = {}
+    for e in rows:
+        a = (e["from_kind"], str(e["from_id"]))
+        b = (e["to_kind"], str(e["to_ref"]))
+        adj.setdefault(a, []).append((b, e["kind"]))
+        adj.setdefault(b, []).append((a, e["kind"]))
+    return adj
+
+
+def graph_stats(root: str, build: bool = True) -> dict:
+    """图谱体检：边数/边型分布/节点数/已连条目/孤岛数/最大簇。"""
+    if build:
+        graph_build(root)
+    with db_conn(root) as conn:
+        try:
+            edges = conn.execute("SELECT COUNT(*) c FROM relations").fetchone()["c"]
+            by_kind = {r["kind"]: r["c"] for r in
+                       conn.execute("SELECT kind, COUNT(*) c FROM relations GROUP BY kind")}
+            n_mem = conn.execute("SELECT COUNT(*) c FROM memories WHERE " + _live_sql()).fetchone()["c"]
+            n_rec = conn.execute("SELECT COUNT(*) c FROM records WHERE " + _rec_live_sql()).fetchone()["c"]
+            linked = conn.execute("SELECT COUNT(DISTINCT from_id) c FROM relations "
+                                  "WHERE from_kind IN ('record','memory')").fetchone()["c"]
+        except sqlite3.Error:
+            return {"error": "图谱统计失败（表缺失？）"}
+    cl = graph_clusters(root, limit=1, build=False)
+    return {"edges": edges, "by_kind": by_kind, "nodes": {"record": n_rec, "memory": n_mem},
+            "linked": linked, "isolated": max(0, n_rec + n_mem - linked),
+            "largest_cluster": (cl[0]["size"] if cl else 0)}
+
+
+def graph_neighbors(root: str, ref: str, limit: int = 30) -> dict:
+    """某节点的直接邻居（出边/入边分开列，带来源摘要）。"""
+    kind, sid = _node(ref)
+    if not kind:
+        return {"error": f"节点格式不对：{ref!r}（应如 record:12 / memory:3 / tag:踩坑 / project:项目名）"}
+    lim = max(1, min(int(limit or 30), 100))
+    try:
+        iid = int(sid)
+    except (TypeError, ValueError):
+        iid = -1
+    with db_conn(root) as conn:
+        out_e = [dict(r) for r in conn.execute(
+            "SELECT * FROM relations WHERE from_kind=? AND from_id=? ORDER BY id DESC LIMIT ?",
+            (kind, iid, lim)).fetchall()]
+        in_e = [dict(r) for r in conn.execute(
+            "SELECT * FROM relations WHERE to_kind=? AND to_ref=? ORDER BY id DESC LIMIT ?",
+            (kind, sid, lim)).fetchall()]
+        for r in out_e + in_e:
+            r["snippet"], r["project"] = _src_snippet(conn, r["from_kind"], int(r["from_id"] or 0))
+    return {"node": f"{kind}:{sid}", "out": out_e, "in": in_e}
+
+
+def graph_related(root: str, ref: str, limit: int = 10) -> list:
+    """与某条目最相关的条目（二跳内，按 距离衰减 + 显式边加权 排序）。
+
+    与检索的分工：检索按「词像不像」，这里按「图上近不近」——
+    一条没提到关键词但同项目同标签的记录，检索找不到，图谱能。
+    """
+    kind, sid = _node(ref)
+    if not kind:
+        return []
+    lim = max(1, min(int(limit or 10), 50))
+    start = (kind, sid)
+    with db_conn(root) as conn:
+        adj = _graph_adj(conn)
+        scores: dict = {}
+        seen = {start}
+        frontier = [start]
+        for depth in (1, 2):
+            nxt = []
+            for n in frontier:
+                for nb, ek in adj.get(n, []):
+                    if nb in seen:
+                        continue
+                    seen.add(nb)
+                    nxt.append(nb)
+                    if nb[0] in ("record", "memory"):
+                        # 显式边（双链/手工）比结构边（同标签/同项目）更能说明「有关」
+                        scores[nb] = scores.get(nb, 0.0) + (2.0 / depth) + (0.5 if ek in ("mention", "link") else 0)
+            frontier = nxt
+        out = sorted(scores.items(), key=lambda kv: -kv[1])[:lim]
+        res = []
+        for (k, i), s in out:
+            try:
+                ii = int(i)
+            except (TypeError, ValueError):
+                continue
+            snip, proj = _src_snippet(conn, k, ii, 60)
+            res.append({"node": f"{k}:{i}", "score": round(s, 2), "snippet": snip, "project": proj})
+    return res
+
+
+def graph_path(root: str, a: str, b: str, max_depth: int = 4) -> dict:
+    """两节点间最短路径（BFS）。找不到就明说找不到——编一条路径比说不知道更糟。"""
+    ka, ia = _node(a)
+    kb, ib = _node(b)
+    if not ka or not kb:
+        return {"error": f"节点格式不对：{a!r} 或 {b!r}（应如 record:12 / tag:踩坑）"}
+    if (ka, ia) == (kb, ib):
+        return {"found": True, "path": [f"{ka}:{ia}"], "depth": 0}
+    depth = max(1, min(int(max_depth or 4), 6))
+    with db_conn(root) as conn:
+        adj = _graph_adj(conn)
+    start, goal = (ka, ia), (kb, ib)
+    prev: dict = {start: None}
+    frontier = [start]
+    for _ in range(depth):
+        nxt = []
+        for n in frontier:
+            for nb, _ek in adj.get(n, []):
+                if nb in prev:
+                    continue
+                prev[nb] = n
+                if nb == goal:
+                    path, cur = [], goal
+                    while cur is not None:
+                        path.append(f"{cur[0]}:{cur[1]}")
+                        cur = prev[cur]
+                    return {"found": True, "path": list(reversed(path)), "depth": len(path) - 1}
+                nxt.append(nb)
+        frontier = nxt
+        if not frontier:
+            break
+    return {"found": False, "depth": depth,
+            "hint": f"{depth} 跳内不相连（可先 action=build 重建结构边，或放大 max_depth）"}
+
+
+def graph_clusters(root: str, limit: int = 8, min_size: int = 2, build: bool = False) -> list:
+    """知识簇（并查集连通分量，只统计 record/memory 节点）。
+
+    用途：看见「知识孤岛」——孤立条目没跟任何东西相连，检索时最难被顺带唤起，
+    也最容易被遗忘。规模最大的簇通常就是当前真正的主线。
+    """
+    if build:
+        graph_build(root)
+    lim = max(1, min(int(limit or 8), 30))
+    with db_conn(root) as conn:
+        try:
+            rows = conn.execute("SELECT from_kind,from_id,to_kind,to_ref FROM relations").fetchall()
+        except sqlite3.Error:
+            return []
+        parent: dict = {}
+
+        def find(x):
+            while parent.get(x, x) != x:
+                parent[x] = parent.get(parent[x], parent[x])
+                x = parent[x]
+            return x
+
+        for r in rows:
+            a = (r["from_kind"], str(r["from_id"]))
+            b = (r["to_kind"], str(r["to_ref"]))
+            parent.setdefault(a, a)
+            parent.setdefault(b, b)
+            ra, rb = find(a), find(b)
+            if ra != rb:
+                parent[ra] = rb
+        groups: dict = {}
+        for n in list(parent):
+            if n[0] not in ("record", "memory"):
+                continue
+            groups.setdefault(find(n), []).append(n)
+        out = [{"size": len(v), "nodes": v} for v in groups.values() if len(v) >= max(2, min_size)]
+        out.sort(key=lambda g: -g["size"])
+        for g in out[:lim]:
+            reps = []
+            for k, i in g["nodes"][:3]:
+                try:
+                    ii = int(i)
+                except (TypeError, ValueError):
+                    continue
+                s, _p = _src_snippet(conn, k, ii, 48)
+                reps.append(f"{k}:{i}｜{s}")
+            g["sample"] = reps
+            g["nodes"] = [f"{k}:{i}" for k, i in g["nodes"]]
+    return out[:lim]

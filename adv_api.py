@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""adv_api.py（X2·v2.39）：REST API 桥 + Web 仪表盘回归。
+"""adv_api.py（X2·v2.40）：REST API 桥 + Web 仪表盘回归。
 
 起本地服务（端口 0 自动分配，线程内跑）→ urllib 打各端点 → 断言：
   仪表盘可打开 / 工具清单非空 / 常用路由返回内容 / 未知路由 404 /
@@ -77,6 +77,9 @@ def t_api_readonly():
             code, body = c.get(path)
             assert code == 200, (path, code, body[:80])
             assert must in body, (path, body[:120])
+        # Y1-Y3 编排概览（只读视图，走 brain 层不经写工具通道）
+        code, body = c.get("/api/orchestration")
+        assert code == 200 and "最近执行" in body and "图谱" in body, (code, body[:120])
         # 任意只读工具（白名单外但非写工具也放行）
         code, body = c.get("/api/call?name=hub_list_projects")
         assert code == 200, (code, body[:80])

@@ -23,7 +23,9 @@ import time
 from pathlib import Path
 
 DEPLOY_DIR = Path.home() / ".agenthub" / "mcp_server"
-DEPLOY_FILES = ["core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py", "cli.py", "codec.py", "my/__init__.py", "my/work/__init__.py"]
+# Y4：api.py（X2 REST 桥）此前不在清单里，改了源码不落部署检测不到——实测 X2 收尾就漏过一次
+DEPLOY_FILES = ["core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py",
+                "cli.py", "codec.py", "api.py", "my/__init__.py", "my/work/__init__.py"]
 PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一致
 
 # name -> (一句话说明, 是否需要 target 目录)
