@@ -911,8 +911,11 @@ MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # report.py（1.3 hub_report 依赖）与 ops.py（检查工具箱）必须随部署同步——
 # 缺了就是部署版 ImportError / 检查项不存在（03 已知空白①根修：ops.py 此前不在名单）
 # my/ 两件（3.4 可编程数据包）：部署目录自包含后，agent 对部署目录 sys.path 即可 import my.work
+# 单一来源：deploy_server 按它复制，ops.DEPLOY_FILES 直接引用它做一致性检查。
+# 此前两份清单各写各的（core 这份没有 api.py），结果「检查说一致、实际没部署」——
+# 2026-10-13 release playbook 实跑时 deploy_diff 抓到 api.py 不一致，根因即此。
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
-                "my/__init__.py", "my/work/__init__.py")
+                "api.py", "my/__init__.py", "my/work/__init__.py")
 
 
 def find_python() -> str:

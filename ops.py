@@ -23,9 +23,11 @@ import time
 from pathlib import Path
 
 DEPLOY_DIR = Path.home() / ".agenthub" / "mcp_server"
-# Y4：api.py（X2 REST 桥）此前不在清单里，改了源码不落部署检测不到——实测 X2 收尾就漏过一次
-DEPLOY_FILES = ["core.py", "brain.py", "agenthub_mcp.py", "agentscore.py", "ops.py", "report.py",
-                "cli.py", "codec.py", "api.py", "my/__init__.py", "my/work/__init__.py"]
+# 与部署动作同源（core.SERVER_FILES）——检查清单与部署清单各写一份就是漂移的温床：
+# 2026-10-13 实跑 release playbook 时发现 api.py「检查说一致、实际没部署」即此根因。
+import core  # noqa: E402  ops 与 core 互有依赖，此处仅取常量（core 不 import ops）
+
+DEPLOY_FILES = list(core.SERVER_FILES)
 PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一致
 
 # name -> (一句话说明, 是否需要 target 目录)
