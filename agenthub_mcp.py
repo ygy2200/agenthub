@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.6"}  # v2.40.5=isError正确性+清单漂移收口；本版=响应体积双封顶（防管道死锁/上下文冲爆）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.7"}  # v2.40.6=响应体积双封顶；本版=协议健壮性（畸形请求-32600/异常不外泄路径SQL）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2420,6 +2420,12 @@ def _is_error_text(text: str) -> bool:
 
 def handle_message(msg: dict, root: str) -> dict | None:
     """处理一条 JSON-RPC 请求，返回响应；通知返回 None。"""
+    # 防御：畸形请求（非 dict / 空 / 数组）不能让整个 stdio 服务崩——回 JSON-RPC Invalid Request。
+    # arxiv MCP 故障分类（2606.05339）指出"请求处理前未做校验"是高发故障源；客户端发来坏帧
+    # 时应优雅拒绝而非抛未捕获异常（未捕获异常会断连、工具全失）。
+    if not isinstance(msg, dict):
+        return {"jsonrpc": "2.0", "id": None,
+                "error": {"code": -32600, "message": "Invalid Request: expected a JSON object"}}
     method = msg.get("method", "")
     mid = msg.get("id")
     is_notification = mid is None
@@ -2486,10 +2492,13 @@ def handle_message(msg: dict, root: str) -> dict | None:
                 result["structuredContent"] = structured
             return {"jsonrpc": "2.0", "id": mid, "result": result}
         except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落库错误登记
-            text = f"工具执行失败：{type(e).__name__}: {e}"
+            # 模型侧只给稳定可行动文案（含异常类型，不含原始堆栈/SQL/路径——MCP 官方 wati.io
+            # 明确禁止把堆栈/SQL/秘密塞回模型）；完整细节只在 error_add + stderr 留痕（服务端可见）。
+            text = (f"工具执行失败（{type(e).__name__}）：已记入大脑错误，可重试；"
+                    f"若持续失败联系管理员")
             try:
                 brain.error_add(root, str(args.get("agent") or "mcp-server"),
-                                f"MCP 工具 {tname} 执行异常", text,
+                                f"MCP 工具 {tname} 执行异常", f"{type(e).__name__}: {e}",
                                 project=str(args.get("project") or ""))
             except Exception:  # noqa: BLE001 登记失败不影响协议响应
                 pass

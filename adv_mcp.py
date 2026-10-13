@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.6"
+    assert r["serverInfo"]["version"] == "2.40.7"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -89,7 +89,8 @@ def t_protocol(root):
     from unittest import mock
     with mock.patch.object(m, "call_tool", side_effect=RuntimeError("模拟崩溃")):
         r = m.handle_message(rpc("tools/call", {"name": "hub_x", "arguments": {"agent": "zcode"}}, 3), str(root))
-    assert r["result"]["isError"] is True and "模拟崩溃" in r["result"]["content"][0]["text"]
+    assert r["result"]["isError"] is True and "RuntimeError" in r["result"]["content"][0]["text"]
+    assert "模拟崩溃" not in r["result"]["content"][0]["text"]  # 原始异常消息不得回吐模型（wati.io）
     errs = brain.error_list(str(root))
     assert any("hub_x" in e.get("title", "") and e.get("agent") == "zcode" for e in errs), \
         "工具异常未自动登记错误"
@@ -1074,6 +1075,34 @@ def t_response_size_guard():
     assert t2 == "ok" and s2 is None
 
 
+def t_handle_message_robustness(root):
+    """协议健壮性（2026-10-13 缺陷自查补）：① 畸形请求（非 dict）回 -32600 而非崩服务；
+    ② 工具抛异常时模型侧文案不得回吐原始路径/SQL（细节只留服务端）。来源：arxiv 2606.05339
+    （请求处理前未校验是高发故障）+ wati.io（禁止把堆栈/SQL 塞回模型）。"""
+    # ① 畸形请求 / 缺 method
+    bad = m.handle_message(["not", "a", "dict"], str(root))
+    assert bad["error"]["code"] == -32600, bad
+    miss = m.handle_message({"jsonrpc": "2.0", "method": "no/such/method", "id": 1}, str(root))
+    assert miss["error"]["code"] == -32601, miss
+
+    # ② 异常不外泄原始细节
+    orig = m.call_tool
+
+    def _boom(*a, **k):
+        raise RuntimeError("boom at C:\\secret\\db.sqlite3 : UNIQUE constraint failed records.x")
+    try:
+        m.call_tool = _boom
+        r = m.handle_message(rpc("tools/call", {"name": "hub_status", "arguments": {}}), str(root))
+        res = r["result"]
+        assert res["isError"] is True, res
+        body = res["content"][0]["text"]
+        assert "C:\\secret" not in body, f"原始路径不应回吐模型：{body}"
+        assert "UNIQUE constraint" not in body, f"原始 SQL 不应回吐模型：{body}"
+        assert "工具执行失败" in body and "RuntimeError" in body, f"应保留异常类型：{body}"
+    finally:
+        m.call_tool = orig
+
+
 def t_p3_contract(tmp):
     """P3-1 契约：profile 切片（藏起≠禁用）/ discover 协商（-32022）/ max_chars 截断
     / dry_run 不落库 / confirm=false 闸门 / 写后审计与 undo 句柄 / 发现工具。"""
@@ -1514,6 +1543,7 @@ def main():
     case("MCP协议（握手/50工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
     case("响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）", lambda: t_response_size_guard())
+    case("协议健壮性（畸形请求-32600 / 异常不外泄路径SQL）", lambda: t_handle_message_robustness(root))
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
