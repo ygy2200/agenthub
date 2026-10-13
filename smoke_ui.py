@@ -229,6 +229,16 @@ def main():
         w.playbook_page.reload()
         check("编排中心流程清单有内置模板", w.playbook_page.listw.count() >= 5,
               str(w.playbook_page.listw.count()))
+        # 执行历史：选中一次执行后展开分步（先造一条：极简 noop 流程跑一次）
+        brain.playbook_upsert(str(tmp), "smokeflow", title="冒烟流程",
+                              steps=[{"key": "a", "title": "打点", "action": "noop",
+                                      "args": {"text": "ok"}}])
+        res = brain.playbook_run(str(tmp), "smokeflow", "冒烟-项目", "zcode")
+        w.playbook_page.seg.setCurrentItem("runs")
+        w.playbook_page.cur_run = res.get("run_id", 0)
+        w.playbook_page.reload()
+        check("编排中心执行历史可展开分步", w.playbook_page.listw.count() >= 2,
+              str(w.playbook_page.listw.count()))
         # 统计页同类残留回归：set_db 两次后标签数不变（agentBox 行布局同 bug 的第二实例）
         w.stats_page.set_db(brain.stats(str(tmp)))
         m1 = len(w.stats_page.findChildren(QLabel))

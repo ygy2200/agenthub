@@ -24,6 +24,7 @@ class PlaybookPage(QWidget):
         self._runs: dict = {}     # id(item) -> 执行行
         self._trig: dict = {}     # id(item) -> 触发器行
         self.cur_flow = ""
+        self.cur_run = 0     # 执行历史里展开分步的那一条
         lay = QVBoxLayout(self)
         lay.setContentsMargins(24, 24, 24, 24)
         lay.addWidget(_page_head(
@@ -82,6 +83,16 @@ class PlaybookPage(QWidget):
 
         self.seg.currentItemChanged.connect(lambda _k: self.reload())
         self.listw.itemDoubleClicked.connect(lambda _it: self.run_flow())
+        self.listw.itemSelectionChanged.connect(self._on_select)
+
+    def _on_select(self):
+        """执行历史段：选中哪条就展开哪条的分步（变化时刷新一次，不重复递归）。"""
+        if self.seg.currentItem() != "runs":
+            return
+        row = self._selected()
+        if row and int(row.get("id") or 0) != self.cur_run:
+            self.cur_run = int(row["id"])
+            self.reload()
 
     # ---------- 数据 ----------
     def reload(self):
@@ -178,6 +189,19 @@ class PlaybookPage(QWidget):
             self._add(f"#{r['id']} {r['playbook']} [{r['status']}] {r['summary']}"
                       f"（{r['project'] or '无项目'} · {r['agent'] or '无'} · {r['started'][:16]}）",
                       self._runs, r)
+            # 选中的那条就地展开分步：失败停在第几步、每步输出是什么，桌面端也得看得见
+            if r["id"] == self.cur_run:
+                try:
+                    steps = brain.playbook_run_steps(self.win.root, r["id"])
+                except Exception:  # noqa: BLE001
+                    steps = []
+                for s in steps:
+                    mark = {"done": "√", "failed": "×", "manual": "手",
+                            "pending": "·", "skipped": "-"}.get(s["status"], "·")
+                    out = f"  → {(s.get('output') or '')[:70]}" if s.get("output") else ""
+                    it = QListWidgetItem(f"    [{mark}] {s['seq']}. {s['title']}{out}")
+                    it.setFlags(Qt.ItemFlag.NoItemFlags)  # 分步不是可选项，避免误选
+                    self.listw.addItem(it)
 
     def _load_trig(self):
         try:
