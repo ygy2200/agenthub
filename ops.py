@@ -50,6 +50,7 @@ CHECKS = {
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
     "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
     "graph_health": ("知识图谱健康（2026-10-13）：结构边数/已连条目/孤岛数/最大簇——孤岛变多=该补标签的信号，边归零=图谱接线坏了", False),
+    "date_health": ("日期格式健康（2026-10-13）：date-only 列（记录日期/决策回顾日/任务截止/记忆有效期）是否全是 YYYY-MM-DD——格式一歪，「到期提醒」会静默不提醒（v2.40.13 修的就是这个静默失效）", False),
     "stdout_guard": ("stdout 污染守卫（2026-10-13）：MCP stdio 协议下任何 print 落到 stdout 都会让客户端 JSON-RPC 解析失败、工具全消失——外部检索列的头号致命缺陷。扫描 MCP 进程加载的模块", True),
     "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
 }
@@ -91,6 +92,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _db_health(root)
     elif name == "graph_health":
         r = _graph_health(root)
+    elif name == "date_health":
+        r = _date_health(root)
     elif name == "stdout_guard":
         r = _stdout_guard(t)
     elif name == "schema_drift":
@@ -533,6 +536,54 @@ def _schema_drift() -> dict:
             "summary": (f"{len(declared)} 个带 action enum 的工具全部与分发代码一致"
                         if not bad else f"{len(bad)} 处 schema 漂移（声明了没实现）"),
             "detail": bad[:8]}
+
+
+def _date_health(root: str) -> dict:
+    """日期格式健康（只读，Round 13 / 2026-10-13）：date-only 列是否全是 YYYY-MM-DD。
+
+    为什么值得单列一项：M11 决策回顾、任务超期、记忆有效期都走 SQLite 的**字典序**比较
+    （`date <= date('now')`），格式一歪就「静默不提醒」——实测 '2026/10/01' 恒大于
+    '2026-10-13'，已到期的决策**永远不进队列且无任何报错**。v2.40.13 已在 MCP 入口规范化，
+    但 brain 层直写不经那道闸门，所以日常扫一遍兜底（发现即需清洗，别等提醒失效了才发现）。
+    口径只含 date-only 列；带时间部分的 datetime 列（*.updated 形如 2026-10-13T09:35:31）不算坏。
+    """
+    import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
+    if not root:
+        return {"ok": False, "summary": "大脑库根目录未配置", "detail": []}
+    targets = [("records", "date"), ("decision_reviews", "review_date"),
+               ("tasks", "due"), ("memories", "valid_until"), ("records", "valid_until")]
+    iso = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+    checked = 0
+    detail: list = []
+    try:
+        with brain.db_conn(root) as conn:
+            for tbl, col in targets:
+                try:
+                    rows = conn.execute(
+                        f'SELECT rowid AS _r, "{col}" AS v FROM "{tbl}" '
+                        f"WHERE \"{col}\" IS NOT NULL AND \"{col}\"!=''").fetchall()
+                except Exception:  # noqa: BLE001  老库缺表/缺列 → 跳过该项
+                    continue
+                for r in rows:
+                    checked += 1
+                    s = str(r["v"]).strip()
+                    good = False
+                    if iso.match(s):
+                        try:
+                            datetime.date(*map(int, s.split("-")))
+                            good = True
+                        except ValueError:
+                            good = False
+                    if not good:
+                        if len(detail) < 8:
+                            detail.append(f"{tbl}.{col} rowid={r['_r']} → {s[:24]!r}")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"日期健康检查失败：{type(e).__name__}: {e}"[:120], "detail": []}
+    if detail:
+        return {"ok": False,
+                "summary": f"发现坏格式日期（共扫 {checked} 条 date-only 值）——会让「到期提醒」静默失效，需清洗",
+                "detail": detail}
+    return {"ok": True, "summary": f"日期格式干净（扫 {checked} 条 date-only 值，0 坏格式）", "detail": []}
 
 
 def _graph_health(root: str) -> dict:

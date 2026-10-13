@@ -8,6 +8,7 @@ from __future__ import annotations
 import datetime
 import json
 import os
+import re
 import subprocess
 import sys
 import tempfile
@@ -61,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.13"
+    assert r["serverInfo"]["version"] == "2.40.14"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -82,9 +83,10 @@ def t_protocol(root):
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
-    # limit 非法值容错（v1.3.1：不再抛异常，返回正常结果）
+    # limit 非法值容错（v1.3.1：不抛异常；v2.40.14 起契约收紧为「清晰整数错误」——
+    # 仍是「不崩不断连」，但错误必须能被模型纠正，不再悄悄回落默认值让模型以为生效）
     r = m.handle_message(rpc("tools/call", {"name": "hub_get_progress", "arguments": {"limit": "abc"}}, 2), str(root))
-    assert r["result"]["isError"] is False, r
+    assert r["result"]["isError"] is True and "必须是整数" in r["result"]["content"][0]["text"], r
     # 工具抛异常 -> isError 且自动落盘错误登记（mock 掉 call_tool 模拟任意异常）
     from unittest import mock
     with mock.patch.object(m, "call_tool", side_effect=RuntimeError("模拟崩溃")):
@@ -259,6 +261,73 @@ def t_round12_date_normalize(root):
                                    "content": "无回顾日决策"})["isError"] is False
     assert res_of("hub_task_add", {"title": "无截止任务", "agent": "zcode"})["isError"] is False
     assert res_of("hub_memory_write", {"content": "无有效期记忆", "agent": "zcode"})["isError"] is False
+
+
+def t_round13_int_params_central(root):
+    """Round 13：18 个工具的整数入参坏类型不再静默回落默认值（集中式声明 + 漂移守卫）。
+
+    此前这些字段是 `try/except → 默认值`：模型传 "abc" 时参数被**悄悄忽略**
+    （如 supersedes 传错 → 旧记忆根本没被取代，模型以为生效了）。现在集中在 call_tool
+    入口按 `_INT_PARAMS` 声明校验，坏类型给「错误：参数 X 必须是整数」。
+    """
+    def res_of(name, args):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), str(root))
+        return r["result"]
+
+    # ① 漂移守卫：源码里每个 `int(arguments.get("<k>"` 直转点，其 (工具, 参数) 必须已声明或豁免
+    src = Path(m.__file__).read_text(encoding="utf-8").splitlines()
+    declared = {(t, k) for t, ks in m._INT_PARAMS.items() for k in ks}
+    cur = None
+    undeclared = []
+    for i, ln in enumerate(src, 1):
+        mm = re.match(r'\s*if name == "(\w+)"', ln)
+        if mm:
+            cur = mm.group(1)
+        m3 = re.search(r'int\(arguments\.get\(\s*"(\w+)"', ln)
+        if m3 and m3.group(1) not in m._INT_EXEMPT_PARAMS and (cur, m3.group(1)) not in declared:
+            undeclared.append((i, cur, m3.group(1)))
+    assert not undeclared, f"仍有未声明/未豁免的整数直转点（请登记 _INT_PARAMS）：{undeclared}"
+
+    # ② 机制单测：声明字段坏类型拦、豁免字段放行、缺省/空值放行
+    assert m._bad_int_param("hub_events", {"since_id": "abc"}) and "since_id" in \
+        m._bad_int_param("hub_events", {"since_id": "abc"})
+    assert m._bad_int_param("hub_memory_write", {"supersedes": "x"}) is not None
+    assert m._bad_int_param("hub_tasks", {"limit": None}) is None
+    assert m._bad_int_param("hub_tasks", {"limit": ""}) is None
+    assert m._bad_int_param("hub_tasks", {}) is None
+    assert m._bad_int_param("hub_tasks", {"limit": "5"}) is None       # 数字串合法
+    assert m._bad_int_param("hub_status", {"max_chars": "abc"}) is None   # 豁免：协议级预算
+    assert m._bad_int_param("hub_note_read", {"note_id": "abc"}) is None  # 豁免：自身已清晰
+
+    # ③ 端到端：坏类型 → 清晰整数错误（不再静默回落）
+    bad_calls = [
+        ("hub_tasks", {"limit": "abc"}),
+        ("hub_next", {"limit": "abc"}),
+        ("hub_list_todos", {"limit": "abc"}),
+        ("hub_get_record", {"record_id": "abc"}),
+        ("hub_memory_read", {"limit": "abc"}),
+        ("hub_events", {"since_id": "abc"}),
+        ("hub_audit", {"limit": "abc"}),
+        ("hub_export", {"action": "export", "limit": "abc"}),
+    ]
+    for name, args in bad_calls:
+        res = res_of(name, args)
+        body = res["content"][0]["text"]
+        assert res["isError"] is True, (name, args, res)
+        assert "必须是整数" in body, (name, args, body)
+
+    # ④ 合法值零回归（数字串 / 整数 / 缺省均照常）
+    for lim in ("5", 5, None):
+        args = {"action": "list"}
+        if lim is not None:
+            args["limit"] = lim
+        res = res_of("hub_audit", args)
+        assert res["isError"] is False, (lim, res)
+        assert "必须是整数" not in res["content"][0]["text"], (lim, res)
+
+    # ⑤ 关键语义：supersedes 传坏类型必须报错，绝不能静默写出一条「没取代」的记忆
+    res = res_of("hub_memory_write", {"content": "R13 supersedes 坏类型验证", "supersedes": "abc"})
+    assert res["isError"] is True and "必须是整数" in res["content"][0]["text"], res
 
 
 def t_tools(root):
@@ -552,7 +621,7 @@ def t_new_tools(tmp):
     assert any(r["date"] == today and "date畸形" in r["content"]
                for r in brain.list_records(root_s, project="测试-项目", limit=2000)), "date 兜底失败"
     out = m.call_tool("hub_get_progress", {"limit": "abc"}, root_s)
-    assert "各 agent 最近工作" in out
+    assert "必须是整数" in out, out   # v2.40.14：坏类型给清晰错误（原为静默回落默认值）
     out = m.call_tool("hub_get_progress", {"limit": 99999}, root_s)
     assert "各 agent 最近工作" in out
     out = m.call_tool("hub_log_work", {"project": "", "agent": "zcode", "content": "y"}, root_s)
@@ -762,10 +831,14 @@ def t_get_record_and_search_files(tmp):
         conn.execute("UPDATE records SET status='deleted' WHERE id=?", (rid,))
     out = m.call_tool("hub_get_record", {"record_id": rid}, root_s)
     assert "records#" in out and "已软删/撤销" in out, out
-    # 畸形 id 容错
-    for bad in (0, -1, "abc", None, 999999):
+    # 畸形 id 容错：整数类畸形（0/-1/None/越界）→「未找到记录」；
+    # 非整数（"abc"）v2.40.14 起给清晰整数错误——原先把 "abc" 当 0 报「未找到记录 #0」，
+    # 属于「把参数问题伪装成数据问题」（模型会一直换个 id 重试）。
+    for bad in (0, -1, None, 999999):
         out = m.call_tool("hub_get_record", {"record_id": bad}, root_s)
         assert "未找到记录" in out, (bad, out)
+    out = m.call_tool("hub_get_record", {"record_id": "abc"}, root_s)
+    assert "必须是整数" in out, out
     # hub_search_files：死代码 bug 回归——列表必须真的拼进返回值
     from unittest import mock
     fake = {"results": ["D:/a/结果1.py", "D:/b/结果2.txt"], "engine": "everything"}
@@ -1827,6 +1900,8 @@ def main():
          lambda: t_round11_int_param_type(root))
     case("Round12·日期入参规范化（斜杠/非法日期/到期提醒静默失效修复+缺省零回归）",
          lambda: t_round12_date_normalize(root))
+    case("Round13·18工具整数入参不再静默回落（集中校验+漂移守卫+supersedes语义）",
+         lambda: t_round13_int_params_central(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

@@ -5547,6 +5547,8 @@ _BUILTIN_PLAYBOOKS = [
           "args": {"name": "schema_drift"}},
          {"key": "graph", "title": "图谱健康（边/孤岛/最大簇）", "action": "ops_check",
           "args": {"name": "graph_health"}},
+         {"key": "date_health", "title": "日期格式健康（坏格式会让到期提醒静默失效）", "action": "ops_check",
+          "args": {"name": "date_health"}},
          {"key": "sentry", "title": "哨兵巡检（gap 自动广播）", "action": "sentry", "args": {}},
          {"key": "stalled", "title": "停滞项目", "action": "ops_check", "args": {"name": "stalled"}},
          {"key": "hygiene", "title": "整洁体检", "action": "ops_check", "args": {"name": "hygiene"}},

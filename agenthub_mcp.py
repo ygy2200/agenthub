@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.13"}  # v2.40.12=整数入参坏类型纠正；本版=日期入参规范化（修「格式偏差→到期提醒静默失效」）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.14"}  # v2.40.13=日期入参规范化；本版=18工具整数入参不再静默回落（_INT_PARAMS 集中校验+漂移守卫）+ 新增 date_health 巡检（防到期提醒静默失效）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -191,6 +191,11 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if miss:
         need = "、".join(_effective_required(name))
         return f"错误：必填参数 {'、'.join(miss)} 缺失（{name} 需要：{need}）"
+    # 集中式整数入参校验（Round 13）：声明为整数的字段坏类型给清晰错误，
+    # 不再由各工具 try/except 静默回落默认值（静默回落=模型以为参数生效了）。
+    bad_int = _bad_int_param(name, arguments)
+    if bad_int:
+        return bad_int
     # B2 单点派生：把进程锁定身份下发到本次调用（覆盖 agent 参数）。
     # 放在最前，后面所有工具的 arguments.get("agent") 拿到的都是已校验的锁定值。
     arguments = apply_server_agent(name, arguments, root)
@@ -2309,6 +2314,55 @@ def _required_missing(tname: str, args: dict) -> list:
     if not req:
         return []
     return [p for p in req if p not in args]
+
+
+# ---- 集中式整数入参校验（Round 13 / 2026-10-13）----
+# 为什么：这些字段此前是「try/except → 静默回落默认值」——模型传坏类型时参数被**悄悄忽略**，
+# 模型却以为生效了（如 supersedes 传错 → 旧记忆根本没被取代；limit 传错 → 用默认条数）。
+# 这类「静默错误」比报错更难发现，与 R11/R12 同一主题（入参问题必须显式可纠正）。
+# 声明即契约：新增整数参数时在此登记，漂移守卫（adv_mcp.t_round13_int_params_central）
+# 会扫描源码里所有 `int(arguments.get("<k>"` 直转点，未声明即失败——防止再漏。
+_INT_PARAMS = {
+    "hub_asset_find": ("limit",),
+    "hub_audit": ("limit",),
+    "hub_distill": ("limit",),
+    "hub_duplicates": ("min_len",),
+    "hub_env_list": ("limit",),
+    "hub_events": ("limit", "since_id"),
+    "hub_export": ("limit",),
+    "hub_get_progress": ("limit",),
+    "hub_get_record": ("record_id",),
+    "hub_handoff": ("handoff_id",),
+    "hub_list_todos": ("limit",),
+    "hub_memory_read": ("limit",),
+    "hub_memory_write": ("supersedes",),
+    "hub_next": ("limit",),
+    "hub_search_files": ("limit",),
+    "hub_skill_match": ("topk",),
+    "hub_tasks": ("limit",),
+    "hub_todo_done": ("record_id",),
+}
+# 豁免（均已在各自位置处理得当，不再集中拦截）：
+#   · max_chars —— 协议级结果预算参数，_shape_result 刻意「非法值回落默认」的硬预算设计
+#     （抄 aider：撑不住时自我降级并明确告知），不属业务语义；
+#   · note_id（hub_note_read）—— schema 声明为 string，工具自身已返回
+#     「错误：note_id 必须是数字（如 12）」，本就是清晰可纠正。
+_INT_EXEMPT_PARAMS = frozenset({"max_chars", "note_id"})
+
+
+def _bad_int_param(tname: str, args: dict):
+    """返回第一个「声明为整数但不可转 int」的参数错误文案（无则 None）。空值与缺省放行。"""
+    for key in _INT_PARAMS.get(tname, ()):
+        if key not in args:
+            continue
+        v = args.get(key)
+        if v is None or v == "":
+            continue
+        try:
+            int(v)
+        except (TypeError, ValueError):
+            return f"错误：参数 {key} 必须是整数（收到 {str(v)[:40]!r}）"
+    return None
 
 
 def _as_int(arguments: dict, key: str, default: int) -> tuple:
