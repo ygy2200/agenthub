@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.10"
+    assert r["serverInfo"]["version"] == "2.40.11"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -121,6 +121,31 @@ def t_protocol_encoding(root):
     desc_frame.encode("ascii")
     assert any(("搜索" in t["description"] or "记录" in t["description"]) for t in tools), \
         "工具描述中文必须随 ASCII 帧无损传输"
+
+
+def t_round10_checkpoint_no_tid(root):
+    """Round 10：hub_checkpoint 的 list/latest 无 task_id 不再退化成「任务 #None」。
+
+    此前 brain.checkpoint_list/latest 对 None 调 int(None) 抛异常返回空/None，
+    工具层却渲染成「任务 #None 还没有检查点」——把「漏传参数」伪装成「数据问题」，
+    且 #None 不专业。现在无 task_id 直接给清晰必填提示（isError=True，模型可自我纠正）。
+    """
+    def call(action, tid=None):
+        args = {"action": action}
+        if tid is not None:
+            args["task_id"] = tid
+        r = m.handle_message(rpc("tools/call", {"name": "hub_checkpoint", "arguments": args}), str(root))
+        return r["result"]
+
+    for action in ("list", "latest"):
+        res = call(action)
+        assert res["isError"] is True, (action, res)
+        assert "task_id" in res["content"][0]["text"], (action, res)
+        assert "#None" not in res["content"][0]["text"], (action, res)
+    # 有 task_id（不存在的任务）→ 不再退化 #None，正常提示无检查点且无错误
+    res = call("list", 999999)
+    assert res["isError"] is False, res
+    assert "#None" not in res["content"][0]["text"], res
 
 
 def t_tools(root):
@@ -1684,6 +1709,7 @@ def main():
          lambda: t_graph(tmp))
     case("Y1 内置模板可升级（回归步骤补种/历史执行不受影响）", lambda: t_playbook_upgrade(tmp))
     case("Round8·协议帧编码加固（ensure_ascii=True纯ASCII帧/中文无损/工具描述无损）", lambda: t_protocol_encoding(root))
+    case("Round10·hub_checkpoint 无task_id 不再#None（清晰必填提示/有tid不退化）", lambda: t_round10_checkpoint_no_tid(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

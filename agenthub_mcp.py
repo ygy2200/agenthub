@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.10"}  # v2.40.9=修3处静默成功；本版=协议帧 ensure_ascii=True（UTF-8 stdio 崩溃路径加固）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.11"}  # v2.40.10=协议帧编码加固；本版=hub_checkpoint 无task_id 退化文案(#None)纠正为清晰必填提示
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -1394,6 +1394,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             return (f"检查点已存 #{cid}\n"
                     "长任务建议每完成一小步就存一条——断点续跑/换人接手不用从零翻记录")
         if action == "list":
+            if not tid:
+                return ("错误：查看检查点时间线需要 task_id"
+                        "（检查点按任务维度组织：hub_checkpoint(action=list, task_id=<id>)）")
             rows = brain.checkpoint_list(root, tid)
             if not rows:
                 return f"（任务 #{tid} 还没有检查点。执行中随手 hub_checkpoint(action=save, content=...)）"
@@ -1403,6 +1406,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"- #{c['id']} {c['ts'][5:16]} [{tag}] {c['agent']}：{c['content'][:80]}")
             return "\n".join(lines)
         if action == "latest":
+            if not tid:
+                return "错误：查看最新检查点需要 task_id（hub_checkpoint(action=latest, task_id=<id>)）"
             cp = brain.checkpoint_latest(root, tid)
             if not cp:
                 return f"（任务 #{tid} 还没有检查点）"
