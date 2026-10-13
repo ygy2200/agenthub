@@ -5226,6 +5226,10 @@ _BUILTIN_PLAYBOOKS = [
      "steps": [
          {"key": "env", "title": "环境预检", "action": "ops_check", "args": {"name": "env"}},
          {"key": "syntax", "title": "语法检查", "action": "ops_check", "args": {"name": "py_compile"}},
+         # 回归（7 套约 90 秒）放在部署之前：编译过不代表没改坏行为，早点失败早点停。
+         # 耗时由断点续跑兜住——真超时了 resume 从这一步继续，不重跑前面已过的步骤。
+         {"key": "regression", "title": "回归测试（7 套，约 90 秒）", "action": "ops_check",
+          "args": {"name": "regression"}},
          {"key": "deploy", "title": "部署一致性（源码 vs ~/.agenthub）", "action": "ops_check",
           "args": {"name": "deploy_diff"}},
          {"key": "exe", "title": "exe 是否比源码旧", "action": "ops_check", "args": {"name": "release"}},
@@ -5417,27 +5421,48 @@ PB_ACTIONS = {
 _PB_SEEDED: set = set()
 
 
+def _pb_insert_steps(conn, pb: dict) -> None:
+    for i, s in enumerate(pb["steps"]):
+        conn.execute("INSERT INTO playbook_steps(playbook,seq,key,title,action,args,note) "
+                     "VALUES(?,?,?,?,?,?,?)",
+                     (pb["name"], i + 1, s.get("key") or f"s{i + 1}",
+                      s.get("title") or "", s.get("action") or "manual",
+                      json.dumps(s.get("args") or {}, ensure_ascii=False),
+                      s.get("note") or ""))
+
+
 def _pb_seed(root) -> int:
-    """内置模板入库（builtin=1）。只补缺失，已存在的一律不动——
-    用户改过的流程不能被下次升级冲掉（宁可缺新模板，不可覆盖人的改动）。"""
+    """内置模板入库（builtin=1）。缺失补种；已存在则按**步骤指纹**判断是否新版——
+    指纹变了就重建步骤（内置模板用户改不了：playbook_upsert 拒绝覆盖 builtin=1，
+    所以库里的内置步骤只可能是旧版出厂状态，重建安全）。
+
+    为什么必须有升级：v2.40 首发时 release 模板漏了回归测试，而「只补缺失」的旧逻辑
+    会让这个修正永远推不进已经建过库的真实大脑——模板一发即固化，是活的系统不该有的。
+    """
     if root in _PB_SEEDED:
         return 0
     n = 0
     try:
         with db_conn(root) as conn:
             for pb in _BUILTIN_PLAYBOOKS:
-                if conn.execute("SELECT 1 FROM playbooks WHERE name=?", (pb["name"],)).fetchone():
+                row = conn.execute("SELECT 1 FROM playbooks WHERE name=?", (pb["name"],)).fetchone()
+                if row is None:
+                    conn.execute("INSERT INTO playbooks(name,title,desc,builtin,created,updated) "
+                                 "VALUES(?,?,?,1,?,?)",
+                                 (pb["name"], pb["title"], pb["desc"], _now(), _now()))
+                    _pb_insert_steps(conn, pb)
+                    n += 1
                     continue
-                conn.execute("INSERT INTO playbooks(name,title,desc,builtin,created,updated) "
-                             "VALUES(?,?,?,1,?,?)",
-                             (pb["name"], pb["title"], pb["desc"], _now(), _now()))
-                for i, s in enumerate(pb["steps"]):
-                    conn.execute("INSERT INTO playbook_steps(playbook,seq,key,title,action,args,note) "
-                                 "VALUES(?,?,?,?,?,?,?)",
-                                 (pb["name"], i + 1, s.get("key") or f"s{i + 1}",
-                                  s.get("title") or "", s.get("action") or "manual",
-                                  json.dumps(s.get("args") or {}, ensure_ascii=False),
-                                  s.get("note") or ""))
+                cur = conn.execute("SELECT seq,key,action FROM playbook_steps WHERE playbook=? "
+                                   "ORDER BY seq", (pb["name"],)).fetchall()
+                old_fp = "|".join(f"{r['seq']}:{r['key']}:{r['action']}" for r in cur)
+                new_fp = "|".join(
+                    f"{i + 1}:{s.get('key') or f's{i + 1}'}:{s.get('action') or 'manual'}"
+                    for i, s in enumerate(pb["steps"]))
+                if old_fp == new_fp:
+                    continue
+                conn.execute("DELETE FROM playbook_steps WHERE playbook=?", (pb["name"],))
+                _pb_insert_steps(conn, pb)
                 n += 1
     except sqlite3.Error:
         return 0
@@ -6164,6 +6189,53 @@ def graph_path(root: str, a: str, b: str, max_depth: int = 4) -> dict:
             break
     return {"found": False, "depth": depth,
             "hint": f"{depth} 跳内不相连（可先 action=build 重建结构边，或放大 max_depth）"}
+
+
+def graph_isolated(root: str, limit: int = 20, build: bool = False) -> list:
+    """孤岛清单：既无标签/项目结构边、也无双链/手工边的条目。
+
+    给清单而不是只给个数——stats 说「孤岛 38」人没法行动，得知道**是哪 38 条**。
+    孤岛在检索里最难被顺带唤起，是最该补标签或建关联的一批。
+    """
+    if build:
+        graph_build(root)
+    lim = max(1, min(int(limit or 20), 100))
+    with db_conn(root) as conn:
+        try:
+            lr = {str(r["from_id"]) for r in conn.execute(
+                "SELECT DISTINCT from_id FROM relations WHERE from_kind='record'").fetchall()}
+            lm = {str(r["from_id"]) for r in conn.execute(
+                "SELECT DISTINCT from_id FROM relations WHERE from_kind='memory'").fetchall()}
+            lr |= {str(r["to_ref"]) for r in conn.execute(
+                "SELECT DISTINCT to_ref FROM relations WHERE to_kind='record'").fetchall()}
+            lm |= {str(r["to_ref"]) for r in conn.execute(
+                "SELECT DISTINCT to_ref FROM relations WHERE to_kind='memory'").fetchall()}
+        except sqlite3.Error:
+            return []
+        out = []
+        try:
+            recs = conn.execute("SELECT id,title,content,project,date FROM records WHERE "
+                                + _rec_live_sql() + " ORDER BY id DESC LIMIT 3000").fetchall()
+        except sqlite3.Error:
+            recs = []
+        for r in recs:
+            if str(r["id"]) in lr:
+                continue
+            out.append({"node": f"record:{r['id']}", "kind": "record",
+                        "snippet": (r["title"] or r["content"] or "")[:60],
+                        "project": r["project"] or "", "date": r["date"] or ""})
+        try:
+            mems = conn.execute("SELECT id,content,project,kind FROM memories WHERE "
+                                + _live_sql() + " ORDER BY id DESC LIMIT 3000").fetchall()
+        except sqlite3.Error:
+            mems = []
+        for m in mems:
+            if str(m["id"]) in lm:
+                continue
+            out.append({"node": f"memory:{m['id']}", "kind": "memory",
+                        "snippet": (m["content"] or "")[:60],
+                        "project": m["project"] or "", "date": ""})
+    return out[:lim]
 
 
 def graph_clusters(root: str, limit: int = 8, min_size: int = 2, build: bool = False) -> list:

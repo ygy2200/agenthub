@@ -1638,6 +1638,16 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             if not res.get("found"):
                 return f"未找到路径：{res.get('hint', '')}"
             return f"路径（{res['depth']} 跳）：" + " → ".join(res["path"])
+        if action == "isolated":
+            rows = brain.graph_isolated(root, int(arguments.get("limit", 20) or 20))
+            if not rows:
+                return "（没有孤岛——所有条目都跟别的东西有连接）"
+            lines = [f"孤岛 {len(rows)} 条（无边相连，检索最难顺带唤起它们）："]
+            for r in rows:
+                proj = f"[{r['project']}] " if r.get("project") else ""
+                lines.append(f"- {r['node']} {proj}{r['snippet']}")
+            lines.append("处理：给它补标签（记忆）或建 [[双链]]（记录），再 action=build 重建边")
+            return "\n".join(lines)
         if action == "clusters":
             rows = brain.graph_clusters(root, int(arguments.get("limit", 8) or 8))
             if not rows:
@@ -2020,8 +2030,8 @@ TOOLS = [
      "description": "Y3 知识图谱（关联检索）：检索按「词像不像」，图谱按「图上近不近」——一条没提到关键词但同项目同标签的记录，检索找不到，图谱能。action=stats 体检（边/节点/孤岛/最大簇）、neighbors 某节点一跳邻居、related 二跳内最相关条目（显式双链加权）、path 两节点最短路径、clusters 知识簇与孤岛、build 重建结构边（记忆→标签、记录→项目，幂等）",
      "inputSchema": {"type": "object",
                      "properties": {"action": {"type": "string",
-                                               "enum": ["stats", "neighbors", "related", "path", "clusters", "build"],
-                                               "description": "stats 体检（缺省）/ neighbors 邻居 / related 相关条目 / path 最短路径 / clusters 知识簇 / build 重建结构边"},
+                                               "enum": ["stats", "neighbors", "related", "path", "clusters", "isolated", "build"],
+                                               "description": "stats 体检（缺省）/ neighbors 邻居 / related 相关条目 / path 最短路径 / clusters 知识簇 / isolated 孤岛清单 / build 重建结构边"},
                                     "node": {"type": "string",
                                              "description": "neighbors/related：节点，格式 record:12 / memory:3 / tag:踩坑 / project:项目名"},
                                     "from_node": {"type": "string", "description": "path：起点节点"},

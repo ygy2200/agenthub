@@ -1316,12 +1316,37 @@ def t_graph(tmp):
     cl = brain.graph_clusters(rs, build=False)
     assert cl and cl[0]["size"] >= 2, f"未成簇：{cl}"
 
+    # 孤岛清单：无标签无项目的记忆应在清单里（stats 只给个数，行动要靠清单）
+    m3 = brain.add_memory(rs, "孤立记忆", tags="", project="", agent="zcode")
+    iso = brain.graph_isolated(rs, limit=50)
+    assert any(x["node"] == f"memory:{m3}" for x in iso), f"孤岛清单漏了孤立记忆：{iso[:5]}"
+    assert not any(x["node"] == f"memory:{m1}" for x in iso), "有边的记忆不该算孤岛"
+
     assert "结构边已重建" in m.call_tool("hub_graph", {"action": "build"}, rs)
     assert "知识图谱体检" in m.call_tool("hub_graph", {"action": "stats"}, rs)
     assert "路径（2 跳）" in m.call_tool("hub_graph", {"action": "path", "from_node": f"record:{r1}",
                                                       "to_node": f"memory:{m1}"}, rs)
     assert "知识簇" in m.call_tool("hub_graph", {"action": "clusters"}, rs)
     assert "邻居" in m.call_tool("hub_graph", {"action": "neighbors", "node": "tag:图谱"}, rs)
+    assert "孤岛" in m.call_tool("hub_graph", {"action": "isolated", "limit": 5}, rs)
+
+
+def t_playbook_upgrade(tmp):
+    """内置模板可升级：改了内置定义，已建库的步骤要跟着变（否则修正永远推不进真实大脑）。"""
+    root = fresh_hub(tmp, "pbup")
+    rs = str(root)
+    keys = [s["key"] for s in brain.playbook_get(rs, "release")["steps"]]
+    assert "regression" in keys, f"release 应含回归步骤：{keys}"
+    # 抹掉一步（模拟旧版出厂状态）→ 重新 seed 应重建回新版
+    with brain.db_conn(rs) as conn:
+        conn.execute("DELETE FROM playbook_steps WHERE playbook='release' AND key='regression'")
+    assert "regression" not in [s["key"] for s in brain.playbook_get(rs, "release")["steps"]]
+    brain._PB_SEEDED.discard(rs)
+    brain._pb_seed(rs)
+    keys2 = [s["key"] for s in brain.playbook_get(rs, "release")["steps"]]
+    assert "regression" in keys2, f"内置模板未升级：{keys2}"
+    # 升级不得动历史执行记录
+    assert isinstance(brain.playbook_runs(rs), list)
 
 
 def main():
@@ -1368,8 +1393,9 @@ def main():
          lambda: t_playbook(tmp))
     case("Y2 自动化（默认停用/条件匹配/冷却/强制试跑/心跳可见/playbook动作/停用删除/坏参）",
          lambda: t_trigger(tmp))
-    case("Y3 知识图谱（结构边物化/体检/邻居/相关条目/最短路径/知识簇/坏参）",
+    case("Y3 知识图谱（结构边物化/体检/邻居/相关条目/最短路径/知识簇/孤岛清单/坏参）",
          lambda: t_graph(tmp))
+    case("Y1 内置模板可升级（回归步骤补种/历史执行不受影响）", lambda: t_playbook_upgrade(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
