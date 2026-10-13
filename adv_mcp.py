@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.5"
+    assert r["serverInfo"]["version"] == "2.40.6"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1053,6 +1053,27 @@ def t_iserror_correctness(root):
     assert claim["isError"] is True, f"hub_claim 缺 agent 应为 isError=True，实际 {claim}"
 
 
+def t_response_size_guard():
+    """响应体积双封顶（2026-10-13 缺陷自查补）：防 stdio 管道死锁 / 上下文冲爆。
+    ① 默认 4000 预算：超大文本截断 + full_text 内联 ≤16K；② max_chars=0 下失控输出(>64K)兜底截断。"""
+    big = "x" * 200_000
+    # 默认预算
+    text, structured = m._shape_result(big, {})
+    assert len(text) <= 4000 + 200, f"默认路径文本应≤预算，实际 {len(text)}"
+    assert structured is not None and len(structured["full_text"]) <= m.STRUCTURED_FULL_CAP + 200
+    assert "已截断" in text and "未全量内联" in text, "超大结果应提示截断 + full_text 未全量内联"
+    # max_chars=0 但失控输出
+    text0, _s0 = m._shape_result(big, {"max_chars": 0})
+    assert len(text0) <= m.HARD_MAX_CHARS + 200, f"max_chars=0 失控输出应兜底，实际 {len(text0)}"
+    assert "响应硬上限" in text0, "应明确告知触发硬上限"
+    # 正常小文本不受影响
+    small = "ok"
+    t1, s1 = m._shape_result(small, {})
+    assert t1 == "ok" and s1 is None
+    t2, s2 = m._shape_result(small, {"max_chars": 0})
+    assert t2 == "ok" and s2 is None
+
+
 def t_p3_contract(tmp):
     """P3-1 契约：profile 切片（藏起≠禁用）/ discover 协商（-32022）/ max_chars 截断
     / dry_run 不落库 / confirm=false 闸门 / 写后审计与 undo 句柄 / 发现工具。"""
@@ -1492,6 +1513,7 @@ def main():
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
     case("MCP协议（握手/50工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
+    case("响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）", lambda: t_response_size_guard())
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))

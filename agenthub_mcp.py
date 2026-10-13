@@ -38,10 +38,17 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.5"}  # v2.40.4=缺陷自查守卫+3缺陷修复；本版=isError正确性（业务失败不再被当成功）+清单漂移守卫收口
+SERVER_INFO = {"name": "agenthub", "version": "2.40.6"}  # v2.40.5=isError正确性+清单漂移收口；本版=响应体积双封顶（防管道死锁/上下文冲爆）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
+# 响应体积硬上限（防 stdio 管道缓冲死锁 + 防 agent 上下文被巨量结果冲爆）：
+# ① STRUCTURED_FULL_CAP —— structuredContent.full_text 内联上限（默认路径也会把完整原文塞进
+#    full_text，不封顶则单条大结果就能让 JSON 响应无限膨胀；16K 足够程序化取用又远低于管道缓冲）；
+# ② HARD_MAX_CHARS —— max_chars<=0（显式关闭截断）时的兜底上限，只拦病理性/失控输出（>64K），
+#    正常工具（<64K）的「不截断」契约不变；>64K 必为异常，截断并明确告知，避免卡死客户端。
+STRUCTURED_FULL_CAP = 16 * 1024
+HARD_MAX_CHARS = 64 * 1024
 MAX_CONTENT = 128 * 1024  # 单条记录/记忆写入上限，防 agent 失控灌爆
 
 
@@ -2339,18 +2346,42 @@ for _t in TOOLS:
 
 def _shape_result(text: str, arguments: dict) -> tuple:
     """结果契约（P3-1）：默认预算内原样返回；超预算 → 截断 + 文末明确标注 + structuredContent。
-    max_chars=0 关闭截断；非法值回落默认（撑不住时自我降级并明确告知，抄 aider 硬预算）。"""
+    max_chars=0 关闭截断（正常输出保持原样）；非法值回落默认（撑不住时自我降级并明确告知，抄 aider 硬预算）。
+
+    响应体积双封顶（2026-10-13 缺陷自查补，来源：MCP Dev Summit / codex.danielvaughan 把
+    stdio 管道缓冲死锁列为头号运维脆弱点）：structuredContent.full_text 内联 ≤ STRUCTURED_FULL_CAP；
+    max_chars<=0 时文本本身 ≤ HARD_MAX_CHARS（仅拦病理性失控输出，正常「不截断」契约不变）。
+    """
     try:
         budget = (int(arguments.get("max_chars"))
                   if arguments.get("max_chars") is not None else DEFAULT_MAX_CHARS)
     except (TypeError, ValueError):
         budget = DEFAULT_MAX_CHARS
-    if budget <= 0 or len(text) <= budget:
+    total = len(text)
+    # 显式关闭截断但输出失控 → 兜底硬上限（正常 <64K 不受影响）
+    if budget <= 0:
+        if total <= HARD_MAX_CHARS:
+            return text, None
+        shown = HARD_MAX_CHARS
+        capped_full = text[:STRUCTURED_FULL_CAP]
+        meta = {"total": total, "shown": shown, "truncated": True,
+                "reason": "hard_cap", "cursor": shown}
+        foot = (f"\n…（响应硬上限：原文 {total} 字符（远超正常用量，疑似失控/异常输出），"
+                f"此处仅显示前 {shown}；完整内容过大未全量内联，请缩小范围或分页获取）")
+        return text[:shown] + foot, {"meta": meta, "full_text": capped_full}
+    if total <= budget:
         return text, None
-    meta = {"total": len(text), "shown": budget, "truncated": True, "cursor": budget}
-    foot = (f"\n…（已截断：原文 {len(text)} 字符，此处显示前 {budget}；完整内容见 "
-            "structuredContent.full_text，或传 max_chars=0 关闭截断）")
-    return text[:budget] + foot, {"meta": meta, "full_text": text}
+    meta = {"total": total, "shown": budget, "truncated": True, "cursor": budget}
+    if total <= STRUCTURED_FULL_CAP:
+        full = text
+        foot = (f"\n…（已截断：原文 {total} 字符，此处显示前 {budget}；完整内容见 "
+                "structuredContent.full_text，或传 max_chars=0 关闭截断）")
+    else:
+        full = text[:STRUCTURED_FULL_CAP]
+        foot = (f"\n…（已截断：原文 {total} 字符，此处显示前 {budget}；完整内容过长"
+                f"（>{STRUCTURED_FULL_CAP}）未全量内联，请缩小范围或分页获取，"
+                "或传 max_chars=0 关闭截断）")
+    return text[:budget] + foot, {"meta": meta, "full_text": full}
 
 
 def _audit_write(root: str, tname: str, arguments: dict, text: str) -> None:
