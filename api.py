@@ -57,19 +57,24 @@ def _tool_list_drift() -> list:
     return sorted(out)
 
 
-def _call_tool(root: str, name: str, args: dict) -> str:
-    """调一个 MCP 工具，返回文本结果（异常转成错误文本）。"""
+def _call_tool(root: str, name: str, args: dict) -> tuple[str, bool]:
+    """调一个 MCP 工具，返回 (文本结果, 是否业务失败)。异常转成 (错误文本, True)。
+
+    业务失败指工具成功执行但语义失败（如「项目不存在」），由 handle_message 标记 isError=True。
+    此前只返回纯文本、丢失 isError，外部 HTTP 调用方无法程序化区分成功/失败（只能 hack 文本前缀）。
+    现在透传 is_error，让 /api/call 用 HTTP 状态码（200/422）表达（与 R1-R7 的 isError 正确性一致）。
+    """
     rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": name, "arguments": args}}
     try:
         r = agenthub_mcp.handle_message(rpc, root)
     except Exception as e:  # noqa: BLE001
-        return f"调用异常：{e}"
+        return f"调用异常：{e}", True
     res = r.get("result") or {}
     if "content" in res:
-        return res["content"][0]["text"]
+        return res["content"][0]["text"], bool(res.get("isError"))
     err = r.get("error") or {}
-    return err.get("message") or str(r)
+    return err.get("message") or str(r), True
 
 
 def _coerce(v: str):
@@ -161,7 +166,8 @@ class _Handler(BaseHTTPRequestHandler):
             # 便捷别名：网页里习惯写 q=，工具参数叫 query
             if route == "hub_search" and "q" in q:
                 q["query"] = q.pop("q")
-            return self._send(200, _call_tool(self.root, route, q))
+            # 只读便捷端点：dashboard 依赖纯文本，保持原样（is_error 仅成功路径，忽略）
+            return self._send(200, _call_tool(self.root, route, q)[0])
         if u.path == "/api/orchestration":
             # Y1-Y3 只读概览：直接走 brain 只读函数，不经 MCP 写工具通道
             # （hub_playbook/hub_graph 都属写工具，走 /api/call 会被 403——这里只读，安全）
@@ -202,7 +208,9 @@ class _Handler(BaseHTTPRequestHandler):
             if name in agenthub_mcp.WRITE_TOOLS and not (
                     self.allow_write and q.pop("token", "") == self.token):
                 return self._send(403, "写工具默认关闭（启动加 --allow-write 并带 token）")
-            return self._send(200, _call_tool(self.root, name, q))
+            text, is_error = _call_tool(self.root, name, q)
+            # 业务失败用 422（请求格式合法但语义失败），让调用方程序化识别，而非 200 伪装成功
+            return self._send(200 if not is_error else 422, text)
         return self._send(404, "未知路由：" + u.path)
 
 

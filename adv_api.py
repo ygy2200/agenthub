@@ -147,11 +147,37 @@ def t_api_write_guard():
         httpd2.server_close()
 
 
+def t_api_call_iserror():
+    """Round 9：REST 桥透传 isError（业务失败返回 422 + 错误文本，而非 200 伪装成功）。
+
+    与 R1-R7 的 isError 正确性一致——外部 HTTP 调用方此前拿 200 + 「错误：项目不存在」
+    无法程序化识别失败；现在用 HTTP 422 表达语义失败，body 仍是纯文本（dashboard 等兼容）。
+    """
+    from urllib.parse import quote  # noqa: PLC0415
+    root = _fresh_root()
+    httpd, port, _ = api.serve(root, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        time.sleep(0.3)
+        c = _Client(port)
+        # ① 成功工具 → 200
+        code, body = c.get("/api/call?name=hub_status")
+        assert code == 200, (code, body[:80])
+        # ② 业务失败（项目不存在）→ 422 + 错误文本
+        code, body = c.get("/api/call?name=hub_get_project&project=" + quote("不存在的"))
+        assert code == 422, (code, body[:120])
+        assert "错误" in body, (code, body[:120])
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def main() -> int:
     print("=== adv_api：REST API 桥 + Web 仪表盘（X2） ===")
     case("只读面（仪表盘/工具清单/五路由/只读工具/404·400）", t_api_readonly)
     case("写守卫（默认403 / 开启后无token仍403 / 带token才通）", t_api_write_guard)
     case("工具清单一致性（名不重复 / WRITE_TOOLS ⊆ TOOLS）", t_tool_list_consistency)
+    case("Round9·REST桥透传isError（业务失败422/成功200/纯文本兼容）", t_api_call_iserror)
     failed = globals().get("_FAILED", [])
     print()
     if failed:
