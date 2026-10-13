@@ -1276,6 +1276,20 @@ def t_trigger(tmp):
     fired = m.call_tool("hub_trigger", {"action": "fire", "id": tid3, "force": True}, rs)
     assert "√" in fired and "onboard" in fired, f"playbook 动作未跑起来：{fired[:200]}"
 
+    # due 事件（时点类）：无到期项静默；有到期项才触发，并带 {{due_count}}/{{due_detail}}
+    r4 = m.call_tool("hub_trigger", {"action": "add", "name": "到期提醒", "on_event": "due",
+                                     "action_type": "notify",
+                                     "action_args": {"text": "有 {{due_count}} 项到期：{{due_detail}}"}}, rs)
+    tid4 = int(r4.split("#")[1].split("（")[0])
+    m.call_tool("hub_trigger", {"action": "enable", "id": tid4}, rs)
+    assert brain.trigger_eval(rs, "due", {}) == [], "无到期项时 due 触发器应静默"
+    yesterday = (datetime.date.today() - datetime.timedelta(days=1)).isoformat()
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode", "content": "决策测试",
+                                 "decision": "选 A", "review_date": yesterday}, rs)
+    res4 = brain.trigger_eval(rs, "due", {})
+    assert res4 and res4[0]["status"] == "fired" and "1 项到期" in res4[0]["text"], \
+        f"due 触发器未按时点触发：{res4}"
+
     assert "触发器" in m.call_tool("hub_trigger", {"action": "list"}, rs)
     assert "停用" in m.call_tool("hub_trigger", {"action": "disable", "id": tid2}, rs)
     assert "删除" in m.call_tool("hub_trigger", {"action": "del", "id": tid2}, rs)

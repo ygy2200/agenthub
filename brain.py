@@ -5748,7 +5748,9 @@ def playbook_abort(root: str, run_id) -> str:
 #   ② 冷却（默认 12h）——心跳一天好几次，不冷却同一件事会反复推；
 #   ③ 时间预算——playbook 可能耗时（回归几分钟），心跳里跑必须有上限，超时丢弃不阻塞。
 
-TRIGGER_EVENTS = ("heartbeat", "signal", "record")
+# due=「时点到了」类事件（决策到回顾日 / 任务超期）——与 heartbeat 的区别：
+# heartbeat 每次心跳都评估，due 只在**真有到期项**时才跑（没事就不出声）。
+TRIGGER_EVENTS = ("heartbeat", "signal", "record", "due")
 TRIGGER_ACTIONS = ("notify", "signal", "playbook")
 _TRIGGER_DEFAULT_COOLDOWN = 720  # 分钟（12h）
 
@@ -5812,6 +5814,36 @@ def _run_budget(fn, budget: float):
     if "e" in box:
         return False, f"{type(box['e']).__name__}: {box['e']}"
     return False, f"超过时间预算 {budget:.0f}s（动作仍在后台跑完，本次结果不计入）"
+
+
+def due_summary(root: str) -> dict:
+    """到期事项汇总（触发器 due 事件的数据源）：决策到回顾日 + 任务超期未完成。
+
+    只读、fail-open（表异常 = 没有到期项）。count=0 时 due 类触发器一律不跑——
+    「时点到了才提醒」的触发器，没到期还推就变成了噪音。
+    """
+    out: dict = {"count": 0, "kinds": [], "detail": ""}
+    try:
+        dec = decision_review_due(root, limit=20)
+    except Exception:  # noqa: BLE001
+        dec = []
+    over = []
+    try:
+        with db_conn(root) as conn:
+            over = [dict(r) for r in conn.execute(
+                "SELECT id,title,project,due FROM tasks WHERE due!='' AND due<date('now') "
+                "AND status NOT IN ('done') ORDER BY due ASC LIMIT 20").fetchall()]
+    except sqlite3.Error:
+        over = []
+    out["count"] = len(dec) + len(over)
+    if dec:
+        out["kinds"].append(f"决策到期 {len(dec)}")
+    if over:
+        out["kinds"].append(f"任务超期 {len(over)}")
+    out["detail"] = "；".join(
+        [f"决策#{d.get('record_id')}（{d.get('review_date')} 到期）" for d in dec[:3]]
+        + [f"任务#{t['id']}（{t['due']} 到期）" for t in over[:3]])
+    return out
 
 
 def trigger_add(root: str, name: str, on_event: str = "heartbeat", action_type: str = "notify",
@@ -5936,6 +5968,14 @@ def trigger_eval(root: str, event: str, ctx: dict = None, budget_sec: float = 20
     ctx.setdefault("event", event)
     if event not in TRIGGER_EVENTS:
         return []
+    if event == "due":
+        # 先算「有没有到期的事」：没有就不往下走（到期类触发器没到期项还推 = 噪音）
+        pending = due_summary(root)
+        if not pending["count"]:
+            return []
+        ctx["due_count"] = str(pending["count"])
+        ctx["due_kinds"] = "、".join(pending["kinds"])
+        ctx["due_detail"] = pending["detail"]
     try:
         with db_conn(root) as conn:
             rows = [dict(r) for r in conn.execute(

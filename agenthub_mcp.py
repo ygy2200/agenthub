@@ -856,6 +856,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             fired = brain.trigger_eval(root, "heartbeat",
                                        {"agent": agent, "project": project, "note": note},
                                        budget_sec=20)
+            # Y2 due 类：有到期的事（决策到回顾日/任务超期）才跑，没有就静默
+            fired += brain.trigger_eval(root, "due", {"agent": agent, "project": project},
+                                        budget_sec=20)
         except Exception:  # noqa: BLE001  自动化绝不能把心跳搞挂
             fired = []
         fired = [f for f in fired if f.get("status") in ("fired", "failed")]  # 冷却中的不报，免噪音
@@ -2011,8 +2014,9 @@ TOOLS = [
                                                "enum": ["list", "add", "enable", "disable", "del", "fire"],
                                                "description": "list 清单（缺省）/ add 新建 / enable 启用 / disable 停用 / del 删除 / fire 手动触发一次"},
                                     "name": {"type": "string", "description": "add：触发器名（写清触发什么）"},
-                                    "on_event": {"type": "string", "enum": ["heartbeat", "signal", "record"],
-                                                 "description": "add/list：监听什么事件，缺省 heartbeat"},
+                                    "on_event": {"type": "string",
+                                                 "enum": ["heartbeat", "signal", "record", "due"],
+                                                 "description": "add/list：监听什么事件。heartbeat 每次心跳（受冷却约束）/ due **时点到了**才跑（决策到回顾日、任务超期；没到期项不出声）"},
                                     "action_type": {"type": "string", "enum": ["notify", "signal", "playbook"],
                                                     "description": "add：触发后做什么，缺省 notify"},
                                     "action_args": {"type": "object",
