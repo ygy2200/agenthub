@@ -220,6 +220,15 @@ def main():
         w.governance_page.reload()
         check("治理中心五段可切且 reload 不崩", w.governance_page.stack.count() == 5)
         check("治理中心隔离区子页就位", w.governance_page.subs[0].listw.count() >= 0)
+        # 编排中心（v2.40）：流程/步骤/执行历史/触发器/图谱 五段逐个 reload 不崩
+        for key in ("flows", "steps", "runs", "trig", "graph"):
+            w.playbook_page.seg.setCurrentItem(key)
+            w.playbook_page.reload()
+        check("编排中心五段可切且 reload 不崩", w.playbook_page.listw.count() >= 0)
+        w.playbook_page.seg.setCurrentItem("flows")
+        w.playbook_page.reload()
+        check("编排中心流程清单有内置模板", w.playbook_page.listw.count() >= 5,
+              str(w.playbook_page.listw.count()))
         # 统计页同类残留回归：set_db 两次后标签数不变（agentBox 行布局同 bug 的第二实例）
         w.stats_page.set_db(brain.stats(str(tmp)))
         m1 = len(w.stats_page.findChildren(QLabel))

@@ -49,6 +49,7 @@ class PlaybookPage(QWidget):
         self.seg.addItem("steps", "步骤")
         self.seg.addItem("runs", "执行历史")
         self.seg.addItem("trig", "触发器")
+        self.seg.addItem("graph", "图谱")
         self.listw = ListWidget()
         self.listw.setMinimumHeight(300)
         lay.addWidget(self.seg)
@@ -110,8 +111,10 @@ class PlaybookPage(QWidget):
             self._load_steps()
         elif seg == "runs":
             self._load_runs()
-        else:
+        elif seg == "trig":
             self._load_trig()
+        else:
+            self._load_graph()
 
     def _add(self, text, store=None, row=None):
         it = QListWidgetItem(text)
@@ -190,6 +193,46 @@ class PlaybookPage(QWidget):
             self._add(f"#{t['id']} [{state}] {t['name']}：{t['on_event']} → {t['action_type']}"
                       f"（冷却 {t['cooldown_min']} 分钟 · 已触发 {t['fire_count']} 次 · "
                       f"上次 {(t.get('last_fired') or '从未')[:16]}）", self._trig, t)
+
+    def _load_graph(self):
+        """图谱段：体检一行 + 最大几个知识簇 + 孤岛清单（能看才能行动）。"""
+        try:
+            st = brain.graph_stats(self.win.root, build=False)
+        except Exception as e:  # noqa: BLE001
+            self.listw.addItem(f"读取失败：{e}")
+            return
+        bk = "、".join(f"{k} {v}" for k, v in (st.get("by_kind") or {}).items()) or "无"
+        head = QListWidgetItem(
+            f"── 边 {st.get('edges', 0)} 条（{bk}）｜已连条目 {st.get('linked', 0)}"
+            f" · 孤岛 {st.get('isolated', 0)} · 最大簇 {st.get('largest_cluster', 0)}")
+        head.setFlags(Qt.ItemFlag.NoItemFlags)
+        self.listw.addItem(head)
+        try:
+            cl = brain.graph_clusters(self.win.root, limit=5, build=False)
+        except Exception:  # noqa: BLE001
+            cl = []
+        if cl:
+            c = QListWidgetItem("知识簇（规模降序）：")
+            c.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.listw.addItem(c)
+            for g in cl:
+                self.listw.addItem(f"  {g['size']} 个条目：" + "；".join((g.get("sample") or [])[:2]))
+        try:
+            iso = brain.graph_isolated(self.win.root, limit=15)
+        except Exception:  # noqa: BLE001
+            iso = []
+        if iso:
+            c = QListWidgetItem(f"孤岛 {len(iso)} 条（无边相连，检索最难唤起它们）：")
+            c.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.listw.addItem(c)
+            for r in iso:
+                proj = f"[{r['project']}] " if r.get("project") else ""
+                self.listw.addItem(f"  {r['node']} {proj}{r['snippet']}")
+            tip = QListWidgetItem("  处理：补标签（记忆）或建 [[双链]]（记录），再点「重建图谱边」")
+            tip.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.listw.addItem(tip)
+        if not cl and not iso:
+            self.listw.addItem("（图谱还没有成规模的簇与孤岛）")
 
     def _selected(self):
         it = self.listw.currentItem()
