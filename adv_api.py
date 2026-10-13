@@ -95,6 +95,23 @@ def t_api_readonly():
         httpd.server_close()
 
 
+def t_tool_list_consistency():
+    """工具清单一致性（2026-10-13 缺陷自查补）：所有手写清单 ⊆ TOOLS 且名字无重复。
+
+    真缺陷背景：api.py 里一个从未被使用的只读白名单漂移出两个不存在的工具名；
+    另一处 PROFILE_WORKER / WRITE_TOOLS 是两份各自维护的清单，注入错别字到 PROFILE_WORKER
+    时旧的 _write_tools_missing 根本查不到。"清单与真实工具名静默漂移"是我们踩过两次的坑
+    （另一次是策划部署清单）。现在用 _tool_list_drift 把所有手写清单一次性核对，让漂移当场暴露。
+    """
+    import agenthub_mcp  # noqa: PLC0415
+    names = [t["name"] for t in agenthub_mcp.TOOLS]
+    dup = sorted({n for n in names if names.count(n) > 1})
+    assert not dup, f"工具名重复：{dup}"
+    drift = api._tool_list_drift()
+    assert not drift, f"手写清单登记了不存在的工具：{drift}"
+    assert len(names) >= 60, f"工具数异常：{len(names)}"
+
+
 def t_api_write_guard():
     """写守卫：默认 403；--allow-write 后无 token 仍 403，带 token 才通。"""
     from urllib.parse import quote  # noqa: PLC0415
@@ -134,6 +151,7 @@ def main() -> int:
     print("=== adv_api：REST API 桥 + Web 仪表盘（X2） ===")
     case("只读面（仪表盘/工具清单/五路由/只读工具/404·400）", t_api_readonly)
     case("写守卫（默认403 / 开启后无token仍403 / 带token才通）", t_api_write_guard)
+    case("工具清单一致性（名不重复 / WRITE_TOOLS ⊆ TOOLS）", t_tool_list_consistency)
     failed = globals().get("_FAILED", [])
     print()
     if failed:

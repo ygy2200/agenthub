@@ -29,12 +29,32 @@ import brain
 import ops
 
 
-READ_ONLY_OK = ("hub_status", "hub_health", "hub_next", "hub_search", "hub_signals",
-                "hub_tasks", "hub_get_progress", "hub_list_projects", "hub_get_project",
-                "hub_memory_read", "hub_note_read", "hub_list_todos", "hub_history",
-                "hub_env_list", "hub_ops_list", "hub_agents", "hub_tool_index",
-                "hub_skill_match", "hub_asset_find", "hub_user_profile", "hub_skill_stats",
-                "hub_checkpoint")
+# 写工具守卫走**黑名单**（agenthub_mcp.WRITE_TOOLS），不是白名单——
+# 2026-10-13 缺陷自查发现：这里曾定义一个 READ_ONLY_OK 白名单却从未被使用（死代码，
+# 且已漂移出两个不存在的工具名 hub_agents/hub_tool_index）。死代码 + 漂移的双重教训：
+# ① 白名单看起来更安全但没人用它就是幻觉；② 清单与真实工具名会静默漂移（同部署清单那次）。
+# 现在把"清单必须与真实工具名一致"变成回归断言（adv_api）+ 保留 fail-open 黑名单语义。
+def _tool_list_drift() -> list:
+    """所有手写工具清单里登记了、但 TOOLS 里不存在的名字（错别字 / 删工具忘改清单）。
+
+    2026-10-13 教训：手写清单会静默漂移——本轮已抓到两处
+    （api 的死白名单含 hub_agents/hub_tool_index；PROFILE_WORKER 与 WRITE_TOOLS 是两份
+    各自维护的清单，注入测试时才发现改错一份根本不会被任何检查发现）。
+    清单越多越要机器核对：这里把 PROFILE_* / WRITE_TOOLS 全部纳入。
+    """
+    names = {t["name"] for t in agenthub_mcp.TOOLS}
+    out = []
+    lists = [("WRITE_TOOLS", agenthub_mcp.WRITE_TOOLS),
+             ("PROFILE_READER", getattr(agenthub_mcp, "PROFILE_READER", ())),
+             ("PROFILE_WORKER", getattr(agenthub_mcp, "PROFILE_WORKER", ()))]
+    always = getattr(agenthub_mcp, "PROFILE_ALWAYS", ())
+    if always:
+        lists.append(("PROFILE_ALWAYS", always))
+    for label, seq in lists:
+        for n in seq:
+            if n not in names:
+                out.append(f"{label}: {n}")
+    return sorted(out)
 
 
 def _call_tool(root: str, name: str, args: dict) -> str:
