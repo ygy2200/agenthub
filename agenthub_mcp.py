@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.9"}  # v2.40.8=集中式必填校验；本版=修3处业务失败缺「错误：」前缀的静默成功
+SERVER_INFO = {"name": "agenthub", "version": "2.40.10"}  # v2.40.9=修3处静默成功；本版=协议帧 ensure_ascii=True（UTF-8 stdio 崩溃路径加固）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2608,8 +2608,14 @@ def serve(root: str, fixed: bool = False, agent: str = "", profile: str = "") ->
             resp = ({"jsonrpc": "2.0", "id": msg.get("id"),
                      "error": {"code": -32603, "message": "internal error"}} if msg.get("id") is not None else None)
         if resp:
-            sys.stdout.write(json.dumps(resp, ensure_ascii=False) + "\n")
-            sys.stdout.flush()
+            try:
+                # ensure_ascii=True：协议帧恒为纯 ASCII，不依赖 stdout 编码为 UTF-8，
+                # 即使启动期 reconfigure 在异常环境下失败（被吞异常）也不会因中文抛 UnicodeEncodeError 炸进程。
+                # 客户端 json.loads 会自动把 \uXXXX 还原为中文，行为无感。
+                sys.stdout.write(json.dumps(resp, ensure_ascii=True) + "\n")
+                sys.stdout.flush()
+            except (OSError, UnicodeError) as e:
+                log(f"写出失败（{type(e).__name__}）：{e}")
     return 0
 
 

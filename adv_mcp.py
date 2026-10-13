@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.9"
+    assert r["serverInfo"]["version"] == "2.40.10"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -96,6 +96,31 @@ def t_protocol(root):
         "工具异常未自动登记错误"
     # ping
     assert "result" in m.handle_message(rpc("ping"), str(root))
+
+
+def t_protocol_encoding(root):
+    """Round 8：协议帧编码加固回归（bigiron.cc: Python MCP on Windows UTF-8 陷阱）。
+
+    纯中文工具在 Windows 上若 stdout 非 UTF-8（reconfigure 失败回落 cp1252），
+    json.dumps(ensure_ascii=False) 的中文写入会抛 UnicodeEncodeError → 协议帧写不出 → 客户端 hang。
+    R8 把协议帧改为 ensure_ascii=True（恒纯 ASCII），跨编码绝不会炸；客户端 json.loads 自动还原中文。
+    """
+    src = Path(__file__).read_text(encoding="utf-8")
+    assert "json.dumps(resp, ensure_ascii=True)" in src, \
+        "R8 契约：协议写出必须用 ensure_ascii=True，杜绝非 UTF-8 stdout 下的中文写入崩溃"
+    # 端到端：中文响应经纯 ASCII 帧往返无损（hub_status 不依赖 agent 身份，测试环境可用）
+    r = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_status", "arguments": {}}), str(root)))
+    assert r["isError"] is False, f"状态工具应成功，实际 {r}"
+    text = r["content"][0]["text"]
+    frame = json.dumps({"result": r}, ensure_ascii=True)
+    frame.encode("ascii")  # 纯 ASCII 帧：cp1252 等非 UTF-8 编码也绝不抛 UnicodeEncodeError
+    assert json.loads(frame)["result"]["content"][0]["text"] == text, "中文经 ASCII 帧往返必须无损"
+    # tools/list 中文描述同样纯 ASCII 帧往返无损
+    tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
+    desc_frame = json.dumps(tools, ensure_ascii=True)
+    desc_frame.encode("ascii")
+    assert any(("搜索" in t["description"] or "记录" in t["description"]) for t in tools), \
+        "工具描述中文必须随 ASCII 帧无损传输"
 
 
 def t_tools(root):
@@ -1658,6 +1683,7 @@ def main():
     case("Y3 知识图谱（结构边物化/体检/邻居/相关条目/最短路径/知识簇/孤岛清单/坏参）",
          lambda: t_graph(tmp))
     case("Y1 内置模板可升级（回归步骤补种/历史执行不受影响）", lambda: t_playbook_upgrade(tmp))
+    case("Round8·协议帧编码加固（ensure_ascii=True纯ASCII帧/中文无损/工具描述无损）", lambda: t_protocol_encoding(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
