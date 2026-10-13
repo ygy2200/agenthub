@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import json as _json
 import secrets
+import sys
 import threading
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from urllib.parse import parse_qs, urlparse
@@ -202,6 +203,12 @@ def serve(root: str, port: int = 8787, allow_write: bool = False,
 def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
                   open_browser: bool = False) -> int:
     """CLI 入口：阻塞运行（Ctrl+C 停止）。返回退出码。"""
+    # 同 cli.main：Windows OEM codepage 下中文重定向会 UnicodeEncodeError 崩掉
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001
+            pass
     try:
         httpd, real_port, token = serve(root, port, allow_write, open_browser)
     except OSError as e:

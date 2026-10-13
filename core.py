@@ -538,6 +538,25 @@ def memory_file(root: str) -> Path:
     return Path(root) / DIR_META / "memory.md"
 
 
+def _restore_backup(bak: str, p: Path, what: str) -> str:
+    """写失败后把刚备份的原文件还原；**还原也失败必须留痕**。
+
+    2026-10-13 吞异常审计发现：原实现两层 except 都是静默 pass——写失败本身会返回错误，
+    但"还原也失败"意味着原文件既被改动又没还原成功，用户只看到一条普通写入失败，
+    不知道该去查备份。数据丢失类缺陷最贵的形态就是"有错误提示但提示不到点子上"。
+    """
+    try:
+        shutil.copy2(bak, p)
+        return ""
+    except OSError as e:
+        try:
+            print(f"[agenthub] 严重：{what} 写入失败且原文件还原也失败"
+                  f"（备份 {bak}，目标 {p}）：{e}", file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001  日志自身失败不再递归
+            pass
+        return f"；且原文件还原失败（备份仍保留在 {bak}，请手工恢复）"
+
+
 def write_text_backed(path: str, text: str, root: str = "", agent: str = "user",
                       action: str = "edit") -> str:
     """备份原文件后写新内容（记忆/全局配置编辑用）。文件不存在时直接创建。
@@ -550,11 +569,8 @@ def write_text_backed(path: str, text: str, root: str = "", agent: str = "user",
         p.parent.mkdir(parents=True, exist_ok=True)
         p.write_text(text, encoding="utf-8")
     except OSError as e:
-        if bak:  # 写失败：把刚 rename 走的原文件还原回来
-            try:
-                shutil.copy2(bak, p)
-            except OSError:
-                pass
+        if bak:  # 写失败：把刚备份的原文件还原回来（还原也失败要留痕，见 _restore_backup）
+            return f"写入失败：{e}" + _restore_backup(bak, p, "记忆/配置写入")
         return f"写入失败：{e}"
     if root:
         journal(root, agent, action, path, bak)
@@ -787,10 +803,7 @@ def remove_bootstrap(path: str, root: str, agent: str = "user") -> str:
         p.write_text(_strip_bootstrap(old).rstrip("\n") + "\n", encoding="utf-8")
     except OSError as e:
         if bak:
-            try:
-                shutil.copy2(bak, p)
-            except OSError:
-                pass
+            return f"写入失败：{e}" + _restore_backup(bak, p, "引导移除")
         return f"写入失败：{e}"
     journal(root, agent, "bootstrap_remove", str(p), bak)
     return ""

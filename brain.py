@@ -115,8 +115,14 @@ def _apply_pragmas(conn) -> None:
         conn.execute("PRAGMA journal_mode=WAL")
         conn.execute("PRAGMA busy_timeout=15000")
         conn.execute("PRAGMA synchronous=NORMAL")
-    except sqlite3.Error:
-        pass
+    except sqlite3.Error as e:
+        # 留痕（2026-10-13 吞异常审计补）：PRAGMA 静默失败 = 并发配置没生效，
+        # 症状是"偶发 database is locked"却查不到原因——必须有人能看见它失败过。
+        try:
+            print(f"[agenthub] PRAGMA 应用失败（{e}），该连接可能未启用 WAL/15s 超时",
+                  file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def _close_sentinels() -> None:
@@ -5535,6 +5541,10 @@ _BUILTIN_PLAYBOOKS = [
          {"key": "health", "title": "大脑体检", "action": "ops_check", "args": {"name": "brain"}},
          {"key": "db", "title": "数据库健康（WAL/并发/体积）", "action": "ops_check",
           "args": {"name": "db_health"}},
+         {"key": "stdout", "title": "stdout 污染守卫（防 MCP 崩）", "action": "ops_check",
+          "args": {"name": "stdout_guard"}},
+         {"key": "drift", "title": "工具 schema 漂移（声明了没实现）", "action": "ops_check",
+          "args": {"name": "schema_drift"}},
          {"key": "graph", "title": "图谱健康（边/孤岛/最大簇）", "action": "ops_check",
           "args": {"name": "graph_health"}},
          {"key": "sentry", "title": "哨兵巡检（gap 自动广播）", "action": "sentry", "args": {}},

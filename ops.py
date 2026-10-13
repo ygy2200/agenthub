@@ -50,6 +50,8 @@ CHECKS = {
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
     "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
     "graph_health": ("知识图谱健康（2026-10-13）：结构边数/已连条目/孤岛数/最大簇——孤岛变多=该补标签的信号，边归零=图谱接线坏了", False),
+    "stdout_guard": ("stdout 污染守卫（2026-10-13）：MCP stdio 协议下任何 print 落到 stdout 都会让客户端 JSON-RPC 解析失败、工具全消失——外部检索列的头号致命缺陷。扫描 MCP 进程加载的模块", True),
+    "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
 }
 
 
@@ -89,6 +91,10 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _db_health(root)
     elif name == "graph_health":
         r = _graph_health(root)
+    elif name == "stdout_guard":
+        r = _stdout_guard(t)
+    elif name == "schema_drift":
+        r = _schema_drift()
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -391,6 +397,142 @@ def _db_health(root: str) -> dict:
     if shm.is_file() and not wal.is_file():
         lines.append("-shm 存在但 -wal 不在（异常组合，检查是否有进程异常退出）")
     return {"ok": ok, "summary": summary, "detail": lines[:8]}
+
+
+# MCP server 进程会加载的模块（stdio 协议下这些文件里的裸 print 都是致命污染源）。
+# 与 core.SERVER_FILES 同源：CLI/api 是独立进程（print 到 stdout 是正确输出），
+# 真正致命的是被 MCP server import 的模块。
+_STDOUT_MODULES = ("agenthub_mcp.py", "core.py", "brain.py", "agentscore.py", "ops.py",
+                   "report.py", "codec.py", "my/__init__.py", "my/work/__init__.py")
+
+
+def _stdout_guard(target: Path) -> dict:
+    """stdout 污染守卫：MCP 进程加载的模块里不允许有落到 stdout 的 print。
+
+    为什么值得一个检查项：外部检索（vantaige/lobehub MCP 缺陷清单）把
+    "logging to stdout corrupts the JSON-RPC stream" 列为**头号致命缺陷**——
+    客户端症状是"工具列表突然全空"，极难往这个方向排查。
+    我们目前是干净的（2026-10-13 首扫 0 处），这个检查项防的是**后人新增**：
+    在 brain.py 里随手加一句 print 调试，MCP 就全盘崩了。
+    """
+    if not (target / "agenthub_mcp.py").is_file():
+        return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 agenthub_mcp.py）", "detail": []}
+    import ast  # noqa: PLC0415
+    bad = []
+    for name in _STDOUT_MODULES:
+        p = target / name
+        if not p.is_file():
+            continue
+        try:
+            tree = ast.parse(p.read_text(encoding="utf-8"))
+        except SyntaxError as e:
+            bad.append(f"{name}: 语法错误 {e}")
+            continue
+        for node in ast.walk(tree):
+            if not (isinstance(node, ast.Call) and isinstance(node.func, ast.Name)
+                    and node.func.id == "print"):
+                continue
+            if not any(kw.arg == "file" and "stderr" in ast.unparse(kw.value)
+                       for kw in node.keywords):
+                bad.append(f"{name}:{node.lineno} print 未指定 file=sys.stderr")
+    return {"ok": not bad,
+            "summary": (f"MCP 模块 {len(_STDOUT_MODULES)} 个全部无 stdout 污染"
+                        if not bad else f"发现 {len(bad)} 处 stdout 污染（会崩掉整个 MCP）"),
+            "detail": bad[:8]}
+
+
+def _schema_drift() -> dict:
+    """工具 schema 漂移：TOOLS 声明的 action enum ⊆ call_tool 分发代码实际处理的字符串。
+
+    为什么值得一个检查项：外部检索（yaw.sh MCP Server Anatomy「Unrecognized enum values」）
+    与我们的历史事故（2026-10-03 工具 schema 枚选手抄漂移）都指向同一类缺陷——
+    **声明了但没实现**。agent 按 schema 调过去只得到"错误：action 只支持 …"，
+    每次都要多绕一轮对话，且没有任何测试会自然发现它（手写 enum 与手写 if 链必然漂移）。
+    """
+    import ast  # noqa: PLC0415
+    src = (Path(__file__).resolve().parent / "agenthub_mcp.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    # ① TOOLS 里每个工具的 action enum
+    declared: dict = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "TOOLS" for t in node.targets)):
+            continue
+        for item in ast.walk(node.value):
+            if not isinstance(item, ast.Dict):
+                continue
+            name = None
+            for k, v in zip(item.keys, item.values):
+                if isinstance(k, ast.Constant) and k.value == "name" and isinstance(v, ast.Constant):
+                    name = v.value
+            if not name:
+                continue
+            for k, v in zip(item.keys, item.values):
+                if isinstance(k, ast.Constant) and k.value == "inputSchema" and isinstance(v, ast.Dict):
+                    props = None
+                    for pk, pv in zip(v.keys, v.values):
+                        if isinstance(pk, ast.Constant) and pk.value == "properties":
+                            props = pv
+                    if not isinstance(props, ast.Dict):
+                        continue
+                    for pk, pv in zip(props.keys, props.values):
+                        if isinstance(pk, ast.Constant) and pk.value == "action" and isinstance(pv, ast.Dict):
+                            for ek, ev in zip(pv.keys, pv.values):
+                                if isinstance(ek, ast.Constant) and ek.value == "enum" and isinstance(ev, (ast.List, ast.Tuple)):
+                                    declared[name] = [c.value for c in ev.elts
+                                                      if isinstance(c, ast.Constant)]
+    # ② call_tool 里每个工具块实际处理的字符串（== 右侧 与 in 元组成员）
+    handled: dict = {}
+    fn = next((n for n in ast.walk(tree)
+               if isinstance(n, ast.FunctionDef) and n.name == "call_tool"), None)
+    if fn is None:
+        return {"ok": False, "summary": "找不到 call_tool 函数", "detail": []}
+    # 按行切块：`if name == "hub_x":` 到下一个同类 if
+    marks = []
+    for node in fn.body:
+        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
+            t = node.test
+            if (isinstance(t.left, ast.Name) and t.left.id == "name"
+                    and any(isinstance(o, ast.Eq) for o in t.ops)
+                    and any(isinstance(c, ast.Constant) and str(c.value).startswith("hub_")
+                            for c in t.comparators)):
+                marks.append((node.lineno, node.end_lineno or node.lineno,
+                              next(c.value for c in t.comparators if isinstance(c, ast.Constant))))
+    marks.sort()
+    for i, (s, _e, tool) in enumerate(marks):
+        end = marks[i + 1][0] - 1 if i + 1 < len(marks) else (fn.end_lineno or s)
+        vals = set()
+        for node in ast.walk(fn):
+            if not hasattr(node, "lineno") or not (s <= node.lineno <= end):
+                continue
+            if isinstance(node, ast.Compare):
+                for c in node.comparators:
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                        vals.add(c.value)
+            elif isinstance(node, (ast.Tuple, ast.List, ast.Set)):
+                for c in node.elts:
+                    if isinstance(c, ast.Constant) and isinstance(c.value, str):
+                        vals.add(c.value)
+            elif (isinstance(node, ast.Call) and isinstance(node.func, ast.Attribute)
+                  and node.func.attr == "get" and node.args
+                  and isinstance(node.args[0], ast.Constant) and node.args[0].value == "action"
+                  and len(node.args) > 1 and isinstance(node.args[1], ast.Constant)):
+                # 默认 action（如 arguments.get("action", "list")）走的是 else 分支，
+                # 没有显式 == 比较——不认它就会把"实现了但作为缺省"的误报成漂移。
+                vals.add(str(node.args[1].value))
+        handled[tool] = vals
+    # ③ 比对：声明了但代码里找不到 = 漂移
+    bad = []
+    for tool, acts in sorted(declared.items()):
+        have = handled.get(tool, set())
+        for a in acts:
+            if a not in have:
+                bad.append(f"{tool}: schema 声明了 action={a!r} 但分发代码里找不到")
+    # 反向：代码里处理了 action-like 短串却没声明（只查 in 元组里的，降噪）
+    return {"ok": not bad,
+            "summary": (f"{len(declared)} 个带 action enum 的工具全部与分发代码一致"
+                        if not bad else f"{len(bad)} 处 schema 漂移（声明了没实现）"),
+            "detail": bad[:8]}
 
 
 def _graph_health(root: str) -> dict:

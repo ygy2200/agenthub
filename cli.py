@@ -209,6 +209,13 @@ def cmd_serve(root: str, port: int, allow_write: bool, open_browser: bool) -> in
 
 
 def main(argv=None) -> int:
+    # Windows OEM codepage（cmd 默认 850/936）下把中文重定向到管道会抛
+    # UnicodeEncodeError 直接崩掉——我们的工具返回全是中文，这条必须最先做。
+    for _stream in (sys.stdout, sys.stderr):
+        try:
+            _stream.reconfigure(encoding="utf-8", errors="replace")
+        except Exception:  # noqa: BLE001  老 Python/非标准流不支持 reconfigure 时静默跳过
+            pass
     ap = argparse.ArgumentParser(prog="agenthub", description="AgentHub 命令行（headless 接入/自查）")
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
     sub = ap.add_subparsers(dest="cmd")

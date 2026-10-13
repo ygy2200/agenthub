@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.3"}  # v2.40.2=检索图路+并发加固；本版=矛盾检测/跨类型增强/图谱可观测性收口
+SERVER_INFO = {"name": "agenthub", "version": "2.40.4"}  # v2.40.3=矛盾检测/跨类型/图谱可观测；本版=缺陷自查周（stdout守卫/codepage/吞异常/schema漂移）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -510,6 +510,11 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
 
     if name == "hub_search":
         kw = str(arguments.get("keyword", "")).strip()
+        if not kw:
+            # 空关键词不该走检索再回报"无结果"——那是把参数问题伪装成数据问题，
+            # agent 收到"无结果"会去换关键词重试，永远修不好（2026-10-13 体验审计）。
+            return ("错误：keyword 必填且不能为空（如 hub_search keyword=备份）。"
+                    "想浏览全部内容用 hub_list_projects / hub_get_progress")
         res = brain.search_all(root, kw)
         n_total = (len(res["records"]) + len(res["memories"]) + len(res["files"])
                    + len(res.get("notes", [])))  # notes 漏加=纯随记命中误报无结果（实测抓到）
@@ -1382,10 +1387,12 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 tag = "自动" if c["kind"] == "auto_claim" else "手写"
                 lines.append(f"- #{c['id']} {c['ts'][5:16]} [{tag}] {c['agent']}：{c['content'][:80]}")
             return "\n".join(lines)
-        cp = brain.checkpoint_latest(root, tid)
-        if not cp:
-            return f"（任务 #{tid} 还没有检查点）"
-        return f"任务 #{tid} 最新检查点（{cp['ts'][5:16]} {cp['agent']}）：{cp['content']}"
+        if action == "latest":
+            cp = brain.checkpoint_latest(root, tid)
+            if not cp:
+                return f"（任务 #{tid} 还没有检查点）"
+            return f"任务 #{tid} 最新检查点（{cp['ts'][5:16]} {cp['agent']}）：{cp['content']}"
+        return f"错误：action 只支持 save/list/latest（收到 {action!r}）"
 
     if name == "hub_sentry":
         summary, sid = brain.sentry_sweep(root)
@@ -1527,8 +1534,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"- {b['mtime']}  {b['size'] // 1024}KB  {b['path']}")
             lines.append("校验：hub_export action=verify path=…（只读校验，不恢复）")
             return "\n".join(lines)
-        err, summary = brain.backup_verify(root, str(arguments.get("path", "")))
-        return f"错误：{err}" if err else summary
+        if action == "verify":
+            err, summary = brain.backup_verify(root, str(arguments.get("path", "")))
+            return f"错误：{err}" if err else summary
+        return f"错误：action 只支持 export/backup/backups/verify（收到 {action!r}）"
 
     if name == "hub_history":
         h = brain.history_of(root, str(arguments.get("kind", "record")),
@@ -2358,8 +2367,13 @@ def _audit_write(root: str, tname: str, arguments: dict, text: str) -> None:
                 kind, ref = "memory", m.group(1)
         brain.audit_add(root, str(arguments.get("agent") or ""), tname,
                         str(arguments.get("project") or ""), summary, kind, ref)
-    except Exception:  # noqa: BLE001 审计失败不影响主流程
-        pass
+    except Exception as e:  # noqa: BLE001 审计失败不影响主流程，但要留痕（2026-10-13 审计补）
+        try:
+            brain.error_add(root, "system", f"写审计留痕失败（{tname}）",
+                            f"{type(e).__name__}: {e}"[:300],
+                            str(arguments.get("project") or ""))
+        except Exception:  # noqa: BLE001
+            pass
 
 
 def handle_message(msg: dict, root: str) -> dict | None:
