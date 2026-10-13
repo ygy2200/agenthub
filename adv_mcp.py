@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.1"
+    assert r["serverInfo"]["version"] == "2.40.2"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1343,6 +1343,38 @@ def t_graph(tmp):
     assert "知识簇" in m.call_tool("hub_graph", {"action": "clusters"}, rs)
     assert "邻居" in m.call_tool("hub_graph", {"action": "neighbors", "node": "tag:图谱"}, rs)
     assert "孤岛" in m.call_tool("hub_graph", {"action": "isolated", "limit": 5}, rs)
+
+    # 检索接入图路（Graphiti 同款第四路）：与查询词零重叠但图上相连的条目应被召回
+    brain.add_memory(rs, "锚点记忆：只在它里面有 zzzmarker 这个词", tags="图检索",
+                     project="测试-图谱", agent="zcode")
+    brain.add_memory(rs, "另一条完全不提那个标记的记忆", tags="图检索",
+                     project="测试-图谱", agent="zcode")
+    brain.add_memory(rs, "八竿子打不着的无关记忆", tags="别的标签",
+                     project="别的-项目", agent="zcode")
+    brain.graph_build(rs)
+    hits = brain.search_memories(rs, "zzzmarker", limit=10)
+    texts = [h["content"] for h in hits]
+    assert any("zzzmarker" in t for t in texts), f"锚点自身未命中：{texts}"
+    assert any("完全不提" in t for t in texts), f"图路未召回零重叠条目：{texts}"
+    assert any("graph" in (h.get("_channels") or {}) for h in hits), "命中应带 graph 通道标记"
+    assert not any("八竿子" in t for t in texts), f"无关记忆被误召回：{texts}"
+    # 近重复折叠（业界流水线第 3 步：进上下文前 dedup）
+    brain.add_memory(rs, "折叠测试：SQLite 备份必须走 backup API", tags="折叠",
+                     project="测试-图谱", agent="zcode")
+    brain.add_memory(rs, "折叠测试：SQLite 备份必须走 backup API！", tags="折叠",
+                     project="测试-图谱", agent="zcode")
+    hits2 = brain.search_memories(rs, "SQLite 备份 backup API", limit=10, count_hits=False)
+    n_dup = sum(1 for h in hits2 if "折叠测试" in (h.get("content") or ""))
+    assert n_dup == 1, f"近重复应折叠成 1 条，实际 {n_dup}：{[h['content'][:40] for h in hits2]}"
+    assert any(int(h.get("_dup_n") or 0) >= 1 for h in hits2), "折叠应留痕 _dup_n"
+
+    # 图路可关闭（独立降级开关）
+    brain._RRF_W_GRAPH = 0.0
+    try:
+        off = [h["content"] for h in brain.search_memories(rs, "zzzmarker", limit=10)]
+        assert not any("完全不提" in t for t in off), f"关闭图路后不该再召回：{off}"
+    finally:
+        brain._RRF_W_GRAPH = 1.0
 
 
 def t_playbook_upgrade(tmp):

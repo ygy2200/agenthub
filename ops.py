@@ -48,6 +48,7 @@ CHECKS = {
     "hygiene": ("整洁体检：备份文件（.bak*）堆积量与最旧年龄 + agents 表零记录冗余行——只报不动手，供你决定清哪些", False),
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
+    "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
 }
 
 
@@ -83,6 +84,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _ponytail_gate(t)
     elif name == "coverage_gate":
         r = _coverage_gate(t)
+    elif name == "db_health":
+        r = _db_health(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -311,7 +314,8 @@ def _regression(target: Path) -> dict:
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 adv_brain.py）", "detail": []}
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py",
-              "adv_report.py", "adv_auto_log.py", "adv_mywork.py"]
+              "adv_report.py", "adv_auto_log.py", "adv_mywork.py",
+              "adv_concurrency.py"]  # 2026-10-13：并发/WAL 收尾（外部已知缺陷防线）
     detail, fails, cost = [], [], 0.0
     for s in suites:
         t0 = time.perf_counter()
@@ -333,6 +337,57 @@ def _regression(target: Path) -> dict:
     head = f"{len(suites) - len(fails)}/{len(suites)} 套通过（共 {cost:.0f}s）"
     return {"ok": not fails, "summary": head + ("" if not fails else f"，失败：{'、'.join(fails)}"),
             "detail": detail}
+
+
+def _db_health(root: str) -> dict:
+    """大脑库健康体检（只读）。
+
+    检查项来自外部检索到的真实事故，逐条对号入座：
+      - journal_mode 非 wal：并发读写必然互相阻塞（codegraph#238）
+      - busy_timeout < 15000：HTTP+MCP 并发访问下"database is locked"（mcp-memory-service 多客户端文档）
+      - synchronous=OFF：断电可能损坏库（不是慢，是安全性）
+      - -wal 体积过大：检查点没跑，读要扫的 frame 越来越多（业界实测 P99 5.2s→0.18s 的关键项）
+      - -wal/-shm 残留本身不算错（常驻连接下正常），只在体积异常时才报
+    """
+    import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
+    p = Path(root) / brain.core.DIR_META / brain.DB_NAME if root else None
+    if not root or p is None or not p.is_file():
+        return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+    lines: list = []
+    ok = True
+    try:
+        with brain.db_conn(root) as conn:
+            mode = str(conn.execute("PRAGMA journal_mode").fetchone()[0]).lower()
+            bt = int(conn.execute("PRAGMA busy_timeout").fetchone()[0] or 0)
+            sync = int(conn.execute("PRAGMA synchronous").fetchone()[0] or 0)
+            n_rec = conn.execute("SELECT COUNT(*) c FROM records WHERE " + brain._rec_live_sql()).fetchone()["c"]
+            n_mem = conn.execute("SELECT COUNT(*) c FROM memories WHERE " + brain._live_sql()).fetchone()["c"]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"库健康检查失败：{type(e).__name__}: {e}"[:120], "detail": []}
+    if mode != "wal":
+        ok = False
+        lines.append(f"journal_mode={mode}（应 wal，否则读写互相阻塞）")
+    if bt < 15000:
+        ok = False
+        lines.append(f"busy_timeout={bt}ms（<15000，并发访问易 locked）")
+    if sync == 0:
+        ok = False
+        lines.append("synchronous=OFF（断电可能损坏库，应为 NORMAL）")
+    db_mb = p.stat().st_size / 1048576
+    wal = Path(str(p) + "-wal")
+    shm = Path(str(p) + "-shm")
+    wal_mb = (wal.stat().st_size / 1048576) if wal.is_file() else 0.0
+    if wal_mb > 32:
+        ok = False
+        lines.append(f"-wal {wal_mb:.1f}MB 偏大（检查点没跑，读性能会随 WAL 增长下降）")
+    sync_cn = {0: "OFF", 1: "NORMAL", 2: "FULL"}.get(sync, str(sync))
+    summary = (f"库 {db_mb:.1f}MB · WAL {wal_mb:.1f}MB · 记录 {n_rec} · 记忆 {n_mem} · "
+               f"{mode}/busy{bt}ms/sync={sync_cn}")
+    if not ok:
+        summary += "，异常：" + "、".join(lines[:3])
+    if shm.is_file() and not wal.is_file():
+        lines.append("-shm 存在但 -wal 不在（异常组合，检查是否有进程异常退出）")
+    return {"ok": ok, "summary": summary, "detail": lines[:8]}
 
 
 def _deploy_diff(target: Path) -> dict:

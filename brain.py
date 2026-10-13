@@ -96,12 +96,51 @@ def _keep_wal(root: str) -> None:
                 except Exception:
                     pass
         try:
-            c = sqlite3.connect(p, timeout=5, check_same_thread=False)
-            c.execute("PRAGMA journal_mode=WAL")
-            c.execute("PRAGMA busy_timeout=5000")
+            c = sqlite3.connect(p, timeout=15, check_same_thread=False)
+            _apply_pragmas(c)
             _SENTINELS[p] = c
         except sqlite3.Error:
             pass
+
+
+def _apply_pragmas(conn) -> None:
+    """连接级 PRAGMA（单一来源：常驻哨兵与短连接都走这里，防两边配置漂移）。
+
+    busy_timeout 由 5000 → 15000：业界明确点名默认 5s 在「一个进程写 + 另一个进程读/
+    HTTP 服务并发访问」下不够（mcp-memory-service 多客户端文档把 5s 列为根因，推荐 15s）。
+    synchronous=NORMAL：WAL 下的推荐档（完全持久化语义保留，只把 fsync 交给 WAL 检查点），
+    比 FULL 快且不增加损坏风险——断电只可能丢最后一个检查点之后的事务，不丢库。
+    """
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA busy_timeout=15000")
+        conn.execute("PRAGMA synchronous=NORMAL")
+    except sqlite3.Error:
+        pass
+
+
+def _close_sentinels() -> None:
+    """进程退出前收尾：checkpoint + 关闭常驻连接，不留 -wal/-shm 残留。
+
+    对应业界已知事故（ruvnet/ruflo#3397，2026-09）：常驻 WAL 句柄若从不释放，
+    残留的 -wal/-shm 会让**其他进程**的首次写入被拒（对方无法区分"正写着"和"握着不用"），
+    只能重启 + 手工 checkpoint 才恢复。我们的常驻哨兵是刻意为之（防 Windows 删 wal），
+    但**必须有退出钩子**——否则就变成那起事故的形状。
+    """
+    with _SENTINEL_LOCK:
+        for _p, c in list(_SENTINELS.items()):
+            try:
+                c.execute("PRAGMA wal_checkpoint(TRUNCATE)")
+            except Exception:  # noqa: BLE001  退出路径不抛
+                pass
+            try:
+                c.close()
+            except Exception:  # noqa: BLE001
+                pass
+        _SENTINELS.clear()
+
+
+atexit.register(_close_sentinels)
 
 
 def release_root(root: str) -> None:
@@ -136,11 +175,10 @@ def db_conn(root: str):
     打开前先确保本进程有常驻连接（防 Windows 上 -wal 反复删建导致的只读句柄）。"""
     p = db_path(root)
     _keep_wal(root)
-    conn = sqlite3.connect(str(p), timeout=5)
+    conn = sqlite3.connect(str(p), timeout=15)
     conn.row_factory = sqlite3.Row
     try:
-        conn.execute("PRAGMA journal_mode=WAL")
-        conn.execute("PRAGMA busy_timeout=5000")
+        _apply_pragmas(conn)
         yield conn
         conn.commit()
     except Exception:
@@ -1461,14 +1499,14 @@ def search_records(root: str, kw: str, limit: int = 30) -> list:
     else:
         rows = _records_query(root, words, limit)
     if rows:
-        return rows
+        return _fold_near_dupes(rows)      # 近重复折叠：进上下文前先去重
     retry = _retry_bigrams(kw)
     if not retry:
         return []
     rows = _records_query(root, retry, limit)
     for r in rows:  # 放宽召回标记：真实大库里常见二字组合会命中弱相关，输出层须标注
         r["_bigram"] = True
-    return rows
+    return _fold_near_dupes(rows)
 
 
 def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
@@ -1494,6 +1532,7 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
     for eid, _, r in sem_rows:
         by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
+    _apply_graph_channel(root, "record", scores, channels, by_id)  # 第四路：图遍历
     fused = []
     for mid, s in scores.items():
         r = dict(by_id[mid])
@@ -2506,6 +2545,126 @@ _RRF_W_RECENCY = 0.0  # recency 加成（P4.4）：评测三档定档 β=0.10→
 # 触发重评条件=记忆规模显著增长或唤起分布变化（07 计划 v1.5）
 _RRF_ENABLED = True  # 融合回滚开关：False 即回 LIKE 单路旧行为
 _RRF_W_SEMANTIC = 1.5  # 语义路权重（P0-3 embedding 第三路；eval 标定；0=关闭独立降级到两路）
+# 图路（第四路，Y3 接线 2026-10-13）：Graphiti/Zep 的检索是「向量 + BM25 + 图遍历」三路 RRF，
+# 我们此前只有词法两路 + 语义一路，图谱造好了却没接进检索——与查询词**零重叠**的条目永远捞不回。
+# 权重低于 BM25（主路），因为图路是补充召回不是主排序依据；0=关闭（可独立降级）。
+_RRF_W_GRAPH = 1.0
+_GRAPH_SEED_N = 8      # 从融合 top-N 取种子（业界做法：RRF 之后再扩展，不做全图遍历）
+_GRAPH_HOPS = 2        # 跳数上限（2 跳以上扇出爆炸，业界共识）
+_FOLD_THRESHOLD = 0.85  # 检索结果内近重复折叠阈值（bigram Jaccard，见 _fold_near_dupes）
+
+
+def _fold_near_dupes(rows: list, threshold: float = 0.0) -> list:
+    """检索结果内近重复折叠：同一件事的多条只保留分最高的那条。
+
+    为什么需要：库里必然有近似重复（M7 整合提案就是实证），一起返回时同一个事实在上下文里
+    占好几个位置，既费 token 又把真相关的条目挤出 limit。业界混合检索流水线把它列为
+    **固定的第 3 步**（RRF 之后、进上下文之前）：dedup before context。
+
+    折叠=不返回，但在保留行上留 `_dup_n`（折了几条）——信息不丢，事后可查。
+    阈值取高（0.85）：只折"几乎一模一样"的。宁可漏折，不可误折——
+    误折会让 agent 少看到一条真不同的事实，这比多看一条重复贵得多。
+    """
+    thr = threshold or _FOLD_THRESHOLD
+    if thr <= 0 or len(rows) < 2:
+        return rows
+    kept: list = []
+    kept_toks: list = []
+    for r in rows:
+        t = _tokens(r.get("content") or r.get("title") or "")
+        hit = -1
+        for i, kt in enumerate(kept_toks):
+            if not t or not kt:
+                continue
+            union = len(t | kt)
+            if union and len(t & kt) / union >= thr:
+                hit = i
+                break
+        if hit >= 0:
+            kept[hit]["_dup_n"] = int(kept[hit].get("_dup_n") or 0) + 1
+            continue
+        kept.append(r)
+        kept_toks.append(t)
+    return kept
+
+
+def _graph_expand(root: str, entity: str, seeds: list, limit: int = 30) -> list:
+    """图扩展召回：从种子做 1~2 跳遍历，返回 [(eid, score)]（分数越高越「图上近」）。
+
+    entity: "record" / "memory"（与 relations 表的 kind 口径一致）。
+    计分：2.0/跳数 + 显式边（双链 mention / 手工 link）0.5 加成——
+    显式边说明「有人认定它们有关」，比结构边（同项目/同标签）更能说明问题。
+    """
+    if not seeds or _RRF_W_GRAPH <= 0:
+        return []
+    try:
+        with db_conn(root) as conn:
+            adj = _graph_adj(conn)
+    except sqlite3.Error:
+        return []
+    scores: dict = {}
+    for seed in {(entity, str(s)) for s in seeds}:
+        seen = {seed}
+        frontier = [seed]
+        for depth in range(1, _GRAPH_HOPS + 1):
+            nxt = []
+            for n in frontier:
+                for nb, ek in adj.get(n, []):
+                    if nb in seen:
+                        continue
+                    seen.add(nb)
+                    nxt.append(nb)
+                    if nb[0] != entity:
+                        continue
+                    try:
+                        eid = int(nb[1])
+                    except (TypeError, ValueError):
+                        continue
+                    scores[eid] = scores.get(eid, 0.0) + (2.0 / depth) + (
+                        0.5 if ek in ("mention", "link") else 0)
+            frontier = nxt
+    return sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, min(limit, 50))]
+
+
+def _rows_by_ids(root: str, entity: str, ids: list) -> dict:
+    """按 id 批量取行（图路候选补齐用），只取现行有效的（失效条目不进检索）。"""
+    if not ids:
+        return {}
+    ids = [int(i) for i in ids if str(i).lstrip("-").isdigit()][:50]
+    if not ids:
+        return {}
+    ph = ",".join("?" * len(ids))
+    tbl, live = ("records", _rec_live_sql()) if entity == "record" else ("memories", _live_sql())
+    try:
+        with db_conn(root) as conn:
+            rows = conn.execute(f"SELECT * FROM {tbl} WHERE id IN ({ph}) AND {live}", ids).fetchall()
+    except sqlite3.Error:
+        return {}
+    return {int(r["id"]): dict(r) for r in rows}
+
+
+def _apply_graph_channel(root: str, entity: str, scores: dict, channels: dict,
+                         by_id: dict, limit: int = 30) -> None:
+    """把图遍历作为第四路接进 RRF（原地改 scores/channels/by_id）。
+
+    顺序按业界共识：**先融合前三路 → 取 top 种子 → 图扩展 → 二次计入 RRF**。
+    不做全图遍历（扇出爆炸），也不把图当 boost（那样召不回零重叠条目，白做）。
+    """
+    if _RRF_W_GRAPH <= 0 or not scores:
+        return
+    seeds = [k for k, _ in sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:_GRAPH_SEED_N]]
+    g_rows = _graph_expand(root, entity, seeds, limit=limit)
+    if not g_rows:
+        return
+    missing = [eid for eid, _ in g_rows if eid not in by_id]
+    if missing:  # 图路独有候选（词法/语义都没召回的）在这里补进候选池
+        for eid, r in _rows_by_ids(root, entity, missing).items():
+            by_id.setdefault(eid, r)
+    for rank, (eid, _g) in enumerate(g_rows):
+        if eid not in by_id:      # 已删/已失效的条目不进融合
+            continue
+        scores[eid] = scores.get(eid, 0.0) + _RRF_W_GRAPH / (_RRF_K + rank + 1)
+        channels.setdefault(eid, {})["graph"] = rank + 1
 
 
 def _recency_of(r: dict, now: datetime.datetime) -> float:
@@ -2848,6 +3007,7 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
     for eid, _, r in sem_rows:
         by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
+    _apply_graph_channel(root, "memory", scores, channels, by_id)  # 第四路：图遍历
     fused = []
     now = datetime.datetime.now()
     for mid, s in scores.items():
@@ -2886,6 +3046,8 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
             rows = _memories_query(root, retry, kind, limit)  # 放宽重试保持旧路径（融合外）
             for r in rows:  # 同 search_records：放宽召回须可识别
                 r["_bigram"] = True
+    if rows:
+        rows = _fold_near_dupes(rows)   # 折叠在计唤起之前：被折掉的没进上下文，不该算唤起
     if rows and words and count_hits:
         now = _now()
         _bump_access(root, [r["id"] for r in rows], now)
@@ -5250,6 +5412,8 @@ _BUILTIN_PLAYBOOKS = [
      "desc": "只读体检套餐：大脑健康→哨兵巡检→停滞项目→整洁度→Inbox 积压。全通过则安静",
      "steps": [
          {"key": "health", "title": "大脑体检", "action": "ops_check", "args": {"name": "brain"}},
+         {"key": "db", "title": "数据库健康（WAL/并发/体积）", "action": "ops_check",
+          "args": {"name": "db_health"}},
          {"key": "sentry", "title": "哨兵巡检（gap 自动广播）", "action": "sentry", "args": {}},
          {"key": "stalled", "title": "停滞项目", "action": "ops_check", "args": {"name": "stalled"}},
          {"key": "hygiene", "title": "整洁体检", "action": "ops_check", "args": {"name": "hygiene"}},
