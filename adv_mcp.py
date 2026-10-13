@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.12"
+    assert r["serverInfo"]["version"] == "2.40.13"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -206,6 +206,59 @@ def t_round11_int_param_type(root):
     errs = brain.error_list(str(root), limit=100)
     titles = [e.get("title", "") for e in errs]
     assert any("入参类型错误" in t for t in titles), titles
+
+
+def t_round12_date_normalize(root):
+    """Round 12：日期入参规范化——修「格式偏差 → 到期提醒静默失效」。
+
+    M11 决策回顾队列 / 任务超期 / 记忆有效期都走 SQLite `<= date('now')` 的**字典序**比较：
+    '2026/10/01'（斜杠）在索引 4 是 '/'（0x2F）> '-'（0x2D），恒大于同日期的 ISO 串——
+    也就是「明明是过去的日期，却永远不进到期队列、永远不提醒」，且无任何报错。
+    """
+    def res_of(name, args):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), str(root))
+        return r["result"]
+
+    today = datetime.date.today()
+    slash_this_month = f"{today.year}/{today.month:02d}/01"      # 斜杠格式、≤ 今天
+    expect_iso = f"{today.year}-{today.month:02d}-01"
+
+    # ① 不可解析 / 非法日期 → 清晰错误（模型可自我纠正）
+    bad = [
+        ("hub_log_work", {"project": "测试-项目", "agent": "zcode", "content": "决策：x",
+                          "decision": "x", "review_date": "tomorrow"}),
+        ("hub_task_add", {"title": "任务X", "agent": "zcode", "due": "下周五"}),
+        ("hub_memory_write", {"content": "记忆X", "agent": "zcode", "valid_until": "2026-02-30"}),
+    ]
+    for name, args in bad:
+        res = res_of(name, args)
+        body = res["content"][0]["text"]
+        assert res["isError"] is True, (name, args, res)
+        assert "YYYY-MM-DD" in body or "合法日期" in body, (name, body)
+
+    # ② 斜杠格式「已到期」决策：规范成 ISO 后真的进到期队列（修复的核心证据）。
+    #    修复前该日期字典序更大 → 永不触发（静默失效）。
+    res = res_of("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                  "content": "决策：斜杠日期验证", "decision": "选 A",
+                                  "review_date": slash_this_month})
+    assert res["isError"] is False, res
+    due = brain.decision_review_due(str(root), 200)
+    assert any(d.get("review_date") == expect_iso for d in due), \
+        f"斜杠日期未规范成 {expect_iso} 并进到期队列：{[(d.get('record_id'), d.get('review_date')) for d in due]}"
+
+    # ③ 任务 due 同样规范化入库
+    res = res_of("hub_task_add", {"title": "斜杠截止任务", "agent": "zcode",
+                                  "project": "测试-项目", "due": slash_this_month})
+    assert res["isError"] is False, res
+    rows = [t for t in brain.task_list(str(root), limit=200)
+            if t["title"] == "斜杠截止任务"]
+    assert rows and rows[0]["due"] == expect_iso, rows
+
+    # ④ 缺省 / 空值零回归（不传行为与旧版一致）
+    assert res_of("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                   "content": "无回顾日决策"})["isError"] is False
+    assert res_of("hub_task_add", {"title": "无截止任务", "agent": "zcode"})["isError"] is False
+    assert res_of("hub_memory_write", {"content": "无有效期记忆", "agent": "zcode"})["isError"] is False
 
 
 def t_tools(root):
@@ -1772,6 +1825,8 @@ def main():
     case("Round10·hub_checkpoint 无task_id 不再#None（清晰必填提示/有tid不退化）", lambda: t_round10_checkpoint_no_tid(root))
     case("Round11·整数入参坏类型不再伪装服务端故障（hub_graph/hub_playbook 清晰整数提示/合法值零回归/登记归类）",
          lambda: t_round11_int_param_type(root))
+    case("Round12·日期入参规范化（斜杠/非法日期/到期提醒静默失效修复+缺省零回归）",
+         lambda: t_round12_date_normalize(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

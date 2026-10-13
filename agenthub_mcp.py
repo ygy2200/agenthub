@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.12"}  # v2.40.11=hub_checkpoint #None 纠正；本版=hub_graph/hub_playbook 整数入参坏类型不再伪装成服务端故障（_as_int + 通用兜底区分入参错误）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.13"}  # v2.40.12=整数入参坏类型纠正；本版=日期入参规范化（修「格式偏差→到期提醒静默失效」）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -267,6 +267,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     # ---- P3-2 待办状态机 + 事件流 ----
 
     if name == "hub_task_add":
+        ok, due_s = _norm_date(arguments.get("due"), "due")
+        if not ok:
+            return due_s
         err, tid = brain.task_add(root, str(arguments.get("title", "")),
                                   project=str(arguments.get("project", "")),
                                   detail=str(arguments.get("detail", "")),
@@ -274,7 +277,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                   agent=str(arguments.get("agent", "")),
                                   priority=arguments.get("priority", brain.DEFAULT_PRIORITY),
                                   deps=str(arguments.get("deps", "")),
-                                  due=str(arguments.get("due", "")))
+                                  due=due_s)
         if err:
             return "错误：" + err
         return (f"任务已建 #{tid}：{str(arguments.get('title', ''))[:60]}\n"
@@ -290,6 +293,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 f"（超 {brain.CLAIM_TTL_HOURS}h 未更新自动可被接管）")
 
     if name == "hub_task_update":
+        ok, due_s = _norm_date(arguments.get("due"), "due")
+        if not ok:
+            return due_s
         err, row = brain.task_update(root, arguments.get("task_id"),
                                      status=str(arguments.get("status", "")),
                                      agent=str(arguments.get("agent", "")),
@@ -297,7 +303,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                      detail=str(arguments.get("detail", "")),
                                      priority=arguments.get("priority"),
                                      deps=str(arguments.get("deps", "")),
-                                     due=str(arguments.get("due", "")))
+                                     due=due_s)
         if err:
             return f"错误：{err}"
         msg = (f"任务 #{row['id']} 已更新：status={brain.TASK_CN.get(row['status'], row['status'])}"
@@ -473,10 +479,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             tag = f"\n[豁免门禁] {waive[:100]}"
             room = MAX_CONTENT - len(tag)
             content = (content[:room] if len(content) > room else content) + tag
+        ok, rdate = _norm_date(arguments.get("review_date"), "review_date")
+        if not ok:
+            return rdate
         rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
                                   context=ctx, options=opts, decision=dec, tradeoffs=tro,
                                   record_type=rt,
-                                  review_date=str(arguments.get("review_date", "")).strip()[:10])
+                                  review_date=rdate)
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
@@ -705,7 +714,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             supersedes = int(arguments.get("supersedes", 0) or 0)
         except (TypeError, ValueError):
             supersedes = 0
-        valid_until = str(arguments.get("valid_until", "")).strip()[:10]
+        ok, valid_until = _norm_date(arguments.get("valid_until"), "valid_until")
+        if not ok:
+            return valid_until
         try:
             confidence = float(arguments.get("confidence", 1.0))
         except (TypeError, ValueError):
@@ -2315,6 +2326,35 @@ def _as_int(arguments: dict, key: str, default: int) -> tuple:
         return True, int(v)
     except (TypeError, ValueError):
         return False, f"错误：参数 {key} 必须是整数（收到 {str(v)[:40]!r}）"
+
+
+_DATE_RE = re.compile(r"^(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})$")
+
+
+def _norm_date(value, field: str) -> tuple:
+    """日期入参规范化/校验（Round 12 / 2026-10-13）：回 (True, "YYYY-MM-DD") 或 (False, 提示)。
+
+    为什么必须做：M11 决策回顾队列、任务超期（due_summary）、记忆有效期（valid_until）
+    都走 SQLite 的 `date <= date('now')` —— **字典序**比较。于是：
+      · '2026/01/01'（斜杠）字典序恒 > '2026-10-13' → 永远不触发；
+      · '2026-2-1'（未补零）在月份 ≥10 的今天同样被静默漏掉。
+    就是说日期格式稍有偏差，「到期提醒」这个功能会**静默失效**（用户永远收不到回顾提醒），
+    而且没有任何报错可循。这里统一收口：可解析的（含 / . 分隔、未补零、非法日期）规范成
+    YYYY-MM-DD 或给清晰错误；空值照旧放行（保持「不传行为与旧版一致」）。
+    """
+    s = str(value or "").strip()
+    if not s:
+        return True, ""
+    m = _DATE_RE.match(s)
+    if not m:
+        return False, (f"错误：{field} 需为 YYYY-MM-DD（如 2026-10-20），"
+                       f"收到 {s[:20]!r}——格式不对会让「到期提醒」静默不触发")
+    y, mo, d = (int(x) for x in m.groups())
+    try:
+        datetime.date(y, mo, d)
+    except ValueError:
+        return False, f"错误：{field} 不是合法日期（收到 {s[:20]!r}）"
+    return True, f"{y:04d}-{mo:02d}-{d:02d}"
 
 
 def _fmt_playbook_run(res: dict) -> str:
