@@ -1045,6 +1045,10 @@ def t_iserror_correctness(root):
     unk = call("hub_call_tool", {"name": "hub_no_such_tool_xyz"})
     assert unk["isError"] is True, f"未知工具转发应为 isError=True，实际 {unk}"
 
+    # 直接 tools/call 一个不存在的工具名（不经 hub_call_tool）也必须 isError=True
+    direct_unk = call("hub_no_such_tool_direct", {})
+    assert direct_unk["isError"] is True, f"直接调用未知工具应为 isError=True，实际 {direct_unk}"
+
     claim = call("hub_claim", {"task_id": 1})
     assert claim["isError"] is True, f"hub_claim 缺 agent 应为 isError=True，实际 {claim}"
 

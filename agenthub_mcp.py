@@ -1800,7 +1800,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"   #{n['id']} {n['ts'][:10]}{mood} {n['content'][:70]}")
         return "\n".join(lines)
 
-    return f"未知工具：{name}"
+    return f"错误：未知工具 {name}（用 hub_search_tools 搜索可用工具）"
 
 
 TOOLS = [
@@ -2443,6 +2443,12 @@ def handle_message(msg: dict, root: str) -> dict | None:
             is_err = _is_error_text(text)
             if tname in WRITE_TOOLS and not is_err:
                 _audit_write(root, tname, args, text)
+            if is_err:
+                # 服务端留痕（MCP 官方/ mcpcat 建议：内部记录完整错误，模型侧只给可行动文案，
+                # 不把堆栈/SQL 直接塞回模型）。写 stderr，不污染 stdout 协议流。
+                sys.stderr.write(f"[agenthub][tool-error] {tname} "
+                                 f"agent={args.get('agent') or '-'} :: {text[:200]}\n")
+                sys.stderr.flush()
             text, structured = _shape_result(text, args)
             result = {"content": [{"type": "text", "text": text}], "isError": is_err}
             if structured is not None:
