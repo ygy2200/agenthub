@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.11"
+    assert r["serverInfo"]["version"] == "2.40.12"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -146,6 +146,66 @@ def t_round10_checkpoint_no_tid(root):
     res = call("list", 999999)
     assert res["isError"] is False, res
     assert "#None" not in res["content"][0]["text"], res
+
+
+def t_round11_int_param_type(root):
+    """Round 11：整数入参传坏类型不再伪装成「服务端故障/联系管理员」。
+
+    此前 hub_graph（neighbors/related/path/isolated/clusters）与 hub_playbook（runs）直接
+    `int(arguments.get(...))`——模型传 "abc" 抛 ValueError，被通用兜底渲染成
+    「工具执行失败（ValueError）…联系管理员」：入参问题伪装成服务端故障（模型无法自我纠正），
+    且错误登记归类成「执行异常」淹没真故障。现在统一给「错误：参数 X 必须是整数」。
+    """
+    def res_of(name, args):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), str(root))
+        return r["result"]
+
+    # ① 5 个 hub_graph 动作 + hub_playbook：坏类型 → 清晰整数提示（isError=True）
+    bad_calls = [
+        ("hub_graph", {"action": "clusters", "limit": "abc"}),
+        ("hub_graph", {"action": "isolated", "limit": "x"}),
+        ("hub_graph", {"action": "neighbors", "node": "record:1", "limit": "bad"}),
+        ("hub_graph", {"action": "related", "node": "record:1", "limit": "2.5"}),
+        ("hub_graph", {"action": "path", "from_node": "a", "to_node": "b", "max_depth": "nan"}),
+        ("hub_playbook", {"action": "runs", "limit": "oops"}),
+    ]
+    for name, args in bad_calls:
+        res = res_of(name, args)
+        body = res["content"][0]["text"]
+        assert res["isError"] is True, (name, args, res)
+        assert "必须是整数" in body, (name, args, body)
+        assert "联系管理员" not in body and "工具执行失败" not in body, (name, args, body)
+
+    # ② 合法值不受影响：数字串 / 整数 / 缺省（零回归）
+    for lim in ("5", 5, None):
+        args = {"action": "clusters"}
+        if lim is not None:
+            args["limit"] = lim
+        res = res_of("hub_graph", args)
+        assert res["isError"] is False, (lim, res)
+        assert "必须是整数" not in res["content"][0]["text"], (lim, res)
+    res = res_of("hub_playbook", {"action": "runs", "limit": "3"})
+    assert res["isError"] is False, res
+
+    # ③ 通用兜底是「安全网」：逃逸的 Type/ValueError 归类为入参问题（不再渲染成服务端故障）。
+    #    注意：②的 _as_int 走的是「正常返回清晰错误」，与 R6 必填校验一致——不登记错误库；
+    #    只有逃逸到通用兜底的异常才登记，且这里要归到「入参类型错误」而非「执行异常」。
+    orig = m.call_tool
+
+    def _boom_value(*a, **k):
+        raise ValueError("invalid literal for int() with base 10: 'abc'")
+    try:
+        m.call_tool = _boom_value
+        res = res_of("hub_status", {})
+        body = res["content"][0]["text"]
+        assert res["isError"] is True, res
+        assert "入参不符合要求" in body, body
+        assert "联系管理员" not in body and "工具执行失败" not in body, body
+    finally:
+        m.call_tool = orig
+    errs = brain.error_list(str(root), limit=100)
+    titles = [e.get("title", "") for e in errs]
+    assert any("入参类型错误" in t for t in titles), titles
 
 
 def t_tools(root):
@@ -1710,6 +1770,8 @@ def main():
     case("Y1 内置模板可升级（回归步骤补种/历史执行不受影响）", lambda: t_playbook_upgrade(tmp))
     case("Round8·协议帧编码加固（ensure_ascii=True纯ASCII帧/中文无损/工具描述无损）", lambda: t_protocol_encoding(root))
     case("Round10·hub_checkpoint 无task_id 不再#None（清晰必填提示/有tid不退化）", lambda: t_round10_checkpoint_no_tid(root))
+    case("Round11·整数入参坏类型不再伪装服务端故障（hub_graph/hub_playbook 清晰整数提示/合法值零回归/登记归类）",
+         lambda: t_round11_int_param_type(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

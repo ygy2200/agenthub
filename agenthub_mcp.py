@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.11"}  # v2.40.10=协议帧编码加固；本版=hub_checkpoint 无task_id 退化文案(#None)纠正为清晰必填提示
+SERVER_INFO = {"name": "agenthub", "version": "2.40.12"}  # v2.40.11=hub_checkpoint #None 纠正；本版=hub_graph/hub_playbook 整数入参坏类型不再伪装成服务端故障（_as_int + 通用兜底区分入参错误）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -1636,8 +1636,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                         str(arguments.get("target", "")).strip())
             return "错误：" + res["error"] if res.get("error") else _fmt_playbook_run(res)
         if action == "runs":
-            rows = brain.playbook_runs(root, str(arguments.get("name", "")).strip(),
-                                       int(arguments.get("limit", 10) or 10))
+            ok, lim = _as_int(arguments, "limit", 10)
+            if not ok:
+                return lim
+            rows = brain.playbook_runs(root, str(arguments.get("name", "")).strip(), lim)
             if not rows:
                 return "（还没有执行记录。hub_playbook action=run name=… 跑一次）"
             lines = [f"执行历史 {len(rows)} 条（新在前）："]
@@ -1658,8 +1660,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                     f"项目边 {s['in']} 条（覆盖 {s['records']} 条记录）。"
                     "（双链 mention 与手工 link 边由写入侧维护，本次不动）")
         if action == "neighbors":
-            res = brain.graph_neighbors(root, str(arguments.get("node", "")),
-                                        int(arguments.get("limit", 30) or 30))
+            ok, lim = _as_int(arguments, "limit", 30)
+            if not ok:
+                return lim
+            res = brain.graph_neighbors(root, str(arguments.get("node", "")), lim)
             if res.get("error"):
                 return "错误：" + res["error"]
             lines = [f"节点 {res['node']} 的邻居：出边 {len(res['out'])} · 入边 {len(res['in'])}"]
@@ -1673,8 +1677,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append("  （孤立节点：没跟任何东西相连——要么先 action=build，要么它真的是孤岛）")
             return "\n".join(lines)
         if action == "related":
-            rows = brain.graph_related(root, str(arguments.get("node", "")),
-                                       int(arguments.get("limit", 10) or 10))
+            ok, lim = _as_int(arguments, "limit", 10)
+            if not ok:
+                return lim
+            rows = brain.graph_related(root, str(arguments.get("node", "")), lim)
             if not rows:
                 return ("（图上没有关联条目。可能该节点本身孤立——先 action=build 重建结构边；"
                         "或换条记录试）")
@@ -1684,16 +1690,21 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"- {r['node']}（相关度 {r['score']}）{proj}{r['snippet']}")
             return "\n".join(lines)
         if action == "path":
+            ok, depth = _as_int(arguments, "max_depth", 4)
+            if not ok:
+                return depth
             res = brain.graph_path(root, str(arguments.get("from_node", "")),
-                                   str(arguments.get("to_node", "")),
-                                   int(arguments.get("max_depth", 4) or 4))
+                                   str(arguments.get("to_node", "")), depth)
             if res.get("error"):
                 return "错误：" + res["error"]
             if not res.get("found"):
                 return f"未找到路径：{res.get('hint', '')}"
             return f"路径（{res['depth']} 跳）：" + " → ".join(res["path"])
         if action == "isolated":
-            rows = brain.graph_isolated(root, int(arguments.get("limit", 20) or 20))
+            ok, lim = _as_int(arguments, "limit", 20)
+            if not ok:
+                return lim
+            rows = brain.graph_isolated(root, lim)
             if not rows:
                 return "（没有孤岛——所有条目都跟别的东西有连接）"
             lines = [f"孤岛 {len(rows)} 条（无边相连，检索最难顺带唤起它们）："]
@@ -1704,7 +1715,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines.append("处理：给它补标签（记忆）或建 [[双链]]（记录），再 action=build 重建边")
             return "\n".join(lines)
         if action == "clusters":
-            rows = brain.graph_clusters(root, int(arguments.get("limit", 8) or 8))
+            ok, lim = _as_int(arguments, "limit", 8)
+            if not ok:
+                return lim
+            rows = brain.graph_clusters(root, lim)
             if not rows:
                 return "（还没有成规模的簇。先 action=build 重建结构边，或库里条目还太少）"
             lines = [f"知识簇 {len(rows)} 个（按规模；≥2 个条目才算簇）："]
@@ -2286,6 +2300,23 @@ def _required_missing(tname: str, args: dict) -> list:
     return [p for p in req if p not in args]
 
 
+def _as_int(arguments: dict, key: str, default: int) -> tuple:
+    """读整数字段：缺省 / 空串用 default；不可转则回 (False, 清晰提示)。
+
+    Round 11（2026-10-13）：此前 hub_graph / hub_playbook 的 limit / max_depth 直接
+    `int(arguments.get(...))`——模型传坏类型（如 "abc"）会抛 ValueError，被协议层通用兜底
+    渲染成「工具执行失败（ValueError）…联系管理员」：把「入参类型问题」伪装成「服务端故障」，
+    模型无法自我纠正，还在错误登记里留噪声。这里统一转成可行动的「错误：参数 X 必须是整数」。
+    """
+    v = arguments.get(key)
+    if v is None or v == "":
+        return True, default
+    try:
+        return True, int(v)
+    except (TypeError, ValueError):
+        return False, f"错误：参数 {key} 必须是整数（收到 {str(v)[:40]!r}）"
+
+
 def _fmt_playbook_run(res: dict) -> str:
     """playbook 执行结果排版（run/resume 共用）。
 
@@ -2538,11 +2569,20 @@ def handle_message(msg: dict, root: str) -> dict | None:
         except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落库错误登记
             # 模型侧只给稳定可行动文案（含异常类型，不含原始堆栈/SQL/路径——MCP 官方 wati.io
             # 明确禁止把堆栈/SQL/秘密塞回模型）；完整细节只在 error_add + stderr 留痕（服务端可见）。
-            text = (f"工具执行失败（{type(e).__name__}）：已记入大脑错误，可重试；"
-                    f"若持续失败联系管理员")
+            # Round 11：区分「入参类型问题」与「服务端异常」——前者多因模型传了坏类型，
+            # 文案要能自我纠正；此前一律渲染成「联系管理员」会把入参问题伪装成服务端故障，
+            # 误导模型原地重试同一坏参数。登记时也分开归类（便于运维过滤，不淹没真故障）。
+            input_err = isinstance(e, (TypeError, ValueError))
+            if input_err:
+                text = (f"错误：入参不符合要求（{type(e).__name__}）：请核对参数类型后重试"
+                        "（如 limit / max_depth / record_id / since_id 等字段应为整数）")
+            else:
+                text = (f"工具执行失败（{type(e).__name__}）：已记入大脑错误，可重试；"
+                        f"若持续失败联系管理员")
             try:
                 brain.error_add(root, str(args.get("agent") or "mcp-server"),
-                                f"MCP 工具 {tname} 执行异常", f"{type(e).__name__}: {e}",
+                                f"MCP 工具 {tname} " + ("入参类型错误" if input_err else "执行异常"),
+                                f"{type(e).__name__}: {e}",
                                 project=str(args.get("project") or ""))
             except Exception:  # noqa: BLE001 登记失败不影响协议响应
                 pass
