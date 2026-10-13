@@ -347,9 +347,26 @@ def _deploy_diff(target: Path) -> dict:
             diffs.append(f"{name}: 部署缺失")
         elif hashlib.md5(src.read_bytes()).hexdigest() != hashlib.md5(dst.read_bytes()).hexdigest():
             diffs.append(f"{name}: 不一致（源码与部署谁新？先确认再同步）")
-    return {"ok": not diffs,
-            "summary": f"{len(DEPLOY_FILES) - len(diffs)}/{len(DEPLOY_FILES)} 与部署一致（{DEPLOY_DIR}）"
-            + ("" if not diffs else "，差异：" + "、".join(diffs)),
+    # 反向漂移：部署目录里**源码清单没有**的 .py。清单缩过（模块下线）就会留幽灵文件，
+    # 而 MCP 进程 import 时可能吃到这份旧版——只报不阻断（历史遗留未必是错，但要让人看见）。
+    ghosts = []
+    try:
+        for p in DEPLOY_DIR.rglob("*.py"):
+            # _bak = 部署脚本自己的上一版备份（预期存在，不是幽灵）；__pycache__ 同理
+            if "__pycache__" in p.parts or "_bak" in p.parts:
+                continue
+            rel = p.relative_to(DEPLOY_DIR).as_posix()
+            if rel not in DEPLOY_FILES:
+                ghosts.append(f"{rel}: 部署残留（源码清单里没有，疑似下线模块的幽灵）")
+    except OSError:
+        ghosts = []
+    if ghosts:
+        diffs.extend(ghosts[:4])  # 进 detail 供人看，但不计入 ok（残留不该阻断发布）
+    return {"ok": not any(d for d in diffs if "残留" not in d),
+            "summary": f"{len(DEPLOY_FILES) - len([d for d in diffs if '残留' not in d])}/{len(DEPLOY_FILES)}"
+                       f" 与部署一致（{DEPLOY_DIR}）"
+                       + (f"，另有部署残留 {len(ghosts)} 个" if ghosts else "")
+                       + ("" if not diffs else "：" + "、".join(diffs[:4])),
             "detail": diffs[:8]}
 
 
