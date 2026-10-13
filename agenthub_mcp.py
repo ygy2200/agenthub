@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.8"}  # v2.40.7=协议健壮性；本版=集中式必填参数校验（执行前按声明schema校验入参）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.9"}  # v2.40.8=集中式必填校验；本版=修3处业务失败缺「错误：」前缀的静默成功
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -417,7 +417,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         proj = brain.get_project(root, pname)
         if not proj:
             close = [p["name"] for p in brain.list_projects(root, 200) if pname.lower() in p["name"].lower()][:8]
-            return f"项目不存在：{pname}。相近项目：{'、'.join(close) if close else '无'}"
+            return f"错误：项目不存在：{pname}。相近项目：{'、'.join(close) if close else '无'}"
         out = [f"项目：{proj['name']}", f"归属:{proj['agent'] or '未知'}  最近活动：{proj['last_active'] or '无'}",
                "", "最近记录："]
         for r in proj["records"]:
@@ -1558,7 +1558,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         h = brain.history_of(root, str(arguments.get("kind", "record")),
                              arguments.get("id"))
         if not h["item"]:
-            return f"（{h['kind']} #{arguments.get('id')} 不存在）"
+            return f"错误：{h['kind']} #{arguments.get('id')} 不存在"
         lines = [f"{h['kind']} #{h['id']} 变更史 {len(h['timeline'])} 条（时间升序；"
                  "来源 journal 流水 / supersede 取代链 / 条目自身时点）："]
         for t in h["timeline"]:
@@ -1587,7 +1587,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             nm = str(arguments.get("name", "")).strip()
             pb = brain.playbook_get(root, nm)
             if not pb:
-                return f"（流程「{nm}」不存在。hub_playbook action=list 看清单）"
+                return f"错误：流程「{nm}」不存在。hub_playbook action=list 看清单"
             m = pb["meta"]
             lines = [f"流程 {m['name']} — {m['title']}（{'内置模板' if m.get('builtin') else '自定义'}）"]
             if m.get("desc"):

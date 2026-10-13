@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.8"
+    assert r["serverInfo"]["version"] == "2.40.9"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1154,6 +1154,27 @@ def t_required_validation(root):
     assert m._effective_required("hub_log_work") == ["project", "content"]
 
 
+def t_round7_iserror_notfound(root):
+    """Round 7（2026-10-13）：业务失败返回路径必须带「错误：」前缀，否则被客户端当成功
+    （isError 正确性 Round 1 的收口项）。覆盖 3 处原本缺前缀、静默成功的路径：
+    hub_get_project 项目不存在 / hub_history 条目不存在 / hub_playbook show 流程不存在。"""
+    def call(name, args):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), str(root))
+        return r["result"]
+
+    miss_proj = call("hub_get_project", {"project": "不存在的项目XYZ"})
+    assert miss_proj["isError"] is True, miss_proj
+    assert "不存在" in miss_proj["content"][0]["text"], miss_proj
+
+    miss_hist = call("hub_history", {"id": 999999})
+    assert miss_hist["isError"] is True, miss_hist
+    assert "不存在" in miss_hist["content"][0]["text"], miss_hist
+
+    miss_pb = call("hub_playbook", {"action": "show", "name": "不存在的流程XYZ"})
+    assert miss_pb["isError"] is True, miss_pb
+    assert "不存在" in miss_pb["content"][0]["text"], miss_pb
+
+
 def t_p3_contract(tmp):
     """P3-1 契约：profile 切片（藏起≠禁用）/ discover 协商（-32022）/ max_chars 截断
     / dry_run 不落库 / confirm=false 闸门 / 写后审计与 undo 句柄 / 发现工具。"""
@@ -1596,6 +1617,7 @@ def main():
     case("响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）", lambda: t_response_size_guard())
     case("协议健壮性（畸形请求-32600 / 异常不外泄路径SQL）", lambda: t_handle_message_robustness(root))
     case("集中式必填校验（缺参拦截/agent豁免/checkpoint豁免/透传覆盖）", lambda: t_required_validation(root))
+    case("Round7·业务失败缺前缀静默成功（项目/条目/流程不存在→isError=True）", lambda: t_round7_iserror_notfound(root))
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
