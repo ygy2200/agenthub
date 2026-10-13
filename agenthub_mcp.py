@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.7"}  # v2.40.6=响应体积双封顶；本版=协议健壮性（畸形请求-32600/异常不外泄路径SQL）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.8"}  # v2.40.7=协议健壮性；本版=集中式必填参数校验（执行前按声明schema校验入参）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -183,6 +183,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
         return f"错误：AgentHub 根目录不存在：{root}"
+    # 集中式必填校验（MCP 官方 / mcpcat.io：执行前按声明 schema 校验入参，防把失败当成功）。
+    # 无害性论证（2026-10-13）：仅判「键缺失」不判空值（空值由下游工具自身「错误：」文案处理）；
+    # 豁免 agent（进程锁定身份 apply_server_agent 已兜底，强制要求会误杀 6 个已接入 agent 的正常调用）；
+    # 豁免 hub_checkpoint（task_id 仅 save 必填，list/latest 不需要，且其 save 路径内部已校验）。
+    miss = _required_missing(name, arguments)
+    if miss:
+        need = "、".join(_effective_required(name))
+        return f"错误：必填参数 {'、'.join(miss)} 缺失（{name} 需要：{need}）"
     # B2 单点派生：把进程锁定身份下发到本次调用（覆盖 agent 参数）。
     # 放在最前，后面所有工具的 arguments.get("agent") 拿到的都是已校验的锁定值。
     arguments = apply_server_agent(name, arguments, root)
@@ -2240,6 +2248,37 @@ TOOLS = [
                                     "project": {"type": "string", "description": "按项目过滤"},
                                     "agent": {"type": "string", "description": "按来源 agent 过滤"}}}},
 ]
+
+
+# ---- 集中式必填校验（Round 6 / 2026-10-13）----
+# 已声明 required 的工具在执行前统一校验，避免「参数名拼错 / 漏传」导致的隐晦下游错误，
+# 也符合 MCP 官方与 mcpcat.io 的「执行前按 schema 校验入参」最佳实践。
+# 安全豁免（见 call_tool 内注释）：agent（进程锁定身份兜底）/ hub_checkpoint（条件必填）。
+_REQUIRED_EXEMPT_TOOLS = frozenset({"hub_checkpoint"})
+_REQUIRED_EXEMPT_PARAMS = frozenset({"agent"})
+
+
+def _effective_required(tname: str) -> list:
+    """返回某工具实际需要强制的必填参数（已剔除豁免参数 agent）。"""
+    for t in TOOLS:
+        if t["name"] == tname:
+            return [p for p in (t["inputSchema"].get("required") or [])
+                    if p not in _REQUIRED_EXEMPT_PARAMS]
+    return []
+
+
+def _required_missing(tname: str, args: dict) -> list:
+    """返回该调用缺失的必填参数名（空列表=无缺失）。
+
+    - 豁免整工具（hub_checkpoint）：其 required=[task_id] 仅 action=save 成立（list/latest 不需要）。
+    - 只判键是否存在，不判空值：空字符串可能是合法输入，且空值由下游工具自身「错误：」文案处理。
+    """
+    if tname in _REQUIRED_EXEMPT_TOOLS:
+        return []
+    req = _effective_required(tname)
+    if not req:
+        return []
+    return [p for p in req if p not in args]
 
 
 def _fmt_playbook_run(res: dict) -> str:

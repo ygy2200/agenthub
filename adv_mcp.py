@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.7"
+    assert r["serverInfo"]["version"] == "2.40.8"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -909,8 +909,9 @@ def t_ask_metacog_tool(tmp):
     assert "不知道" in out2, out2
     out3 = m.call_tool("hub_metacognition", {}, rs)
     assert "元认知" in out3 and ("覆盖盲区" in out3 or "现行记忆" in out3), out3
-    # 空参数不崩（question 缺失 → 走弃权/空问句）
-    assert "问大脑" in m.call_tool("hub_ask", {}, rs)
+    # 空参数不崩：question 缺失 → 集中校验返回清晰的必填提示（isError=True），而非崩溃
+    empty = m.call_tool("hub_ask", {}, rs)
+    assert "必填参数" in empty and "question" in empty, empty
 
 
 # ---------------------------------------------------------------- B1/B2 身份锁定（2026-10-10）
@@ -1101,6 +1102,56 @@ def t_handle_message_robustness(root):
         assert "工具执行失败" in body and "RuntimeError" in body, f"应保留异常类型：{body}"
     finally:
         m.call_tool = orig
+
+
+def t_required_validation(root):
+    """集中式必填校验（Round 6 / 2026-10-13）：执行前按 TOOLS 声明的 required 拦缺失参数。
+    覆盖：① 直接 tools/call 缺 project → isError=True 且提示缺失参数；② hub_search 缺 keyword
+    同样拦截；③ 带必填参数 → 不触发拦截（走正常路径）；④ agent 豁免：hub_heartbeat 不传
+    agent 不应被「必填参数 缺失」拦截；⑤ hub_checkpoint 整工具豁免；⑥ hub_call_tool 透传
+    也会对 inner 工具校验（统一覆盖）。机制单测：_required_missing 直接断言豁免与判定逻辑。"""
+    def call(name, args):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), str(root))
+        return r["result"]
+
+    # ① 缺 project（文案形如「错误：必填参数 project 缺失（...）」）
+    miss = call("hub_get_project", {})
+    assert miss["isError"] is True, miss
+    assert "必填参数" in miss["content"][0]["text"] and "缺失" in miss["content"][0]["text"] \
+        and "project" in miss["content"][0]["text"]
+
+    # ② 缺 keyword
+    miss2 = call("hub_search", {})
+    assert miss2["isError"] is True and "keyword" in miss2["content"][0]["text"], miss2
+
+    # ③ 带必填参数 → 不触发集中拦截（测试 hub 内「测试-项目」存在，应成功）
+    ok = call("hub_get_project", {"project": "测试-项目"})
+    assert ok["isError"] is False, ok
+
+    # ④ agent 豁免：hub_heartbeat 无 agent 不应出现集中校验的「必填参数」提示
+    hb = call("hub_heartbeat", {})
+    assert "必填参数" not in hb["content"][0]["text"], \
+        f"agent 应豁免集中校验：{hb['content'][0]['text']}"
+
+    # ⑤ hub_checkpoint 整工具豁免：无 task_id 不出现集中校验的「必填参数」提示
+    cp = call("hub_checkpoint", {"action": "list"})
+    assert "必填参数" not in cp["content"][0]["text"], \
+        f"checkpoint 应豁免：{cp['content'][0]['text']}"
+
+    # ⑥ hub_call_tool 透传：inner 缺必填也拦
+    via = call("hub_call_tool", {"name": "hub_get_project", "arguments": {}})
+    assert via["isError"] is True and "project" in via["content"][0]["text"], via
+
+    # 机制单测：豁免与判定
+    assert m._required_missing("hub_heartbeat", {}) == [], "agent 应豁免"
+    assert m._required_missing("hub_log_work", {"project": "p", "content": "c"}) == [], \
+        "agent 豁免后无缺失"
+    assert m._required_missing("hub_log_work", {}) == ["project", "content"], \
+        m._required_missing("hub_log_work", {})
+    assert m._required_missing("hub_checkpoint", {}) == [], "checkpoint 整工具豁免"
+    assert m._required_missing("hub_get_project", {}) == ["project"]
+    assert m._effective_required("hub_heartbeat") == [], "heartbeat 有效必填空（agent 剔除）"
+    assert m._effective_required("hub_log_work") == ["project", "content"]
 
 
 def t_p3_contract(tmp):
@@ -1544,6 +1595,7 @@ def main():
     case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
     case("响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）", lambda: t_response_size_guard())
     case("协议健壮性（畸形请求-32600 / 异常不外泄路径SQL）", lambda: t_handle_message_robustness(root))
+    case("集中式必填校验（缺参拦截/agent豁免/checkpoint豁免/透传覆盖）", lambda: t_required_validation(root))
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))
