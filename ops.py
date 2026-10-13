@@ -49,6 +49,7 @@ CHECKS = {
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
     "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
+    "graph_health": ("知识图谱健康（2026-10-13）：结构边数/已连条目/孤岛数/最大簇——孤岛变多=该补标签的信号，边归零=图谱接线坏了", False),
 }
 
 
@@ -86,6 +87,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _coverage_gate(t)
     elif name == "db_health":
         r = _db_health(root)
+    elif name == "graph_health":
+        r = _graph_health(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -387,6 +390,36 @@ def _db_health(root: str) -> dict:
         summary += "，异常：" + "、".join(lines[:3])
     if shm.is_file() and not wal.is_file():
         lines.append("-shm 存在但 -wal 不在（异常组合，检查是否有进程异常退出）")
+    return {"ok": ok, "summary": summary, "detail": lines[:8]}
+
+
+def _graph_health(root: str) -> dict:
+    """知识图谱体检（只读；先重建结构边再统计，保证数字不是陈的）。
+
+    关注两件事：孤岛变多（= 新写的记忆没打标签，检索最难顺带唤起它们）、
+    边归零（= 图谱接线坏了——2026-10-13 就修过一个同源 bug：图谱造好却没接进检索）。
+    """
+    import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
+    try:
+        brain.graph_build(root)
+        st = brain.graph_stats(root, build=False)
+        cl = brain.graph_clusters(root, limit=3, build=False)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"图谱体检失败：{type(e).__name__}: {e}"[:120], "detail": []}
+    iso = int(st.get("isolated") or 0)
+    edges = int(st.get("edges") or 0)
+    lines: list = []
+    ok = True
+    if not edges:
+        ok = False
+        lines.append("图谱无边（结构边没建？跑 hub_graph action=build）")
+    if iso > 50:
+        ok = False
+        lines.append(f"孤岛 {iso} 条偏多（hub_graph action=isolated 看清单，补标签或建 [[双链]]）")
+    summary = (f"边 {edges} · 已连 {st.get('linked', 0)} · 孤岛 {iso} · "
+               f"最大簇 {st.get('largest_cluster', 0)}")
+    if cl:
+        summary += f"｜top簇 {cl[0]['size']} 个条目"
     return {"ok": ok, "summary": summary, "detail": lines[:8]}
 
 

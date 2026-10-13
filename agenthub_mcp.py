@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.2"}  # v2.40=Y1/Y2/Y3；v2.40.1=发布闭环补全；本版=检索图路接线+并发加固（外部已知缺陷防线）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.3"}  # v2.40.2=检索图路+并发加固；本版=矛盾检测/跨类型增强/图谱可观测性收口
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -525,12 +525,27 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         if any("_bigram" in r for r in res["records"]) or any("_bigram" in mem for mem in res["memories"]):
             lines.insert(1, "（连续长串无直接命中，已拆词放宽召回——按相关度排序，弱相关自行取舍）")
         for r in res["records"]:
-            lines.append(f"[记录#{r['id']}] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:60]}")
+            src = (f"（图关联自{r['_cross'][2:]}）" if r.get("_cross")
+                   else "（图关联）" if "graph" in (r.get("_channels") or {}) else "")
+            lines.append(f"[记录#{r['id']}] {r['date']} {r['project']}（{r['agent']}）：{r['title'][:60]}{src}")
             snip = _snippet(r["content"], words)
             if snip:
                 lines.append(f"  ↳ {snip}")
         for mem in res["memories"]:
-            lines.append(f"[记忆#{mem['id']}] {brain.KIND_CN.get(mem['kind'], mem['kind'])}：{mem['content'][:100]}")
+            src = (f"（图关联自{mem['_cross'][2:]}）" if mem.get("_cross")
+                   else "（图关联）" if "graph" in (mem.get("_channels") or {}) else "")
+            lines.append(f"[记忆#{mem['id']}] {brain.KIND_CN.get(mem['kind'], mem['kind'])}：{mem['content'][:100]}{src}")
+        # 矛盾提示（2026-10-13）：业界把冲突检测定位为「取回后、进上下文前」的标准步骤——
+        # 不检测就交给 LLM 自己发现，行为不确定且不可审计。这里只提示，不替用户裁决。
+        conflicted = [m for m in res["memories"] if m.get("_conflict_with")]
+        if conflicted:
+            pairs = set()
+            for m in conflicted:
+                for other in m["_conflict_with"]:
+                    pairs.add(tuple(sorted((m["id"], other))))
+            lines.append(f"⚠️ 检出 {len(pairs)} 对疑似互斥记忆（一条像在修正另一条）："
+                         + "、".join(f"#{a}<->#{b}" for a, b in sorted(pairs)[:3])
+                         + "。裁决：用 hub_memory_write supersedes=旧id 取代，或 hub_consolidate 看整合提案")
         for n in res.get("notes", []):
             mood = f"（{n['mood']}）" if n.get("mood") else ""
             lines.append(f"[随记#{n['id']}] {n['ts'][:10]}{mood}：{n['content'][:100]}")
@@ -742,7 +757,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines = [out, "", f"[大脑推送] 开工先读（{project or '全局'}相关/置顶记忆，共 {len(recall)} 条）："]
                 for m in recall:
                     flag = "★" if m["pinned"] else "·"
-                    lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}")
+                    conf = f" ⚠️疑似互斥#{'/#'.join(str(i) for i in m['_conflict_with'])}" if m.get("_conflict_with") else ""
+                    lines.append(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}] {m['content'][:120]}{conf}")
             if recall:  # 先把记忆推送定型，技能建议再追加（顺序反了会被 lines 覆盖掉）
                 out = "\n".join(lines)
         # 技能原生化·阶段4：开工顺带召回本任务可能用到的技能（跨 agent，只给路径不加载）。
@@ -1180,6 +1196,12 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                  f"（停滞 {h['projects_stalled']}）· 待处理错误 {h['errors_open']}",
                  f"- 结晶率 {h['crystallization']}%（记忆/记录）· 检索：今日 {h['searches_today']} / 累计 {h['searches_total']} 次",
                  f"- 待办线索 {h['todo_count']} 条 · 疑似重复记忆 {h['dup_memory_count']} 组"]
+        if h.get("conflict_pair_count"):
+            lines.append(f"- ⚠️ 疑似互斥记忆 {h['conflict_pair_count']} 对（一条像在修正另一条，"
+                         "agent 可能拿矛盾的事实干活）：")
+            for d in h["conflict_pairs"][:3]:
+                lines.append(f"  ◆ #{d['a']}~#{d['b']}：{d['content_a'][:36]} ↔ {d['content_b'][:36]}")
+            lines.append("  裁决：hub_memory_write supersedes=旧id 取代，或 hub_consolidate 看整合提案")
         if h["todos"]:
             lines.append("待办线索（最近 5 条，全部用 hub_list_todos）：")
             for t in h["todos"][:5]:
@@ -1648,7 +1670,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines = [f"孤岛 {len(rows)} 条（无边相连，检索最难顺带唤起它们）："]
             for r in rows:
                 proj = f"[{r['project']}] " if r.get("project") else ""
-                lines.append(f"- {r['node']} {proj}{r['snippet']}")
+                sug = f"｜建议标签：{'、'.join(r['suggested_tags'])}" if r.get("suggested_tags") else ""
+                lines.append(f"- {r['node']} {proj}{r['snippet']}{sug}")
             lines.append("处理：给它补标签（记忆）或建 [[双链]]（记录），再 action=build 重建边")
             return "\n".join(lines)
         if action == "clusters":

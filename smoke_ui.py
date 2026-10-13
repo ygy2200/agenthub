@@ -111,6 +111,11 @@ def main():
         check("搜索页分类过滤", w.search_page.view_hits and
               all(k == "record" for k, _ in w.search_page.view_hits))
         w.search_page.kindFilter.setCurrentIndex(0)
+        # 搜索页图关联/互斥标注（与 MCP 层同源逻辑）：此处只验渲染路径不崩，
+        # 标注正确性由 adv_mcp 的 hub_search 断言覆盖（同一份 _cross/_conflict_with 口径）
+        w.search_page.edit.setText("存档")
+        w.search_page.run()
+        check("搜索页图关联标注不破坏渲染", w.search_page.result.count() >= 1)
         w.search_page.result.setCurrentRow(0)  # 选中触发预览+关键词高亮+按钮显隐
         check("搜索页预览与操作按钮", bool(w.search_page.preview.toPlainText().strip())
               and w.search_page.btnOpen.isHidden() and not w.search_page.btnJump.isHidden())

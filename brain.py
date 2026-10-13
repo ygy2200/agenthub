@@ -1499,14 +1499,14 @@ def search_records(root: str, kw: str, limit: int = 30) -> list:
     else:
         rows = _records_query(root, words, limit)
     if rows:
-        return _fold_near_dupes(rows)      # 近重复折叠：进上下文前先去重
+        return _mark_conflicts(_fold_near_dupes(rows))   # 去重 + 矛盾标记（records 与 memories 对称）
     retry = _retry_bigrams(kw)
     if not retry:
         return []
     rows = _records_query(root, retry, limit)
     for r in rows:  # 放宽召回标记：真实大库里常见二字组合会命中弱相关，输出层须标注
         r["_bigram"] = True
-    return _fold_near_dupes(rows)
+    return _mark_conflicts(_fold_near_dupes(rows))
 
 
 def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
@@ -2389,7 +2389,9 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
             r["last_hit"] = now
     # 推送落检索日志（tool=recall_push）：推送可观测，"推送 top10 是工作知识"才可验收
     log_search(root, "recall_push", (project or "")[:200], len(rows), agent=agent)
-    return rows
+    # 推送内也要做矛盾标记（2026-10-13）：开工即见的记忆里若有互斥对，agent 会同时收到
+    # 两个矛盾版本——和检索路径同一口径，别让 LLM 自己发现。
+    return _mark_conflicts(rows)
 
 
 def should_push(root: str, agent: str, project: str) -> bool:
@@ -2552,6 +2554,46 @@ _RRF_W_GRAPH = 1.0
 _GRAPH_SEED_N = 8      # 从融合 top-N 取种子（业界做法：RRF 之后再扩展，不做全图遍历）
 _GRAPH_HOPS = 2        # 跳数上限（2 跳以上扇出爆炸，业界共识）
 _FOLD_THRESHOLD = 0.85  # 检索结果内近重复折叠阈值（bigram Jaccard，见 _fold_near_dupes）
+# 检索结果矛盾检测阈值：相似到这个程度才有资格谈"互斥"（太低会把无关两条也判成矛盾）。
+# 业界定位（theneuralbase「Conflicting memories」）：**冲突检测是检索后处理步骤——
+# 取回之后、进上下文之前**，而不是等 LLM 自己发现（那样行为不确定且不可审计）。
+_CONFLICT_SIM = 0.55  # 检索结果矛盾检测的**包含度**阈值（见 _mark_conflicts 为何不用 Jaccard）
+
+
+def _mark_conflicts(rows: list, threshold: float = 0.0) -> list:
+    """给同时命中的相似条目标 `_conflict_with`（疑似互斥，需人或 agent 显式裁决）。
+
+    为什么用**包含度**而不是 Jaccard：「一条修正另一条」的典型形态是新条**包含**旧条全文
+    再追加修正说明（"X 是 A——不对，实际是 B"）。Jaccard 会被长条稀释：短条 token 集是
+    长条的子集时，Jaccard 只有 |短|/|长|，永远够不到阈值（实测 0.33）。
+    包含度 |交|/min(|A|,|B|) 对这种"包含式修正"是 1.0，才对症。
+
+    为什么只标不裁：仲裁策略（最新优先/权威源优先/置信度优先）各有利弊，
+    替用户拍板的代价 > 多看一条标记。系统负责把"这两条可能互斥"这件事**说出来**。
+    复用 consolidate 的 _verdict 判定（恰一条含修正词 → 疑似矛盾），不另造第二套口径。
+    """
+    thr = threshold or _CONFLICT_SIM
+    if thr <= 0 or len(rows) < 2:
+        return rows
+    toks = [(i, _tokens(r.get("content") or r.get("title") or ""),
+             r.get("kind") or "") for i, r in enumerate(rows)]
+    for i in range(len(rows)):
+        for j in range(i + 1, len(rows)):
+            ta, tb = toks[i][1], toks[j][1]
+            if not ta or not tb:
+                continue
+            inter = len(ta & tb)
+            if not inter:
+                continue
+            containment = inter / min(len(ta), len(tb))
+            if containment < thr:
+                continue
+            if _verdict(rows[i].get("content") or "", rows[j].get("content") or "",
+                        toks[i][2] == toks[j][2]) != "疑似矛盾（一条修正另一条）":
+                continue  # 只标互斥；"疑似重复"已由折叠处理，"相关"不是问题
+            rows[i].setdefault("_conflict_with", []).append(rows[j]["id"])
+            rows[j].setdefault("_conflict_with", []).append(rows[i]["id"])
+    return rows
 
 
 def _fold_near_dupes(rows: list, threshold: float = 0.0) -> list:
@@ -2624,6 +2666,78 @@ def _graph_expand(root: str, entity: str, seeds: list, limit: int = 30) -> list:
                         0.5 if ek in ("mention", "link") else 0)
             frontier = nxt
     return sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, min(limit, 50))]
+
+
+def _graph_expand_cross(root: str, src: str, dst: str, seeds: list, limit: int = 10) -> list:
+    """跨类型图扩展：从 src 类型的种子出发，捞 dst 类型的邻居（分数 ×0.5）。
+
+    为什么要单独一个函数而不是给 _graph_expand 加参数：同类型扩展是「一路召回」进 RRF，
+    跨类型是「另一类的补充信息」，权重与去处都不同——混在一个函数里迟早搞乱。
+    """
+    if not seeds:
+        return []
+    try:
+        with db_conn(root) as conn:
+            adj = _graph_adj(conn)
+    except sqlite3.Error:
+        return []
+    scores: dict = {}
+    for seed in {(src, str(s)) for s in seeds}:
+        seen = {seed}
+        frontier = [seed]
+        for depth in range(1, _GRAPH_HOPS + 1):
+            nxt = []
+            for n in frontier:
+                for nb, ek in adj.get(n, []):
+                    if nb in seen:
+                        continue
+                    seen.add(nb)
+                    nxt.append(nb)
+                    if nb[0] != dst:
+                        continue
+                    try:
+                        eid = int(nb[1])
+                    except (TypeError, ValueError):
+                        continue
+                    scores[eid] = scores.get(eid, 0.0) + ((2.0 / depth) + (
+                        0.5 if ek in ("mention", "link") else 0)) * 0.5  # 跨类型减半
+            frontier = nxt
+    return sorted(scores.items(), key=lambda kv: (-kv[1], kv[0]))[:max(1, min(limit, 20))]
+
+
+def _cross_enrich(root: str, r: dict, limit: int = 30) -> None:
+    """search_all 层跨类型图增强（原地改 r["records"]/r["memories"]）。
+
+    来源（FalkorDB《Your Agent's Memory Problem Is a Retrieval Architecture Problem》）：
+    "start in vectors for semantic discovery, end in the graph for structural enrichment"——
+    从一类条目出发，沿图把**另一类**的结构关联带回来。
+    跨类型是补充信息，权重减半、只追加不插队，绝不压制同类型结果。
+    不放进 search_records/search_memories：那会破坏两者的返回契约（调用方预期同类型列表）。
+    """
+    if _RRF_W_GRAPH <= 0:
+        return
+    pairs = (("record", "memory"), ("memory", "record"))
+    for src, dst in pairs:
+        rows = r["records"] if src == "record" else r["memories"]
+        if not rows:
+            continue
+        # 种子优先取**词法真正命中**的（带 like/bm25 通道），而不是融合后的前 N——
+        # 否则图路/语义捞回的低相关条目会占满种子位，把真正该扩展的目标挤出去
+        # （2026-10-13 实测：预置数据占满前 8，目标记录排到 8 名外，跨类型召回为空）。
+        seeds = [x["id"] for x in rows
+                 if "like" in (x.get("_channels") or {}) or "bm25" in (x.get("_channels") or {})]
+        if not seeds:
+            seeds = [x["id"] for x in rows]
+        seeds = seeds[:_GRAPH_SEED_N]
+        for eid, _sc in _graph_expand_cross(root, src, dst, seeds, limit=8):
+            dst_rows = r["memories"] if dst == "memory" else r["records"]
+            if any(x["id"] == eid for x in dst_rows):
+                continue
+            row = _rows_by_ids(root, dst, [eid]).get(eid)
+            if not row:
+                continue
+            row["_cross"] = f"来自{src}"
+            dst_rows.append(row)
 
 
 def _rows_by_ids(root: str, entity: str, ids: list) -> dict:
@@ -3048,6 +3162,7 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
                 r["_bigram"] = True
     if rows:
         rows = _fold_near_dupes(rows)   # 折叠在计唤起之前：被折掉的没进上下文，不该算唤起
+        rows = _mark_conflicts(rows)    # 矛盾标记（业界：取回后、进上下文前检测，别让 LLM 自己发现）
     if rows and words and count_hits:
         now = _now()
         _bump_access(root, [r["id"] for r in rows], now)
@@ -3320,10 +3435,12 @@ def search_all(root: str, kw: str, limit: int = 30) -> dict:
     """全脑检索：工作记录 + 记忆 + 随记 + 文件名。返回 {"records": [...], "memories": [...], "notes": [...], "files": [...]}"""
     if not kw.strip():
         return {"records": [], "memories": [], "notes": [], "files": []}
-    return {"records": search_records(root, kw, limit),
-            "memories": search_memories(root, kw, limit),
-            "notes": search_notes(root, kw, limit),
-            "files": search_files(root, kw, limit)}
+    out = {"records": search_records(root, kw, limit=limit),
+           "memories": search_memories(root, kw, limit=limit),  # 必须关键字：search_memories 第三参是 kind，
+           "notes": search_notes(root, kw, limit),             # 位置传 limit 会把 limit 塞进 kind（2026-10-13 实测）
+           "files": search_files(root, kw, limit)}
+    _cross_enrich(root, out, limit)   # 跨类型图增强：从一类条目沿图把另一类带回来
+    return out
 
 
 def skill_sync(root: str, rows: list) -> dict:
@@ -5147,6 +5264,10 @@ def health_report(root: str) -> dict:
             "searches_today": s.get("searches_today", 0), "searches_total": s.get("searches_total", 0),
             "todos": todos, "todo_count": len(todos),
             "dup_memories": sims, "dup_memory_count": len(sims),
+            # 疑似互斥对（2026-10-13）：一条像在修正另一条——比"疑似重复"更危险，
+            # 重复只是浪费上下文，互斥会让 agent 拿矛盾的事实干活。只报数不仲裁。
+            "conflict_pairs": [x for x in sims if "矛盾" in (x.get("verdict") or "")],
+            "conflict_pair_count": sum(1 for x in sims if "矛盾" in (x.get("verdict") or "")),
             "bare_titles": bare_titles,
             "recall_push_total": push_total, "push_by_agent": push_by_agent,
             "search_by_agent": search_by_agent, "tool_breakdown": tool_breakdown,
@@ -5414,6 +5535,8 @@ _BUILTIN_PLAYBOOKS = [
          {"key": "health", "title": "大脑体检", "action": "ops_check", "args": {"name": "brain"}},
          {"key": "db", "title": "数据库健康（WAL/并发/体积）", "action": "ops_check",
           "args": {"name": "db_health"}},
+         {"key": "graph", "title": "图谱健康（边/孤岛/最大簇）", "action": "ops_check",
+          "args": {"name": "graph_health"}},
          {"key": "sentry", "title": "哨兵巡检（gap 自动广播）", "action": "sentry", "args": {}},
          {"key": "stalled", "title": "停滞项目", "action": "ops_check", "args": {"name": "stalled"}},
          {"key": "hygiene", "title": "整洁体检", "action": "ops_check", "args": {"name": "hygiene"}},
@@ -6288,8 +6411,14 @@ def graph_stats(root: str, build: bool = True) -> dict:
                        conn.execute("SELECT kind, COUNT(*) c FROM relations GROUP BY kind")}
             n_mem = conn.execute("SELECT COUNT(*) c FROM memories WHERE " + _live_sql()).fetchone()["c"]
             n_rec = conn.execute("SELECT COUNT(*) c FROM records WHERE " + _rec_live_sql()).fetchone()["c"]
-            linked = conn.execute("SELECT COUNT(DISTINCT from_id) c FROM relations "
-                                  "WHERE from_kind IN ('record','memory')").fetchone()["c"]
+            # linked 与 graph_isolated 同口径（2026-10-13 修订）：记忆看**标签边**、记录看任何边。
+            # 旧口径（记忆有任何边即算连上）会把"有项目无标签"的记忆全算成已连，
+            # 而它们恰恰是最该补标签的一批，stats 会给出虚假的安心感。
+            lm = conn.execute("SELECT COUNT(DISTINCT from_id) c FROM relations "
+                              "WHERE from_kind='memory' AND kind='tag'").fetchone()["c"]
+            lr = conn.execute("SELECT COUNT(DISTINCT from_id) c FROM relations "
+                              "WHERE from_kind='record'").fetchone()["c"]
+            linked = int(lm or 0) + int(lr or 0)
         except sqlite3.Error:
             return {"error": "图谱统计失败（表缺失？）"}
     cl = graph_clusters(root, limit=1, build=False)
@@ -6396,24 +6525,42 @@ def graph_path(root: str, a: str, b: str, max_depth: int = 4) -> dict:
 
 
 def graph_isolated(root: str, limit: int = 20, build: bool = False) -> list:
-    """孤岛清单：既无标签/项目结构边、也无双链/手工边的条目。
+    """孤岛清单 + 补标签建议：**没有标签边**的记忆 + 没有任何边的记录。
 
-    给清单而不是只给个数——stats 说「孤岛 38」人没法行动，得知道**是哪 38 条**。
-    孤岛在检索里最难被顺带唤起，是最该补标签或建关联的一批。
+    口径说明（2026-10-13 修订）：旧口径「无任何边」把"有项目但没标签"的记忆全排除了——
+    而它们恰恰是最该补标签的一批（项目边太泛，说明不了语义关联）。标签边才是
+    「顺带唤起」的主要载体，所以记忆侧只看标签边；记录没有标签概念，仍看任何边。
+    stats 的 isolated 计数与本函数同口径，两边数字对得上。
+
+    建议标签：同项目其他条目的高频标签里，这条还没有的——修不修由人定，
+    但别再让人从零想「该打什么标签」。
     """
     if build:
         graph_build(root)
     lim = max(1, min(int(limit or 20), 100))
+    # 同项目标签频次（建议来源）
+    proj_tags: dict = {}
+    try:
+        with db_conn(root) as conn:
+            for r in conn.execute("SELECT project, tags FROM memories WHERE " + _live_sql()):
+                if not (r["project"] or "").strip():
+                    continue
+                bucket = proj_tags.setdefault(r["project"].strip(), {})
+                for t in re.split(r"[,，]", r["tags"] or ""):
+                    t = t.strip()
+                    if t:
+                        bucket[t] = bucket.get(t, 0) + 1
+    except sqlite3.Error:
+        proj_tags = {}
     with db_conn(root) as conn:
         try:
             lr = {str(r["from_id"]) for r in conn.execute(
                 "SELECT DISTINCT from_id FROM relations WHERE from_kind='record'").fetchall()}
+            # 记忆侧只认**标签边**（含入边：被打标签的记忆）
             lm = {str(r["from_id"]) for r in conn.execute(
-                "SELECT DISTINCT from_id FROM relations WHERE from_kind='memory'").fetchall()}
-            lr |= {str(r["to_ref"]) for r in conn.execute(
-                "SELECT DISTINCT to_ref FROM relations WHERE to_kind='record'").fetchall()}
+                "SELECT DISTINCT from_id FROM relations WHERE from_kind='memory' AND kind='tag'").fetchall()}
             lm |= {str(r["to_ref"]) for r in conn.execute(
-                "SELECT DISTINCT to_ref FROM relations WHERE to_kind='memory'").fetchall()}
+                "SELECT DISTINCT to_ref FROM relations WHERE to_kind='tag'").fetchall()}
         except sqlite3.Error:
             return []
         out = []
@@ -6427,18 +6574,28 @@ def graph_isolated(root: str, limit: int = 20, build: bool = False) -> list:
                 continue
             out.append({"node": f"record:{r['id']}", "kind": "record",
                         "snippet": (r["title"] or r["content"] or "")[:60],
-                        "project": r["project"] or "", "date": r["date"] or ""})
+                        "project": r["project"] or "", "date": r["date"] or "",
+                        "suggested_tags": []})
         try:
-            mems = conn.execute("SELECT id,content,project,kind FROM memories WHERE "
+            mems = conn.execute("SELECT id,content,project,kind,tags FROM memories WHERE "
                                 + _live_sql() + " ORDER BY id DESC LIMIT 3000").fetchall()
         except sqlite3.Error:
             mems = []
         for m in mems:
             if str(m["id"]) in lm:
                 continue
+            # 建议标签：同项目高频标签里这条还没有的（最多 2 个）
+            sug = []
+            mine = {t.strip() for t in re.split(r"[,，]", m["tags"] or "") if t.strip()}
+            for t, _n in sorted((proj_tags.get((m["project"] or "").strip()) or {}).items(),
+                                key=lambda kv: (-kv[1], kv[0])):
+                if t not in mine:
+                    sug.append(t)
+                if len(sug) >= 2:
+                    break
             out.append({"node": f"memory:{m['id']}", "kind": "memory",
                         "snippet": (m["content"] or "")[:60],
-                        "project": m["project"] or "", "date": ""})
+                        "project": m["project"] or "", "date": "", "suggested_tags": sug})
     return out[:lim]
 
 

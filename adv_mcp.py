@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.2"
+    assert r["serverInfo"]["version"] == "2.40.3"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1367,6 +1367,65 @@ def t_graph(tmp):
     n_dup = sum(1 for h in hits2 if "折叠测试" in (h.get("content") or ""))
     assert n_dup == 1, f"近重复应折叠成 1 条，实际 {n_dup}：{[h['content'][:40] for h in hits2]}"
     assert any(int(h.get("_dup_n") or 0) >= 1 for h in hits2), "折叠应留痕 _dup_n"
+
+    # 矛盾检测（业界：取回后、进上下文前检测互斥，别让 LLM 自己发现）
+    # 形态 = 新条包含旧条全文 + 修正词（"一条修正另一条"的典型写法）
+    brain.add_memory(rs, "矛盾测试：AgentHub 部署目录是 ~/.agenthub/mcp_server", tags="矛盾",
+                     project="测试-图谱", agent="zcode")
+    brain.add_memory(rs, "矛盾测试：AgentHub 部署目录是 ~/.agenthub/mcp_server——不对，实际是 ~/.agenthub/server",
+                     tags="矛盾", project="测试-图谱", agent="zcode")
+    hits3 = brain.search_memories(rs, "AgentHub 部署目录", limit=10, count_hits=False)
+    marked = [h for h in hits3 if h.get("_conflict_with")]
+    assert len(marked) == 2, f"应两条互标，实际 {len(marked)}：{[m['content'][:30] for m in marked]}"
+    out3 = m.call_tool("hub_search", {"keyword": "AgentHub 部署目录"}, rs)
+    assert "疑似互斥" in out3, f"hub_search 未给可行动提示：{out3[-200:]}"
+    # 无修正词的相似条（只相似不互斥）不该被标
+    assert not any(h.get("_conflict_with") for h in hits3
+                   if "SQLite 备份" in (h.get("content") or "")), "非互斥不应被标记"
+
+    # 跨类型图增强（FalkorDB：从语义发现出发，沿图做结构增强）
+    r1c = brain.add_record(rs, "跨类-项目", "zcode", "2026-10-13", "备份方案设计记录",
+                           "这份记录讲备份方案 zzzrecord")
+    m1c = brain.add_memory(rs, "完全不同的记忆内容 zzzmemory", tags="跨类",
+                           project="跨类-项目", agent="zcode")
+    brain.graph_build(rs)
+    allr = brain.search_all(rs, "备份方案")
+    rec_ids = [x["id"] for x in allr["records"]]
+    mem_ids = [x["id"] for x in allr["memories"]]
+    assert r1c in rec_ids, "同项目记录应命中"
+    assert m1c in mem_ids, f"跨类型记忆未被带回：{mem_ids}"
+    assert any(x.get("_cross") for x in allr["memories"]), "跨类型候选应带 _cross 标记"
+    # limit 必须真生效（2026-10-13 抓到的真 bug：search_all 位置参把 limit 传进了 kind）
+    lim = brain.search_all(rs, "备份方案", limit=3)
+    assert len(lim["memories"]) <= 3 + 8 and len(lim["records"]) <= 3 + 8, \
+        f"search_all 的 limit 未生效：{len(lim['records'])}/{len(lim['memories'])}"
+    # 不破坏单类型检索契约（search_records 只回记录）
+    assert all("title" in x for x in brain.search_records(rs, "备份方案", limit=5))
+    # 可解释性（铁律 3）：图关联条目要在输出里说明来源，否则 agent 不知道它为什么出现
+    out_all = m.call_tool("hub_search", {"keyword": "备份方案"}, rs)
+    assert "图关联" in out_all, f"hub_search 未标注图关联来源：{out_all[:400]}"
+    # hub_health 报库级疑似互斥对（互斥= agent 可能拿矛盾事实干活，比重复更危险）
+    hp = brain.health_report(rs)
+    assert "conflict_pair_count" in hp and hp["conflict_pair_count"] >= 1, "health 未报互斥对"
+    assert "疑似互斥" in m.call_tool("hub_health", {}, rs)
+    # records 也要做矛盾标记（与 memories 对称，2026-10-13 补）
+    brain.add_record(rs, "测试-图谱", "zcode", "2026-10-13", "记录矛盾甲",
+                     "本项目备份目录是 _hub/backup")
+    brain.add_record(rs, "测试-图谱", "zcode", "2026-10-13", "记录矛盾乙",
+                     "本项目备份目录是 _hub/backup——不对，实际是 _hub/backups")
+    rc = brain.search_records(rs, "本项目备份目录", limit=10)
+    assert any(r.get("_conflict_with") for r in rc), f"记录矛盾未标记：{[r['title'] for r in rc]}"
+    # 孤岛给补标签建议（别再让人从零想该打什么标签）
+    brain.add_memory(rs, "有标签的记忆甲", tags="建议标签测试", project="孤岛-项目", agent="zcode")
+    iso_mem = brain.add_memory(rs, "没有标签的孤岛记忆", tags="", project="孤岛-项目", agent="zcode")
+    brain.graph_build(rs)
+    iso2 = brain.graph_isolated(rs, limit=50)
+    row = next((x for x in iso2 if x["node"] == f"memory:{iso_mem}"), None)
+    assert row, "无标签记忆应进孤岛清单（口径：记忆看标签边）"
+    assert "建议标签测试" in (row.get("suggested_tags") or []), f"未给建议标签：{row}"
+    # stats 与清单同口径：无标签记忆计入孤岛
+    st3 = brain.graph_stats(rs, build=False)
+    assert st3["isolated"] >= 1, f"stats 孤岛数应含无标签记忆：{st3}"
 
     # 图路可关闭（独立降级开关）
     brain._RRF_W_GRAPH = 0.0

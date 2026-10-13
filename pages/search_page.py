@@ -133,10 +133,15 @@ class SearchPage(QWidget):
                     self.result.addItem(h)
                     self.view_hits.append(("info", h))
             elif k == "record":
-                self.result.addItem(f"[记录] {h['date']} {h['project']}（{h['agent']}）：{h['title'][:80]}")
+                src = (f"（图关联自{h['_cross'][2:]}）" if h.get("_cross")
+                       else "（图关联）" if "graph" in (h.get("_channels") or {}) else "")
+                self.result.addItem(f"[记录] {h['date']} {h['project']}（{h['agent']}）：{h['title'][:80]}{src}")
                 self.view_hits.append((k, h))
             elif k == "memory":
-                self.result.addItem(f"[记忆#{h['id']}] {brain.KIND_CN.get(h['kind'], h['kind'])}：{h['content'][:100]}")
+                src = (f"（图关联自{h['_cross'][2:]}）" if h.get("_cross")
+                       else "（图关联）" if "graph" in (h.get("_channels") or {}) else "")
+                conf = f" ⚠️疑似互斥#{'/#'.join(str(i) for i in h['_conflict_with'])}" if h.get("_conflict_with") else ""
+                self.result.addItem(f"[记忆#{h['id']}] {brain.KIND_CN.get(h['kind'], h['kind'])}：{h['content'][:100]}{src}{conf}")
                 self.view_hits.append((k, h))
             elif k == "file":
                 self.result.addItem(f"[文件] {h['project']}\\{h['name']}")

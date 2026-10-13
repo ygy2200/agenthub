@@ -25,6 +25,7 @@ from urllib.parse import parse_qs, urlparse
 
 import agenthub_mcp
 import brain
+import ops
 
 
 READ_ONLY_OK = ("hub_status", "hub_health", "hub_next", "hub_search", "hub_signals",
@@ -163,6 +164,12 @@ class _Handler(BaseHTTPRequestHandler):
                              f"（已触发 {t['fire_count']} 次）")
             lines.append(f"图谱：边 {g.get('edges', 0)}｜已连条目 {g.get('linked', 0)}"
                          f"｜孤岛 {g.get('isolated', 0)}｜最大簇 {g.get('largest_cluster', 0)}")
+            # 图谱健康一行（孤岛偏多=新写的没打标签；边归零=接线坏了）
+            try:
+                gh = ops.run_check("graph_health", "", self.root)
+                lines.append(f"图谱健康：{'OK ' if gh.get('ok') else '⚠ '}{gh.get('summary', '')}")
+            except Exception:  # noqa: BLE001
+                pass
             return self._send(200, "\n".join(lines))
         if u.path == "/api/call":
             name = (q.pop("name", "") or "").strip()
