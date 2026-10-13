@@ -61,7 +61,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.4"
+    assert r["serverInfo"]["version"] == "2.40.5"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1023,6 +1023,32 @@ def t_parse_argv():
     assert m.parse_argv([])[3] == ""
 
 
+def t_iserror_correctness(root):
+    """isError 正确性（2026-10-13 缺陷自查补）：业务失败必须以 isError=True 返回，
+    否则 MCP 客户端把失败当成功、模型无法自我纠正（MCP 官方反对的反模式）。
+
+    覆盖：① 成功读工具 isError=False；② 缺必填参数（hub_task_add 无 title）isError=True；
+    ③ 未知工具经 hub_call_tool 转发 isError=True；④ hub_claim 缺 agent 的未加前缀错误
+    也必须是 isError=True（验证 L272 归一化）。
+    """
+    def call(name, args):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), str(root))
+        return r["result"]
+
+    ok = call("hub_status", {})
+    assert ok["isError"] is False, f"成功读工具应为 isError=False，实际 {ok}"
+
+    miss = call("hub_task_add", {})
+    assert miss["isError"] is True, f"缺必填参数应为 isError=True，实际 {miss}"
+    assert "错误" in miss["content"][0]["text"], f"错误文案应含「错误」，实际 {miss}"
+
+    unk = call("hub_call_tool", {"name": "hub_no_such_tool_xyz"})
+    assert unk["isError"] is True, f"未知工具转发应为 isError=True，实际 {unk}"
+
+    claim = call("hub_claim", {"task_id": 1})
+    assert claim["isError"] is True, f"hub_claim 缺 agent 应为 isError=True，实际 {claim}"
+
+
 def t_p3_contract(tmp):
     """P3-1 契约：profile 切片（藏起≠禁用）/ discover 协商（-32022）/ max_chars 截断
     / dry_run 不落库 / confirm=false 闸门 / 写后审计与 undo 句柄 / 发现工具。"""
@@ -1461,6 +1487,7 @@ def main():
     print(f"临时目录：{tmp}\n")
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
     case("MCP协议（握手/50工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
     case("批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）", lambda: t_ask_metacog_tool(tmp))
     case("MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）", lambda: t_tools(root))
     case("记忆overwrite语义（真清空+备份+非法mode）", lambda: t_memory_overwrite(tmp))

@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.4"}  # v2.40.3=矛盾检测/跨类型/图谱可观测；本版=缺陷自查周（stdout守卫/codepage/吞异常/schema漂移）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.5"}  # v2.40.4=缺陷自查守卫+3缺陷修复；本版=isError正确性（业务失败不再被当成功）+清单漂移守卫收口
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -269,7 +269,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         err, row = brain.task_claim(root, arguments.get("task_id"),
                                     str(arguments.get("agent", "")))
         if err:
-            return err
+            return "错误：" + err
         return (f"认领成功：任务 #{row['id']} [{brain.TASK_CN.get(row['status'], row['status'])}] "
                 f"{row['title'][:60]} —— owner={row['owner']}"
                 f"（超 {brain.CLAIM_TTL_HOURS}h 未更新自动可被接管）")
@@ -2376,6 +2376,17 @@ def _audit_write(root: str, tname: str, arguments: dict, text: str) -> None:
             pass
 
 
+def _is_error_text(text: str) -> bool:
+    """判断工具返回文本是否为业务失败。
+
+    约定：全代码库 50+ 个业务失败站点统一以「错误：」开头返回，成功文案从不以此开头
+    （已核实无碰撞）。据此把业务失败正确标记为 isError=True，让 MCP 客户端/模型看到失败、
+    能够自我纠正——否则 isError 恒为 False，模型把失败当成功、无法重试，正是 MCP 官方
+    （modelcontextprotocol.io / wati.io）明确反对的反模式。
+    """
+    return isinstance(text, str) and text.startswith(("错误：", "错误:"))
+
+
 def handle_message(msg: dict, root: str) -> dict | None:
     """处理一条 JSON-RPC 请求，返回响应；通知返回 None。"""
     method = msg.get("method", "")
@@ -2429,10 +2440,11 @@ def handle_message(msg: dict, root: str) -> dict | None:
                         "未落任何库；去掉 dry_run 后正式执行。")}], "isError": False}}
         try:
             text = call_tool(tname, args, root)
-            if tname in WRITE_TOOLS:
+            is_err = _is_error_text(text)
+            if tname in WRITE_TOOLS and not is_err:
                 _audit_write(root, tname, args, text)
             text, structured = _shape_result(text, args)
-            result = {"content": [{"type": "text", "text": text}], "isError": False}
+            result = {"content": [{"type": "text", "text": text}], "isError": is_err}
             if structured is not None:
                 result["structuredContent"] = structured
             return {"jsonrpc": "2.0", "id": mid, "result": result}
