@@ -942,9 +942,9 @@ class MemoryHistoryDialog(MessageBoxBase):
             for ln in diff:
                 e = html.escape(ln)
                 if ln.startswith("+"):
-                    body.append(f"<span style='color:#3c9a5f'>{e}</span>")
+                    body.append(f"<span style='color:{tokens.C(tokens.SUCCESS)}'>{e}</span>")
                 elif ln.startswith("-"):
-                    body.append(f"<span style='color:#d9534f'>{e}</span>")
+                    body.append(f"<span style='color:{tokens.C(tokens.DANGER)}'>{e}</span>")
                 else:
                     body.append(e)
             parts.append("<p>内容 diff：</p><pre>" + "\n".join(body) + "</pre>")

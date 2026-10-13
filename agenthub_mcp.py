@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.14"}  # v2.40.13=日期入参规范化；本版=18工具整数入参不再静默回落（_INT_PARAMS 集中校验+漂移守卫）+ 新增 date_health 巡检（防到期提醒静默失效）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.15"}  # v2.40.14=整数入参+date_health；本版=UI 轮：徽章兜底色白字对比度 3.45→4.74:1（AA达标）+ diff 色改走 tokens（浅色主题不再 3.34/3.77）+ 布局压测覆盖 13→18 页 + UI 审计修 2 处假警报
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent

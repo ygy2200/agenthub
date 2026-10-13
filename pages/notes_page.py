@@ -218,8 +218,9 @@ class NotesPage(QWidget):
             line = QHBoxLayout()
             line.setSpacing(8)
             lb = QLabel(kind)
-            lb.setStyleSheet(f"color:#fff;background:{tokens.BADGE_FALLBACK};border-radius:8px;"
-                             "padding:1px 8px;font-size:11px;")
+            # 色值一律走 tokens（白字常量也在 tokens.WHITE），不再内联 #fff
+            lb.setStyleSheet(f"color:{tokens.WHITE};background:{tokens.BADGE_FALLBACK};"
+                             "border-radius:8px;padding:1px 8px;font-size:11px;")
             lb.setFixedHeight(20)
             line.addWidget(lb)
             body = CaptionLabel(f"#{item['id']} {str(item.get('content', ''))[:90]}")

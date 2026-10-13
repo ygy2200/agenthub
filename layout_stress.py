@@ -1,18 +1,25 @@
 # -*- coding: utf-8 -*-
-"""布局压力测试（批次 3 复测）：920×600 逐页检测内容最小需求 vs 可用高度。"""
+"""布局压力测试（Round 1 / 2026-10-13 扩覆盖）：逐页检测内容最小需求 vs 可用尺寸。
+
+为什么改：
+① 原脚本硬编码 13 页，漏了 actions.PAGES 里的 5 页（工作台 / 信号中心 / 治理中心 /
+   编排中心 / 组件预览）——新增的页面没人守压扁风险；
+② 滚动保护检测用 `hasattr(page, "scroll")`，换个属性名就误判成「无保护」。
+现在：页面清单直接取 actions.PAGES（与左侧导航 / 命令面板同源，杜绝两份清单漂移），
+滚动保护用 findChildren(QScrollArea) 递归识别（qfw ScrollArea 是 QScrollArea 子类）。
+"""
 import os
 import sys
 
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
 sys.path.insert(0, r'D:\agent资料\zcode项目记录\AgentHub-多agent文件统一管理\AgentHub')
 
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QScrollArea
 app = QApplication([])
-import ui, tokens
+import ui, tokens, actions
 tokens.apply_theme('dark')
 
 w = ui.AgentHubWindow()
-w.resize(920, 600)
 w.show()
 
 # 等扫描
@@ -22,35 +29,58 @@ while getattr(w.project_page, "snap", None) is None and time.time() - t0 < 20:
     app.processEvents()
     time.sleep(0.05)
 
-pages = [
-    ("总览", w.overview_page), ("项目", w.project_page), ("时间线", w.timeline_page),
-    ("Agent 中心", w.hub_page), ("随记", w.notes_page), ("大脑", w.brain_page),
-    ("流水·对账", w.ledger_page), ("统计", w.stats_page), ("运营报告", w.report_page),
-    ("搜索", w.search_page), ("接入", w.connect_page),
-    ("帮助", w.help_page), ("设置", w.settings_page),
-]
+SIZES = [(920, 600), (1280, 800)]   # 最小窗 + 常见窗
+
+
+def _scroll_protected(page):
+    return bool(page.findChildren(QScrollArea))
+
+
+def _min_size(page):
+    lay = page.layout()
+    if lay is None:
+        return 0, 0
+    ms = lay.minimumSize()
+    return ms.height(), ms.width()
+
 
 risky = []
-for name, page in pages:
-    w.switchTo(page)
+for wpx, hpx in SIZES:
+    w.resize(wpx, hpx)
     app.processEvents()
     app.processEvents()
-    h_avail = page.height()
-    lay = page.layout()
-    min_h = 0
-    if lay is not None:
-        min_h = lay.minimumSize().height()
-    has_scroll = hasattr(page, "scroll")
-    # 有 ScrollArea 的页面：内容超高时滚动，无压扁风险
-    status = "滚动保护" if has_scroll else ("压扁风险" if min_h > h_avail else "OK")
-    if status == "压扁风险":
-        risky.append(name)
-    print(f"  {name:<10} 可用 {h_avail:>4}px | 最小需求 {min_h:>4}px | {status}")
+    print(f"\n== 窗口 {wpx}×{hpx} ==")
+    for attr, title, _icon, _group, _kw, _ctrl in actions.PAGES:
+        page = actions.page_of(w, attr)
+        if page is None:
+            print(f"  {title:<10} 缺页（未实例化）")
+            risky.append((f"{wpx}x{hpx}", title, "缺页"))
+            continue
+        w.switchTo(page)
+        app.processEvents()
+        app.processEvents()
+        min_h, min_w = _min_size(page)
+        h_avail, w_avail = page.height(), page.width()
+        prot = _scroll_protected(page)
+        v_risk = (not prot) and min_h > h_avail
+        h_risk = min_w > w_avail
+        flags = []
+        if v_risk:
+            flags.append("压扁风险")
+        if h_risk:
+            flags.append("横向溢出")
+        if flags:
+            risky.append((f"{wpx}x{hpx}", title, "/".join(flags)))
+        flag = "/".join(flags) if flags else "OK"
+        print(f"  {title:<10} 可用 {h_avail:>4}×{w_avail:<4} | 最小需求 {min_h:>4}×{min_w:<4} | "
+              f"{'滚动保护' if prot else '无滚动  '} | {flag}")
 
 print()
 if risky:
-    print("压扁风险页:", risky)
+    print(f"风险 {len(risky)} 处：")
+    for s in risky:
+        print("   ", s)
 else:
-    print("压扁风险清零（无滚动保护的页面均不超限）")
+    print("压扁 / 横向溢出风险清零")
 sys.stdout.flush()
 os._exit(0)

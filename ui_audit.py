@@ -178,40 +178,10 @@ def main():
     except Exception as e:
         note("BUG", "Agent中心", f"异常: {type(e).__name__}: {e}\n{traceback.format_exc()[-400:]}")
 
-    print("\n== 能力市场 ==")
-    try:
-        mp = w.market_page
-        app.processEvents()
-        mp.reload_market()
-        app.processEvents()
-        for _ in range(30):  # 等后台索引线程
-            app.processEvents()
-            if mp.marketList.count() and "加载中" not in mp.marketList.item(0).text():
-                break
-            time_sleep(0.1)
-        n_local = mp.marketList.count()
-        ok("能力市场", f"本地缓存源载入 {n_local} 项")
-        # 坏 identifier 直装应被拒
-        mp.idEdit.setText("bad-format")
-        mp.install_identifier()
-        app.processEvents()
-        ok("能力市场", "坏 identifier 被拒不崩")
-        # MCP 目录复制片段
-        mp.seg.setCurrentItem("mcp")
-        app.processEvents()
-        if mp.mcpList.count() < 5:
-            note("BUG", "能力市场", f"MCP 目录仅 {mp.mcpList.count()} 项")
-        mp.mcpList.setCurrentRow(0)
-        mp.preview_mcp(mp.mcpList.currentItem())
-        mp.copy_mcp_config()
-        app.processEvents()
-        clip = app.clipboard().text()
-        if "mcpServers" not in clip:
-            note("BUG", "能力市场", "复制片段后剪贴板无 mcpServers")
-        else:
-            ok("能力市场", "配置片段复制 OK")
-    except Exception as e:
-        note("BUG", "能力市场", f"异常: {type(e).__name__}: {e}")
+    # 说明：原「能力市场」段随 MarketPage + MCP_CATALOG 在 v2.25 一并删除（死代码清理），
+    # 本文件曾是全库最后一处 market_page 引用，每次运行都抛 AttributeError 假 BUG。
+    # 其覆盖的「MCP 配置写入/坏 json 自愈」已由 adv_agenthub.py / adv_mcp.py 在 core 层守住，
+    # 故此处不再重建 UI 段（避免为一个已下线页面维持假覆盖）。
 
     print("\n== 流水·对账 ==")
     try:
@@ -254,10 +224,17 @@ def main():
     try:
         w.stats_page.set_db(brain.stats(str(root)))
         app.processEvents()
-        if "/" not in w.stats_page.cardSearch.value.text():
-            note("BUG", "统计", f"检索卡格式异常: {w.stats_page.cardSearch.value.text()}")
+        # v2.25 起统计页卡结构改名：cardSearch.value → valSearch（TitleLabel），断言随之更新
+        txt = w.stats_page.valSearch.text()
+        if "/" not in txt:
+            note("BUG", "统计", f"检索读数格式异常（应 今日/累计）: {txt}")
         else:
-            ok("统计", f"检索卡显示 {w.stats_page.cardSearch.value.text()}")
+            ok("统计", f"检索读数显示 {txt}")
+        # 其余四个读数必须是数字（0 也合法）——空/非数字即数据没渲染出来
+        for nm, lab in (("项目", w.stats_page.valProj), ("记录", w.stats_page.valRec),
+                        ("对账问题", w.stats_page.valIssue), ("停滞", w.stats_page.valStalled)):
+            if not lab.text().strip().isdigit():
+                note("BUG", "统计", f"{nm}读数非数字: {lab.text()!r}")
         ok("统计", "set_db 渲染不崩")
     except Exception as e:
         note("BUG", "统计", f"异常: {type(e).__name__}: {e}")
@@ -314,7 +291,9 @@ def main():
 
     print("\n== 帮助页 ==")
     try:
-        if not w.help_page.findChild(object.__class__) and not w.help_page.children():
+        # 原写法 findChild(object.__class__) 把 type 当控件类型查，恒不命中（恒为真），
+        # 条件永远走 else——等于没检查。直接看有没有内容子件即可。
+        if not w.help_page.children():
             note("UX", "帮助", "页面无内容子件")
         else:
             ok("帮助", "内容渲染")
