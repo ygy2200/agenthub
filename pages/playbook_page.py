@@ -337,9 +337,10 @@ class PlaybookPage(QWidget):
         try:
             msg = brain.trigger_set_enabled(self.win.root, row["id"], new_state)
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("操作失败", str(e), parent=self)
+            op_failed("切换触发器", e, parent=self)
             return
-        InfoBar.success("触发器", msg, parent=self)
+        # Round 1：原标题只有名词「触发器」，缺结果——用户看不出是启用还是停用
+        InfoBar.success("触发器已启用" if new_state else "触发器已停用", msg, parent=self)
         self.reload()
 
     def build_graph(self):

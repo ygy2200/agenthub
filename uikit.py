@@ -575,6 +575,19 @@ def rel_time(ts: str) -> str:
     return f"{t:%Y-%m-%d %H:%M}"
 
 
+def op_failed(op: str, err, parent, hint: str = "可重试；若持续失败请把这条信息发给管理员") -> None:
+    """统一的「操作失败」提示（Round 1 / 2026-10-14 文字逻辑整改）。
+
+    原来 7 处共用标题「操作失败」：治理中心 5 个不同按钮（解除隔离 / 执行整合 / 记回顾 /
+    关注 / 取消关注）+ 触发器启停 + 发送信号，失败时用户看到的是**同一句话**，
+    判断不出是哪一步挂了（正是 UX writing 说的 vague error：没说清 what failed）。
+    且原来直接裸 `str(e)` 当正文。
+
+    现在：标题点名操作，正文给原因 + 下一步（[什么失败] + [为什么] + [怎么办]）。
+    """
+    InfoBar.error(f"{op}失败", f"{err}（{hint}）", duration=5000, parent=parent)
+
+
 def list_empty_guard(listw, layout, title: str, desc: str = "", index=None):
     """给列表挂空态引导：为空时显示、非空时隐藏（懒创建，挂一次即可）。
 

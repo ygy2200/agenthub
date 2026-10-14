@@ -102,7 +102,7 @@ class JournalPage(QWidget):
         e = self.errors[row]
         err = brain.error_set_status(self.win.root, e["id"], status)
         if err:
-            InfoBar.error("操作失败", err, duration=4000, parent=self.win)
+            op_failed("标记错误状态", err, parent=self.win)
         else:
             InfoBar.success("已更新", f"#{e['id']} → {status}", duration=2000, parent=self.win)
         self.reload()

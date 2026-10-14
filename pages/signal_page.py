@@ -181,7 +181,7 @@ class SignalPage(QWidget):
         try:
             msg = brain.signal_mark_read(self.win.root, s["id"], me)
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("操作失败", str(e), parent=self)
+            op_failed("标记已读", e, parent=self)
             return
         InfoBar.success("已读回执", msg, parent=self)
         self.reload()

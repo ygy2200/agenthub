@@ -95,7 +95,7 @@ class _QuarantineSub(_SubPage):
         try:
             msg = fn(self.win.root, r["id"], "")
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("操作失败", str(e), parent=self)
+            op_failed("解除隔离", e, parent=self)
             return
         InfoBar.success("已解除", msg, parent=self)
         self.reload()
@@ -145,7 +145,7 @@ class _ConsolidateSub(_SubPage):
         try:
             err, mid = brain.consolidate_apply(self.win.root, p["ids"], text, "")
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("整合失败", str(e), parent=self)
+            op_failed("执行整合", e, parent=self)
             return
         if err:
             InfoBar.error("整合失败", err, parent=self)
@@ -201,7 +201,7 @@ class _DecisionSub(_SubPage):
         try:
             msg = brain.decision_review(self.win.root, d["id"], verdict, note, "")
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("操作失败", str(e), parent=self)
+            op_failed("记回顾", e, parent=self)
             return
         InfoBar.success("已回顾", msg, parent=self)
         self.reload()
@@ -251,7 +251,7 @@ class _ViewSub(_SubPage):
         try:
             msg = brain.view_follow(self.win.root, "workbuddy", "project", name)
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("操作失败", str(e), parent=self)
+            op_failed("关注", e, parent=self)
             return
         InfoBar.success("已关注", msg, parent=self)
         self.followEdit.clear()
@@ -266,7 +266,7 @@ class _ViewSub(_SubPage):
             msg = brain.view_unfollow(self.win.root, "workbuddy", v["scope_type"],
                                       v["scope_value"])
         except Exception as e:  # noqa: BLE001
-            InfoBar.error("操作失败", str(e), parent=self)
+            op_failed("取消关注", e, parent=self)
             return
         InfoBar.success("已取消", msg, parent=self)
         self.reload()
