@@ -41,7 +41,10 @@ class ProjectPage(QWidget):
             head.addWidget(b)
         self.pathLabel = CaptionLabel("")
         self.issueLabel = BodyLabel("")
-        self.issueLabel.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};")
+        # Round 3（配色逻辑）：审计问题是「警告」性质（目录命名不规范/缺记录，软件只报告不自动改），
+        # 原来用 DANGER（红=失败/危险）过强且语义不符；改用 WARNING（琥珀）。
+        # 这也是 tokens.WARNING 的首次真正使用——此前该语义色定义后全库 0 引用。
+        self.issueLabel.setStyleSheet(f"color:{tokens.C(tokens.WARNING)};")
 
         self.browser = TextBrowser()
         self.browser.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>左侧选择项目查看工作记录</p>")

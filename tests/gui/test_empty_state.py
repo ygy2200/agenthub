@@ -45,12 +45,19 @@ def test_empty_lists_have_guidance(qapp, hub_root):
             if page is None:
                 continue
             w.switchTo(page)
-            for _ in range(8):
-                qapp.processEvents()
-            hints = len(page.findChildren(QWidget, "EMPTY_STATE_TEST"))
-            empty = [lw for lw in page.findChildren(QListWidget) if lw.count() == 0]
-            if empty and not hints:
-                bad.append(f"{title}（{len(empty)} 个空列表）")
+
+            def _settled(p=page):
+                """列表被 worker 填上内容，或空态引导已出现——两者皆可。
+                早先这里只做固定 8 次 processEvents：各页列表由**异步 worker** 填充，
+                未落定时既没内容也没空态 → 偶发误报（守卫本身变成负债，狼来了）。
+                """
+                if page.findChildren(QWidget, "EMPTY_STATE_TEST"):
+                    return True
+                return not [lw for lw in p.findChildren(QListWidget) if lw.count() == 0]
+
+            if not pump(qapp, _settled, 8.0):
+                n_empty = len([lw for lw in page.findChildren(QListWidget) if lw.count() == 0])
+                bad.append(f"{title}（{n_empty} 个空列表，等待 8s 后仍无引导）")
         # 空态挂在 reload/填充路径里，所以也要真跑一次填充动作：
         # Round 5 时 run() 里引用了 __init__ 的局部变量 lay，只有这里跑一次才会炸 NameError
         # （空数据快照路径不经过 run()，故之前漏掉）。

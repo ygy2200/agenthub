@@ -76,12 +76,17 @@ class ConnectPage(QWidget):
             if it.widget():
                 it.widget().deleteLater()
         py, server, rows = self._rows_data()
+        # Round 3（配色逻辑）：三态原来共用默认色——「部署失败」和「服务端就绪」长得一模一样，
+        # 用户扫一眼判断不出接入是否正常。按语义阶梯着色：缺前提=警告 / 真失败=危险 / 就绪=成功。
         if not py:
             self.pyLabel.setText("⚠ 未找到可用的 python.exe，无法自动接入（MCP server 需要 python 运行）")
+            self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.WARNING)};")
         elif not server:
             self.pyLabel.setText("⚠ MCP server 部署失败")
+            self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};")
         else:
             self.pyLabel.setText(f"服务端就绪：{server}")
+            self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.SUCCESS)};")
         for r in rows:
             card = CardWidget()
             card.setMinimumHeight(96)  # 锁最小高度：三行文字不被压扁裁掉
