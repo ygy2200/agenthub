@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.16"}  # v2.40.15=UI结构轮（可达性/页头/空态）；本版=UI逻辑轮1：提示文案整改（7处笼统「操作失败」→op_failed点名操作；截断成功标题「触发器」→已启用/已停用）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.17"}  # v2.40.16=提示文案整改；本版=UI逻辑轮2：「先选中」类守卫术语统一+说明补全（19处）+ 状态同步实证
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent

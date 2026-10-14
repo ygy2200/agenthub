@@ -89,7 +89,7 @@ class _QuarantineSub(_SubPage):
     def release(self):
         r = self._selected()
         if not r:
-            InfoBar.warning("先选中", "选中一条隔离条目再解除", parent=self)
+            InfoBar.warning("先选中一条隔离条目", "在「隔离区」列表里选中一条，再点「解除隔离」", parent=self)
             return
         fn = brain.release_record if r["src"] == "record" else brain.release_memory
         try:
@@ -135,7 +135,7 @@ class _ConsolidateSub(_SubPage):
     def apply(self):
         p = self._selected()
         if not p:
-            InfoBar.warning("先选中提案", "选中一组提案再执行整合", parent=self)
+            InfoBar.warning("先选中一组提案", "在「整合提案」列表里选中一组，再点「执行整合」", parent=self)
             return
         text, ok = QInputDialog.getMultiLineText(
             self, "执行整合", "整合后的完整内容（要能独立读懂，不是摘要）：",
@@ -193,7 +193,7 @@ class _DecisionSub(_SubPage):
     def review(self, verdict):
         d = self._selected()
         if not d:
-            InfoBar.warning("先选中", "选中一条到期的决策再记回顾", parent=self)
+            InfoBar.warning("先选中一条决策", "在「待验证决策」列表里选中一条，再点对/错/部分对", parent=self)
             return
         note, ok = QInputDialog.getText(self, "记回顾", "结论说明（可空）：")
         if not ok:
@@ -260,7 +260,7 @@ class _ViewSub(_SubPage):
     def unfollow(self):
         v = self._selected()
         if not v:
-            InfoBar.warning("先选中", "选中一条关注再取消", parent=self)
+            InfoBar.warning("先选中一条关注", "在「关注管理」列表里选中一条，再点「取消关注」", parent=self)
             return
         try:
             msg = brain.view_unfollow(self.win.root, "workbuddy", v["scope_type"],

@@ -76,3 +76,29 @@ def test_op_failed_shape(qapp):
     assert seen.get("title") == "解除隔离失败", seen
     assert "boom" in seen.get("content", ""), seen
     assert "可重试" in seen.get("content", ""), f"缺下一步指引：{seen}"
+
+
+# ---- Round 2：「先选中」类守卫的术语统一 + 说明不可为空 ----
+# 原来同一概念有 4 种写法（先选中 / 先选中提案 / 先选择一条… / 先选一条… / 先在…中选择），
+# 且有 8 处第二参数是空串——只剩一句标题，没告诉用户「去哪儿选、选完点什么」。
+# 检索结论（Basis Design System / UX Bit / NN-g）明确：这类前提不满足的提示
+# **不该**把按钮改成禁用（会有键盘焦点/屏幕阅读器/对比度等可达性硬伤，用户还会以为按钮坏了），
+# 而应保持可用 + 点击后给**具体可行动**的反馈。所以这里统一术语并强制说明非空。
+_CANON_PREFIXES = ("先选中一条", "先选中一组", "先选中一个", "先选择根目录")
+
+
+def test_selection_guards_use_canonical_wording():
+    """「先选中」类守卫：标题用规范前缀，且第二参数（说明）不得为空。"""
+    bad_title, bad_empty = [], []
+    for f in _iter_py():
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            m = re.search(r'InfoBar\.warning\(\s*"([^"]*)"\s*,\s*"([^"]*)"', line)
+            if not m or not m.group(1).startswith("先"):
+                continue
+            title, content = m.group(1), m.group(2)
+            if not title.startswith(_CANON_PREFIXES):
+                bad_title.append(f"{f.name}:{i}: {title!r}")
+            if not content.strip():
+                bad_empty.append(f"{f.name}:{i}: {title!r}")
+    assert not bad_title, f"非规范前缀（术语不统一）：{bad_title}"
+    assert not bad_empty, f"守卫提示缺可行动说明（只有标题）：{bad_empty}"

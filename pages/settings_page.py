@@ -166,7 +166,7 @@ class SettingsPage(QWidget):
 
     def backup_now(self):
         if not self.win.root:
-            InfoBar.warning("先选择根目录", "", duration=2000, parent=self.win)
+            InfoBar.warning("先选择根目录", "先在上面选好数据根目录，再进行此操作", duration=2000, parent=self.win)
             return
         err = brain.backup_brain(self.win.root)
         if err.startswith("_") or "失败" in err:
@@ -177,7 +177,7 @@ class SettingsPage(QWidget):
 
     def init_struct(self):
         if not self.win.root:
-            InfoBar.warning("先选择根目录", "", duration=2000, parent=self.win)
+            InfoBar.warning("先选择根目录", "先在上面选好数据根目录，再进行此操作", duration=2000, parent=self.win)
             return
         err = core.init_hub(self.win.root)
         if err:

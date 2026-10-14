@@ -102,7 +102,7 @@ class TodayPage(QWidget):
     def mark_done(self):
         t = self._selected_task()
         if not t:
-            InfoBar.warning("先选中任务", "选中「进行中」段里的任务再标记完成", parent=self)
+            InfoBar.warning("先选中一个任务", "选中「进行中」段里的任务，再标记完成", parent=self)
             return
         if t["status"] != "in_progress":
             InfoBar.warning("状态不符",

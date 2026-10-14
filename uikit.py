@@ -1002,7 +1002,8 @@ class MemoryHistoryDialog(MessageBoxBase):
     def accept(self):
         """『回滚到此版本』：确认后回滚并原地刷新（不关窗，新修订立即可见）。"""
         if not self._sel_rev:
-            InfoBar.warning("先选一条修订", "", duration=2000, parent=self.win)
+            InfoBar.warning("先选中一条修订", "在上方修订历史里选中一条，再点「回滚到此版本」",
+                            duration=2000, parent=self.win)
             return
         rev = self._sel_rev
         box = MessageBox("确认回滚？",

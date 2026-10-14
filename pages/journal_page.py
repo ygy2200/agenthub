@@ -97,7 +97,7 @@ class JournalPage(QWidget):
     def set_status(self, status):
         row = self.errList.currentRow()
         if row < 0 or row >= len(self.errors):
-            InfoBar.warning("先选择一条错误登记", "", duration=2000, parent=self.win)
+            InfoBar.warning("先选中一条错误登记", "在「错误登记」列表里选中一条，再标记状态", duration=2000, parent=self.win)
             return
         e = self.errors[row]
         err = brain.error_set_status(self.win.root, e["id"], status)
@@ -119,7 +119,7 @@ class JournalPage(QWidget):
     def undo_selected(self):
         row = self.jList.currentRow()
         if row < 0 or row >= len(self.journal):
-            InfoBar.warning("先选择一条操作流水", "", duration=2000, parent=self.win)
+            InfoBar.warning("先选中一条操作流水", "在「操作流水」列表里选中一条，再撤销", duration=2000, parent=self.win)
             return
         e = self.journal[row]
         if e["action"] != "log_work":

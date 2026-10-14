@@ -175,7 +175,7 @@ class SignalPage(QWidget):
     def mark_read(self):
         s = self._selected()
         if not s or self.seg.currentItem() == "sent":
-            InfoBar.warning("先选中信号", "在「收件箱」里选中一条未读信号再标已读", parent=self)
+            InfoBar.warning("先选中一条信号", "在「收件箱」里选中一条未读信号，再标已读", parent=self)
             return
         me = self.meCombo.currentText()
         try:

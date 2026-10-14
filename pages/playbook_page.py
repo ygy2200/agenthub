@@ -272,7 +272,7 @@ class PlaybookPage(QWidget):
             return
         row = self._selected()
         if self.seg.currentItem() != "flows" or not row:
-            InfoBar.warning("先选一条流程", "切到「流程」段并选中要跑的流程", parent=self)
+            InfoBar.warning("先选中一条流程", "切到「流程」段并选中要跑的流程", parent=self)
             return
         name = row["name"]
         proj = self.projEdit.text().strip()
@@ -301,7 +301,7 @@ class PlaybookPage(QWidget):
             return
         row = self._selected()
         if self.seg.currentItem() != "runs" or not row:
-            InfoBar.warning("先选一条执行记录", "切到「执行历史」段并选中一条", parent=self)
+            InfoBar.warning("先选中一条执行记录", "切到「执行历史」段并选中一条", parent=self)
             return
         try:
             res = brain.playbook_resume(self.win.root, row["id"], self.agentCombo.currentText())
@@ -318,7 +318,7 @@ class PlaybookPage(QWidget):
     def abort_run(self):
         row = self._selected()
         if self.seg.currentItem() != "runs" or not row:
-            InfoBar.warning("先选一条执行记录", "切到「执行历史」段并选中一条", parent=self)
+            InfoBar.warning("先选中一条执行记录", "切到「执行历史」段并选中一条", parent=self)
             return
         try:
             msg = brain.playbook_abort(self.win.root, row["id"])
@@ -331,7 +331,7 @@ class PlaybookPage(QWidget):
     def toggle_trig(self):
         row = self._selected()
         if self.seg.currentItem() != "trig" or not row:
-            InfoBar.warning("先选一条触发器", "切到「触发器」段并选中一条", parent=self)
+            InfoBar.warning("先选中一条触发器", "切到「触发器」段并选中一条", parent=self)
             return
         new_state = not int(row.get("enabled") or 0)
         try:

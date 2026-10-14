@@ -192,7 +192,7 @@ class HubPage(QWidget):
     def scan_env(self):
         """自动采集本机配置快照写入环境档案（幂等 UPSERT）。"""
         if not self.win.root:
-            InfoBar.warning("先在设置页选择根目录", "", duration=2500, parent=self.win)
+            InfoBar.warning("先选择根目录", "到「设置」页选择数据根目录后再操作", duration=2500, parent=self.win)
             return
         InfoBar.info("采集本机配置中", "标准库只读采集，秒级完成", duration=2000, parent=self.win)
 
@@ -357,7 +357,7 @@ class HubPage(QWidget):
 
     def new_memory(self):
         if not self.win.root:
-            InfoBar.warning("先在设置页选择根目录", "", duration=2500, parent=self.win)
+            InfoBar.warning("先选择根目录", "到「设置」页选择数据根目录后再操作", duration=2500, parent=self.win)
             return
         dlg = MemoryEditDialog(self.win, None)
         if dlg.exec():
@@ -369,7 +369,7 @@ class HubPage(QWidget):
 
     def delete_memory(self):
         if not self.cur_path or not (isinstance(self.cur_path, str) and self.cur_path.startswith("mem:")):
-            InfoBar.warning("先在列表中选择一条记忆", "", duration=2500, parent=self.win)
+            InfoBar.warning("先选中一条记忆", "在上方记忆列表里选中一条，再点此按钮", duration=2500, parent=self.win)
             return
         mid = int(self.cur_path[4:])
         err = brain.delete_memory(self.win.root, mid, agent="user")
@@ -384,7 +384,7 @@ class HubPage(QWidget):
     def show_history(self):
         """P1-1 版本历史：选中记忆 → 修订列表 + diff + 一键回滚（在弹窗内完成，改动进流水）。"""
         if not self.cur_path or not (isinstance(self.cur_path, str) and self.cur_path.startswith("mem:")):
-            InfoBar.warning("先在记忆列表中选择一条", "", duration=2500, parent=self.win)
+            InfoBar.warning("先选中一条记忆", "在上方记忆列表里选中一条，再点此按钮", duration=2500, parent=self.win)
             return
         MemoryHistoryDialog(self.win, int(self.cur_path[4:])).exec()
         self.fill_memories()
