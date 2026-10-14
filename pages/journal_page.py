@@ -2,6 +2,8 @@
 """JournalPage（P2-1 自 ui.py 拆出）。"""
 from __future__ import annotations
 
+import re
+
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
 class JournalPage(QWidget):
@@ -123,9 +125,19 @@ class JournalPage(QWidget):
             return
         e = self.journal[row]
         if e["action"] != "log_work":
-            InfoBar.warning("只能撤销「写工作记录」类型的操作", "", duration=2500, parent=self.win)
+            act = self.ACTION_CN.get(e["action"], e["action"])
+            InfoBar.warning("只能撤销「写工作记录」",
+                            f"选中的是「{act}」——流水里只有 agent 写工作记录可以撤销",
+                            duration=2500, parent=self.win)
             return
-        err, info = brain.undo_last_record(self.win.root, e["agent"])
+        # Round 4：按**选中条目**的记录 id 撤销（原来调栈式的 undo_last_record(agent)，
+        # 撤的永远是该 agent 最新一条 —— 选中较早的流水会静默撤掉另一条，操作错对象）。
+        mt = re.search(r"records#(\d+)", str(e.get("target") or ""))
+        if not mt:
+            InfoBar.warning("这条流水没有可撤销的记录",
+                            "目标里没有记录编号，可能不是记录写入动作", duration=2500, parent=self.win)
+            return
+        err, info = brain.undo_record(self.win.root, int(mt.group(1)))
         if err:
             InfoBar.error("撤销失败", err, duration=4000, parent=self.win)
         else:

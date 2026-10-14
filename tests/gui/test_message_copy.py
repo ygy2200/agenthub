@@ -102,3 +102,19 @@ def test_selection_guards_use_canonical_wording():
                 bad_empty.append(f"{f.name}:{i}: {title!r}")
     assert not bad_title, f"非规范前缀（术语不统一）：{bad_title}"
     assert not bad_empty, f"守卫提示缺可行动说明（只有标题）：{bad_empty}"
+
+
+def test_every_warning_has_content():
+    """**所有** InfoBar.warning 都必须带说明，不止「先选中」那一类。
+
+    Round 2 的守卫只覆盖了「先」开头的标题，于是漏掉了
+    `InfoBar.warning("只能撤销「写工作记录」类型的操作", "", ...)` ——
+    用户只看到一句"不能"，不知道"为什么不能 / 那能做什么"。
+    """
+    bad = []
+    for f in _iter_py():
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            m = re.search(r'InfoBar\.warning\(\s*"([^"]*)"\s*,\s*"([^"]*)"', line)
+            if m and not m.group(2).strip():
+                bad.append(f"{f.name}:{i}: {m.group(1)!r}")
+    assert not bad, f"警告缺说明（只有标题，用户不知为何/如何解决）：{bad}"

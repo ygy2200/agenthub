@@ -1293,6 +1293,30 @@ def undo_last_record(root: str, agent: str) -> tuple:
         return "", f"#{row['id']} {row['date']} {row['project']}：{row['title']}"
 
 
+def undo_record(root: str, rec_id) -> tuple:
+    """软删**指定 id** 的 hub 记录（非栈式）。返回 (错误或"", 撤掉的记录摘要)。
+
+    为什么要有它（Round 4 / 2026-10-14）：GUI 流水页让用户「选中一条流水再撤销」，
+    但此前调的是栈式的 `undo_last_record(agent)` —— 撤的永远是该 agent **最新一条**。
+    实测：选中较早的 #2、点撤销，被软删的是 #3（操作错对象），且没有任何提示。
+    界面承诺撤销"选中项"，就必须按 id 撤。
+    口径与 `undo_last_record` 一致：仅 hub 写入（source='hub'）且仍 active 的记录可撤。
+    """
+    try:
+        rid = int(rec_id)
+    except (TypeError, ValueError):
+        return "记录 id 必须是整数", ""
+    with db_conn(root) as conn:
+        row = conn.execute(
+            "SELECT id,project,date,title FROM records "
+            "WHERE id=? AND source='hub' AND status='active'", (rid,)).fetchone()
+        if not row:
+            return f"#{rid} 不是可撤销的 hub 记录（可能已被撤销，或不是 agent 写入的）", ""
+        conn.execute("UPDATE records SET status='deleted', valid_until=? WHERE id=?",
+                     (_now()[:10], rid))
+        return "", f"#{row['id']} {row['date']} {row['project']}：{row['title']}"
+
+
 def list_records(root: str, project: str = "", agent: str = "", limit: int = 100) -> list:
     q = "SELECT * FROM records WHERE status='active'"
     args: list = []
