@@ -575,6 +575,35 @@ def rel_time(ts: str) -> str:
     return f"{t:%Y-%m-%d %H:%M}"
 
 
+def list_empty_guard(listw, layout, title: str, desc: str = "", index=None):
+    """给列表挂空态引导：为空时显示、非空时隐藏（懒创建，挂一次即可）。
+
+    Round 5（2026-10-13）：v2.25 立了「空态组件化」标准，但后续新增/合并的页面没跟上——
+    实测空库下有 **6 个页面**的列表是空的却没有任何引导（治理中心 4 个最严重），
+    用户首次进入就是一片空白、不知道该干什么。此助手把「显隐 + 懒创建」收在一处，
+    页面只需在 reload() 末尾调一次。
+
+    用法：`list_empty_guard(self.listw, self.layout(), "暂无隔离条目", "…")`
+    index：插到 layout 的第几位（默认列表后一位；列表不在该 layout 时用，如 QSplitter 场景）
+    """
+    key = "_empty_hint_widget"
+    hint = getattr(listw, key, None)
+    empty = (listw.count() == 0)
+    if hint is None:
+        hint = empty_state("INFO", title, desc)
+        try:
+            setattr(listw, key, hint)
+        except Exception:  # noqa: BLE001  极少数 Qt 对象不允许挂属性：退化为只提示一次
+            pass
+        if index is None:
+            idx = layout.indexOf(listw) if layout is not None else -1
+            index = (idx + 1) if idx >= 0 else (layout.count() if layout is not None else 0)
+        if layout is not None:
+            layout.insertWidget(index, hint)
+    hint.setVisible(empty)
+    return hint
+
+
 class MoodPicker(QWidget):
     """心情单选点排（Daily_You 式）：点选高亮为心情色，再点取消——替代下拉框，少一次点击。"""
 

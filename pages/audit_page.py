@@ -31,6 +31,10 @@ class AuditPage(QWidget):
         self.listw.clear()
         for i in snap.issues:
             self.listw.addItem(f"[{ISSUE_KIND_CN.get(i.kind, i.kind)}]  {i.detail}")
+        # Round 5：无对账问题时给引导（原来是一片空白）
+        list_empty_guard(self.listw, self.layout(),
+                         "没有对账问题",
+                         "目录命名、记录文件都在规范内；本软件只报告不自动改名")
 
     def current_issue(self):
         row = self.listw.currentRow()

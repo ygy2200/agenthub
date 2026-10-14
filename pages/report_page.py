@@ -43,6 +43,11 @@ class ReportPage(QWidget):
     def reload_reports(self):
         self.histList.clear()
         d = Path(self.win.root) / "_hub" / "reports" if self.win.root else None
+        # Round 5：没有报告目录/还没生成过报告时给引导（原来是一片空白）
+        list_empty_guard(self.histList, self.histList.parentWidget().layout(),
+                         "还没有运营报告",
+                         "点「生成报告」产出一份 HTML（含近期待办/停滞项目/错误登记摘要），"
+                         "生成后可双击打开")
         if not d or not d.is_dir():
             return
         for p in sorted(d.glob("反馈报告-*.html"), reverse=True):

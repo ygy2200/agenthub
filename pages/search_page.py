@@ -55,6 +55,8 @@ class SearchPage(QWidget):
         split.setStretchFactor(1, 4)
         split.setSizes([520, 420])
         lay.addWidget(split, 1)
+        self.lay = lay        # Round 5：run() 里定位空态要用（局部变量在方法外不可见）
+        self.split = split
 
         self.hits = []       # 本地命中（kind, data）
         self.view_hits = []  # 当前过滤下显示的命中
@@ -64,6 +66,12 @@ class SearchPage(QWidget):
         self.edit.returnPressed.connect(self.run)
         self.result.currentRowChanged.connect(self.show_hit)
         self.result.itemDoubleClicked.connect(lambda _: self.open_current())
+        # Round 5：run() 只在用户回车时才跑，启动时也要有引导（助手幂等，run() 再调只会显隐）
+        list_empty_guard(self.result, lay,
+                         "输入关键词开始检索",
+                         "回车执行：全脑检索（记录 + 记忆）+ 全盘文件；"
+                         "支持分类筛选与「全部」视图",
+                         index=lay.indexOf(split))
 
     # ---- 数据
     def run(self):
@@ -149,6 +157,13 @@ class SearchPage(QWidget):
         if not self.view_hits and self.hits and self.hits[0][0] != "info":
             self.result.addItem(f"该分类下无结果（全部 {len(self.hits)} 条）——切「全部」查看其他类型")
         tight_rows(self.result)
+        # Round 5：还没检索/无结果时给引导（原来是一片空白）。
+        # 结果列表在 QSplitter 里（不是 layout 子项），故显式指定插到分栏之前。
+        list_empty_guard(self.result, self.lay,
+                         "输入关键词开始检索",
+                         "回车执行：全脑检索（记录 + 记忆）+ 全盘文件；"
+                         "支持分类筛选与「全部」视图",
+                         index=self.lay.indexOf(self.split))
 
     def _current(self):
         row = self.result.currentRow()

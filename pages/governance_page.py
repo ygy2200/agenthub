@@ -18,6 +18,8 @@ class _SubPage(QWidget):
     """分段子页基座：列表 + 按钮行 + reload 钩子。"""
 
     TITLE = ""
+    EMPTY_TITLE = "暂无数据"
+    EMPTY_DESC = ""
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -40,6 +42,14 @@ class _SubPage(QWidget):
         return getattr(self, "_items", {}).get(id(it)) if it else None
 
     def reload(self):
+        """统一入口：先填列表，再同步空态——保证提前 return 的分支也有引导。"""
+        self._fill()
+        self._finish()
+
+    def _finish(self):
+        list_empty_guard(self.listw, self.layout(), self.EMPTY_TITLE, self.EMPTY_DESC)
+
+    def _fill(self):
         self.listw.clear()
         self._items = {}
 
@@ -48,6 +58,8 @@ class _QuarantineSub(_SubPage):
     """M8 隔离区：列出被隔离的记录/记忆，管理面解除。"""
 
     TITLE = "隔离区"
+    EMPTY_TITLE = "隔离区是空的"
+    EMPTY_DESC = "没有条目被隔离——隔离用于把错误/冲突条目移出检索与推送视野，由 hub_quarantine 或写入时的冲突拦截产生"
 
     def _build_buttons(self):
         self.relBtn = PushButton("解除隔离")
@@ -56,8 +68,8 @@ class _QuarantineSub(_SubPage):
         self.btnRow.addWidget(self.relBtn)
         self.btnRow.addStretch(1)
 
-    def reload(self):
-        super().reload()
+    def _fill(self):
+        super()._fill()
         if not self.win.root:
             return
         try:
@@ -93,6 +105,8 @@ class _ConsolidateSub(_SubPage):
     """M7 整合提案：疑似重复组 → 桌面输入整合内容 → apply（管理面）。"""
 
     TITLE = "整合提案"
+    EMPTY_TITLE = "暂无整合提案"
+    EMPTY_DESC = "没有疑似重复的记忆组——库里条目足够多、出现高度相似内容时，hub_consolidate 才会给出提案"
 
     def _build_buttons(self):
         self.applyBtn = PushButton("执行整合")
@@ -101,8 +115,8 @@ class _ConsolidateSub(_SubPage):
         self.btnRow.addWidget(self.applyBtn)
         self.btnRow.addStretch(1)
 
-    def reload(self):
-        super().reload()
+    def _fill(self):
+        super()._fill()
         if not self.win.root:
             return
         try:
@@ -144,6 +158,8 @@ class _DecisionSub(_SubPage):
     """M11 待验证决策：到期未回顾的决策 → 桌面记 verdict。"""
 
     TITLE = "待验证决策"
+    EMPTY_TITLE = "暂无待验证决策"
+    EMPTY_DESC = "写决策记录时带 review_date，到期才会进这个队列——决策写了没人回顾等于白写"
 
     def _build_buttons(self):
         self.btnRow.addWidget(StrongBodyLabel("记回顾："))
@@ -156,8 +172,8 @@ class _DecisionSub(_SubPage):
             self.btnRow.addWidget(b)
         self.btnRow.addStretch(1)
 
-    def reload(self):
-        super().reload()
+    def _fill(self):
+        super()._fill()
         if not self.win.root:
             return
         try:
@@ -195,6 +211,8 @@ class _ViewSub(_SubPage):
     """M9 关注管理：关注/取消关注项目，心跳第四段速览来源。"""
 
     TITLE = "关注管理"
+    EMPTY_TITLE = "还没有关注任何项目/标签"
+    EMPTY_DESC = "关注后，心跳开工推送会带上它们的进展（多 agent 各看各的地盘）；用 hub_view 或本页上方输入关注"
 
     def _build_buttons(self):
         self.followEdit = LineEdit()
@@ -209,8 +227,8 @@ class _ViewSub(_SubPage):
         self.btnRow.addStretch(1)
         self.followEdit.returnPressed.connect(self.follow)
 
-    def reload(self):
-        super().reload()
+    def _fill(self):
+        super()._fill()
         if not self.win.root:
             return
         me = "workbuddy"  # 桌面管理面关注清单挂workbuddy（心跳推送按 agent 各自读）
@@ -258,9 +276,11 @@ class _SkillStatsSub(_SubPage):
     """M12 技能资产统计：top 命中 + 零使用清理候选（只读）。"""
 
     TITLE = "技能统计"
+    EMPTY_TITLE = "暂无技能使用数据"
+    EMPTY_DESC = "技能索引还没有命中记录——agent 调用过技能后，这里按命中次数排序，零使用的列为清理候选"
 
-    def reload(self):
-        super().reload()
+    def _fill(self):
+        super()._fill()
         if not self.win.root:
             return
         try:

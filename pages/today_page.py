@@ -55,6 +55,14 @@ class TodayPage(QWidget):
 
     # ---------- 数据 ----------
     def reload(self):
+        """统一入口：先填再同步空态——保证「未配置根目录 / 读取失败」等提前 return 也有引导。"""
+        self._fill()
+        list_empty_guard(self.listw, self.layout(),
+                         "前沿队列为空",
+                         "没有待办/在办任务——用 hub_task_add 新建，"
+                         "或从记录里的「待办」句式让 hub_list_todos 提取")
+
+    def _fill(self):
         self.listw.clear()
         self._item2task.clear()
         if not self.win.root:

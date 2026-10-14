@@ -18,6 +18,7 @@ class ProjectPage(QWidget):
         _outer.addLayout(root, 1)
 
         left = QVBoxLayout()
+        self.left = left  # Round 5：留着给 list_empty_guard 定位空态
         self.filterEdit = SearchLineEdit()
         self.filterEdit.setPlaceholderText("过滤项目…")
         self.listw = ListWidget()
@@ -46,6 +47,7 @@ class ProjectPage(QWidget):
         self.browser.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>左侧选择项目查看工作记录</p>")
 
         file_col = QVBoxLayout()
+        self.file_col = file_col  # Round 5：同上
         file_col.addWidget(CaptionLabel("项目文件总览（历史项目无 input/output 时按实际位置分组 · 双击打开所在位置）"))
         self.fileList = ListWidget()
         file_col.addWidget(self.fileList, 1)
@@ -98,6 +100,15 @@ class ProjectPage(QWidget):
         tight_rows(self.listw)
         if self.listw.count():
             self.listw.setCurrentRow(0)
+        # Round 5：空库/过滤无命中时给引导（原来是一片空白）
+        if kw:
+            list_empty_guard(self.listw, self.left,
+                             f"没有匹配「{kw}」的项目",
+                             "换个关键词，或清空过滤框看全部项目")
+        else:
+            list_empty_guard(self.listw, self.left,
+                             "还没有任何项目",
+                             "点「新建项目」创建第一个项目，或让 agent 调 hub_create_project")
 
     def on_select(self, row):
         if row < 0 or row >= self.listw.count():
@@ -128,6 +139,11 @@ class ProjectPage(QWidget):
                 self.fileList.item(self.fileList.count() - 1).setData(Qt.UserRole, fp)
             if not proj_scan.files:
                 self.fileList.addItem("（空目录）")
+        # Round 5：没选中项目时给引导（原来是空白）
+        if not proj_scan:
+            list_empty_guard(self.fileList, self.file_col,
+                             "暂未选中项目",
+                             "选中左侧项目后，这里列出它的 input/output 等文件")
 
     def open_file_loc(self, item):
         fp = item.data(Qt.UserRole)
