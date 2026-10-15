@@ -98,16 +98,72 @@ class ComponentsPage(QWidget):
         lay.addWidget(r3)
 
         lay.addSpacing(16)
-        lay.addWidget(StrongBodyLabel("数字卡（大数字 + 小标题）"))
-        nrow = QHBoxLayout()
-        for v, t in (("1,378", "记忆向量"), ("124", "活跃项目"), ("43", "决策记录"), ("7", "在线 agent")):
+        lay.addWidget(StrongBodyLabel(
+            "数字卡（P2 改版：标签上置 + 32px 定宽数字 + 上下文行 + 图标 + e1 描边）"))
+        mrow = FlowLayout()
+        for v, t, icn, ctx in (("1,378", "记忆向量", "VIEW", "本周 +42"),
+                               ("124", "活跃项目", "FOLDER", ""),
+                               ("43", "决策记录", "HISTORY", ""),
+                               ("7", "在线 agent", "PEOPLE", "近 24h")):
+            c = NumberCard(t, icon_name=icn, context=ctx)
+            c.value.setText(v)
+            mrow.addWidget(c)
+        lay.addLayout(mrow)
+
+        lay.addSpacing(16)
+        lay.addWidget(StrongBodyLabel("间距阶梯（7 档 · 4px 网格，非标值会被守卫测试拦下）"))
+        srow = QHBoxLayout()
+        srow.setSpacing(tokens.SPACE_M)
+        for v in (4, 8, 12, 16, 20, 24, 32):
             col = QVBoxLayout()
-            col.addWidget(TitleLabel(v))
-            col.addWidget(CaptionLabel(t))
-            nrow.addLayout(col)
-            nrow.addSpacing(32)
-        nrow.addStretch(1)
-        lay.addLayout(nrow)
+            col.setSpacing(tokens.SPACE_XS)
+            bar = QWidget()
+            bar.setFixedSize(v, 16)
+            bar.setStyleSheet(f"background:{tokens.C(tokens.ACCENT)};border-radius:2px;")
+            col.addWidget(bar, 0, Qt.AlignHCenter)
+            cap = CaptionLabel(str(v))
+            cap.setAlignment(Qt.AlignCenter)
+            col.addWidget(cap)
+            srow.addLayout(col)
+        srow.addStretch(1)
+        lay.addLayout(srow)
+
+        lay.addSpacing(16)
+        lay.addWidget(StrongBodyLabel("圆角（3 档：控件 4 / 容器 8 / 胶囊=高÷2）"))
+        rrow = QHBoxLayout()
+        rrow.setSpacing(tokens.SPACE_M)
+        for label, r in (("控件 4", tokens.RADIUS_CTRL), ("容器 8", tokens.RADIUS_CARD),
+                         ("胶囊 10", tokens.pill_radius(20))):
+            col = QVBoxLayout()
+            col.setSpacing(tokens.SPACE_XS)
+            box = QWidget()
+            box.setFixedSize(56, 40)
+            box.setStyleSheet(f"background:{tokens.C('bg_inset')};"
+                              f"border:1px solid {tokens.C(tokens.STROKE_CARD)};border-radius:{r}px;")
+            col.addWidget(box, 0, Qt.AlignHCenter)
+            cap = CaptionLabel(label)
+            cap.setAlignment(Qt.AlignCenter)
+            col.addWidget(cap)
+            rrow.addLayout(col)
+        rrow.addStretch(1)
+        lay.addLayout(rrow)
+
+        lay.addSpacing(16)
+        lay.addWidget(StrongBodyLabel("层级（e0 页面底 / e1 卡片 1px 描边 / e2 浮层——不用投影）"))
+        erow = QHBoxLayout()
+        erow.setSpacing(tokens.SPACE_M)
+        for lvl, note in (("e0", "页面底·无描边"), ("e1", "卡片·1px 描边")):
+            box = QWidget()
+            box.setFixedSize(160, 56)
+            elevate(box, lvl)
+            col = QVBoxLayout()
+            col.setSpacing(tokens.SPACE_XS)
+            col.addWidget(box)
+            cap = CaptionLabel(f"{lvl} {note}")
+            col.addWidget(cap)
+            erow.addLayout(col)
+        erow.addStretch(1)
+        lay.addLayout(erow)
 
         lay.addSpacing(16)
         lay.addWidget(StrongBodyLabel("空态（首次空=教 / 筛选空=恢复路径）"))

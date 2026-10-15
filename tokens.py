@@ -109,6 +109,10 @@ TYPE = {
 }
 _WEIGHT = {"normal": 400, "medium": 500, "demibold": 600, "bold": 700}
 
+# ============ 动效（克制的微交互：只用于"确认输入 / 引导注意"） ============
+MOTION_FAST = 200   # ms，hover/按压反馈（Fluent durationFast）
+MOTION_OFF = 0      # 关闭动效（无障碍/低性能）
+
 # ============ 密实度（P4：长会话工具偏紧凑，但也给舒适档） ============
 DENSITY = {
     "compact": {"row_h": 32, "scale": 0.75},
@@ -251,6 +255,16 @@ def save_density_choice(mode: str) -> None:
     cfg = core.load_config()
     cfg["ui_density"] = mode if mode in ("compact", "comfortable", "basic") else "basic"
     core.save_config(cfg)
+
+
+def motion_ms() -> int:
+    """动效时长：配置关掉时返回 0（调用方据此走"瞬时切换"分支）。"""
+    try:
+        if str(core.load_config().get("ui_motion", "on")).strip().lower() in ("off", "0", "false"):
+            return MOTION_OFF
+    except Exception:  # noqa: BLE001 配置读不到就按开
+        pass
+    return MOTION_FAST
 
 
 def load_theme_choice() -> str:

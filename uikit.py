@@ -16,6 +16,7 @@ from datetime import date, datetime
 from pathlib import Path
 
 from PySide6.QtCore import (Qt, QThread, Signal, QTimer, QEvent, QSize, QPoint, QRect,
+                            QObject, QVariantAnimation, QAbstractAnimation,
                             QAbstractNativeEventFilter)
 from PySide6.QtGui import (QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat,
                           QTextCursor, QIcon, QGuiApplication)
@@ -174,9 +175,13 @@ def guard_overflow(root_widget):
             pass
 
 
-def tight_rows(listw, h: int = 36):
-    """列表降噪（批次 3D）：行高统一 36px（Fallback 规格：数据列表行高 36px 级、行是线不是卡）。
-    在列表填充完成后调用；只收紧已有项，不干预后续 addItem。"""
+def tight_rows(listw, h: int = None):
+    """列表降噪（批次 3D）：行高统一（Fallback 规格：数据列表行高 36px 级、行是线不是卡）。
+
+    P2：默认行高改由 tokens.row_height() 提供（密实度开关可调：32/36/44）。
+    在列表填充完成后调用；只收紧已有项，不干预后续 addItem。
+    """
+    h = tokens.row_height() if h is None else h
     try:
         for i in range(listw.count()):
             it = listw.item(i)
@@ -184,6 +189,120 @@ def tight_rows(listw, h: int = 36):
                 it.setSizeHint(QSize(0, h))
     except Exception:  # noqa: BLE001
         pass
+
+
+def polish_list(listw) -> None:
+    """列表行规格统一（P2）：行高 + hover 高亮 + 1px 行分隔线。
+
+    为什么需要 hover 与分隔：36px 紧凑行距下，纯间距分组会让行连成一片，
+    鼠标扫视时读错行（数据列表最常见的误读来源）。
+
+    实现要点：**追加** QSS 而不是替换——qfw 的 ListWidget 自带完整样式
+    （圆角/内边距/主题底），直接 setStyleSheet 会把它们整份冲掉。
+    """
+    try:
+        base = listw.property("_base_qss")
+        if base is None:
+            base = listw.styleSheet() or ""
+            listw.setProperty("_base_qss", base)
+        cls = type(listw).__name__
+        rules = (f"{cls}::item{{border-bottom:1px solid {tokens.C(tokens.STROKE)};}}"
+                 f"{cls}::item:hover{{background:{tokens.C('bg_inset')};}}"
+                 f"{cls}::item:selected{{background:{tokens.C('accent_soft')};}}")
+        listw.setStyleSheet(base + rules)
+        tight_rows(listw)
+        bind_style(listw, polish_list)
+    except Exception:  # noqa: BLE001 单个列表规格化失败不影响页面
+        pass
+
+
+def polish_lists(root) -> None:
+    """对整页的所有列表统一行规格（与 guard_overflow 同款"巡检式"收口）。"""
+    if root is None:
+        return
+    for lw in root.findChildren(ListWidget):
+        polish_list(lw)
+
+
+def polish_cards(root) -> None:
+    """对整页所有卡片统一 e1 层级（1px 描边 + 卡片底，不用投影）。
+
+    巡检式收口的好处：新增页面/新增卡片自动获得层级，不需要记得调 elevate。
+    """
+    if root is None:
+        return
+    for c in root.findChildren(CardWidget):
+        if c.property("_elev"):      # 已定层级（如 NumberCard 自己调了 e1）不重复处理
+            continue
+        elevate(c, "e1")
+
+
+# ---------------------------------------------------------------- 微交互（P4）
+class _HoverFade(QObject):
+    """hover 淡入（200ms）。Qt QSS 没有 CSS transition，只能自己插值。
+
+    只跑"当前悬停的那一个"控件——同屏最多一个动画在跑，避免几十个行同时动画。
+    """
+
+    def __init__(self, widget, on_paint):
+        super().__init__(widget)
+        self._w = widget
+        self._paint = on_paint
+        self._t = 0.0
+        self._anim = QVariantAnimation(widget)
+        self._anim.setDuration(max(0, tokens.motion_ms()))
+        self._anim.setStartValue(0.0)
+        self._anim.setEndValue(1.0)
+        self._anim.valueChanged.connect(self._on_value)
+        widget.installEventFilter(self)
+
+    def eventFilter(self, obj, ev):
+        if obj is self._w:
+            if ev.type() == QEvent.Enter:
+                self._run(1.0)
+            elif ev.type() == QEvent.Leave:
+                self._run(0.0)
+        return False
+
+    def _run(self, target: float) -> None:
+        if tokens.motion_ms() == 0:      # 关动效：瞬时切换（无障碍/低性能）
+            self._t = target
+            self._paint(self._w, self._t)
+            return
+        self._anim.stop()
+        self._anim.setDirection(QAbstractAnimation.Forward if target > self._t
+                                else QAbstractAnimation.Backward)
+        self._anim.start()
+
+    def _on_value(self, v):
+        self._t = float(v)
+        self._paint(self._w, self._t)
+
+    @property
+    def t(self) -> float:
+        return self._t
+
+
+def attach_hover(widget, hover_key: str = "bg_inset", radius: int = None,
+                 separator: bool = False):
+    """给行/卡片挂 hover 淡入（P4 微交互：只用于确认"指针在这里"）。
+
+    背景在 transparent → tokens 语义色之间插值；圆角默认跟随容器档（8px）。
+    separator=True 时补 1px 行分隔线（36px 紧凑行距下纯间距会连成一片）。
+    每次重画都**现算**颜色，因此换肤后立即正确（不缓存旧主题色值）。
+    """
+    r = tokens.RADIUS_CARD if radius is None else radius
+
+    def _paint(w, t: float) -> None:
+        c = QColor(tokens.C(hover_key))
+        a = int(round(255 * max(0.0, min(1.0, t))))
+        sep = f"border-bottom:1px solid {tokens.C(tokens.STROKE)};" if separator else ""
+        w.setStyleSheet(f"{sep}background:rgba({c.red()},{c.green()},{c.blue()},{a});"
+                        f"border-radius:{r}px;")
+
+    fade = _HoverFade(widget, _paint)
+    bind_style(widget, lambda w: _paint(w, fade.t))   # 换肤后按当前态重画
+    return fade
 
 
 # 徽章色统一走 tokens 单一来源（UI 重构·批次1 2026-10-10）：
@@ -605,6 +724,10 @@ def set_page_margins(lay, bottom: int = None) -> None:
 
 
 CHIP_H = 20   # 徽章 / 状态胶囊统一高度（圆角 = 高度一半，见 chip_qss）
+# 列表行固定列宽（P2）：原实现徽章宽度随文字（WorkBuddy vs ZCode 差一截）、
+# 项目名用 min110/max220 猜——两页之间的右列宽度不一致，标题起点参差不齐。
+BADGE_COL_W = 76     # agent 徽章列
+PROJECT_COL_W = 120  # 项目名列（右对齐 + 省略）
 
 
 def chip_qss(bg: str, fg: str = "", height: int = CHIP_H, border: str = "") -> str:
@@ -629,8 +752,18 @@ _STYLE_BOUND: list = []
 
 
 def bind_style(widget, apply_fn) -> None:
-    """登记"按 token 重算样式"的函数（弱引用，控件销毁后自动剔除）。"""
+    """登记"按 token 重算样式"的函数（弱引用，控件销毁后自动剔除）。
+
+    幂等：同一控件重复登记只**替换函数**不入新条目——页面每次刷新都会重新
+    polish 列表/卡片，不幂等的话注册表会随 F5 次数线性膨胀。
+    """
     try:
+        if widget.property("_style_bound"):
+            for i, (ref, _fn) in enumerate(_STYLE_BOUND):
+                if ref() is widget:
+                    _STYLE_BOUND[i] = (ref, apply_fn)
+                    return
+        widget.setProperty("_style_bound", True)
         _STYLE_BOUND.append((weakref.ref(widget), apply_fn))
     except TypeError:  # 极少数 Qt 对象不可弱引用：退化为不登记（不影响功能）
         pass
@@ -672,6 +805,7 @@ def elevate(widget, level: str = "e1"):
     def _apply(w=None):
         tgt = w or widget
         tgt.setAttribute(Qt.WA_StyledBackground, True)
+        tgt.setProperty("_elev", level)
         if level == "e0":
             tgt.setStyleSheet(f"{type(tgt).__name__}{{background:transparent;border:none;}}")
         else:

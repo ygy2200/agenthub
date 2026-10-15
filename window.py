@@ -347,6 +347,10 @@ class AgentHubWindow(FluentWindow):
                     self.search_page, self.connect_page, self.help_page,
                     self.components_page, self.settings_page):
             guard_overflow(_pg)
+            # P2 巡检式收口：列表行规格（行高/hover/分隔线）与卡片层级（e1 描边）
+            # ——新增页面自动获得，不需要记得手工调 polish_*
+            polish_lists(_pg)
+            polish_cards(_pg)
 
 
 def _install_crash_hook():

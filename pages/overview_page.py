@@ -164,7 +164,11 @@ class OverviewPage(QWidget):
         self.recent = recent
         for r in self.recent:
             row = QHBoxLayout()
-            row.addWidget(badge(r.get("agent", ""), ""))
+            _bdg = badge(r.get("agent", ""), "")
+            # 徽章列固定宽：否则标题起始 x 逐行不齐（"WorkBuddy" 比 "ZCode" 宽一截）
+            _bdg.setFixedWidth(BADGE_COL_W)
+            _bdg.setAlignment(Qt.AlignCenter)
+            row.addWidget(_bdg)
             t = flex_label(ClickBodyLabel(_display_title(r)))
             t.setToolTip(f"{_display_title(r)}\n点击查看完整记录")
             t.setCursor(Qt.PointingHandCursor)
@@ -175,12 +179,13 @@ class OverviewPage(QWidget):
             pn = ElidedLabel(r.get("project", ""))
             pn.setToolTip(r.get("project", ""))
             pn.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
-            pn.setMinimumWidth(110)
-            pn.setMaximumWidth(220)
+            pn.setFixedWidth(PROJECT_COL_W)     # 固定列宽（原 min110/max220 是猜的）
             pn.setProperty("keepWidth", True)
             row.addWidget(pn)
             wrap = QWidget()
             wrap.setLayout(row)
+            wrap.setFixedHeight(tokens.row_height())   # 行高走密实度 token
+            attach_hover(wrap, separator=True)         # hover 反馈 + 1px 行分隔线
             self.recentBox.addWidget(wrap)
         if not self.recent:
             self.recentBox.addWidget(empty_state(
