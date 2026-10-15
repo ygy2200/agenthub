@@ -9,6 +9,7 @@
    新增页面（signal/governance/playbook…）很容易重新内联，浅色主题下就是不可读。
 """
 import re
+import sys
 from pathlib import Path
 
 import pytest
@@ -66,6 +67,38 @@ def test_semantic_colors_pass_wcag_aa_on_both_themes():
             if c < 4.5:
                 bad.append(f"{name}/{mode}={fg} on {bg} {c:.2f}:1")
     assert not bad, f"语义色对比度不达 AA：{bad}"
+
+
+def test_full_cartesian_contrast_passes():
+    """前景 × 底色 × 主题**全笛卡尔积**都要 ≥4.5:1（2026-10-15 P0-2）。
+
+    原测试只验了"语义色 × BG_L0"三对，漏掉 BG_L2 —— 于是 TEXT_3(dark) 在 BG_L2
+    上 4.09:1 不达标却一直逃逸（弹窗正文/代码块/hover 底都走 BG_L2）。
+    现在改为脚本全量验算：python tools/contrast_audit.py
+    """
+    sys.path.insert(0, str(ROOT / "tools"))
+    import contrast_audit
+    bad = contrast_audit.failures()
+    assert not bad, f"对比度不达 AA（全笛卡尔积，需≥4.5:1）：{bad}"
+
+
+def test_tokens_contrast_comments_match_script_output():
+    """tokens.py 行尾的对比度注释必须与脚本实测一致（防手写注释与实测矛盾复发）。
+
+    2026-10-13 抓过 BADGE_FALLBACK"注释写 ≥4.5、实测 3.45"；
+    2026-10-15 又抓到 TEXT_3"注释写 5.0、实测 4.73"。两次同源：手写。
+    """
+    sys.path.insert(0, str(ROOT / "tools"))
+    import contrast_audit
+    p = ROOT / "tokens.py"
+    before = p.read_text(encoding="utf-8")
+    try:
+        contrast_audit._write_comments()
+        after = p.read_text(encoding="utf-8")
+    finally:
+        p.write_text(before, encoding="utf-8")
+    assert after == before, (
+        "tokens.py 的对比度注释与实测不符，请跑：python tools/contrast_audit.py --write")
 
 
 def test_pages_have_no_hardcoded_colors():

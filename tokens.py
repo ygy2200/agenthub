@@ -23,9 +23,13 @@ BG_L0 = {"light": "#f9f9fb", "dark": "#161616"}    # 页面底
 BG_L1 = {"light": "#ffffff", "dark": "#242424"}    # 卡片
 BG_L2 = {"light": "#f5f5f7", "dark": "#2c2c2c"}    # 内嵌区/hover/代码块
 STROKE = {"light": "rgba(0,0,0,0.08)", "dark": "rgba(255,255,255,0.08)"}  # 1px 分隔/描边
-TEXT_1 = {"light": "#1b1b1f", "dark": "#f3f3f3"}   # 主文字    16.3:1 / 14.0:1
-TEXT_2 = {"light": "#61616b", "dark": "#a4a4ac"}   # 次文字      6.1:1 / 6.3:1
-TEXT_3 = {"light": "#6f6f78", "dark": "#8a8a94"}   # 弱提示      5.0:1 / 4.5:1（修正值）
+# 行尾对比度数字由 `python tools/contrast_audit.py --write` 生成（勿手改）——
+# 上一轮手写注释出现过"写着 5.0:1、实测 4.73:1"的自相矛盾。口径：light/dark 各自
+# 对三档底色（L0/L1/L2）中的**最低值**。
+TEXT_1 = {"light": "#1b1b1f", "dark": "#f3f3f3"}   # 15.77 / 12.59（各主题三档底色最低值，由 tools/contrast_audit.py --write 生成）
+TEXT_2 = {"light": "#61616b", "dark": "#a4a4ac"}   # 5.62 / 5.64（各主题三档底色最低值，由 tools/contrast_audit.py --write 生成）
+# TEXT_3 dark 原 #8a8a94：对 BG_L2 只有 4.09:1（<4.5 ✗，弹窗说明文字吃力）→ 提到 #96969f
+TEXT_3 = {"light": "#6f6f78", "dark": "#96969f"}   # 4.57 / 4.76（各主题三档底色最低值，由 tools/contrast_audit.py --write 生成）
 
 # ============ accent（靛蓝，与图标同源） ============
 ACCENT = {"light": "#4a5bd4", "dark": "#7b8ff0"}   # 文字/图标用：5.6:1 / 5.2:1
@@ -57,15 +61,62 @@ KIND_BADGE = {
 }
 MOOD_BADGE = {  # 心情徽章（Daily_You 式）；原值全部达标，保留
     "兴奋": "#d13438", "笃定": "#107c10", "疑问": "#0078d4", "纠结": "#8764b8",
-    "灵感": "#ca5010", "低落": "#5d5a58", "平静": "#4a6b8a",
+    # 灵感：原 #ca5010 白字 4.50:1（贴线，缩放/低质屏下不可靠）→ 加深到 #b8480e（5.29:1）
+    "灵感": "#b8480e", "低落": "#5d5a58", "平静": "#4a6b8a",
 }
 
-# ============ 间距/圆角（4px 网格，对齐课表 #1780） ============
-PAD_PAGE = 24
-PAD_CARD = 16
-GAP_CARD = 12
-RADIUS_CTRL = 4
-RADIUS_CARD = 8
+# ============ 间距（4px 网格，7 档；对齐 Fluent 2 spacingVertical 阶梯） ============
+# 2026-10-15 P1：此前 PAD_*/GAP_*/RADIUS_* 定义了但**引用 0 次**，全仓散落 17 种边距
+# 写法 / 10 种间距值（含 6、10 两个非网格值）。现在这里是唯一来源，页面一律引用常量，
+# 并由 tests/gui/test_spacing_guard.py 扫描源码禁止再出现非白名单字面量。
+SPACE_XS = 4      # 图标与文字、行内元素
+SPACE_S = 8       # 行内间距、按钮之间
+SPACE_M = 12      # 控件与标签、卡片之间
+SPACE_L = 16      # 表面与内容
+SPACE_XL = 20     # 宽卡内边距
+SPACE_2XL = 24    # 页面外边距、区块之间
+SPACE_3XL = 32    # 大分区
+
+PAD_PAGE = SPACE_2XL      # 页面外边距 24
+PAD_CARD = SPACE_L        # 卡片内边距 16（窄卡）
+PAD_CARD_WIDE = SPACE_XL  # 卡片内边距 20（宽卡）
+GAP_CARD = SPACE_M        # 卡片之间 12
+GAP_SECTION = SPACE_2XL   # 区块之间 24
+GAP_ROW = SPACE_S         # 列表行之间 8
+
+# ============ 圆角（3 档） ============
+RADIUS_CTRL = 4    # 控件：按钮/输入/下拉/分段
+RADIUS_CARD = 8    # 容器：卡片/面板/对话框
+RADIUS_PILL = 999  # 胶囊：按控件高度折算（见 pill_radius）；徽章/状态签专用
+
+# ============ 层级（elevation）—— 只用"底色差 + 1px 描边"，不用投影 ============
+# 依据：Fluent 2 在 Windows 上以描边代替 key shadow；且投影在深色底上会消失。
+# e0=页面底（无描边） e1=卡片（1px 描边） e2=浮层/对话框（描边 + qfw 自带阴影）
+STROKE_CARD = {"light": "rgba(0,0,0,0.10)", "dark": "rgba(255,255,255,0.10)"}
+ELEVATION = ("e0", "e1", "e2")
+
+# ============ 字号阶梯（6 档；补上原 20→14 之间的 16 档） ============
+# 原阶梯只有 28/20/14/14/12 五档，且"页面标题"与"数字卡数值"同为 28px 抢同一层级
+# （2026-10-15 P2）。现在：页面标题降到 24，数字独立成 32px + tabular-nums。
+# 元组 = (像素字号, 字重, 行高)。Qt Widgets 无 CSS line-height，行高只对多行控件生效。
+TYPE = {
+    "caption": (12, "normal", 16),
+    "body": (14, "normal", 20),
+    "body_strong": (16, "demibold", 22),
+    "subtitle": (20, "demibold", 28),
+    "title": (24, "demibold", 32),   # 页面标题（原 TitleLabel 28 让位给数字）
+    "metric": (32, "demibold", 40),  # 数字卡数值
+}
+_WEIGHT = {"normal": 400, "medium": 500, "demibold": 600, "bold": 700}
+
+# ============ 密实度（P4：长会话工具偏紧凑，但也给舒适档） ============
+DENSITY = {
+    "compact": {"row_h": 32, "scale": 0.75},
+    "comfortable": {"row_h": 44, "scale": 1.25},
+}
+DEFAULT_DENSITY = "comfortable"   # 与现状 36px 行高一致（36 介于两档之间，取 44 会太松）
+ROW_H_BASE = 36                   # 现状基线行高（未开密度开关时沿用）
+_curr_density = DEFAULT_DENSITY
 
 # ============ 主题管理 ============
 THEME_MODES = ("dark", "light", "auto")
@@ -133,6 +184,73 @@ def kind_badge_color(kind):
 
 def mood_badge_color(mood):
     return MOOD_BADGE.get(mood, BADGE_FALLBACK)
+
+
+# ---------------------------------------------------------------- 派生的尺寸/排版助手
+
+
+def pill_radius(height: int) -> int:
+    """胶囊圆角：恒等于控件高度的一半（原徽章"高 20 + r=8"是方角胶囊，改成 10）。"""
+    return max(2, int(height) // 2)
+
+
+def stroke(level: str = "e1") -> str:
+    """层级描边色：e0 无描边（返回 transparent），e1/e2 用 1px 描边。"""
+    if level == "e0":
+        return "transparent"
+    return _pick(STROKE_CARD)
+
+
+def typeset(widget, role: str) -> None:
+    """按 TYPE 表给控件设字号/字重（P1：字号阶梯单一来源）。
+
+    数字类（metric）额外开 tabular-nums——定宽数字，数值从 4 位变 5 位时不会把
+    相邻卡片挤移位（Qt 侧用 QFont.setFixedPitch≈等宽近似，配合右对齐使用）。
+    """
+    spec = TYPE.get(role)
+    if spec is None:
+        return
+    size, weight, _lh = spec
+    from PySide6.QtGui import QFont
+    f = widget.font()
+    f.setPixelSize(size)
+    f.setWeight(_WEIGHT.get(weight, 400))
+    f.setFixedPitch(role == "metric")   # 定宽数字：读数不抖
+    widget.setFont(f)
+
+
+def set_density(mode: str) -> None:
+    """切换密实度（compact/comfortable/basic）。影响行高与间距缩放系数。"""
+    global _curr_density
+    _curr_density = mode if mode in ("compact", "comfortable") else "basic"
+
+
+def density() -> str:
+    return _curr_density
+
+
+def row_height() -> int:
+    """当前密实度下的列表行高。"""
+    return DENSITY.get(_curr_density, {}).get("row_h", ROW_H_BASE)
+
+
+def gap(base: int) -> int:
+    """按密实度缩放间距（并吸附回 4px 网格）。"""
+    s = DENSITY.get(_curr_density, {}).get("scale", 1.0)
+    v = int(round(base * s / 4.0) * 4)
+    return max(SPACE_XS if base else 0, v)
+
+
+def load_density_choice() -> str:
+    """从配置读密实度（P4 设置页开关）。"""
+    mode = str(core.load_config().get("ui_density", "basic")).strip().lower()
+    return mode if mode in ("compact", "comfortable", "basic") else "basic"
+
+
+def save_density_choice(mode: str) -> None:
+    cfg = core.load_config()
+    cfg["ui_density"] = mode if mode in ("compact", "comfortable", "basic") else "basic"
+    core.save_config(cfg)
 
 
 def load_theme_choice() -> str:

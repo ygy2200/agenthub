@@ -44,6 +44,24 @@ def ic(name, fallback="INFO"):
     return getattr(FIF, name, getattr(FIF, fallback))
 
 
+def apply_page_background(page) -> None:
+    """给内容页画**不透明**底色（唯一入口；所有页面必经，不靠名单）。
+
+    为什么每页都必须画：页面若透明，窗口材质基座（Mica/Acrylic，跟随**系统**主题）会透出
+    来，于是出现"应用深色 + 系统浅色 → 白底浅字"这类**文字不可见**的静默错配
+    （2026-10-10 首次修复；2026-10-15 复盘发现后加的 工作台/信号中心/治理中心/编排中心
+    4 页漏登记、同一缺陷复发 → 本函数取代原来的手写 16 页名单，从结构上杜绝名单漂移）。
+
+    页面是自家 QWidget（非 qfw 样式托管），QSS 不会被 qfw 覆盖（实测）。
+    """
+    try:
+        page.setAttribute(Qt.WA_StyledBackground, True)
+        page.setStyleSheet(
+            f"{type(page).__name__}{{background:{tokens.resolve('bg_page')};}}")
+    except Exception:  # noqa: BLE001 单页上色失败不阻断启动
+        pass
+
+
 def _page_head(title: str, desc: str = "") -> QWidget:
     """统一页头（批次 3B 每页定位）：Title + 一句话说明。
 

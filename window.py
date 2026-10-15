@@ -75,6 +75,9 @@ class AgentHubWindow(FluentWindow):
 
         def _add(page, icon, text, pos=None):
             page.setObjectName(text)
+            # 页面底色唯一入口：所有页面（含隐藏页、含将来新增页）必经此处
+            # （2026-10-15 P0：原为 16 页手写名单，漏了后加的 4 页 → 深色主题白底不可见）
+            apply_page_background(page)
             if text in _hidden_at_boot:
                 self.stackedWidget.addWidget(page)
                 return
@@ -180,24 +183,21 @@ class AgentHubWindow(FluentWindow):
         super().resizeEvent(e)
 
     def _apply_page_bgs(self):
-        """内容页设不透明底色（tokens BG_L0：浅 #f9f9fb / 深 #161616）。
+        """主题变化时重刷内容页底色（tokens bg_page：浅 #f9f9fb / 深 #161616）。
+
         根因（2026-10-10 多路抓图+注册表定位）：用户 Windows 为深色（AppsUseLightTheme=0），
         窗口底由 AcrylicWindow 按**系统深色**画 (30,30,30)；页面若透明，应用切浅色主题时
         会"深底浅字"错配（标题栏浅/内容区深）。修复=页面自己画不透明底，不再依赖窗口底。
-        页面是自家 QWidget（非 qfw 样式托管），QSS 不会被 qfw 覆盖（实测）。
+
+        2026-10-15 P0 复盘：原实现是**手写 16 页名单**，后加的工作台/信号中心/治理中心/
+        编排中心 4 页没进名单 → 深色主题下这 4 页渲染成白底（像素采样近白 79–82%，
+        正常页 3–7%），内容近乎不可见。现在首次上色在 `_add()`（唯一入口）完成，
+        本方法改为遍历 `actions.PAGES` 重刷——**名单消失，新增页面自动覆盖**。
         经 qconfig.themeChangedFinished 信号随任何主题变化自动更新。"""
-        color = tokens.resolve("bg_page")  # P2-3b：根部统一走语义 token
-        for page in (self.overview_page, self.project_page, self.timeline_page,
-                     self.hub_page, self.notes_page, self.brain_page,
-                     self.ledger_page, self.audit_page, self.journal_page,
-                     self.stats_page, self.report_page, self.search_page,
-                     self.connect_page, self.help_page, self.components_page,
-                     self.settings_page):
-            try:
-                page.setAttribute(Qt.WA_StyledBackground, True)
-                page.setStyleSheet(f"{type(page).__name__}{{background:{color};}}")
-            except Exception:
-                pass
+        for _attr, _title, _icon, _group, _kw, _ctrl in actions.PAGES:
+            page = actions.page_of(self, _attr)
+            if page is not None:
+                apply_page_background(page)
 
     def _narrow_nav(self):
         """导航栏按上次退出时的显示模式恢复（qfw 有 COMPACT/MENU/EXPAND 三态，
