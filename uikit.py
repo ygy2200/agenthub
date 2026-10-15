@@ -696,8 +696,10 @@ class FlowLayout(QLayout):
     def __init__(self, parent=None, hspace: int = None, vspace: int = None):
         super().__init__(parent)
         self._items: list = []
-        self._h = tokens.GAP_CARD if hspace is None else hspace
-        self._v = tokens.GAP_CARD if vspace is None else vspace
+        # 2026-10-15 第三轮：卡片间距走 tokens.gap()（密实度可调）——此前 gap() 定义完整
+        # 却零调用方，"间距缩放"整个是摆设，用户切紧凑档只看到行高变。
+        self._h = tokens.gap(tokens.GAP_CARD) if hspace is None else hspace
+        self._v = tokens.gap(tokens.GAP_CARD) if vspace is None else vspace
 
     def addItem(self, item):
         self._items.append(item)
@@ -820,7 +822,9 @@ def set_page_margins(lay, bottom: int = None) -> None:
 CHIP_H = 20   # 徽章 / 状态胶囊统一高度（圆角 = 高度一半，见 chip_qss）
 # 列表行固定列宽（P2）：原实现徽章宽度随文字（WorkBuddy vs ZCode 差一截）、
 # 项目名用 min110/max220 猜——两页之间的右列宽度不一致，标题起点参差不齐。
-BADGE_COL_W = 76     # agent 徽章列
+# 2026-10-15 第三轮：76 → 108。徽章字号从 11px 提到 12px/500 后，最长显示名
+# "WorkBuddy"/"Claude Code" 按生产字体实测需 103px（原 76 会裁成半截名字）。
+BADGE_COL_W = 108    # agent 徽章列
 PROJECT_COL_W = 120  # 项目名列（右对齐 + 省略）
 AGENT_CARD_W = 240   # Agent 中心「agent 卡片」列宽（定宽，防文字被压到 0 宽）
 # 文本可见宽度下限：guard_overflow/flex_label 的 Ignored 策略会让 sizeHint 失效，
@@ -835,12 +839,17 @@ def chip_qss(bg: str, fg: str = "", height: int = CHIP_H, border: str = "") -> s
     此前三种徽章各自手写 `border-radius:8px`（高 20px → 是方角胶囊不是真胶囊），
     状态胶囊又写成 9px——同族元素四种圆角。现在全部走这里：圆角由高度推导，
     不可能再写出"高 20 配 r=8"这种不一致。
+
+    2026-10-15 第三轮：字号/字重从 TYPE["label"] 派生（原先硬编码 11px，
+    是 TYPE 表外的隐性第 7 档，守卫扫不到；实测时间线 700 个标签吃这一档）。
     """
     fg = fg or tokens.WHITE
     r = tokens.pill_radius(height)
     b = f"border:{border};" if border else ""
+    _sz, _wt, _lh = tokens.TYPE["label"]
     return (f"color:{fg};background:{bg};{b}"
-            f"border-radius:{r}px;padding:1px {tokens.SPACE_S}px;font-size:11px;")
+            f"border-radius:{r}px;padding:1px {tokens.SPACE_S}px;"
+            f"font-size:{_sz}px;font-weight:{tokens._WEIGHT[_wt]};")
 
 
 # ---------------------------------------------------------------- token 绑定样式

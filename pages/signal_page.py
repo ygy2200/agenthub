@@ -29,13 +29,20 @@ class SignalPage(QWidget):
                         "收到未读提醒；已读有回执。桌面端可直接发、可查收、可标已读"))
 
         # —— 发送区 ——
+        # 2026-10-15 第三轮：信号中心原整页零图标，控件平铺一段到底。
+        # 注意：本页是无滚动的紧凑表单，加整行 section_head 会在 920x600 下把
+        # 表单区压扁（布局压测实测）——改为给既有标签配图标，不增行高。
         sendBox = QWidget()
         sl = QHBoxLayout(sendBox)
         sl.setContentsMargins(0, 0, 0, 0)
+        _i1 = IconWidget(ic("PEOPLE", "INFO"), sendBox); _i1.setFixedSize(16, 16)
+        sl.addWidget(_i1)
         sl.addWidget(StrongBodyLabel("我是"))
         self.meCombo = ComboBox()
         self.meCombo.setMinimumWidth(110)
         sl.addWidget(self.meCombo)
+        _i2 = IconWidget(ic("SEND", "INFO"), sendBox); _i2.setFixedSize(16, 16)
+        sl.addWidget(_i2)
         sl.addWidget(StrongBodyLabel("发给"))
         self.toCombo = ComboBox()
         self.toCombo.setMinimumWidth(110)
@@ -52,6 +59,7 @@ class SignalPage(QWidget):
         lay.addWidget(sendBox)
 
         # —— 收件箱 / 已发送 ——
+        # 分段控件自带图标位，不额外加行；滚动保护由 listw 承担
         self.seg = SegmentedWidget(self)
         self.seg.addItem("inbox", "收件箱")
         self.seg.addItem("sent", "已发送")

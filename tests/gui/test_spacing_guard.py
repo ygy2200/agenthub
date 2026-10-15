@@ -95,7 +95,51 @@ def test_tokens_spacing_constants_are_actually_used():
     assert not unused, f"tokens 定义了却无人引用（又变成摆设）：{unused}"
 
 
-def test_set_spacing_uses_tokens():
+def test_gap_is_consumed():
+    """tokens.gap() 必须真被页面代码引用（第三轮新增）。
+
+    根因：gap() 定义完整（按密实度缩放 + 吸附回 4px 网格）却**零调用方**——
+    密实度开关因此只调行高（row_height 有 3 个消费方）不调任何间距，
+    用户切"紧凑"看不到间距变化，"间距缩放"是摆设。现由 FlowLayout 接线。
+    """
+    src = "\n".join((ROOT / rel).read_text(encoding="utf-8") for rel in _SCAN
+                    if (ROOT / rel).exists())
+    assert re.search(r"tokens\.gap\(", src), (
+        "tokens.gap() 无人引用——密实度的间距缩放又是摆设（请在 FlowLayout/"
+        "区块间距处接线）")
+
+
+def test_section_icons_min(qapp, hub_root):
+    """每页至少 2 个区块图标（第三轮新增）。
+
+    依据：图标数是"扫读着陆点"的直接度量。审计实测信号中心/编排中心/Agent 中心/
+    帮助/工作台/搜索/接入 ≤1 个，而有图标的页（总览 9、时间线 19）扫读明显更快。
+    组件预览页本来就是样式陈列，按内容计不作要求。
+    """
+    import actions
+    import brain
+    import tokens
+    from PySide6.QtWidgets import QWidget
+    from helpers import boot_window, pump
+
+    brain.init_db(hub_root)
+    tokens.apply_theme("dark")
+    w = boot_window(qapp, hub_root)
+    assert pump(qapp, lambda: getattr(w.project_page, "snap", None) is not None, 40)
+    low = []
+    for attr, title, *_rest in actions.PAGES:
+        if title == "组件预览":
+            continue
+        page = actions.page_of(w, attr)
+        if page is None:
+            continue
+        w.switchTo(page)
+        for _ in range(5):
+            qapp.processEvents()
+        n = len([c for c in page.findChildren(QWidget) if type(c).__name__ == "IconWidget"])
+        if n < 2:
+            low.append(f"{title}={n}")
+    assert not low, f"这些页的区块图标少于 2 个（请用 section_head(text, icon)）：{low}"
     """setSpacing 必须走 tokens.SPACE_*（或 0），不允许裸网格整数。
 
     2026-10-15 第二轮扩面。上一轮只守"值在 4px 网格上"，于是 25 处 `setSpacing(8)`

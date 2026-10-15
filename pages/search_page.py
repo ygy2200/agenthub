@@ -24,6 +24,8 @@ class SearchPage(QWidget):
         self.kindFilter.currentIndexChanged.connect(self.refill)
         top.addWidget(self.kindFilter)
         lay.addLayout(top)
+        lay.addSpacing(tokens.SPACE_S)
+        lay.addWidget(section_head("检索结果", "SEARCH"))
 
         # 左列表右预览可拖分栏：原预览固定 220px 高压在底部，列表只剩几行
         split = QSplitter(Qt.Horizontal)
@@ -33,6 +35,7 @@ class SearchPage(QWidget):
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
         rv.setSpacing(tokens.SPACE_S)
+        rv.addWidget(section_head("内容预览", "DOCUMENT"))
         act = QHBoxLayout()
         act.addStretch(1)
         self.btnOpen = PushButton(ic("LINK", "INFO"), "打开")

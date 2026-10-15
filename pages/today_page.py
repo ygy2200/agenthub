@@ -42,6 +42,7 @@ class TodayPage(QWidget):
 
         self.listw = ListWidget()
         self.listw.setMinimumHeight(320)
+        lay.addWidget(section_head("待办清单", "DATE_TIME"))
         lay.addWidget(self.listw, 1)
 
         row = QHBoxLayout()

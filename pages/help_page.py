@@ -55,8 +55,45 @@ class HelpPage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head("帮助", "使用说明与快捷键一览"))
+
+        # 2026-10-15 第三轮：帮助页原是全站视觉最薄的一页——0 个 qfw 控件、只有 12/24
+        # 两档文字、一个大 TextBrowser，新用户第一眼无处着眼。现在顶部加"常用入口"
+        # 卡片行（图标 + 快捷键胶囊），下方正文套上设计令牌样式。内容一字未改。
+        lay.addSpacing(tokens.SPACE_S)
+        lay.addWidget(section_head("常用入口", "MENU"))
+        quick = QWidget()
+        # FlowLayout：920×600 最小窗口下 QHBoxLayout 会横向溢出（5 个图标 + 5 个胶囊
+        # 一排放不下），流式布局窄窗自动换行（第三轮布局压测实测后改）。
+        ql = FlowLayout(quick)
+        ql.setContentsMargins(tokens.PAD_CARD, tokens.PAD_CARD, tokens.PAD_CARD, tokens.PAD_CARD)
+        for key, desc, icn in (("Ctrl+K", "命令面板", "BRUSH"),
+                               ("Ctrl+1..9", "直达常用页", "TILES"),
+                               ("F5", "刷新扫描", "SYNC"),
+                               ("Ctrl+F", "全脑检索", "SEARCH"),
+                               ("Ctrl+Alt+N", "全局随手记", "EDIT")):
+            chip = QLabel(f"{key}  {desc}")
+            chip.setToolTip(f"{key}：{desc}")
+            chip.setStyleSheet(chip_qss(tokens.C('bg_inset'), fg=tokens.C('text_secondary'),
+                                        border=f"1px solid {tokens.C('stroke_medium')}"))
+            chip.setFixedHeight(CHIP_H)
+            iw = IconWidget(ic(icn, "INFO"), quick)
+            iw.setFixedSize(16, 16)
+            ql.addWidget(iw)
+            ql.addWidget(chip)
+        elevate(quick, "e1")
+        lay.addWidget(quick)
+        lay.addSpacing(tokens.SPACE_M)
+
         browser = TextBrowser()
         browser.setHtml(self.CONTENT)
         browser.setOpenExternalLinks(False)
+        # 正文也走令牌：标题用主色、层级间距统一（此前是 qfw 默认样式，与页面脱节）
+        browser.setStyleSheet(
+            f"TextBrowser{{background:{tokens.C('bg_surface')};"
+            f"border:1px solid {tokens.C('stroke_medium')};"
+            f"border-radius:{tokens.RADIUS_CARD}px;padding:{tokens.PAD_CARD_WIDE}px;}}"
+            f"h2{{color:{tokens.C('accent')};margin:{tokens.SPACE_L}px 0 {tokens.SPACE_S}px 0;}}"
+            f"p,li{{color:{tokens.C('text_primary')};line-height:1.7;}}"
+            f"b{{color:{tokens.C('text_primary')};}}")
         lay.addWidget(browser, 1)
 

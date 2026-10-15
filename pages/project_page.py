@@ -22,6 +22,7 @@ class ProjectPage(QWidget):
         self.filterEdit = SearchLineEdit()
         self.filterEdit.setPlaceholderText("过滤项目…")
         self.listw = ListWidget()
+        left.addWidget(section_head("项目列表", "FOLDER"))
         left.addWidget(self.filterEdit)
         left.addWidget(self.listw, 1)
         btnrow = QHBoxLayout()
@@ -51,7 +52,8 @@ class ProjectPage(QWidget):
 
         file_col = QVBoxLayout()
         self.file_col = file_col  # Round 5：同上
-        file_col.addWidget(CaptionLabel("项目文件总览（历史项目无 input/output 时按实际位置分组 · 双击打开所在位置）"))
+        file_col.addWidget(section_head("项目文件总览", "DOCUMENT"))
+        file_col.addWidget(CaptionLabel("历史项目无 input/output 时按实际位置分组 · 双击打开所在位置"))
         self.fileList = ListWidget()
         file_col.addWidget(self.fileList, 1)
         self.fileList.itemDoubleClicked.connect(self.open_file_loc)

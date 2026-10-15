@@ -288,7 +288,7 @@ code{background:#eef1f4;padding:1px 6px;border-radius:4px;font-size:.9em}
 .muted{color:#68788a;font-size:.92em}
 .warn{color:#a05a00;font-size:.92em}
 .bar{fill:#0a7ea4;opacity:.85}
-.v{font-size:11px;fill:#37506a}
+.v{font-size:11px;fill:#37506a}  /* 图表 SVG 内数值标签：非 UI 字号阶梯，保持 11 以适配窄条 */
 .m{font-size:10px;fill:#68788a}
 .meta{color:#68788a;font-size:.9em}
 nav{font-size:.9em;margin:12px 0}nav a{color:#0a7ea4;margin-right:12px}

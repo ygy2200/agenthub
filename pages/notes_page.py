@@ -342,7 +342,7 @@ class NotesPage(QWidget):
             except ValueError:
                 pass
         dig = ClickBodyLabel("深挖")
-        dig.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};font-size:11px;")
+        dig.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};font-size:12px;")
         dig.setToolTip("生成提示词：agent 会读这条随记并向你反问，把想法展开")
         dig.clicked.connect(lambda _, nid=n["id"]: self._dig(nid))
         line.addWidget(dig)

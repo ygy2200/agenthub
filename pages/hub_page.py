@@ -39,10 +39,15 @@ class HubPage(QWidget):
         # FlowLayout（P2/P4）：窄窗自动换行——固定列宽 + QHBoxLayout 在 920px 窗口下
         # 会把 6 个 agent 列挤出可视区（布局压测实测"横向溢出"）。
         self.cardsRow = FlowLayout()
+        lay.addWidget(section_head("agent 阵容", "PEOPLE"))
         lay.addLayout(self.cardsRow)
 
         viewRow = QHBoxLayout()
-        viewRow.addWidget(CaptionLabel("资产视图"))
+        # 区块标题走 section_head（2026-10-15 第三轮补图标）。注意必须**持有返回的
+        # QWidget 引用**——只取 .title_label 会让承载它的 QWidget 被 GC，
+        # 子标签的 C++ 对象随之删除（libshiboken: already deleted，实测踩到）。
+        self.viewHead = section_head("资产视图", "TILES")
+        viewRow.addWidget(self.viewHead)
         self.viewCombo = ComboBox()
         self.viewCombo.addItems(self.VIEWS)
         self.viewCombo.setFixedWidth(160)

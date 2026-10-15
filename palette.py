@@ -124,7 +124,7 @@ class CommandPalette(QWidget):
             f"QWidget#cpCard{{background:{tokens.C(tokens.BG_L2)};"
             f"border:1px solid {tokens.C(tokens.STROKE)};border-radius:12px;}}")
         self.listw.setStyleSheet("ListWidget{background:transparent;border:none;}")
-        self.hint.setStyleSheet(f"color:{tokens.C(tokens.TEXT_3)};font-size:11px;")
+        self.hint.setStyleSheet(f"color:{tokens.C(tokens.TEXT_3)};font-size:12px;")
 
     # ---------------------------------------------------------------- 过滤/执行
 

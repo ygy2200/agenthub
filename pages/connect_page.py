@@ -38,6 +38,7 @@ class ConnectPage(QWidget):
         self.scroll.setWidget(self.rowsHost)
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         # stretch=2 给卡片区，让它拿走富余高度；下方手动接入区固定不参与拉伸
+        lay.addWidget(section_head("已接入的 agent", "PEOPLE"))
         lay.addWidget(self.scroll, 2)
         lay.addWidget(section_head("手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）", "ADD"))
         self.snippet = TextBrowser()

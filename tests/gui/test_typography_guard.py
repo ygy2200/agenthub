@@ -82,3 +82,59 @@ def test_resolve_accepts_color_object():
             raise AssertionError(f"resolve() 收到色值对象就抛 TypeError：{e}") from e
         assert v.startswith("#"), f"应解析出色值，实际 {v!r}"
         assert v == tokens.C(tokens.ACCENT), "resolve(dict) 应与 C(dict) 结果一致"
+
+
+def test_qss_font_sizes_are_in_type_table():
+    """源码 QSS 里的 font-size 必须落在 TYPE 表的字号集合内（第三轮新增）。
+
+    根因：`chip_qss` 曾硬编码 `font-size:11px`，而 TYPE 表只有 12/14/16/20/24/28/32
+    ——11px 是表外隐性第 7 档，离屏实测时间线页 700 个标签、大脑 26、统计 6 都吃这一档，
+    改字号阶梯时它不跟随，字号探针也扫不到（探针读的是控件 font，不是 QSS）。
+    现在 chip_qss 的字号由 TYPE["label"] 派生，本守卫负责防止别处再写出表外值。
+    """
+    import re
+    from pathlib import Path
+    import tokens
+
+    ROOT = Path(__file__).resolve().parent.parent.parent
+    sizes = {spec[0] for spec in tokens.TYPE.values()}
+    # 豁免：report.py 是**图表 SVG 内部**的 CSS（条形图数值标签/轴标签），
+    # 不是 UI 字号阶梯——窄条里放 12px 会挤爆，且它不进 QLabel 字体体系。
+    # 豁免必须显式列名 + 理由，禁止用通配糊过去。
+    EXEMPT = {"report.py"}
+    files = ["uikit.py", "window.py", "palette.py"] + \
+            [str(p) for p in sorted((ROOT / "pages").glob("*.py"))]
+    bad = []
+    for rel in files:
+        if rel in EXEMPT:
+            continue
+        f = ROOT / rel
+        if not f.exists():
+            continue
+        for i, line in enumerate(f.read_text(encoding="utf-8").splitlines(), 1):
+            body = line.split("  #")[0]
+            if body.strip().startswith("#"):
+                continue
+            for m in re.finditer(r"font-size:\s*(\d+)px", body):
+                if int(m.group(1)) not in sizes:
+                    bad.append(f"{rel}:{i} font-size:{m.group(1)}px")
+    assert not bad, (
+        f"QSS 字号不在 TYPE 表（允许 {sorted(sizes)}）——请改用 tokens.TYPE 派生或登记新档：{bad}")
+
+
+def test_badge_column_fits_longest_agent_name():
+    """徽章定宽列必须放得下最长的 agent 显示名（第三轮：字号 11→12/500 后加宽）。
+
+    11px 时 BADGE_COL_W=76 刚好够；提到 12px/500 后 "Claude Code"/"WorkBuddy"
+    约需 94px，不加宽就会被裁成半截名字（用户看到 "Claude C..."）。
+    """
+    from PySide6.QtGui import QFontMetrics
+    import tokens
+    import uikit
+
+    f = QFontMetrics(uikit.badge("claude", "").font())
+    for name in ("Claude Code", "WorkBuddy", "ZCode"):
+        need = f.horizontalAdvance(name) + 2 * tokens.SPACE_S + 4   # padding + 余量
+        assert uikit.BADGE_COL_W >= need, (
+            f"徽章列宽 {uikit.BADGE_COL_W} 放不下「{name}」（需 {need}px）——"
+            "请调大 uikit.BADGE_COL_W 或给徽章加 tooltip")

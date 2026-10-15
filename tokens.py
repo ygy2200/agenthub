@@ -131,7 +131,12 @@ FOCUS_RING_OFFSET = 2  # px，与控件边缘的间距（不压内容）
 # （2026-10-15 P2）。现在：页面标题降到 24，数字独立成 32px + tabular-nums。
 # 元组 = (像素字号, 字重, 行高)。Qt Widgets 无 CSS line-height，行高只对多行控件生效。
 TYPE = {
-    "caption": (12, "normal", 16),
+    # 2026-10-15 第三轮：caption/label 字重 normal(400) → medium(500)。
+    # 依据（造物云设计系统执行标准）：中文 ≤16px 时 400 显轻飘、600 显闷，500 最清晰耐读；
+    # 400 只留给长段落正文（body）。同时把原先藏在 chip_qss QSS 里的 11px 提为正式档：
+    # ——11 与 12 并存且 11 不在本表，字号阶梯失控、守卫也扫不到（实测时间线 700 个标签吃这一档）。
+    "label": (12, "medium", 16),   # 徽章/胶囊/kicker 小字（原 11px 提档）
+    "caption": (12, "medium", 16), # 元信息/说明小字
     "body": (14, "normal", 20),
     "body_strong": (16, "demibold", 22),
     "subtitle": (20, "demibold", 28),
