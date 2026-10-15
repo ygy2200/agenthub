@@ -443,6 +443,17 @@ def _setup_app_font(app):
     # ① 高分屏缩放策略：必须在 QApplication 创建前设置
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
+
+    # ⓪ 字族统一（视觉打磨 P3 / 2026-10-15）：qfw 默认 ['Segoe UI','Microsoft YaHei',
+    # 'PingFang SC'] → 拉丁字走 Segoe UI、汉字逐字回落到微软雅黑，同一行两种字体两种基线，
+    # 中英混排时字重观感不齐。统一成"中文优先"的一族：拉丁字形也由雅黑 UI 提供。
+    # 必须在任何控件创建前调用（qfw 在 getFont() 时读该配置）。
+    try:
+        from qfluentwidgets.common.font import setFontFamilies
+        setFontFamilies(["Microsoft YaHei UI", "Microsoft YaHei", "Segoe UI"], save=False)
+    except Exception:  # noqa: BLE001 取不到接口就沿用 qfw 默认，不影响启动
+        pass
+
     f = QFont("Microsoft YaHei UI", 9)
     # ② 只做垂直 hinting：字宽不锁死，避免小字号下左右笔画被裁
     f.setHintingPreference(QFont.HintingPreference.PreferVerticalHinting)

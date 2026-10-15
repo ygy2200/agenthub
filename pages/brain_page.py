@@ -42,16 +42,17 @@ class BrainPage(QWidget):
         self.eventBox = QVBoxLayout()
         self.pinBox = QVBoxLayout()
         # 内容组不包卡：间距+小标题分组（Fluent Layout——分组靠 spacing，不需要每块加框）
-        for box, t in ((self.topBox, "记忆唤起 top10（开工推送反射弧记数）"),
-                       (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）"),
-                       (self.taskBox, "任务看板（P3-2 状态机：agent 经 hub_task_add 建、hub_claim 认领，"
-                                      "进行中→阻塞→待办→完成）"),
-                       (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）"),
-                       (self.eventBox, "事件流（agent 经 hub_event_write 写进展，hub_events 增量订阅）"),
-                       (self.pinBox, "置顶记忆（置顶位只放工作知识）")):
+        for box, t, icn in ((self.topBox, "记忆唤起 top10（开工推送反射弧记数）", "VIEW"),
+                            (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）", "PEOPLE"),
+                            (self.taskBox, "任务看板（P3-2 状态机：agent 经 hub_task_add 建、hub_claim 认领，"
+                                           "进行中→阻塞→待办→完成）", "CERTIFICATE"),
+                            (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）", "CHECKBOX"),
+                            (self.eventBox, "事件流（agent 经 hub_event_write 写进展，"
+                                            "hub_events 增量订阅）", "MESSAGE"),
+                            (self.pinBox, "置顶记忆（置顶位只放工作知识）", "PIN")):
             box.setSpacing(8)  # 行距：无间距时唤起/置顶行挤成一片
             lay.addSpacing(16)  # 组间距 > 行距，拉开层级
-            lay.addWidget(StrongBodyLabel(t))
+            lay.addWidget(section_head(t, icn))
             lay.addLayout(box)
         lay.addStretch(1)
         self.scroll.setWidget(body)

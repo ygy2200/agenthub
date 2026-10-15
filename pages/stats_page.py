@@ -39,12 +39,13 @@ class StatsPage(QWidget):
         self.healthLine = CaptionLabel("")
         self.healthLine.setWordWrap(True)
         # 内容组不包卡：间距+小标题分组
-        for box, t in ((self.agentBox, "各 agent 记录分布"), (self.monthBox, "近 6 个月活跃")):
+        for box, t, icn in ((self.agentBox, "各 agent 记录分布", "PEOPLE"),
+                            (self.monthBox, "近 6 个月活跃", "CALENDAR")):
             lay.addSpacing(16)
-            lay.addWidget(StrongBodyLabel(t))
+            lay.addWidget(section_head(t, icn))
             lay.addLayout(box)
         lay.addSpacing(16)
-        lay.addWidget(StrongBodyLabel("大脑体检（智能摘要）"))
+        lay.addWidget(section_head("大脑体检（智能摘要）", "HEART"))
         lay.addWidget(self.healthLine)
         lay.addStretch(1)
 

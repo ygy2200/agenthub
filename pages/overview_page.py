@@ -39,7 +39,7 @@ class OverviewPage(QWidget):
 
         # 随记输入条（08 计划 A-Ⅰ：人的高频入口放首页=最短路径；完整视图在「随记」页）
         lay.addSpacing(16)
-        lay.addWidget(StrongBodyLabel("随记（你的顿悟与想法——回车即存，所有 agent 检索可见）"))
+        lay.addWidget(section_head("随记（你的顿悟与想法——回车即存，所有 agent 检索可见）", "EDIT"))
         noteRow = QHBoxLayout()
         self.noteInput = LineEdit()
         self.noteInput.setPlaceholderText("随手记一条想法/顿悟/摘录…（回车即存）")
@@ -76,7 +76,7 @@ class OverviewPage(QWidget):
         cols.setSpacing(24)  # 左右两栏列距 > 行距，分组靠间距
         # 左：最近 agent 动态
         recentCol = QVBoxLayout()
-        recentCol.addWidget(StrongBodyLabel("最近动态（点击看详情）"))
+        recentCol.addWidget(section_head("最近动态（点击看详情）", "HISTORY"))
         self.recentBox = QVBoxLayout()
         self.recentBox.setSpacing(4)
         recentCol.addLayout(self.recentBox)
@@ -85,17 +85,17 @@ class OverviewPage(QWidget):
         # 右：agent 阵容 + 快捷入口
         rightCol = QVBoxLayout()
         rightCol.setSpacing(8)
-        rightCol.addWidget(StrongBodyLabel("Agent 阵容（Agent 中心探测）"))
+        rightCol.addWidget(section_head("Agent 阵容（Agent 中心探测）", "ROBOT"))
         self.agentBox = QVBoxLayout()
         self.agentBox.setSpacing(4)
         rightCol.addLayout(self.agentBox)
         rightCol.addSpacing(16)
-        rightCol.addWidget(StrongBodyLabel("最近会话（hub_heartbeat 上报 · 近 24 小时）"))
+        rightCol.addWidget(section_head("最近会话（hub_heartbeat 上报 · 近 24 小时）", "PEOPLE"))
         self.sessionBox = QVBoxLayout()
         self.sessionBox.setSpacing(4)
         rightCol.addLayout(self.sessionBox)
         rightCol.addSpacing(16)
-        rightCol.addWidget(StrongBodyLabel("快捷入口"))
+        rightCol.addWidget(section_head("快捷入口", "MENU"))
         quickRow = QHBoxLayout()
         for text, target in (("打开时间线", "timeline"), ("打开 Agent 中心", "hub"),
                              ("检查对账问题", "audit"), ("搜索全部记录", "search")):
@@ -108,6 +108,12 @@ class OverviewPage(QWidget):
         cols.addLayout(rightCol, 2)
         lay.addLayout(cols)
         lay.addStretch(1)
+
+        # 加载态：首屏先放骨架条，数据到达后由 set_* 清空替换
+        # （空白列表无法区分"在加载"与"真的没数据"，观感等同于坏了）
+        self.recentBox.addWidget(Skeleton(4))
+        self.agentBox.addWidget(Skeleton(3))
+        self.sessionBox.addWidget(Skeleton(3))
 
     def goto(self, key):
         page = {"timeline": self.win.timeline_page, "hub": self.win.hub_page,

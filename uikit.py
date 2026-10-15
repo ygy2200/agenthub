@@ -713,6 +713,60 @@ class FlowLayout(QLayout):
         return y + row_h - rect.y()
 
 
+class Skeleton(QWidget):
+    """加载骨架屏（P3）：数据到达前的占位条，替代"一片空白"。
+
+    为什么需要：空列表无法区分"正在加载"与"真的没数据"——冷启动几百毫秒里用户
+    看到的是一整块空白，观感等同于"坏了"。骨架条形状贴近最终内容（列表行），
+    比转圈 spinner 的视觉跳动小（2026 主流推荐）。
+    """
+
+    def __init__(self, rows: int = 3, parent=None, row_h: int = None):
+        super().__init__(parent)
+        h = row_h or tokens.row_height()
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(tokens.SPACE_S)
+        self.bars = []
+        # 宽度递减：模拟真实行的长短差异，避免"整整齐齐三条灰"像禁用态
+        widths = (100, 88, 72, 60, 84)
+        for i in range(max(1, rows)):
+            bar = QWidget(self)
+            bar.setFixedHeight(max(8, h - 2 * tokens.SPACE_S))
+            bar.setMinimumWidth(60)
+            bar.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+            bar.setStyleSheet(f"background:{tokens.C('bg_inset')};"
+                              f"border-radius:{tokens.RADIUS_CTRL}px;")
+            if i < len(widths):
+                bar.setMaximumWidth(int(520 * widths[i] / 100))
+            lay.addWidget(bar)
+            self.bars.append(bar)
+            bind_style(bar, lambda w: w.setStyleSheet(
+                f"background:{tokens.C('bg_inset')};"
+                f"border-radius:{tokens.RADIUS_CTRL}px;"))
+
+
+def section_head(text: str, icon_name: str = "") -> QWidget:
+    """区块标题（P3 图标体系 + 16px 中坚档）：20px 图标 + 16px DemiBold。
+
+    为什么：此前 6 个页面（大脑/统计/时间线/治理/帮助/工作台）**整页零图标**，
+    分组只有一行 14px 文字，扫视时没有视觉着陆点；而字号阶梯在 20 与 14 之间
+    缺一档，分组标题只能挤在正文同号（靠字重区分，中文下差异很弱）。
+    """
+    box = QWidget()
+    lay = QHBoxLayout(box)
+    lay.setContentsMargins(0, 0, 0, 0)
+    lay.setSpacing(tokens.SPACE_XS)
+    if icon_name:
+        iw = IconWidget(ic(icon_name, "INFO"), box)
+        iw.setFixedSize(20, 20)
+        lay.addWidget(iw, 0, Qt.AlignVCenter)
+    lb = StrongBodyLabel(text, box)
+    tokens.typeset(lb, "body_strong")    # 16px（TYPE 表派生）
+    lay.addWidget(lb, 1)
+    return box
+
+
 def set_page_margins(lay, bottom: int = None) -> None:
     """页面外边距（唯一入口，值来自 tokens.PAD_PAGE）。
 
