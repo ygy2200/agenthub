@@ -93,3 +93,26 @@ def test_tokens_spacing_constants_are_actually_used():
         if not re.search(rf"tokens\.{name}\b", src):
             unused.append(name)
     assert not unused, f"tokens 定义了却无人引用（又变成摆设）：{unused}"
+
+
+def test_set_spacing_uses_tokens():
+    """setSpacing 必须走 tokens.SPACE_*（或 0），不允许裸网格整数。
+
+    2026-10-15 第二轮扩面。上一轮只守"值在 4px 网格上"，于是 25 处 `setSpacing(8)`
+    原样留着——**两套来源并存**：改 token 只改到一半，和第一轮"页头 28→24 只落地
+    14/18"是同一种漂移。现在把"间距必须单一来源"也纳入守卫。
+    边距（setContentsMargins）不在此列：那是每个容器自己的布局决策，走网格白名单即可。
+    """
+    bad = []
+    for rel in _SCAN:
+        f = ROOT / rel
+        if not f.exists():
+            continue
+        for i, body, _raw in _code_lines(f.read_text(encoding="utf-8")):
+            for m in re.finditer(r"setSpacing\(([^)]*)\)", body):
+                arg = m.group(1).strip()
+                if arg == "0":
+                    continue
+                if not arg.startswith("tokens.SPACE_"):
+                    bad.append(f"{rel}:{i} {m.group(0)}")
+    assert not bad, f"setSpacing 请改用 tokens.SPACE_*（间距单一来源）：{bad}"

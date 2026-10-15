@@ -258,6 +258,7 @@ class _HoverFade(QObject):
         self._t = 0.0
         self._anim = QVariantAnimation(widget)
         self._anim.setDuration(max(0, tokens.motion_ms()))
+        self._anim.setEasingCurve(tokens.easing())   # 曲线也走 token（Fluent easy-ease）
         self._anim.setStartValue(0.0)
         self._anim.setEndValue(1.0)
         self._anim.valueChanged.connect(self._on_value)
@@ -291,7 +292,7 @@ class _HoverFade(QObject):
 
 
 def attach_hover(widget, hover_key: str = "bg_inset", radius: int = None,
-                 separator: bool = False):
+                 separator: bool = False, focus: bool = False):
     """给行/卡片挂 hover 淡入（P4 微交互：只用于确认"指针在这里"）。
 
     背景在 transparent → tokens 语义色之间插值；圆角默认跟随容器档（8px）。
@@ -299,17 +300,45 @@ def attach_hover(widget, hover_key: str = "bg_inset", radius: int = None,
     每次重画都**现算**颜色，因此换肤后立即正确（不缓存旧主题色值）。
     """
     r = tokens.RADIUS_CARD if radius is None else radius
+    state = {"focus": False}
+
+    def _ring() -> str:
+        if not state["focus"]:
+            return ""
+        c = QColor(tokens.C("focus_ring"))
+        return (f"border:{tokens.FOCUS_RING_W}px solid "
+                f"rgb({c.red()},{c.green()},{c.blue()});"
+                f"border-radius:{r + tokens.FOCUS_RING_W}px;")
 
     def _paint(w, t: float) -> None:
         c = QColor(tokens.C(hover_key))
         a = int(round(255 * max(0.0, min(1.0, t))))
         sep = f"border-bottom:1px solid {tokens.C(tokens.STROKE)};" if separator else ""
         w.setStyleSheet(f"{sep}background:rgba({c.red()},{c.green()},{c.blue()},{a});"
-                        f"border-radius:{r}px;")
+                        f"border-radius:{r}px;{_ring()}")
 
+    if focus:
+        # WCAG 2.2 SC 2.4.11（AA）：焦点指示器 ≥2px 周长、与相邻色对比 ≥3:1。
+        # QSS 无 outline 伪类，只能补 border——2px 位移只发生在焦点态（瞬时、可接受）。
+        widget.setFocusPolicy(Qt.StrongFocus)
+        widget.installEventFilter(_FocusRingFilter(state, lambda: _paint(widget, 1.0)))
     fade = _HoverFade(widget, _paint)
     bind_style(widget, lambda w: _paint(w, fade.t))   # 换肤后按当前态重画
     return fade
+
+
+class _FocusRingFilter(QObject):
+    """焦点进出 → 重画挂上/摘下焦点环（见 attach_hover 的 focus 参数）。"""
+
+    def __init__(self, state, repaint):
+        super().__init__()
+        self._state, self._repaint = state, repaint
+
+    def eventFilter(self, obj, ev):
+        if ev.type() in (QEvent.FocusIn, QEvent.FocusOut):
+            self._state["focus"] = (ev.type() == QEvent.FocusIn)
+            self._repaint()
+        return False
 
 
 # 徽章色统一走 tokens 单一来源（UI 重构·批次1 2026-10-10）：
@@ -569,7 +598,10 @@ class RecordDetailDialog(MessageBoxBase):
 
     def __init__(self, win, r: dict):
         super().__init__(win)
+        # 对话框标题用 28 档（2026-10-15 第二轮补的 heading）：此前只有 20/24 两档，
+        # 详情标题既压不过页头 24、又比正文 14 跳得太少，层级不清。
         self.titleLabel = SubtitleLabel((r.get("title") or "(无标题)")[:60])
+        tokens.typeset(self.titleLabel, "heading")
         meta = QHBoxLayout()
         meta.addWidget(badge(r.get("agent", ""), ""))
         rt = (r.get("record_type") or "").strip()
@@ -864,10 +896,14 @@ def _chip(maker) -> QLabel:
 
 
 def elevate(widget, level: str = "e1"):
-    """层级：e0 页面底（无描边）/ e1 卡片（1px 描边）/ e2 浮层（描边 + 阴影）。
+    """层级：e0 页面底（无描边）/ e1 卡片（1px 描边）/ e2 浮层 / e3 浮层+第 4 档表面。
 
     只用"底色差 + 1px 描边"，不用投影——Fluent 2 在 Windows 上以描边代替 key shadow，
     且投影在深色底上会消失。登记进 token 样式表，换肤时自动重刷。
+
+    2026-10-15 第二轮：e3 用 bg_float（深色 #3a3a3a，浅色 #fff）+ high 档描边，
+    给下拉/菜单/对话框/Tooltip 一个与卡片不同的表面——此前只有 3 档，浮层与卡片同色，
+    深色下边界糊成一片。
     """
     def _apply(w=None):
         tgt = w or widget
@@ -875,6 +911,11 @@ def elevate(widget, level: str = "e1"):
         tgt.setProperty("_elev", level)
         if level == "e0":
             tgt.setStyleSheet(f"{type(tgt).__name__}{{background:transparent;border:none;}}")
+        elif level == "e3":
+            tgt.setStyleSheet(
+                f"{type(tgt).__name__}{{background:{tokens.C('bg_float')};"
+                f"border:1px solid {tokens.C('stroke_high')};"
+                f"border-radius:{tokens.RADIUS_CARD}px;}}")
         else:
             tgt.setStyleSheet(
                 f"{type(tgt).__name__}{{background:{tokens.C('bg_surface')};"
@@ -1094,7 +1135,7 @@ class QuickNotePopup(QDialog):
         self.resize(560, 190)
         v = QVBoxLayout(self)
         v.setContentsMargins(16, 16, 16, 12)
-        v.setSpacing(8)
+        v.setSpacing(tokens.SPACE_S)
         self.input = TextEdit()
         self.input.setPlaceholderText("随手记一条…\nEnter 保存并关闭 · Shift+Enter 换行 · Esc 取消")
         self.input.installEventFilter(self)
@@ -1110,7 +1151,12 @@ class QuickNotePopup(QDialog):
         v.addLayout(h)
         self.input.textChanged.connect(
             lambda: self.saveBtn.setEnabled(bool(self.input.toPlainText().strip())))
-        self.setStyleSheet(f"QDialog{{background:{tokens.C(tokens.BG_L2)};}}")
+        # 浮层表面（2026-10-15 第二轮）：快速捕捉窗是"浮在桌面上的层"，用 e3 的
+        # bg_float + high 档描边，而不是与内嵌区同色的 BG_L2——深色下才能看出"这是浮层"。
+        self.setStyleSheet(
+            f"QDialog{{background:{tokens.C('bg_float')};"
+            f"border:1px solid {tokens.C('stroke_high')};"
+            f"border-radius:{tokens.RADIUS_CARD}px;}}")
 
     def eventFilter(self, obj, ev):
         if obj is self.input and ev.type() == QEvent.KeyPress:
@@ -1191,16 +1237,19 @@ class NumberCard(CardWidget):
         lay.addWidget(self.value)
 
         self.context = BodyLabel(context)
-        self.context.setVisible(bool(context))
+        # 上下文行**恒占位**（2026-10-15 第二轮）：此前无上下文时整行 setVisible(False)，
+        # 一行数字卡里"有上下文的卡"比"没上下文的卡"高出一行 → KPI 行下边缘锯齿，
+        # 扫读时价格感下降。现在恒显（空文本也占一行高），保证同行卡片底部对齐。
         lay.addWidget(self.context)
 
         self.setMinimumWidth(200)   # 低于 200px 数字与标签会挤（行业可读下限）
         elevate(self, "e1")
+        # 焦点环（WCAG 2.2 2.4.11 AA）：数字卡可点击，键盘可达必须有可见焦点
+        self.setFocusPolicy(Qt.StrongFocus)
 
     def set_context(self, text: str) -> None:
-        """上下文行（对比/口径）。传空串则整行隐藏，不留空白。"""
+        """上下文行（对比/口径）。传空串保留占位行（同行卡片仍等高）。"""
         self.context.setText(text or "")
-        self.context.setVisible(bool(text))
 
 
 # ---------------------------------------------------------------- 新建项目 / Inbox 引入 对话框

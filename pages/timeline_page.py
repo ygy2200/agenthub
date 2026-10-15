@@ -52,7 +52,7 @@ class TimelinePage(QWidget):
         self.container = QWidget()
         self.box = QVBoxLayout(self.container)
         self.box.setContentsMargins(4, 12, 16, 24)
-        self.box.setSpacing(16)  # 日期组间距 > 组内行距 8，拉开分组
+        self.box.setSpacing(tokens.SPACE_L)  # 日期组间距 > 组内行距 8，拉开分组
         self.scroll.setWidget(self.container)
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         self.scroll.setWidgetResizable(True)
@@ -198,8 +198,10 @@ class TimelinePage(QWidget):
                     group = QWidget()
                     self._cur_card_lay = QVBoxLayout(group)
                     self._cur_card_lay.setContentsMargins(0, 0, 0, 0)
-                    self._cur_card_lay.setSpacing(8)
-                    self._cur_card_lay.addWidget(StrongBodyLabel(d))
+                    self._cur_card_lay.setSpacing(tokens.SPACE_S)
+                    # 日期组标题走 section_head（2026-10-15 第二轮）：时间线页此前
+                    # 整页零图标，纯 16px 灰字标题在长列表里没有视觉着陆点
+                    self._cur_card_lay.addWidget(section_head(d, "CALENDAR"))
                     self.box.addWidget(group)
                 self._add_row(r)
         finally:

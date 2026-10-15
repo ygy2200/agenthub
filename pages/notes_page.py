@@ -79,7 +79,7 @@ class NotesPage(QWidget):
         # 实时关联浮出：写新想法时浮出你可能想起的旧随记与记忆
         self.relateBox = QVBoxLayout()
         self.relateBox.setContentsMargins(4, 8, 4, 0)
-        self.relateBox.setSpacing(4)
+        self.relateBox.setSpacing(tokens.SPACE_XS)
         self.relatePanel = QWidget()
         self.relatePanel.setLayout(self.relateBox)
         self.relatePanel.setVisible(False)
@@ -92,7 +92,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.recallHead)
         self.recallBox = QVBoxLayout()
         self.recallBox.setContentsMargins(4, 4, 4, 0)
-        self.recallBox.setSpacing(8)
+        self.recallBox.setSpacing(tokens.SPACE_S)
         lay.addLayout(self.recallBox)
 
         # 时光回放：往年今天
@@ -101,7 +101,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.otdHead)
         self.otdBox = QVBoxLayout()
         self.otdBox.setContentsMargins(4, 4, 4, 0)
-        self.otdBox.setSpacing(8)
+        self.otdBox.setSpacing(tokens.SPACE_S)
         lay.addLayout(self.otdBox)
 
         # 胶囊到期
@@ -110,7 +110,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.capsuleHead)
         self.capsuleBox = QVBoxLayout()
         self.capsuleBox.setContentsMargins(4, 4, 4, 0)
-        self.capsuleBox.setSpacing(8)
+        self.capsuleBox.setSpacing(tokens.SPACE_S)
         lay.addLayout(self.capsuleBox)
 
         # 时间线主体：按日期分组的无框行流（行是线不是卡）+ 整理模式（素材勾选）
@@ -145,7 +145,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.pickBar)
         self.tlBox = QVBoxLayout()
         self.tlBox.setContentsMargins(4, 12, 16, 24)
-        self.tlBox.setSpacing(16)
+        self.tlBox.setSpacing(tokens.SPACE_L)
         lay.addLayout(self.tlBox)
         lay.addStretch(1)
         self.scroll.setWidget(body)
@@ -216,7 +216,7 @@ class NotesPage(QWidget):
         self.relateBox.addWidget(CaptionLabel("你可能想起了——"))
         for kind, item in lines[:5]:
             line = QHBoxLayout()
-            line.setSpacing(8)
+            line.setSpacing(tokens.SPACE_S)
             lb = QLabel(kind)
             # 色值一律走 tokens（白字常量也在 tokens.WHITE），不再内联 #fff
             lb.setStyleSheet(chip_qss(tokens.BADGE_FALLBACK, fg=tokens.WHITE))
@@ -312,7 +312,7 @@ class NotesPage(QWidget):
         """通用行：收藏星 + 相对时间 + 心情徽章 + 标签胶囊 + 深挖 + 上下文 + 正文。
         时光胶囊未到期灰显+倒计时；标签胶囊点击=串成该主题的思想演化线。"""
         line = QHBoxLayout()
-        line.setSpacing(8)
+        line.setSpacing(tokens.SPACE_S)
         if self.pick_mode:
             cb = QCheckBox()
             cb.setChecked(n["id"] in self.picked)
@@ -448,7 +448,7 @@ class NotesPage(QWidget):
                 group = QWidget()
                 g = QVBoxLayout(group)
                 g.setContentsMargins(0, 0, 0, 0)
-                g.setSpacing(8)
+                g.setSpacing(tokens.SPACE_S)
                 g.addWidget(StrongBodyLabel(d))
                 box = g
                 self.tlBox.addWidget(group)

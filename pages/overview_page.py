@@ -73,26 +73,26 @@ class OverviewPage(QWidget):
 
         # 内容组不包卡：间距+小标题分组；NumberCard 保留框（绑了 clicked，卡片=可点区域）
         cols = QHBoxLayout()
-        cols.setSpacing(24)  # 左右两栏列距 > 行距，分组靠间距
+        cols.setSpacing(tokens.SPACE_2XL)  # 左右两栏列距 > 行距，分组靠间距
         # 左：最近 agent 动态
         recentCol = QVBoxLayout()
         recentCol.addWidget(section_head("最近动态（点击看详情）", "HISTORY"))
         self.recentBox = QVBoxLayout()
-        self.recentBox.setSpacing(4)
+        self.recentBox.setSpacing(tokens.SPACE_XS)
         recentCol.addLayout(self.recentBox)
         recentCol.addStretch(1)
         cols.addLayout(recentCol, 3)
         # 右：agent 阵容 + 快捷入口
         rightCol = QVBoxLayout()
-        rightCol.setSpacing(8)
+        rightCol.setSpacing(tokens.SPACE_S)
         rightCol.addWidget(section_head("Agent 阵容（Agent 中心探测）", "ROBOT"))
         self.agentBox = QVBoxLayout()
-        self.agentBox.setSpacing(4)
+        self.agentBox.setSpacing(tokens.SPACE_XS)
         rightCol.addLayout(self.agentBox)
         rightCol.addSpacing(16)
         rightCol.addWidget(section_head("最近会话（hub_heartbeat 上报 · 近 24 小时）", "PEOPLE"))
         self.sessionBox = QVBoxLayout()
-        self.sessionBox.setSpacing(4)
+        self.sessionBox.setSpacing(tokens.SPACE_XS)
         rightCol.addLayout(self.sessionBox)
         rightCol.addSpacing(16)
         rightCol.addWidget(section_head("快捷入口", "MENU"))

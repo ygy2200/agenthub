@@ -57,7 +57,7 @@ class BrainPage(QWidget):
                             (self.eventBox, "事件流（agent 经 hub_event_write 写进展，"
                                             "hub_events 增量订阅）", "MESSAGE"),
                             (self.pinBox, "置顶记忆（置顶位只放工作知识）", "PIN")):
-            box.setSpacing(8)  # 行距：无间距时唤起/置顶行挤成一片
+            box.setSpacing(tokens.SPACE_S)  # 行距：无间距时唤起/置顶行挤成一片
             lay.addSpacing(16)  # 组间距 > 行距，拉开层级
             lay.addWidget(section_head(t, icn))
             lay.addLayout(box)
@@ -193,7 +193,7 @@ class BrainPage(QWidget):
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(8)
+        h.setSpacing(tokens.SPACE_S)
         h.addWidget(kind_badge(m["kind"]))
         body = BodyLabel(f"{head}  {m['content'][:100]}")
         body.setWordWrap(True)

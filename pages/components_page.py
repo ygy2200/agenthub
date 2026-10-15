@@ -37,7 +37,7 @@ class ComponentsPage(QWidget):
         body = QWidget()
         lay = QVBoxLayout(body)
         lay.setContentsMargins(4, 12, 16, 24)
-        lay.setSpacing(12)
+        lay.setSpacing(tokens.SPACE_M)
 
         lay.addWidget(StrongBodyLabel("文本层级（Title / Subtitle / Strong / Body / Caption）"))
         lay.addWidget(PageTitleLabel("页面标题 PageTitle 24（本项目页头）"))
@@ -190,7 +190,7 @@ class ComponentsPage(QWidget):
         h.setContentsMargins(tokens.SPACE_M, tokens.SPACE_S,
                               tokens.SPACE_M, tokens.SPACE_S)
         col = QVBoxLayout()
-        col.setSpacing(4)
+        col.setSpacing(tokens.SPACE_XS)
         col.addWidget(BodyLabel(title))
         col.addWidget(CaptionLabel(desc))
         h.addLayout(col, 1)

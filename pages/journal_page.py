@@ -38,7 +38,7 @@ class JournalPage(QWidget):
 
         # 列表区不包卡：ListWidget 自带边界，卡套列表=框中框
         g1 = QVBoxLayout()
-        g1.setSpacing(8)
+        g1.setSpacing(tokens.SPACE_S)
         g1.addWidget(section_head("错误登记（open=待处理 · fixed=已处理）", "FLAG"))
         self.errList = ListWidget()
         self.errList.setMinimumHeight(150)
@@ -54,7 +54,7 @@ class JournalPage(QWidget):
         lay.addLayout(g1, 2)
 
         g2 = QVBoxLayout()
-        g2.setSpacing(8)
+        g2.setSpacing(tokens.SPACE_S)
         g2.addWidget(section_head("操作流水（最新在上，最近 200 条）", "HISTORY"))
         self.jList = ListWidget()
         g2.addWidget(self.jList, 1)

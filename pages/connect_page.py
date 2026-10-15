@@ -34,7 +34,7 @@ class ConnectPage(QWidget):
         self.rowsHost = QWidget()
         self.rowsHost.setLayout(self.rows)
         self.rows.setContentsMargins(0, 0, 8, 0)
-        self.rows.setSpacing(12)
+        self.rows.setSpacing(tokens.SPACE_M)
         self.scroll.setWidget(self.rowsHost)
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         # stretch=2 给卡片区，让它拿走富余高度；下方手动接入区固定不参与拉伸

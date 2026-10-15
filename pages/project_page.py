@@ -12,7 +12,7 @@ class ProjectPage(QWidget):
         self.current = None
         _outer = QVBoxLayout(self)
         set_page_margins(_outer)
-        _outer.setSpacing(12)
+        _outer.setSpacing(tokens.SPACE_M)
         _outer.addWidget(_page_head("项目", "每个项目的进展与工作记录——左选右看；双击列表项打开目录"))
         root = QHBoxLayout()
         _outer.addLayout(root, 1)

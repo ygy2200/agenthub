@@ -32,7 +32,7 @@ class SearchPage(QWidget):
         right = QWidget()
         rv = QVBoxLayout(right)
         rv.setContentsMargins(0, 0, 0, 0)
-        rv.setSpacing(8)
+        rv.setSpacing(tokens.SPACE_S)
         act = QHBoxLayout()
         act.addStretch(1)
         self.btnOpen = PushButton(ic("LINK", "INFO"), "打开")
