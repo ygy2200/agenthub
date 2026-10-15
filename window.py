@@ -38,6 +38,8 @@ class AgentHubWindow(FluentWindow):
         super().__init__()
         self.root = core.get_root()
         core.JOURNAL_SINK = brain.journal_add  # 流水落库
+        # 密实度（P4 设置页开关）：必须在建页面前生效——行高与间距在建布局时就读了
+        tokens.set_density(tokens.load_density_choice())
         self._workers = []
         if self.root and os.path.isdir(self.root):
             # 建表 + 历史 md/jsonl 增量迁移（幂等），后台跑防卡启动

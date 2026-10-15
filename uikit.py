@@ -171,6 +171,13 @@ def guard_overflow(root_widget):
             if len(lb.text() or "") <= 16:
                 continue
             lb.setSizePolicy(QSizePolicy.Ignored, lb.sizePolicy().verticalPolicy())
+            # 宽度下限（2026-10-15）：Ignored 会让 sizeHint 失效，父布局按"0 宽"分配
+            # ——本函数本意是防溢出，结果在"无 stretch 的行"里把整行文字压没了
+            # （实测：工作台 2 处、信号中心 1 处、Agent 中心整列 15 处）。
+            # 加下限 + tooltip：宁可截断（全文进 tooltip），也不能一个字都看不见。
+            lb.setMinimumWidth(TEXT_MIN_VISIBLE_W)
+            if not lb.toolTip():
+                lb.setToolTip(lb.text())
         except Exception:  # noqa: BLE001
             pass
 
@@ -782,6 +789,11 @@ CHIP_H = 20   # 徽章 / 状态胶囊统一高度（圆角 = 高度一半，见 
 # 项目名用 min110/max220 猜——两页之间的右列宽度不一致，标题起点参差不齐。
 BADGE_COL_W = 76     # agent 徽章列
 PROJECT_COL_W = 120  # 项目名列（右对齐 + 省略）
+AGENT_CARD_W = 240   # Agent 中心「agent 卡片」列宽（定宽，防文字被压到 0 宽）
+# 文本可见宽度下限：guard_overflow/flex_label 的 Ignored 策略会让 sizeHint 失效，
+# 父布局可能把标签分配成 0 宽（文字整行消失）。此下限保证至少露出开头若干字，
+# 全文保留在 tooltip。（96px ≈ 12px 字号下 8 个汉字）
+TEXT_MIN_VISIBLE_W = 96
 
 
 def chip_qss(bg: str, fg: str = "", height: int = CHIP_H, border: str = "") -> str:

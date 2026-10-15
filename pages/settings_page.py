@@ -36,10 +36,33 @@ class SettingsPage(QWidget):
             self._themeBtns[_m] = _b
         themeRow.addStretch(1)
         g0.addLayout(themeRow)
+
+        # 密实度（P4：长会话工具偏紧凑，但也给舒适档——行高与间距缩放联动）
+        densRow = QHBoxLayout()
+        densRow.setSpacing(tokens.SPACE_S)
+        densRow.addWidget(CaptionLabel("密实度"))
+        self._densBtns = {}
+        for _k, _cn in (("compact", "紧凑 32px"), ("basic", "标准 36px"),
+                        ("comfortable", "舒适 44px")):
+            _b = PushButton(_cn)
+            _b.clicked.connect(lambda _, kk=_k: self._on_density_pick(kk))
+            densRow.addWidget(_b)
+            self._densBtns[_k] = _b
+        densRow.addStretch(1)
+        g0.addLayout(densRow)
+
+        # 动效开关（关掉后 hover 等反馈瞬时切换，适合低性能设备/无障碍场景）
+        self.motionBox = CheckBox("界面动效（hover 淡入 200ms）")
+        self.motionBox.setChecked(tokens.motion_ms() > 0)
+        self.motionBox.stateChanged.connect(self._on_motion_toggle)
+        g0.addWidget(self.motionBox)
+
         g0.addWidget(CaptionLabel("深色为默认（色值经 WCAG 对比度验算，全部达标）；"
-                                  "「跟随系统」会随 Windows 深浅色切换自动响应。"))
+                                  "「跟随系统」会随 Windows 深浅色切换自动响应。密实度控制列表行高"
+                                  "与间距缩放，切换后立即重排。"))
         lay.addWidget(c0)
         self._sync_theme_btns()
+        self._sync_density_btns()
 
         # 导航显示定制（3E+，Cherry Studio 式）：不重排不删除，用户自行收敛侧边栏
         cN = CardWidget()
@@ -131,6 +154,28 @@ class SettingsPage(QWidget):
         InfoBar.success("导航设置已保存",
                         "重启 AgentHub 后生效；隐藏的页面仍可用 Ctrl+K 命令面板打开",
                         duration=3500, parent=self.win)
+
+    def _sync_density_btns(self):
+        """密实度三键同步：当前档禁用（表达"已选中"）。"""
+        cur = tokens.load_density_choice()
+        for _k, _b in self._densBtns.items():
+            _b.setEnabled(_k != cur)
+            _b.setToolTip("当前密实度" if _k == cur else f"切换到{_b.text()}")
+
+    def _on_density_pick(self, mode: str):
+        """切换密实度：落配置 → 生效 → 重刷（行高与间距缩放按新档重排）。"""
+        tokens.save_density_choice(mode)
+        tokens.set_density(mode)
+        self._sync_density_btns()
+        self.win.refresh()
+        InfoBar.success("密实度已切换", f"列表行高 {tokens.row_height()}px",
+                        duration=2500, parent=self.win)
+
+    def _on_motion_toggle(self, _state=None):
+        """动效开关（0 = 瞬时切换，无障碍/低性能）。"""
+        cfg = core.load_config()
+        cfg["ui_motion"] = "on" if self.motionBox.isChecked() else "off"
+        core.save_config(cfg)
 
     def _sync_theme_btns(self):
         """外观三键同步：当前主题键禁用（表达"已选中"），其余可点。"""

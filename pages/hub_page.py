@@ -36,8 +36,9 @@ class HubPage(QWidget):
         _hubDesc.setWordWrap(True)
         lay.addWidget(_hubDesc)
 
-        self.cardsRow = QHBoxLayout()
-        self.cardsRow.setSpacing(24)  # agent 列间距：去框后靠间距分列
+        # FlowLayout（P2/P4）：窄窗自动换行——固定列宽 + QHBoxLayout 在 920px 窗口下
+        # 会把 6 个 agent 列挤出可视区（布局压测实测"横向溢出"）。
+        self.cardsRow = FlowLayout()
         lay.addLayout(self.cardsRow)
 
         viewRow = QHBoxLayout()
@@ -222,22 +223,31 @@ class HubPage(QWidget):
                 item.widget().deleteLater()
         for a in self.agents:
             # agent 列不包卡：纯展示读数，列间距分隔（卡只留给可点区域）
+            #
+            # ⚠ 2026-10-15 修复：这里原先用 flex_label（水平 Ignored）→ 列宽被布局
+            # 分配成 0，整张卡的文字（名称/目录/技能数）**全部不可见**。
+            # flex_label 的语义是"按可用空间压缩"，但它同时会让 sizeHint 失效，
+            # 在"父布局按 sizeHint 分配"的场景（本列）就会塌成 0 宽。
+            # 正确做法：列宽由卡片固定（CARD_W），长文本走 ElidedLabel 省略。
             col = QVBoxLayout()
             col.setContentsMargins(0, 0, 0, 0)
-            col.setSpacing(4)
-            col.addWidget(flex_label(StrongBodyLabel(a.name)))
-            col.addWidget(flex_label(CaptionLabel((a.home or "未检测到（可手动添加目录）")[:60])))
-            col.addWidget(flex_label(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
-                                                  f"记忆 {len(a.memories)} · 配置 {len(a.configs)}")))
+            col.setSpacing(tokens.SPACE_XS)
+            col.addWidget(StrongBodyLabel(a.name))
+            home = ElidedLabel((a.home or "未检测到（可手动添加目录）")[:60])
+            home.setToolTip(a.home or "未检测到（可手动添加目录）")
+            home.setMaximumWidth(AGENT_CARD_W - tokens.SPACE_M)
+            col.addWidget(home)
+            col.addWidget(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
+                                       f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
             reg = getattr(self, "_reg", {}).get(a.name.lower())
             if reg:
-                col.addWidget(flex_label(CaptionLabel(
+                col.addWidget(CaptionLabel(
                     f"{'● 在线' if reg['online'] else '○ 离线'} · 记录 {reg['records']} 条 · "
-                    f"最近活跃 {reg['last_seen'] or '—'}")))
+                    f"最近活跃 {reg['last_seen'] or '—'}"))
             wrap = QWidget()
             wrap.setLayout(col)
+            wrap.setFixedWidth(AGENT_CARD_W)   # 卡片定宽：文字不再被压没
             self.cardsRow.addWidget(wrap)
-        self.cardsRow.addStretch(1)
 
     def fill_skills(self):
         kw = self.skillFilter.text().strip().lower()
