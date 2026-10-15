@@ -40,7 +40,8 @@ class ComponentsPage(QWidget):
         lay.setSpacing(12)
 
         lay.addWidget(StrongBodyLabel("文本层级（Title / Subtitle / Strong / Body / Caption）"))
-        lay.addWidget(TitleLabel("标题 Title 24"))
+        lay.addWidget(PageTitleLabel("页面标题 PageTitle 24（本项目页头）"))
+        lay.addWidget(TitleLabel("qfw 原生 Title 28（不直接用作页头，仅作对照）"))
         lay.addWidget(SubtitleLabel("副标题 Subtitle 20"))
         lay.addWidget(StrongBodyLabel("强调正文 StrongBody 14"))
         lay.addWidget(BodyLabel("正文 Body 14——常规信息承载层级"))

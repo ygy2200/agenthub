@@ -18,7 +18,7 @@ class HubPage(QWidget):
         set_page_margins(lay)
 
         top = QHBoxLayout()
-        top.addWidget(TitleLabel("Agent 中心"))
+        top.addWidget(PageTitleLabel("Agent 中心"))
         top.addStretch(1)
         addBtn = PushButton(ic("ADD", "INFO"), "添加 agent 目录")
         addBtn.clicked.connect(self.add_agent)

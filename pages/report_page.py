@@ -13,15 +13,16 @@ class ReportPage(QWidget):
         self.win = win
         lay = QVBoxLayout(self)
         set_page_margins(lay)
-        lay.addWidget(TitleLabel("运营报告"))
+        lay.addWidget(PageTitleLabel("运营报告"))
         lay.addWidget(CaptionLabel("大脑运营全景：你在做什么 / 摩擦点与修复 / 值得一试的能力——"
                                    "单文件 HTML 零 LLM 拼装，同一天重复生成会覆盖"))
 
         genCard = CardWidget()
         g = QHBoxLayout(genCard)
-        g.setContentsMargins(20, 16, 20, 16)
+        g.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
         gt = QVBoxLayout()
-        gt.addWidget(StrongBodyLabel("生成今日报告"))
+        gt.addWidget(section_head("生成今日报告", "DOCUMENT"))
         gt.addWidget(BodyLabel("从大脑数据库实时统计，浏览器打开；历史报告保留在同目录可回看。"))
         g.addLayout(gt, 1)
         self.genBtn = PrimaryPushButton(ic("SYNC"), "生成并打开")
@@ -31,8 +32,9 @@ class ReportPage(QWidget):
 
         histCard = CardWidget()
         hv = QVBoxLayout(histCard)
-        hv.setContentsMargins(20, 16, 20, 16)
-        hv.addWidget(StrongBodyLabel("历史报告（双击打开）"))
+        hv.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        hv.addWidget(section_head("历史报告（双击打开）", "LIBRARY"))
         self.histList = ListWidget()
         self.histList.itemDoubleClicked.connect(
             lambda it: os.startfile(it.data(Qt.UserRole)))  # noqa: S606

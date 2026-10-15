@@ -31,7 +31,7 @@ class NotesPage(QWidget):
         set_page_margins(lay)
 
         head = QHBoxLayout()
-        head.addWidget(TitleLabel("随记"))
+        head.addWidget(PageTitleLabel("随记"))
         head.addStretch(1)
         self.statLabel = CaptionLabel("")
         head.addWidget(self.statLabel)
@@ -87,7 +87,7 @@ class NotesPage(QWidget):
 
         # 不期而遇：每日随机回顾（当日固定，收藏优先）
         lay.addSpacing(16)
-        self.recallHead = StrongBodyLabel("不期而遇——今天随机想起的过去")
+        self.recallHead = section_head("不期而遇——今天随机想起的过去", "TAG")
         self.recallHead.setVisible(False)
         lay.addWidget(self.recallHead)
         self.recallBox = QVBoxLayout()
@@ -96,7 +96,7 @@ class NotesPage(QWidget):
         lay.addLayout(self.recallBox)
 
         # 时光回放：往年今天
-        self.otdHead = StrongBodyLabel("时光回放——往年今天")
+        self.otdHead = section_head("时光回放——往年今天", "CALENDAR")
         self.otdHead.setVisible(False)
         lay.addWidget(self.otdHead)
         self.otdBox = QVBoxLayout()
@@ -105,7 +105,7 @@ class NotesPage(QWidget):
         lay.addLayout(self.otdBox)
 
         # 胶囊到期
-        self.capsuleHead = StrongBodyLabel("胶囊到期——封存的想法到货了")
+        self.capsuleHead = section_head("胶囊到期——封存的想法到货了", "MESSAGE")
         self.capsuleHead.setVisible(False)
         lay.addWidget(self.capsuleHead)
         self.capsuleBox = QVBoxLayout()
@@ -117,7 +117,7 @@ class NotesPage(QWidget):
         self.pick_mode = False
         self.picked = set()
         headRow = QHBoxLayout()
-        self.tlHead = StrongBodyLabel("全部随记")
+        self.tlHead = section_head("全部随记", "EDIT")
         headRow.addWidget(self.tlHead)
         headRow.addStretch(1)
         self.pickToggle = ClickBodyLabel("整理")
@@ -397,7 +397,8 @@ class NotesPage(QWidget):
         # 主题串过滤：同一标签的随记按时间串成思想演化线
         tf = self._tag_filter
         shown = [n for n in notes if not tf or tf in (n.get("tags") or "").split()]
-        self.tlHead.setText(f"主题串 #{tf}——这条线的思想演化（{len(shown)} 条，再点标签退出）"
+        self.tlHead.title_label.setText(
+            f"主题串 #{tf}——这条线的思想演化（{len(shown)} 条，再点标签退出）"
                             if tf else "全部随记")
         # 不期而遇
         clear_layout(self.recallBox)

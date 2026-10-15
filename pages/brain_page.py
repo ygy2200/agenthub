@@ -23,14 +23,21 @@ class BrainPage(QWidget):
         set_page_margins(lay)
         lay.addWidget(_page_head("大脑", "公用记忆的运转状态——唤起排行 / 使用分布 / 任务看板 / 待办线索 / 事件流 / 置顶记忆"))
         # 健康读数：纯展示不包卡（卡片语义留给可点区域），大数字+小标题直接排版
-        row = QHBoxLayout()
+        row = FlowLayout()   # 窄窗换行（原 QHBoxLayout 只会等比压扁）
         self.valMem, self.valCrys, self.valPush, self.valTodo = (TitleLabel("0") for _ in range(4))
+        # 数字走 metric（32px 定宽）——原为 TitleLabel 28，与页面标题同字号、层级不分
+        for _v in (self.valMem, self.valCrys, self.valPush, self.valTodo):
+            tokens.typeset(_v, "metric")
         for val, t in ((self.valMem, "记忆总数"), (self.valCrys, "结晶率（记忆/记录）"),
                        (self.valPush, "记忆推送累计"), (self.valTodo, "待办线索")):
             col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(tokens.SPACE_XS)
             col.addWidget(val)
             col.addWidget(CaptionLabel(t))
-            row.addLayout(col)
+            box = QWidget()
+            box.setLayout(col)
+            row.addWidget(box)
         lay.addLayout(row)
 
         # 随记已独立成页（NotesPage——人的模块容器），大脑页回归 agent 数据

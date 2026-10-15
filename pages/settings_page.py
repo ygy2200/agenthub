@@ -25,8 +25,9 @@ class SettingsPage(QWidget):
 
         c0 = CardWidget()
         g0 = QVBoxLayout(c0)
-        g0.setContentsMargins(20, 16, 20, 16)
-        g0.addWidget(StrongBodyLabel("外观"))
+        g0.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        g0.addWidget(section_head("外观", "PALETTE"))
         themeRow = QHBoxLayout()
         self._themeBtns = {}
         for _m in tokens.THEME_MODES:
@@ -67,8 +68,9 @@ class SettingsPage(QWidget):
         # 导航显示定制（3E+，Cherry Studio 式）：不重排不删除，用户自行收敛侧边栏
         cN = CardWidget()
         gN = QVBoxLayout(cN)
-        gN.setContentsMargins(20, 16, 20, 16)
-        gN.addWidget(StrongBodyLabel("导航显示"))
+        gN.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        gN.addWidget(section_head("导航显示", "MENU"))
         gN.addWidget(CaptionLabel(
             "取消勾选的页面从侧边栏收起（总览/设置固定显示）；隐藏的页面仍可用 Ctrl+K 命令面板或 Ctrl+数字 打开；重启后生效。"))
         self._navChecks = {}
@@ -85,8 +87,9 @@ class SettingsPage(QWidget):
 
         c1 = CardWidget()
         g1 = QVBoxLayout(c1)
-        g1.setContentsMargins(20, 16, 20, 16)
-        g1.addWidget(StrongBodyLabel("根目录"))
+        g1.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        g1.addWidget(section_head("根目录", "FOLDER"))
         row = QHBoxLayout()
         self.rootLabel = BodyLabel("未设置")
         pickBtn = PushButton(ic("FOLDER_ADD", "INFO"), "选择…")
@@ -101,8 +104,9 @@ class SettingsPage(QWidget):
 
         c1b = CardWidget()
         g1b = QVBoxLayout(c1b)
-        g1b.setContentsMargins(20, 16, 20, 16)
-        g1b.addWidget(StrongBodyLabel("大脑数据库（_hub\\brain.db —— 记忆/记录/流水的唯一真理）"))
+        g1b.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        g1b.addWidget(section_head("大脑数据库（_hub\\brain.db —— 记忆/记录/流水的唯一真理）", "SAVE"))
         dbRow = QHBoxLayout()
         self.backupBtn = PrimaryPushButton(ic("SAVE", "INFO"), "立即备份大脑")
         self.backupBtn.clicked.connect(self.backup_now)
@@ -116,8 +120,9 @@ class SettingsPage(QWidget):
 
         c1c = CardWidget()
         g1c = QVBoxLayout(c1c)
-        g1c.setContentsMargins(20, 16, 20, 16)
-        g1c.addWidget(StrongBodyLabel("窗口大小（点一下立即生效，边缘拖拽外的一键兜底）"))
+        g1c.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        g1c.addWidget(section_head("窗口大小（点一下立即生效，边缘拖拽外的一键兜底）", "ZOOM"))
         sizeRow = QHBoxLayout()
         for label, wd, ht in (("紧凑 1180×760", 1180, 760), ("标准 1400×900", 1400, 900),
                               ("宽敞 1616×950", 1616, 950)):
@@ -131,8 +136,9 @@ class SettingsPage(QWidget):
 
         c2 = CardWidget()
         g2 = QVBoxLayout(c2)
-        g2.setContentsMargins(20, 16, 20, 16)
-        g2.addWidget(StrongBodyLabel("规则（存 _hub\\rules.md，将来 agent 接入后由工具注入）"))
+        g2.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        g2.addWidget(section_head("规则（存 _hub\\rules.md，将来 agent 接入后由工具注入）", "DOCUMENT"))
         self.rulesEdit = TextEdit()
         self.rulesEdit.setMinimumHeight(220)
         g2.addWidget(self.rulesEdit)

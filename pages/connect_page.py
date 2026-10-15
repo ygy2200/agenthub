@@ -13,7 +13,7 @@ class ConnectPage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         top = QHBoxLayout()
-        top.addWidget(TitleLabel("接入中心 · 公用大脑"))
+        top.addWidget(PageTitleLabel("接入中心 · 公用大脑"))   # 页头统一 24（P2：与数字拉开层级）
         top.addStretch(1)
         refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新状态")
         refreshBtn.clicked.connect(self.refresh_status)
@@ -39,7 +39,7 @@ class ConnectPage(QWidget):
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         # stretch=2 给卡片区，让它拿走富余高度；下方手动接入区固定不参与拉伸
         lay.addWidget(self.scroll, 2)
-        lay.addWidget(StrongBodyLabel("手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）"))
+        lay.addWidget(section_head("手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）", "ADD"))
         self.snippet = TextBrowser()
         self.snippet.setMinimumHeight(110)
         self.snippet.setMaximumHeight(180)

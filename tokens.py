@@ -161,7 +161,14 @@ def _pick(spec, mode: str = ""):
 def resolve(name: str, mode: str = "") -> str:
     """语义 token → 色值（根部统一解析）。
     name 可为语义名（bg_surface/text_primary…）或旧常量名（BG_L0…）；未知返回 ""。
-    mode 传入 "light"/"dark" 时取指定主题（截图/测试用），缺省跟随当前主题。"""
+    mode 传入 "light"/"dark" 时取指定主题（截图/测试用），缺省跟随当前主题。
+
+    2026-10-15 复盘补充：调用方很自然会写 `resolve(tokens.ACCENT)`（传常量本身而非
+    名字字符串），原先会撞进 `SEMANTIC.get(dict)` 抛 `TypeError: unhashable type: 'dict'`
+    ——**入参问题伪装成内部错误**，栈指向库内部、看不出是自己传错了。现在交给 C() 兜底。
+    """
+    if not isinstance(name, str):
+        return C(name)   # 传的是 {"light","dark"} 色值 dict / 其它对象：按 C() 语义解析
     spec = SEMANTIC.get(name)
     if spec is None:
         spec = globals().get(name)

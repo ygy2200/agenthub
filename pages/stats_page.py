@@ -22,16 +22,22 @@ class StatsPage(QWidget):
         set_page_margins(lay)
         lay.addWidget(_page_head("统计", "数据全貌与大脑体检——项目 / 记录 / 对账 / 停滞 / 检索"))
         # 健康读数：纯展示不包卡，大数字+小标题直接排版
-        row = QHBoxLayout()
+        row = FlowLayout()   # 窄窗 5→3→2 换行（原 QHBoxLayout 等比压扁）
         self.valProj, self.valRec, self.valIssue, self.valStalled, self.valSearch = \
             (TitleLabel("0") for _ in range(5))
+        for _v in (self.valProj, self.valRec, self.valIssue, self.valStalled, self.valSearch):
+            tokens.typeset(_v, "metric")   # 数字统一 32px 定宽（与总览数字卡同档）
         for val, t in ((self.valProj, "项目总数"), (self.valRec, "工作记录条数"),
                        (self.valIssue, "对账问题数"), (self.valStalled, "停滞项目（90天）"),
                        (self.valSearch, "检索（今日/累计）")):
             col = QVBoxLayout()
+            col.setContentsMargins(0, 0, 0, 0)
+            col.setSpacing(tokens.SPACE_XS)
             col.addWidget(val)
             col.addWidget(CaptionLabel(t))
-            row.addLayout(col)
+            box = QWidget()
+            box.setLayout(col)
+            row.addWidget(box)
         lay.addLayout(row)
 
         self.agentBox = QVBoxLayout()

@@ -56,7 +56,8 @@ class ProjectPage(QWidget):
         file_col.addWidget(self.fileList, 1)
         self.fileList.itemDoubleClicked.connect(self.open_file_loc)
 
-        self.nameLabel = TitleLabel("—")
+        self.nameLabel = PageTitleLabel("—")   # 主实体名与页头同级 24
+        # （原 TitleLabel 28 —— 比 24 的页头还大，层级倒挂）
         self.nameLabel.setWordWrap(True)  # 长项目名换行（防右下详情列被标题撑宽，2026-10-10 溢出体检）
         right.addWidget(self.nameLabel)
         right.addLayout(head)

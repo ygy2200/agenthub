@@ -771,6 +771,7 @@ def section_head(text: str, icon_name: str = "") -> QWidget:
     lb = StrongBodyLabel(text, box)
     tokens.typeset(lb, "body_strong")    # 16px（TYPE 表派生）
     lay.addWidget(lb, 1)
+    box.title_label = lb   # 暴露给需要动态改标题的调用方（如随记页主题串）
     return box
 
 
