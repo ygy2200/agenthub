@@ -11,7 +11,7 @@ class SearchPage(QWidget):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head("搜索", "全脑检索 + 全盘文件——回车执行，双击打开"))
         top = QHBoxLayout()
         self.edit = SearchLineEdit()

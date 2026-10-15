@@ -15,7 +15,7 @@ class HubPage(QWidget):
         self.win = win
         self.agents: list = []
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
 
         top = QHBoxLayout()
         top.addWidget(TitleLabel("Agent 中心"))

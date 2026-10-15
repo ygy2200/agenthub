@@ -26,7 +26,7 @@ class PlaybookPage(QWidget):
         self.cur_flow = ""
         self.cur_run = 0     # 执行历史里展开分步的那一条
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head(
             "编排中心",
             "把每次都要手工重走的流程固化成**可执行**的 playbook（Y1）+ 事件自动触发（Y2）+ "

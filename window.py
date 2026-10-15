@@ -104,6 +104,9 @@ class AgentHubWindow(FluentWindow):
         # 信号挂 themeChangedFinished——设置页切换/系统联动/启动，任何主题变化自动更新
         qconfig.themeChangedFinished.connect(self._apply_page_bgs)
         self._apply_page_bgs()
+        # token 绑定样式（徽章/胶囊/层级卡片）：凡是创建时"现算色值"的 QSS 都不会
+        # 自己跟着主题变——换肤后会出现"徽章还是旧主题色"的错配。统一登记、统一重刷。
+        qconfig.themeChangedFinished.connect(refresh_token_styles)
         # 边缘拖拽：qframelesswindow 原生链命中带默认 5 物理像素（高分屏拖不到），加宽兜底；
         # 另加 Qt QSizeGrip 角落手柄（startSystemResize，不依赖原生 hit-test）
         self.setResizeEnabled(True)

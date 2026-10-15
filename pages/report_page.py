@@ -12,7 +12,7 @@ class ReportPage(QWidget):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(TitleLabel("运营报告"))
         lay.addWidget(CaptionLabel("大脑运营全景：你在做什么 / 摩擦点与修复 / 值得一试的能力——"
                                    "单文件 HTML 零 LLM 拼装，同一天重复生成会覆盖"))

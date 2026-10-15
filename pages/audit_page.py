@@ -9,7 +9,7 @@ class AuditPage(QWidget):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         top = QHBoxLayout()
         top.addWidget(SubtitleLabel("对账中心"))
         top.addStretch(1)

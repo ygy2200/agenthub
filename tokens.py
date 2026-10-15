@@ -214,7 +214,7 @@ def typeset(widget, role: str) -> None:
     from PySide6.QtGui import QFont
     f = widget.font()
     f.setPixelSize(size)
-    f.setWeight(_WEIGHT.get(weight, 400))
+    f.setWeight(QFont.Weight(_WEIGHT.get(weight, 400)))  # PySide6 要 Weight 枚举，不能传裸 int
     f.setFixedPitch(role == "metric")   # 定宽数字：读数不抖
     widget.setFont(f)
 

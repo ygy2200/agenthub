@@ -23,7 +23,7 @@ class SignalPage(QWidget):
         self._inbox_items: dict = {}   # id(item) -> signal row（收件箱）
         self._sent_items: dict = {}
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head(
             "信号中心", "agent 间的消息（M3）：发给指定 agent 或广播——对方下次开工即在心跳里"
                         "收到未读提醒；已读有回执。桌面端可直接发、可查收、可标已读"))

@@ -53,7 +53,7 @@ class HelpPage(QWidget):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head("帮助", "使用说明与快捷键一览"))
         browser = TextBrowser()
         browser.setHtml(self.CONTENT)

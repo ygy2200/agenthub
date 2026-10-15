@@ -11,16 +11,18 @@ import json
 import os
 import re
 import sys
+import weakref
 from datetime import date, datetime
 from pathlib import Path
 
-from PySide6.QtCore import Qt, QThread, Signal, QTimer, QEvent, QSize, QAbstractNativeEventFilter
+from PySide6.QtCore import (Qt, QThread, Signal, QTimer, QEvent, QSize, QPoint, QRect,
+                            QAbstractNativeEventFilter)
 from PySide6.QtGui import (QShortcut, QKeySequence, QFont, QCursor, QColor, QTextCharFormat,
                           QTextCursor, QIcon, QGuiApplication)
 from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMenu, QSizePolicy,
                                QVBoxLayout, QWidget, QHeaderView, QAbstractItemView,
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
-                               QDialog, QCheckBox, QCompleter)
+                               QDialog, QCheckBox, QCompleter, QLayout, QSizePolicy)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox,
                             FluentIcon as FIF,
                             FluentWindow, IconWidget, InfoBar, LineEdit, ListWidget, MessageBox,
@@ -62,6 +64,22 @@ def apply_page_background(page) -> None:
         pass
 
 
+class PageTitleLabel(TitleLabel):
+    """页面标题：24px（P2 / 2026-10-15）。
+
+    原直接用 TitleLabel(28px)，与数字卡数值**同字号**——全站最该跳出来的数字
+    （项目数/记录数/待处理）和页名一样大，层级互相抵消。现在页面标题降到 24，
+    数字独立成 32px（见 NumberCard）。继承 TitleLabel 是为了继续吃 qfw 的主题色
+    与换肤机制（自绘 QLabel 会失去这套联动）。
+    """
+
+    def getFont(self):
+        from PySide6.QtGui import QFont
+        from qfluentwidgets.common.font import getFont
+        size, weight, _lh = tokens.TYPE["title"]
+        return getFont(size, QFont.Weight(tokens._WEIGHT[weight]))
+
+
 def _page_head(title: str, desc: str = "") -> QWidget:
     """统一页头（批次 3B 每页定位）：Title + 一句话说明。
 
@@ -71,8 +89,8 @@ def _page_head(title: str, desc: str = "") -> QWidget:
     box = QWidget()
     lay = QVBoxLayout(box)
     lay.setContentsMargins(0, 0, 0, 0)
-    lay.setSpacing(2)
-    lay.addWidget(TitleLabel(title))
+    lay.setSpacing(tokens.SPACE_XS)
+    lay.addWidget(PageTitleLabel(title))
     if desc:
         d = CaptionLabel(desc)
         d.setWordWrap(True)
@@ -90,8 +108,8 @@ def empty_state(icon_name: str, title: str, desc: str = "",
     """
     box = QWidget()
     lay = QVBoxLayout(box)
-    lay.setContentsMargins(0, 20, 0, 12)
-    lay.setSpacing(4)
+    lay.setContentsMargins(0, tokens.SPACE_XL, 0, tokens.SPACE_M)
+    lay.setSpacing(tokens.SPACE_XS)
     try:
         iw = IconWidget(ic(icon_name), box)
         iw.setFixedSize(26, 26)
@@ -431,10 +449,10 @@ class RecordDetailDialog(MessageBoxBase):
         rt = (r.get("record_type") or "").strip()
         if rt in brain.RECORD_TYPE_CN:  # P1-2 类型收口的可观测面
             lb = QLabel(f"类型 {brain.RECORD_TYPE_CN[rt]}")
-            lb.setStyleSheet(
-                f"color:{tokens.C(tokens.ACCENT)};border:1px solid {tokens.C(tokens.STROKE)};"
-                "border-radius:8px;padding:1px 8px;font-size:11px;")
-            lb.setFixedHeight(20)
+            lb.setStyleSheet(chip_qss(
+                "transparent", fg=tokens.C(tokens.ACCENT),
+                border=f"1px solid {tokens.C(tokens.STROKE_CARD)}"))
+            lb.setFixedHeight(CHIP_H)
             meta.addWidget(lb)
         meta.addWidget(CaptionLabel(f"{r.get('date') or '日期未标注'} · {r.get('project', '')} · 记录#{r.get('id', '?')}"))
         meta.addStretch(1)
@@ -509,13 +527,167 @@ def _display_title(r: dict) -> str:
 KIND_BADGE_COLOR = tokens.KIND_BADGE
 
 
+class FlowLayout(QLayout):
+    """流式布局：按可用宽度自动换行（窄窗 4 列 → 2 列 → 1 列）。
+
+    为什么需要：数字卡原来是 QHBoxLayout，窄窗下只能**等比压缩**（卡片被挤到
+    200px 以下就不可读了），不会换行。Qt Widgets 没有内置 FlowLayout，
+    这里按 Qt 官方示例（flowlayout）的思路精简实现（仅横向流式 + 固定行高）。
+    """
+
+    def __init__(self, parent=None, hspace: int = None, vspace: int = None):
+        super().__init__(parent)
+        self._items: list = []
+        self._h = tokens.GAP_CARD if hspace is None else hspace
+        self._v = tokens.GAP_CARD if vspace is None else vspace
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._flow(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._flow(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        m = self.contentsMargins()
+        return size + QSize(m.left() + m.right(), m.top() + m.bottom())
+
+    def _flow(self, rect, test_only: bool) -> int:
+        x, y = rect.x(), rect.y()
+        row_h = 0
+        for it in self._items:
+            w = it.widget()
+            if w is None or not w.isVisible():
+                continue
+            sz = it.sizeHint()
+            if x + sz.width() > rect.right() and row_h > 0:
+                x, y = rect.x(), y + row_h + self._v
+                row_h = 0
+            if not test_only:
+                it.setGeometry(QRect(QPoint(x, y), sz))
+            x += sz.width() + self._h
+            row_h = max(row_h, sz.height())
+        return y + row_h - rect.y()
+
+
+def set_page_margins(lay, bottom: int = None) -> None:
+    """页面外边距（唯一入口，值来自 tokens.PAD_PAGE）。
+
+    P1：此前 17 处手写 `(24, 24, 24, 24)`，值与 tokens.PAD_PAGE 只是**巧合相同**
+    ——改 tokens 不会带动页面，页面改也不会被发现不一致。
+    """
+    b = tokens.PAD_PAGE if bottom is None else bottom
+    lay.setContentsMargins(tokens.PAD_PAGE, tokens.PAD_PAGE, tokens.PAD_PAGE, b)
+
+
+CHIP_H = 20   # 徽章 / 状态胶囊统一高度（圆角 = 高度一半，见 chip_qss）
+
+
+def chip_qss(bg: str, fg: str = "", height: int = CHIP_H, border: str = "") -> str:
+    """徽章/状态签的统一 QSS（P1 圆角收敛：胶囊圆角 = 高度一半）。
+
+    此前三种徽章各自手写 `border-radius:8px`（高 20px → 是方角胶囊不是真胶囊），
+    状态胶囊又写成 9px——同族元素四种圆角。现在全部走这里：圆角由高度推导，
+    不可能再写出"高 20 配 r=8"这种不一致。
+    """
+    fg = fg or tokens.WHITE
+    r = tokens.pill_radius(height)
+    b = f"border:{border};" if border else ""
+    return (f"color:{fg};background:{bg};{b}"
+            f"border-radius:{r}px;padding:1px {tokens.SPACE_S}px;font-size:11px;")
+
+
+# ---------------------------------------------------------------- token 绑定样式
+# 为什么需要：凡是用 tokens.C() 现算色值写进 QSS 的控件（徽章/胶囊/层级卡片），
+# 色值是**创建那一刻**算的——切换深浅主题后不会自己变，要等下一次页面重绘才对。
+# 这是"换肤后徽章还是旧主题色"的静默错配。这里登记"重算函数"，主题变化时统一重刷。
+_STYLE_BOUND: list = []
+
+
+def bind_style(widget, apply_fn) -> None:
+    """登记"按 token 重算样式"的函数（弱引用，控件销毁后自动剔除）。"""
+    try:
+        _STYLE_BOUND.append((weakref.ref(widget), apply_fn))
+    except TypeError:  # 极少数 Qt 对象不可弱引用：退化为不登记（不影响功能）
+        pass
+
+
+def refresh_token_styles() -> None:
+    """主题/token 变化后重刷所有登记过的样式（window 挂在 themeChangedFinished 上）。"""
+    alive = []
+    for ref, fn in list(_STYLE_BOUND):
+        w = ref()
+        if w is None:
+            continue
+        try:
+            fn(w)
+        except Exception:  # noqa: BLE001 单个控件刷新失败不影响其余
+            continue
+        alive.append((ref, fn))
+    _STYLE_BOUND[:] = alive
+
+
+def _chip(maker) -> QLabel:
+    """按 maker() 生成 QSS 并登记主题重刷。"""
+    lb = QLabel()
+
+    def _apply(w=None):
+        (w or lb).setStyleSheet(maker())
+    _apply()
+    lb.setFixedHeight(CHIP_H)
+    bind_style(lb, _apply)
+    return lb
+
+
+def elevate(widget, level: str = "e1"):
+    """层级：e0 页面底（无描边）/ e1 卡片（1px 描边）/ e2 浮层（描边 + 阴影）。
+
+    只用"底色差 + 1px 描边"，不用投影——Fluent 2 在 Windows 上以描边代替 key shadow，
+    且投影在深色底上会消失。登记进 token 样式表，换肤时自动重刷。
+    """
+    def _apply(w=None):
+        tgt = w or widget
+        tgt.setAttribute(Qt.WA_StyledBackground, True)
+        if level == "e0":
+            tgt.setStyleSheet(f"{type(tgt).__name__}{{background:transparent;border:none;}}")
+        else:
+            tgt.setStyleSheet(
+                f"{type(tgt).__name__}{{background:{tokens.C('bg_surface')};"
+                f"border:1px solid {tokens.C(tokens.STROKE_CARD)};"
+                f"border-radius:{tokens.RADIUS_CARD}px;}}")
+    _apply()
+    bind_style(widget, _apply)
+    return widget
+
+
 def kind_badge(kind: str) -> QLabel:
     """记忆类型徽章：唤起排行/置顶记忆的正文行用小字灰文本看不清，类型先入彩色徽章分层。"""
-    lb = QLabel(brain.KIND_CN.get(kind, kind))
-    lb.setStyleSheet(
-        f"color:white;background:{KIND_BADGE_COLOR.get(kind, tokens.BADGE_FALLBACK)};"
-        "border-radius:8px;padding:1px 8px;font-size:11px;")
-    lb.setFixedHeight(20)
+    lb = _chip(lambda: chip_qss(KIND_BADGE_COLOR.get(kind, tokens.BADGE_FALLBACK)))
+    lb.setText(brain.KIND_CN.get(kind, kind))
     return lb
 
 
@@ -536,11 +708,8 @@ def badge(agent: str, raw: str) -> QLabel:
         text = raw or "未知来源"  # 确实无归属：诚实标未知，不伪造名字
     else:
         text = AGENT_CN.get(a) or raw or a
-    lb = QLabel(text)
-    lb.setStyleSheet(
-        f"color:white;background:{AGENT_BADGE_COLOR.get(a, tokens.BADGE_FALLBACK)};"
-        "border-radius:8px;padding:1px 8px;font-size:11px;")
-    lb.setFixedHeight(20)
+    lb = _chip(lambda: chip_qss(AGENT_BADGE_COLOR.get(a, tokens.BADGE_FALLBACK)))
+    lb.setText(text)
     return lb
 
 
@@ -548,24 +717,19 @@ MOOD_COLOR = tokens.MOOD_BADGE  # 心情徽章配色（Daily_You 式元信息呈
 
 
 def mood_badge(mood: str) -> QLabel:
-    lb = QLabel(mood)
-    lb.setStyleSheet(
-        f"color:white;background:{MOOD_COLOR.get(mood, tokens.BADGE_FALLBACK)};"
-        "border-radius:8px;padding:1px 8px;font-size:11px;")
-    lb.setFixedHeight(20)
+    lb = _chip(lambda: chip_qss(MOOD_COLOR.get(mood, tokens.BADGE_FALLBACK)))
+    lb.setText(mood)
     return lb
 
 
 def status_chip(text: str, color_key: str = "text_secondary") -> QLabel:
     """状态胶囊（P2-3c 组件预览 / P3-2 待办状态视图共用）：
     淡底 + 描边 + 语义色文字的小圆角签，随主题自适应。color_key 取 tokens 语义名。"""
-    col = tokens.resolve(color_key) or tokens.C(tokens.TEXT_2)
-    lb = QLabel(text)
-    lb.setStyleSheet(
-        f"color:{col};background:{tokens.C('bg_inset')};"
-        f"border:1px solid {tokens.C('stroke_default')};border-radius:9px;"
-        "padding:1px 8px;font-size:11px;")
-    lb.setFixedHeight(20)
+    lb = _chip(lambda: chip_qss(
+        tokens.C("bg_inset"),
+        fg=tokens.resolve(color_key) or tokens.C(tokens.TEXT_2),
+        border=f"1px solid {tokens.C(tokens.STROKE_CARD)}"))
+    lb.setText(text)
     return lb
 
 
@@ -644,7 +808,7 @@ class MoodPicker(QWidget):
         super().__init__(parent)
         h = QHBoxLayout(self)
         h.setContentsMargins(0, 0, 0, 0)
-        h.setSpacing(6)
+        h.setSpacing(tokens.SPACE_S)
         self._buttons = {}
         for m in [x for x in brain._NOTE_MOODS if x]:
             b = QPushButton(m)
@@ -660,10 +824,10 @@ class MoodPicker(QWidget):
     def _style(self, b, on):
         if on:
             b.setStyleSheet(f"color:white;background:{MOOD_COLOR[b.text()]};"
-                            "border:none;border-radius:4px;padding:2px 10px;font-size:12px;")
+                            f"border:none;border-radius:{tokens.RADIUS_CTRL}px;padding:2px 10px;font-size:12px;")
         else:
             b.setStyleSheet(f"color:{tokens.C(tokens.TEXT_2)};background:transparent;"
-                            f"border:1px solid {tokens.C(tokens.STROKE)};border-radius:4px;padding:2px 10px;font-size:12px;")
+                            f"border:1px solid {tokens.C(tokens.STROKE)};border-radius:{tokens.RADIUS_CTRL}px;padding:2px 10px;font-size:12px;")
 
     def _pick(self, m):
         # clicked 信号发出时 Qt 已翻转 checkable 按钮的选中态——直接读当前态，
@@ -792,16 +956,50 @@ def clear_layout(lay):  # 递归摘净控件与子布局（随记时间线重绘
 
 class NumberCard(CardWidget):
     """可点击指标卡：只给绑了 clicked 的实例用（卡片=可交互区域的 Fluent 语义），
-    纯展示读数直接用 TitleLabel+CaptionLabel 排版，不再包卡。"""
+    纯展示读数直接用 TitleLabel+CaptionLabel 排版，不再包卡。
 
-    def __init__(self, title, parent=None):
+    P2 改版（2026-10-15）：
+        旧结构 = 数值 28px（与页面标题同字号）+ 标签在**下** + 无上下文 + 无图标。
+        新结构（对齐 2026 主流 KPI 卡规格）：
+            [图标] 标签 12px 弱色（数字**上方**）
+            数值 32px DemiBold + 定宽数字（4 位变 5 位不挤邻卡）
+            上下文 14px（可空，如"今日 +3"；没有就不占位）
+        容器走 e1 层级（1px 描边）——不用投影：投影在深色底上会消失。
+    """
+
+    def __init__(self, title, parent=None, icon_name: str = "", context: str = ""):
         super().__init__(parent)
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(20, 16, 20, 16)
-        self.value = TitleLabel("0")
+        lay.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        lay.setSpacing(tokens.SPACE_XS)
+
+        head = QHBoxLayout()
+        head.setSpacing(tokens.SPACE_XS)
+        if icon_name:
+            iw = IconWidget(ic(icon_name, "INFO"), self)
+            iw.setFixedSize(20, 20)
+            head.addWidget(iw)
         self.title = CaptionLabel(title)
+        head.addWidget(self.title)
+        head.addStretch(1)
+        lay.addLayout(head)
+
+        self.value = TitleLabel("0")
+        tokens.typeset(self.value, "metric")   # 32px + 定宽数字
         lay.addWidget(self.value)
-        lay.addWidget(self.title)
+
+        self.context = BodyLabel(context)
+        self.context.setVisible(bool(context))
+        lay.addWidget(self.context)
+
+        self.setMinimumWidth(200)   # 低于 200px 数字与标签会挤（行业可读下限）
+        elevate(self, "e1")
+
+    def set_context(self, text: str) -> None:
+        """上下文行（对比/口径）。传空串则整行隐藏，不留空白。"""
+        self.context.setText(text or "")
+        self.context.setVisible(bool(text))
 
 
 # ---------------------------------------------------------------- 新建项目 / Inbox 引入 对话框

@@ -23,10 +23,10 @@ class OverviewPage(QWidget):
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         outer.addWidget(self.scroll)
         lay = QVBoxLayout(_body)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
 
         head = QHBoxLayout()
-        self.hello = TitleLabel("总览")
+        self.hello = PageTitleLabel("总览")   # 页面标题统一 24px（不再与数字卡数值同字号）
         head.addWidget(self.hello)
         head.addStretch(1)
         self.quickNew = PrimaryPushButton(ic("ADD", "INFO"), "新建项目")
@@ -56,11 +56,12 @@ class OverviewPage(QWidget):
         self.noteInput.textChanged.connect(
             lambda: self.noteBtn.setEnabled(bool(self.noteInput.text().strip())))
 
-        row = QHBoxLayout()
-        self.cardProj = NumberCard("项目总数")
-        self.cardRec = NumberCard("工作记录条数")
-        self.cardToday = NumberCard("今日动态")
-        self.cardTodo = NumberCard("待处理（Inbox+对账）")
+        # 数字卡区：FlowLayout —— 窄窗自动 4→2→1 列换行（原 QHBoxLayout 只会等比压扁）
+        row = FlowLayout()
+        self.cardProj = NumberCard("项目总数", icon_name="FOLDER")
+        self.cardRec = NumberCard("工作记录条数", icon_name="HISTORY")
+        self.cardToday = NumberCard("今日动态", icon_name="CALENDAR")
+        self.cardTodo = NumberCard("待处理（Inbox+对账）", icon_name="FLAG")
         for c in (self.cardProj, self.cardRec, self.cardToday, self.cardTodo):
             row.addWidget(c)
         lay.addLayout(row)
@@ -142,6 +143,8 @@ class OverviewPage(QWidget):
     def set_snapshot(self, snap):
         self.snap = snap
         self.cardTodo.value.setText(str(len(snap.issues) + len(snap.inbox)))
+        # 上下文行（口径）：总数说不清"待收"和"待改"各多少，拆开才可执行
+        self.cardTodo.set_context(f"待收 {len(snap.inbox)} · 待改 {len(snap.issues)}")
 
     def set_db(self, s: dict, recent: list):
         """大脑数据库统计与最近记录（总览的数字/动态改读 brain.db）。"""

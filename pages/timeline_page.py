@@ -33,7 +33,7 @@ class TimelinePage(QWidget):
         self._vepoch = 0
         self._vstate = None
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 0)
+        set_page_margins(lay, bottom=0)
         lay.addWidget(_page_head("时间线", "谁在什么时候干了什么——所有 agent 的最近动态"))
         top = QHBoxLayout()
         top.addStretch(1)

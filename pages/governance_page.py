@@ -311,7 +311,7 @@ class GovernancePage(QWidget):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head(
             "治理中心", "大脑的日常治理面：可疑内容隔离、重复记忆整合、决策到期回顾、"
                         "关注项目管理、技能使用统计——桌面直接操作"))

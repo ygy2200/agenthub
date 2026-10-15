@@ -24,7 +24,7 @@ class JournalPage(QWidget):
         self.errors: list = []
         self.journal: list = []
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
 
         top = QHBoxLayout()
         top.addWidget(SubtitleLabel("流水 · 错误与操作"))

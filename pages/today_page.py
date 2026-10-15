@@ -26,7 +26,7 @@ class TodayPage(QWidget):
         self.win = win
         self._item2task: dict = {}  # id(QListWidgetItem) -> task row（分组标题不进映射）
         lay = QVBoxLayout(self)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head(
             "工作台", "今天该干什么——前沿队列（hub_next 同源）：可认领按优先级排队，"
                       "进行中 / 可接管 / 等待依赖一屏看全；标记完成走管理通道（自动结晶）"))

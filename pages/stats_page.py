@@ -19,7 +19,7 @@ class StatsPage(QWidget):
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         outer.addWidget(self.scroll)
         lay = QVBoxLayout(_body)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head("统计", "数据全貌与大脑体检——项目 / 记录 / 对账 / 停滞 / 检索"))
         # 健康读数：纯展示不包卡，大数字+小标题直接排版
         row = QHBoxLayout()

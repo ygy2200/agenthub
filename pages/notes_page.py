@@ -28,7 +28,7 @@ class NotesPage(QWidget):
         self.scroll.enableTransparentBackground()
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
 
         head = QHBoxLayout()
         head.addWidget(TitleLabel("随记"))
@@ -92,7 +92,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.recallHead)
         self.recallBox = QVBoxLayout()
         self.recallBox.setContentsMargins(4, 4, 4, 0)
-        self.recallBox.setSpacing(6)
+        self.recallBox.setSpacing(8)
         lay.addLayout(self.recallBox)
 
         # 时光回放：往年今天
@@ -101,7 +101,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.otdHead)
         self.otdBox = QVBoxLayout()
         self.otdBox.setContentsMargins(4, 4, 4, 0)
-        self.otdBox.setSpacing(6)
+        self.otdBox.setSpacing(8)
         lay.addLayout(self.otdBox)
 
         # 胶囊到期
@@ -110,7 +110,7 @@ class NotesPage(QWidget):
         lay.addWidget(self.capsuleHead)
         self.capsuleBox = QVBoxLayout()
         self.capsuleBox.setContentsMargins(4, 4, 4, 0)
-        self.capsuleBox.setSpacing(6)
+        self.capsuleBox.setSpacing(8)
         lay.addLayout(self.capsuleBox)
 
         # 时间线主体：按日期分组的无框行流（行是线不是卡）+ 整理模式（素材勾选）
@@ -141,7 +141,7 @@ class NotesPage(QWidget):
         cancelPick.clicked.connect(self._toggle_pick)
         pb.addWidget(cancelPick)
         self.pickBar.setVisible(False)
-        self.pickBar.setStyleSheet(f"background:{tokens.C(tokens.ACCENT_SOFT)};border-radius:4px;")
+        self.pickBar.setStyleSheet(f"background:{tokens.C(tokens.ACCENT_SOFT)};border-radius:{tokens.RADIUS_CTRL}px;")
         lay.addWidget(self.pickBar)
         self.tlBox = QVBoxLayout()
         self.tlBox.setContentsMargins(4, 12, 16, 24)
@@ -219,9 +219,10 @@ class NotesPage(QWidget):
             line.setSpacing(8)
             lb = QLabel(kind)
             # 色值一律走 tokens（白字常量也在 tokens.WHITE），不再内联 #fff
-            lb.setStyleSheet(f"color:{tokens.WHITE};background:{tokens.BADGE_FALLBACK};"
-                             "border-radius:8px;padding:1px 8px;font-size:11px;")
-            lb.setFixedHeight(20)
+            lb.setStyleSheet(chip_qss(tokens.BADGE_FALLBACK, fg=tokens.WHITE))
+            lb.setFixedHeight(CHIP_H)
+            bind_style(lb, lambda w: w.setStyleSheet(
+                chip_qss(tokens.BADGE_FALLBACK, fg=tokens.WHITE)))
             line.addWidget(lb)
             body = CaptionLabel(f"#{item['id']} {str(item.get('content', ''))[:90]}")
             body.setWordWrap(True)
@@ -327,9 +328,11 @@ class NotesPage(QWidget):
             line.addWidget(mood_badge(n["mood"]))
         for t in (n.get("tags") or "").split():
             tg = ClickBodyLabel(f"#{t}")
-            tg.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};background:{tokens.C(tokens.ACCENT_SOFT)};"
-                             f"border-radius:8px;padding:1px 8px;font-size:11px;")
-            tg.setFixedHeight(20)
+            tg.setStyleSheet(chip_qss(tokens.C(tokens.ACCENT_SOFT),
+                                      fg=tokens.C(tokens.ACCENT)))
+            tg.setFixedHeight(CHIP_H)
+            bind_style(tg, lambda w: w.setStyleSheet(
+                chip_qss(tokens.C(tokens.ACCENT_SOFT), fg=tokens.C(tokens.ACCENT))))
             tg.clicked.connect(lambda _, tt=t: self._filter_tag(tt))
             line.addWidget(tg)
         if dim:
@@ -369,7 +372,8 @@ class NotesPage(QWidget):
                 color = tokens.C(tokens.SUCCESS)
             else:
                 color = dim_gray
-            cell.setStyleSheet(f"background:{color};border-radius:1px;")
+            # 热力格：小色块统一 2px 微圆角（Fluent borderRadiusSmall；原 1px 是随手值）
+            cell.setStyleSheet(f"background:{color};border-radius:2px;")
             cell.setToolTip(f"{d}  {cnt} 条" + (f"  {mood}" if mood else ""))
 
     def showEvent(self, e):  # 切入即重读：agent 侧 hub_note 写入后 GUI 跟上

@@ -19,7 +19,7 @@ class SettingsPage(QWidget):
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         outer.addWidget(self.scroll)
         lay = QVBoxLayout(_body)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head("设置", "根目录 / 数据库 / 规则 / 外观 / 导航"))
         lay.addSpacing(4)
 

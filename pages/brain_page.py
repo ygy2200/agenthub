@@ -20,7 +20,7 @@ class BrainPage(QWidget):
         self.scroll.enableTransparentBackground()
         body = QWidget()
         lay = QVBoxLayout(body)
-        lay.setContentsMargins(24, 24, 24, 24)
+        set_page_margins(lay)
         lay.addWidget(_page_head("大脑", "公用记忆的运转状态——唤起排行 / 使用分布 / 任务看板 / 待办线索 / 事件流 / 置顶记忆"))
         # 健康读数：纯展示不包卡（卡片语义留给可点区域），大数字+小标题直接排版
         row = QHBoxLayout()
