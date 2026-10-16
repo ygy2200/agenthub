@@ -720,7 +720,14 @@ class FlowLayout(QLayout):
         return True
 
     def heightForWidth(self, width):
-        return self._flow(QRect(0, 0, width, 0), True)
+        # 2026-10-16 复盘修复：必须把 contentsMargins 的**上下**算进去。
+        # 原实现只返回 _flow() 的净高，而 minimumSize() 是加了的——两者不一致，
+        # 父布局（QVBoxLayout 等）走 heightForWidth()，于是每个 FlowLayout 容器
+        # 的高度都比内容少一整个边距：实测帮助页"常用入口"卡片声明 20px、内容需要
+        # 20+16+16=52px，芯片的上下 padding 被裁掉；默认边距还是 Qt 样式的 11px
+        # （不是 0），所以裸用 FlowLayout 的卡片栅格一律少 22px。
+        m = self.contentsMargins()
+        return self._flow(QRect(0, 0, width, 0), True) + m.top() + m.bottom()
 
     def setGeometry(self, rect):
         super().setGeometry(rect)

@@ -17,6 +17,7 @@
 from qfluentwidgets import qconfig, setTheme, setThemeColor, Theme, isDarkTheme
 
 import core
+import re
 import sys
 
 # ============ 中性色阶（浅/深双套） ============
@@ -47,7 +48,6 @@ TEXT_3 = {"light": "#6f6f78", "dark": "#96969f"}   # 4.57 / 4.76（各主题三�
 #   （本机实测 #009faa 青），与令牌的靛蓝各唱各调——见 apply_accent()。
 ACCENT = {"light": "#4a5bd4", "dark": "#7b8ff0"}   # 文字/图标用：5.6:1 / 5.2:1
 ACCENT_FILL = "#4a5bd4"      # 按钮/选中/勾选填充（双主题同值；白字 5.62:1）
-ON_ACCENT = "#ffffff"       # 填充上的文字
 ACCENT_SOFT = {"light": "rgba(74,91,212,0.10)", "dark": "rgba(123,143,240,0.16)"}  # 选中行/胶囊淡底
 WHITE = "#ffffff"
 
@@ -152,9 +152,8 @@ _WEIGHT = {"normal": 400, "medium": 500, "demibold": 600, "bold": 700}
 # 2026-10-15 第二轮：从"只有一档 200ms"扩成时长阶梯 + 曲线（Fluent motion 令牌口径：
 # durationFast 150 / durationNormal 200，曲线 cubic-bezier(0.33, 0, 0.67, 1)）。
 MOTION_FAST = 150   # ms，hover/按压反馈（Fluent durationFast）
-MOTION_NORMAL = 200  # ms，面板/选中过渡
 MOTION_OFF = 0      # 关闭动效（无障碍/低性能/系统关动画）
-MOTION_CURVE = "cubic-bezier(0.33, 0, 0.67, 1)"   # Fluent easy-ease
+MOTION_CURVE = "cubic-bezier(0.33, 0, 0.67, 1)"   # Fluent easy-ease；唯一消费方是 easing()
 # 2026 趋势要求尊重系统"减少动态效果"；Windows 侧对应
 # HKCU\Control Panel\Desktop\WindowMetrics\MinAnimate == 0（关闭窗口动画）。
 _SYS_MOTION_REG = r"Control Panel\Desktop\WindowMetrics"
@@ -204,7 +203,6 @@ SEMANTIC = {
     "text_tertiary": TEXT_3,       # 弱提示
     "accent": ACCENT,              # 主色（文字/图标）
     "accent_fill": ACCENT_FILL,    # 主色（按钮/选中填充，单值）
-    "on_accent": ON_ACCENT,        # 填充上的文字
     "accent_soft": ACCENT_SOFT,    # 选中行/胶囊淡底
     "focus_ring": FOCUS_RING,      # 焦点环（WCAG 2.2 2.4.11）
     "success": SUCCESS,
@@ -342,13 +340,31 @@ def motion_ms() -> int:
 
 
 def easing():
-    """动效曲线（Fluent easy-ease cubic-bezier(0.33, 0, 0.67, 1) 的 Qt 近似）。
+    """动效曲线：解析 MOTION_CURVE 的 cubic-bezier 控制点，映射到最接近的 Qt 曲线。
 
-    Qt 不接受 CSS 曲线字符串，用最接近的 InOutQuad；关动效时返回线性（配合 duration=0
-    走瞬时分支，曲线无实际作用）。"""
+    2026-10-16 复盘：原实现硬编码 `QEasingCurve.InOutQuad`，MOTION_CURVE 只是个没人读的
+    文档字符串（零消费=摆设）。现在真正解析它。CSS bezier 的 (x1,y1,x2,y2) 里：
+      · y1=0   → 入端切线水平 = **起步慢**（加速段）
+      · y2=1   → 出端切线水平 = **收尾慢**（减速段）
+    两端都水平 → InOutQuad；只入端水平 → InQuad；只出端水平 → OutQuad。
+    关动效时返回 Linear（配合 duration=0 走瞬时分支，曲线无实际作用）。
+    """
     from PySide6.QtCore import QEasingCurve
     if motion_ms() == 0:
         return QEasingCurve(QEasingCurve.Type.Linear)
+    m = re.search(r"cubic-bezier\(\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*,\s*([\d.]+)\s*\)",
+                  MOTION_CURVE)
+    if not m:
+        return QEasingCurve(QEasingCurve.Type.InOutQuad)
+    _x1, y1, _x2, y2 = (float(g) for g in m.groups())
+    in_flat = abs(y1) < 0.05          # 入端水平（起步慢）
+    out_flat = abs(y2 - 1.0) < 0.05   # 出端水平（收尾慢）
+    if in_flat and out_flat:
+        return QEasingCurve(QEasingCurve.Type.InOutQuad)
+    if in_flat:
+        return QEasingCurve(QEasingCurve.Type.InQuad)
+    if out_flat:
+        return QEasingCurve(QEasingCurve.Type.OutQuad)
     return QEasingCurve(QEasingCurve.Type.InOutQuad)
 
 

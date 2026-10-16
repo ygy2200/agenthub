@@ -43,8 +43,10 @@ class CommandPalette(QWidget):
         outer.addWidget(card)
 
         lay = QVBoxLayout(card)
-        lay.setContentsMargins(12, 12, 12, 10)
-        lay.setSpacing(8)
+        # 2026-10-16 复盘：原写 (12,12,12,10) + setSpacing(8)——10 不在 4px 网格上，
+        # 且 palette.py 不在间距守卫的扫描范围里，所以一直没人发现。统一走 token。
+        lay.setContentsMargins(tokens.SPACE_M, tokens.SPACE_M, tokens.SPACE_M, tokens.SPACE_M)
+        lay.setSpacing(tokens.SPACE_S)
 
         self.search = LineEdit(card)
         self.search.setPlaceholderText("搜索：页面 / 动作 / 项目…（↑↓ 选择 · Enter 执行 · Esc 关闭）")
@@ -122,7 +124,10 @@ class CommandPalette(QWidget):
         """按当前主题刷新面板样式（tokens 单一来源）。"""
         self.setStyleSheet(
             f"QWidget#cpCard{{background:{tokens.C(tokens.BG_L2)};"
-            f"border:1px solid {tokens.C(tokens.STROKE)};border-radius:12px;}}")
+            f"border:1px solid {tokens.C(tokens.STROKE)};"
+            # 2026-10-16 复盘：原硬编码 border-radius:12px（不在 2/4/8 白名单，
+            # 也是 palette.py 不在守卫扫描范围内才能一直活着）→ 改走令牌
+            f"border-radius:{tokens.RADIUS_CARD}px;}}")
         self.listw.setStyleSheet("ListWidget{background:transparent;border:none;}")
         self.hint.setStyleSheet(f"color:{tokens.C(tokens.TEXT_3)};font-size:12px;")
 

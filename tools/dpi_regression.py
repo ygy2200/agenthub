@@ -19,6 +19,7 @@ PassThrough 策略 + PreferVerticalHinting 修复）。字号阶梯改过之后�
 from __future__ import annotations
 
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -27,14 +28,37 @@ ROOT = Path(__file__).resolve().parent.parent
 FACTORS = ("1.0", "1.25", "1.5")
 
 
-def run_child(factor: str) -> tuple:
+def _verdict(out: str) -> tuple:
+    """从子进程 stdout 判定是否真的有缩放问题。
+
+    2026-10-16 复盘：不能信退出码。离屏渲染下子进程打印完结论后会在退出路径上
+    access violation（returncode 0xC0000005，实测 1.0/1.25 崩、1.5 不崩，纯看运气），
+    父进程若 `rc |= returncode` 就会把"三档都 0 问题"误报成「存在缩放问题」。
+    真正的判定依据是子进程打印的「问题 N 项」与「✗」明细行。
+    """
+    m = re.search(r"问题\s+(\d+)\s+项", out)
+    if m:
+        return int(m.group(1)), out
+    return None, out          # 没打印结论（崩得更早）→ 交给出退出码处理
+
+
+def run_child(factor: str, retries: int = 2) -> tuple:
     env = dict(os.environ)
     env["QT_SCALE_FACTOR"] = factor
     env["QT_QPA_PLATFORM"] = "offscreen"
-    r = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child", factor],
-                       cwd=str(ROOT), env=env, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", timeout=300)
-    return r.returncode, (r.stdout or "") + (r.stderr or "")
+    last = (None, "")
+    for attempt in range(max(1, retries)):
+        r = subprocess.run([sys.executable, str(Path(__file__).resolve()), "--child", factor],
+                           cwd=str(ROOT), env=env, capture_output=True, text=True,
+                           encoding="utf-8", errors="replace", timeout=300)
+        out = (r.stdout or "") + (r.stderr or "")
+        n, _ = _verdict(out)
+        if n is not None:
+            # 拿到了明确结论（哪怕进程随后崩了）——以结论为准
+            return (1 if n else 0), out
+        last = (r.returncode, out)
+    # 始终没拿到结论：工具自身不稳，报一个可识别的专用码（-9），由上层提示重跑
+    return -9, last[1]
 
 
 def _check(factor: str) -> int:
@@ -93,7 +117,14 @@ def _check(factor: str) -> int:
     print(f"[缩放 {factor}] 问题 {len(bad)} 项")
     for x in bad:
         print("   ✗", x)
-    return 1 if bad else 0
+    # 2026-10-16 复盘修复：子进程必须**硬退出**。原先 return 后走 Qt 正常析构，
+    # 而离屏渲染下窗口/线程析构会间歇性 abort（exit 127，"QThreadStorage: entry
+    # destroyed before end of thread"）。父进程把 127 当成"有缩放问题"，
+    # 于是明明三档都 0 问题却报「存在缩放问题」——实测连跑三次 exit 0/127/0。
+    # 本项目的既定解法见 window._hard_exit：flush 后 os._exit 跳过全部析构回调。
+    sys.stdout.flush()
+    sys.stderr.flush()
+    os._exit(1 if bad else 0)
 
 
 def main() -> int:
@@ -102,11 +133,18 @@ def main() -> int:
         return _check(sys.argv[i + 1] if len(sys.argv) > i + 1 else "1.0")
 
     print("=== 缩放回归：100% / 125% / 150% ===")
-    rc = 0
+    rc, unstable = 0, []
     for f in FACTORS:
         code, out = run_child(f)
         print(out.strip() or "(无输出)")
-        rc |= code
+        if code == -9:
+            unstable.append(f)
+        else:
+            rc |= code
+    if unstable:
+        print(f"\n⚠ 工具不稳定：{unstable} 档的子进程始终没打印结论（离屏 Qt 退出路径偶发"
+              f" access violation）。请单独重跑：python tools/dpi_regression.py")
+        return 2
     print("\n结论：", "全部通过" if rc == 0 else "存在缩放问题（见上）")
     return rc
 

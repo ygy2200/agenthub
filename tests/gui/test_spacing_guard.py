@@ -18,7 +18,11 @@ ROOT = Path(__file__).resolve().parent.parent.parent
 SPACING_GRID = {0, 4, 8, 12, 16, 20, 24, 32}
 RADIUS_OK = {2, 4, 8}
 
-_SCAN = ["uikit.py", "window.py"] + [f"pages/{p.name}" for p in sorted((ROOT / "pages").glob("*.py"))]
+# 2026-10-16 复盘：补入 palette.py。此前它不在扫描范围，于是命令面板卡片里
+# `setContentsMargins(12,12,12,10)`（10 不在 4px 网格）和 `setSpacing(8)` 一直没人发现——
+# 间距守卫与字号守卫的扫描范围不一致，后者含 palette.py、前者不含。
+_SCAN = ["uikit.py", "window.py", "palette.py"] + \
+        [f"pages/{p.name}" for p in sorted((ROOT / "pages").glob("*.py"))]
 _RE_SPACING = re.compile(r"\b(?:setSpacing|addSpacing)\((\d+)\)")
 _RE_MARGINS = re.compile(r"setContentsMargins\(([\d,\s]+)\)")
 _RE_RADIUS = re.compile(r"border-radius:\s*(\d+)px")
@@ -101,12 +105,21 @@ def test_gap_is_consumed():
     根因：gap() 定义完整（按密实度缩放 + 吸附回 4px 网格）却**零调用方**——
     密实度开关因此只调行高（row_height 有 3 个消费方）不调任何间距，
     用户切"紧凑"看不到间距变化，"间距缩放"是摆设。现由 FlowLayout 接线。
+
+    2026-10-16 复盘加固：必须走 `_code_lines()` 剥注释。第一版直接读整份源码，
+    结果**注释里写一句 `tokens.gap()` 就能把守卫骗过**——实测把 FlowLayout 改回
+    `tokens.GAP_CARD` 后本测试仍然通过（注释命中），守卫形同虚设。
     """
-    src = "\n".join((ROOT / rel).read_text(encoding="utf-8") for rel in _SCAN
-                    if (ROOT / rel).exists())
-    assert re.search(r"tokens\.gap\(", src), (
-        "tokens.gap() 无人引用——密实度的间距缩放又是摆设（请在 FlowLayout/"
-        "区块间距处接线）")
+    hits = 0
+    for rel in _SCAN:
+        f = ROOT / rel
+        if not f.exists():
+            continue
+        for _i, body, _raw in _code_lines(f.read_text(encoding="utf-8")):
+            hits += len(re.findall(r"tokens\.gap\(", body))
+    assert hits > 0, (
+        "tokens.gap() 无人引用（注释不算）——密实度的间距缩放又是摆设"
+        "（请在 FlowLayout/区块间距处接线）")
 
 
 def test_section_icons_min(qapp, hub_root):

@@ -122,16 +122,24 @@ def test_qss_font_sizes_are_in_type_table():
         f"QSS 字号不在 TYPE 表（允许 {sorted(sizes)}）——请改用 tokens.TYPE 派生或登记新档：{bad}")
 
 
-def test_badge_column_fits_longest_agent_name():
+def test_badge_column_fits_longest_agent_name(qapp, hub_root):
     """徽章定宽列必须放得下最长的 agent 显示名（第三轮：字号 11→12/500 后加宽）。
 
-    11px 时 BADGE_COL_W=76 刚好够；提到 12px/500 后 "Claude Code"/"WorkBuddy"
-    约需 94px，不加宽就会被裁成半截名字（用户看到 "Claude C..."）。
+    11px 时 BADGE_COL_W=76 刚好够；提到 12px/500 后 "WorkBuddy" 按生产字体实测需
+    103px，不加宽就会被裁成半截名字（用户看到 "Claude C..."）。
+
+    ⚠ 必须带 `qapp` fixture：badge() 内部要创建 QLabel，**没有 QApplication 时 Qt 直接
+    abort（exit 127，无任何输出）**。2026-10-16 复盘实测：本测试最初漏了 fixture，
+    只有当别的测试先建好 app 时才侥幸跑过；单独 `pytest path::test` 静默死亡，
+    等于守卫在"单跑"场景下失效。带 fixture 后两种跑法都真跑。
     """
     from PySide6.QtGui import QFontMetrics
+    import brain
     import tokens
     import uikit
 
+    brain.init_db(hub_root)
+    tokens.apply_theme("dark")
     f = QFontMetrics(uikit.badge("claude", "").font())
     for name in ("Claude Code", "WorkBuddy", "ZCode"):
         need = f.horizontalAdvance(name) + 2 * tokens.SPACE_S + 4   # padding + 余量
