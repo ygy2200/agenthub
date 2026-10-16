@@ -18,8 +18,13 @@ class AuditPage(QWidget):
         self.copyBtn = PushButton(ic("COPY", "INFO"), "复制建议名")
         top.addWidget(self.copyBtn)
         lay.addLayout(top)
-        lay.addWidget(CaptionLabel("发现不合规目录：agent 前缀平行目录 / 野目录 / 重复组 / 缺工作记录。"
-                                   "本软件不自动改名，收编请人工确认后进行。"))
+        # 2026-10-16：长说明文字开自动换行。此前不换行 → 该标签 minimumSizeHint 宽 620px，
+        # 把整页最小需求顶到 584px，920×600 窗口（扣导航后内容区仅 551px）下必压扁
+        # （layout_stress 从第一轮报到现在）。开 wordWrap 后按可用宽度折行，最小宽度随之回落。
+        _desc = CaptionLabel("发现不合规目录：agent 前缀平行目录 / 野目录 / 重复组 / 缺工作记录。"
+                             "本软件不自动改名，收编请人工确认后进行。")
+        _desc.setWordWrap(True)
+        lay.addWidget(_desc)
         self.listw = ListWidget()
         lay.addWidget(self.listw, 1)
         self.issues = []

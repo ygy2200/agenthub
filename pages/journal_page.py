@@ -23,7 +23,19 @@ class JournalPage(QWidget):
         self.win = win
         self.errors: list = []
         self.journal: list = []
-        lay = QVBoxLayout(self)
+        # 2026-10-16：整页套滚动保护（#2055 修复模式）。此前无滚动，920×600 下
+        # 最小需求高 588 > 可用 551（errList 150 + 两个 section_head + 两行按钮 +
+        # 说明文字），layout_stress 从第一轮报"压扁风险"报到现在。
+        # 内容天然长（流水 200 条），滚动比压缩更合理。
+        _outer = QVBoxLayout(self)
+        _outer.setContentsMargins(0, 0, 0, 0)
+        self.scroll = ScrollArea()
+        self.scroll.setWidgetResizable(True)
+        _body = QWidget()
+        self.scroll.setWidget(_body)
+        self.scroll.enableTransparentBackground()   # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body）
+        _outer.addWidget(self.scroll)
+        lay = QVBoxLayout(_body)
         set_page_margins(lay)
 
         top = QHBoxLayout()
@@ -33,8 +45,13 @@ class JournalPage(QWidget):
         refreshBtn.clicked.connect(self.reload)
         top.addWidget(refreshBtn)
         lay.addLayout(top)
-        lay.addWidget(CaptionLabel("agent 执行出错（自动/主动上报）在这里可查可流转；"
-                                   "每一次写操作（记录/记忆/接入/引导/还原）都有流水，记录类可撤销。"))
+        # 2026-10-16：长说明文字开自动换行。此前不换行 → minimumSizeHint 宽 669px，
+        # 把整页最小需求顶到 584px，920×600 窗口（扣导航后内容区仅 551px）下必压扁
+        # （layout_stress 从第一轮报到现在）。
+        _desc = CaptionLabel("agent 执行出错（自动/主动上报）在这里可查可流转；"
+                             "每一次写操作（记录/记忆/接入/引导/还原）都有流水，记录类可撤销。")
+        _desc.setWordWrap(True)
+        lay.addWidget(_desc)
 
         # 列表区不包卡：ListWidget 自带边界，卡套列表=框中框
         g1 = QVBoxLayout()

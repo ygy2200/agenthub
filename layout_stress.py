@@ -16,6 +16,12 @@ sys.path.insert(0, r'D:\agent资料\zcode项目记录\AgentHub-多agent文件统
 
 from PySide6.QtWidgets import QApplication, QScrollArea
 app = QApplication([])
+# 2026-10-16：必须按**生产字体口径**测量。此前没调 _setup_app_font，离屏下微软雅黑
+# 加载失败回退默认窄体，量到的 minimumSize 与真实不符——「流水·对账 920×600 压扁」
+# 从第一轮报到现在，就是默认字体下某个标签 sizeHint 584px 造成的假象
+# （生产字体口径实测仅 394px，根本不溢出）。
+import window as _winmod
+_winmod._setup_app_font(app)
 import ui, tokens, actions
 tokens.apply_theme('dark')
 
