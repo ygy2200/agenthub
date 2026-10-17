@@ -35,6 +35,15 @@ def _collect(root: str) -> dict:
     h = brain.health_report(root)
     d = {"h": h, "generated": datetime.datetime.now().strftime("%Y-%m-%d %H:%M"),
          "profile": brain.user_profile(root)}
+    # R11：元信息占比的真实拆解——R6 已算好 meta_breakdown，报告此前没用上，
+    # 只拿裸 meta_ratio 喊「挤占库容」是假阳性（实测零唤起 meta 与非 meta 持平）。
+    mc = brain.metacognition(root)
+    mb = mc.get("meta_breakdown", {}) or {}
+    d["meta_breakdown"] = mb
+    zero_meta = mb.get("zero_use_meta", 0)
+    zero_non = mb.get("zero_use_non_meta", 0)
+    # 真正的灌水信号：元信息记忆「从不唤起」显著多于非元信息，而非占比高本身
+    d["meta_polluted"] = zero_meta > zero_non * 2 + 3
     with brain.db_conn(root) as conn:
         d["proj_top"] = [dict(r) for r in conn.execute(
             "SELECT project, COUNT(*) n, COUNT(DISTINCT date) days, MIN(date) d1, MAX(date) d2 "
@@ -54,8 +63,14 @@ def _collect(root: str) -> dict:
         d["done_todos"] = conn.execute("SELECT COUNT(*) FROM todos_done").fetchone()[0]
         d["zero_mem"] = conn.execute(
             "SELECT COUNT(*) FROM memories WHERE status='active' AND use_count=0").fetchone()[0]
-        d["tool_used"] = {r[0]: r[1] for r in conn.execute(
-            "SELECT tool, COUNT(*) n FROM searches GROUP BY tool")}
+        # R11：工具使用判定合并多源——之前只查 searches 表，漏掉 op_audit（hub_ops_run
+        # 等操作的审计轨迹），会把真用过的工具误判为「从未使用」。searches ∪ op_audit。
+        tused = {}
+        for r in conn.execute("SELECT tool, COUNT(*) n FROM searches GROUP BY tool"):
+            tused[r[0]] = tused.get(r[0], 0) + r[1]
+        for r in conn.execute("SELECT tool, COUNT(*) n FROM op_audit GROUP BY tool"):
+            tused[r[0]] = tused.get(r[0], 0) + r[1]
+        d["tool_used"] = tused
     return d
 
 
@@ -144,10 +159,28 @@ def _frictions(d) -> list:
                     "evidence": "Jaccard 相似度检出，重复记忆让检索结果互相稀释",
                     "fix": "按「取代记忆#N」约定：写一条修正版并标注取代谁，全员裁决旧条目"})
     meta_ratio = h.get("honest", {}).get("meta_ratio", 0)
-    if meta_ratio >= 40:
-        out.append({"title": f"元信息占比 {meta_ratio}%（记忆在说 AgentHub 自己，不是你的工作）",
-                    "evidence": f"use_count 从未参与的元记忆挤占了 {h['memories']} 条记忆的库容",
-                    "fix": "蒸馏时跳过 [元信息?] 候选；新记忆写工作知识（坑、事实、决策），系统元信息不进记忆"})
+    mb = d.get("meta_breakdown") or {}
+    if meta_ratio >= 40 and mb:
+        by_kind = mb.get("by_kind", {})
+        kind_parts = "、".join(
+            f"{brain.KIND_CN.get(k, k)} {by_kind[k]['meta']}/{by_kind[k]['total']}"
+            for k in ("project", "lesson", "fact", "preference", "note") if k in by_kind)
+        zero_meta = mb.get("zero_use_meta", 0)
+        zero_non = mb.get("zero_use_non_meta", 0)
+        if d.get("meta_polluted"):
+            out.append({"title": f"元信息占比 {meta_ratio}%，且元信息记忆明显更「死」",
+                        "evidence": f"零唤起对照：元信息 {zero_meta} 条 vs 非元信息 {zero_non} 条——"
+                                    f"元信息沉底更重，存在灌水记忆而非真知识。按 kind 拆：{kind_parts}。",
+                        "fix": "蒸馏时跳过 [元信息?] 候选；新记忆写工作知识（坑、事实、决策），系统元信息不进记忆",
+                        "level": "warn"})
+        else:
+            # 占比高但分布健康：如实说明是项目性质，不报警（避免「狼来了」让用户忽视报告）
+            out.append({"title": f"元信息占比 {meta_ratio}%（偏高，但分布健康）",
+                        "evidence": f"零唤起对照：元信息 {zero_meta} 条 vs 非元信息 {zero_non} 条，基本持平——"
+                                    f"高占比源于本项目工作产品即大脑本身（project 类多为元信息属正常），并非灌水。"
+                                    f"按 kind 拆：{kind_parts}。",
+                        "fix": "维持现状；仍优先把真实工作知识（坑/事实/决策）沉淀为对应 kind，系统元信息保持克制",
+                        "level": "info"})
     zero = d["zero_mem"]
     if h["memories"] and zero * 2 >= h["memories"]:
         out.append({"title": f"{zero}/{h['memories']} 条记忆从未被唤起",
@@ -165,9 +198,10 @@ def _sec_friction(d) -> str:
     if not frs:
         return "<p>没有检出摩擦点——数据干净，保持节奏。</p>"
     blocks = "".join(
-        f"<div class='fric'><b>⚠ {_esc(f['title'])}</b><br>"
-        f"<span class='ev'>证据：{_esc(f['evidence'])}</span><br>"
-        f"<span class='fix'>修复：{_esc(f['fix'])}</span></div>"
+        (lambda lvl: f"<div class='fric {lvl}'><b>{'⚠' if lvl=='warn' else 'ℹ'} {_esc(f['title'])}</b><br>"
+                    f"<span class='ev'>证据：{_esc(f['evidence'])}</span><br>"
+                    f"<span class='fix'>修复：{_esc(f['fix'])}</span></div>")(
+            f.get("level", "warn"))
         for f in frs)
     return blocks + "<p class='muted'>每一处摩擦都配了一个可复用的修复——让同样的错下周不再出现。</p>"
 
@@ -187,18 +221,21 @@ _KNOWN_TOOLS = {
 
 def _sec_try(d) -> str:
     used = set(d["tool_used"])
+    # todos_done 仅由 hub_todo_done 写入，作为第三源补正（否则待办勾销会被误判「从未使用」）
+    if d["done_todos"] > 0:
+        used.add("hub_todo_done")
     unused = [(t, desc) for t, desc in _KNOWN_TOOLS.items()
               if t not in used and t != "hub_report"]
     if not unused:
         return "<p>工具箱里的能力都用起来了，没有闲置。</p>"
     lis = "".join(f"<li><code>{_esc(t)}</code>：{_esc(desc)}</li>" for t, desc in unused[:MAX_LIST])
-    return (f"<p>以下能力已内置但从未使用（检索日志零记录）：</p><ul>{lis}</ul>")
+    return (f"<p>以下能力已内置但从未使用（检索日志与操作审计均零记录）：</p><ul>{lis}</ul>")
 
 
 def _sec_rules(d) -> str:
     """建议的规则/技能修改——可复制粘贴的提案行。⚠ 铁律 9：提案，人确认才入库。"""
     props = []
-    if d["h"].get("honest", {}).get("meta_ratio", 0) >= 40:
+    if d.get("meta_polluted"):
         props.append("写入记忆时 kind 必须选对（坑=lesson、事实=fact、偏好=preference），"
                      "系统自身元信息禁止 hub_memory_write——直接在记录里说清即可")
     if d["done_todos"] == 0:
@@ -285,6 +322,8 @@ code{background:#eef1f4;padding:1px 6px;border-radius:4px;font-size:.9em}
 .fric{border:1px solid #e8d8b8;background:#fdf8ee;border-radius:8px;padding:10px 14px;margin:10px 0}
 .fric .ev{color:#7a6a45;font-size:.92em}
 .fric .fix{color:#0a6b3d;font-size:.92em}
+.fric.info{border-color:#bfe3cf;background:#f1faf4}
+.fric.info .ev{color:#3f6b50}
 .muted{color:#68788a;font-size:.92em}
 .warn{color:#a05a00;font-size:.92em}
 .bar{fill:#0a7ea4;opacity:.85}

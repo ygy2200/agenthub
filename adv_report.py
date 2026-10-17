@@ -116,6 +116,51 @@ def t_idempotent_path(tmp):
     assert Path(p3).name == "custom.html" and Path(p3).is_file()
 
 
+def t_meta_friction_honesty():
+    """R11：元信息摩擦不再「狼来了」——分布健康时降级为 info 且不喊挤占库容；
+    真正灌水（元信息零唤起显著更多）时才报警。纯函数断言，不依赖 DB。"""
+    base = {"h": {"errors_open": 0, "dup_memory_count": 0, "memories": 100,
+                  "projects_stalled": 0, "honest": {"meta_ratio": 62.1}},
+            "zero_mem": 0, "meta_breakdown": {}, "meta_polluted": False}
+    # 1) 分布健康：零唤起 meta==non-meta → info 卡片，无「挤占」指控
+    d_ok = dict(base)
+    d_ok["meta_breakdown"] = {"by_kind": {"project": {"meta": 39, "total": 50}},
+                              "zero_use_meta": 4, "zero_use_non_meta": 4}
+    d_ok["meta_polluted"] = False
+    meta = [f for f in report._frictions(d_ok) if "元信息占比" in f["title"]]
+    assert meta, "高占比时必须给出元信息说明卡片"
+    assert meta[0]["level"] == "info", f"分布健康应降级为 info，实际 {meta[0]['level']}"
+    assert "挤占" not in meta[0]["evidence"], "健康分布不应指控「挤占库容」"
+    assert "并非灌水" in meta[0]["evidence"], "应说明高占比源于项目性质"
+    # 2) 真正灌水：元信息零唤起显著更多 → warn 卡片，含「灌水」指控
+    d_bad = dict(base)
+    d_bad["meta_breakdown"] = {"by_kind": {"project": {"meta": 39, "total": 50}},
+                               "zero_use_meta": 20, "zero_use_non_meta": 2}
+    d_bad["meta_polluted"] = True
+    meta2 = [f for f in report._frictions(d_bad) if "元信息占比" in f["title"]]
+    assert meta2 and meta2[0]["level"] == "warn", "真灌水应报警 warn"
+    assert "灌水" in meta2[0]["evidence"], "真灌水应指出灌水记忆"
+
+
+def t_unused_multisource(tmp):
+    """R11：未用能力判定合并 searches ∪ op_audit ∪ todos_done——op_audit 里的
+    hub_ops_run 与有闭环待办的 hub_todo_done 不得被误判「从未使用」。"""
+    root = Path(tmp) / "hub_unused"
+    root.mkdir()
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    # 模拟 hub_ops_run 走操作审计（不进 searches）；todos_done 仅 hub_todo_done 写
+    with brain.db_conn(rs) as conn:
+        conn.execute("INSERT INTO op_audit(ts, agent, tool, project, summary, undo_kind, undo_ref) "
+                     "VALUES('2026-10-04T10:00:00','zcode','hub_ops_run','x','y','none',0)")
+        conn.execute("INSERT INTO todos_done(id, record_id, todo) VALUES(1, 0, 'test')")
+    doc = _read(report.generate_report(rs))
+    assert "hub_ops_run" not in doc, "op_audit 中的 hub_ops_run 不应被判「从未使用」"
+    assert "hub_todo_done" not in doc, "有闭环待办则 hub_todo_done 不应被判「从未使用」"
+    assert "hub_env_set" in doc, "确实没用过的 hub_env_set 仍应出现在未用清单"
+    _Validator().feed(doc)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_report_")
     print(f"临时目录：{tmp}\n")
@@ -123,6 +168,8 @@ def main():
     case("XSS 转义（script/事件属性/引号）", lambda: t_xss_escape(tmp))
     case("超长截断+无外链（200KB记录/30项目/报告体积受控）", lambda: t_oversize_and_links(tmp))
     case("幂等路径（同日覆盖/显式out/最新数据）", lambda: t_idempotent_path(tmp))
+    case("R11 元信息摩擦诚实化（健康→info/灌水→warn）", t_meta_friction_honesty)
+    case("R11 未用能力多源判定（op_audit/todos_done 不误判）", lambda: t_unused_multisource(tmp))
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
     print()

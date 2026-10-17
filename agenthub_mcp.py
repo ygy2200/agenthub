@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.27"}  # v2.40.26=守卫补缺；本版=文档对齐：README 工具数 53/37→69 双区修正+延迟数字改实测+英文区砍已移除技能市场+补 v2.40.20-26 版本记录；_encode 增 query 向量缓存（重复搜索省一半语义编码）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.28"}  # v2.40.27=文档对齐；本版=R11 反馈报告两处假阳性修复：①元信息摩擦不再「狼来了」（分布健康降级 info、真灌水才 warn，引用 R6 meta_breakdown 真实零唤起对照）②未用能力判定合并 searches∪op_audit∪todos_done（修正 hub_ops_run 等被误判从未使用）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
