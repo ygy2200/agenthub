@@ -2394,6 +2394,42 @@ def t_batchB_metacognition(tmp):
     assert brain.metacognition(rs)["governance"]["live"] == brain.memory_governance_stats(rs)["live"]
 
 
+def t_coverage_gate(fresh):
+    """R4·IDF 加权覆盖度闸门（2026-10-17）：废话查询 0 命中 / 常见词蹭中沉底 / 稀缺查询弱标保留。
+
+    治的病（tools/search_matrix.py 实测复现）：OR 语义 + 常见 bigram——查
+    「不存在的词qwerty」也能蹭「存在/在的」返回 5 条噪音。语义路在本用例里关掉
+    （_RRF_W_SEMANTIC=0），纯测词汇覆盖度逻辑；语义桥（paraphrase）由矩阵脚本验。
+    """
+    root = str(fresh)
+    brain.init_db(root)
+    import datetime
+    d = datetime.date.today().isoformat()
+    brain.add_record(root, "闸门测试-项目", "zcode", d, "强记录alpha", "alphabeta gamma 三者俱全的记录正文")
+    brain.add_record(root, "闸门测试-项目", "zcode", d, "常见词记录", "存在的问题在执行的过程中普遍存在")
+    brain.add_record(root, "闸门测试-项目", "zcode", d, "另一条beta", "只有 beta 的无关内容")
+    brain.add_record(root, "闸门测试-项目", "zcode", d, "独特记录", "delta 与众不同的内容")
+    sem_w = brain._RRF_W_SEMANTIC
+    brain._RRF_W_SEMANTIC = 0
+    try:
+        # ① 强候选在 → 只蹭中一个常见词的候选被挡（R1 全中；R3 只中 beta）
+        res = brain.search_records(root, "alpha beta gamma")
+        assert any("强记录" in (r.get("title") or "") for r in res), [(r.get("title"),) for r in res]
+        assert all("另一条beta" not in (r.get("title") or "") for r in res), [(r.get("title"),) for r in res]
+        # ② 废话查询：零文档 token + 只剩常见词蹭中 → 0 命中（工具层有拆词重查提示）
+        res = brain.search_records(root, "不存在的词qwerty")
+        assert res == [], [(r.get("title"),) for r in res]
+        # ③ 合法但稀缺：token 都在库里但无强覆盖 → 弱结果打 _weak 标记保留（漏比噪贵）
+        res = brain.search_records(root, "alpha 过程 delta")
+        assert res and all(r.get("_weak") for r in res), [(r.get("title"), r.get("_weak")) for r in res]
+        # ④ 短查询（<3 token）不闸——保持宽容召回
+        assert len(brain.search_records(root, "beta")) >= 2
+        # ⑤ _weak 行不破坏近重复折叠/矛盾标记管线（不崩即过）
+        assert isinstance(brain.search_records(root, "alpha 过程 delta"), list)
+    finally:
+        brain._RRF_W_SEMANTIC = sem_w
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2406,6 +2442,8 @@ def main():
     case("agent注册制（写动作登记/计数/保留名过滤/回填幂等/并发登记）", lambda: t_agents_registry(tmp))
     case("反射弧+可塑性（记忆推送/唤起计数/检索日志/项目stalled迁移）", lambda: t_plasticity(tmp))
     case("全脑检索+统计（记录/记忆/文件名）", lambda: t_search_all_and_stats(tmp))
+    case("R4·IDF 加权覆盖度闸门（废话 0 命中/常见词沉底/稀缺弱标/短查询不闸）",
+         lambda: t_coverage_gate(Path(tempfile.mkdtemp(prefix="agenthub_cov_"))))
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))

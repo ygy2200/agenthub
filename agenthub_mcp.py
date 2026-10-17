@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.22"}  # v2.40.21=描述体系升级；本版=错误三件套：必填缺失自动挂描述里的示例（同源不漂移）/项目不存在带核对路径/未知工具带搜索示例
+SERVER_INFO = {"name": "agenthub", "version": "2.40.23"}  # v2.40.22=错误三件套；本版=检索精度：IDF 加权覆盖度闸门（治常见 bigram 蹭中）+ 语义准入线 0.45→0.60 重标定 + 融合处 _semantic_sim 补传
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -561,6 +561,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                  f"（记录行带 #id，精读用 hub_get_record）"]
         if any("_bigram" in r for r in res["records"]) or any("_bigram" in mem for mem in res["memories"]):
             lines.insert(1, "（连续长串无直接命中，已拆词放宽召回——按相关度排序，弱相关自行取舍）")
+        if any(r.get("_weak") for r in res["records"]) or any(m.get("_weak") for m in res["memories"]):
+            lines.insert(1, "（未找到多关键词同时命中的结果，以下为部分命中的弱相关——可拆成更短的词重查）")
         for r in res["records"]:
             src = (f"（图关联自{r['_cross'][2:]}）" if r.get("_cross")
                    else "（图关联）" if "graph" in (r.get("_channels") or {}) else "")

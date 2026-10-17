@@ -1400,6 +1400,120 @@ _CJK_ALL_RE = re.compile(r"[一-鿿]+")  # 任意长度中文段（_retry_bigram
 _BM25_K1, _BM25_B = 1.5, 0.75  # BM25 经典参数，进常量便于评测集调参（07 计划 P4.2）
 
 
+def _token_df(root: str, tokens: list) -> dict:
+    """query token 在 records+memories 的文档频率（content LIKE 计次，只算活跃行）。
+
+    供覆盖度闸门算 IDF 加权覆盖：常见 bigram（存在/在的）df 高 → idf 低，
+    纯计数覆盖治不了「蹭两个常见词冒充强命中」（R4 实测：废话查询靠
+    不存+存在+在的 三个常见词凑满覆盖度）。fail-open：读不了库返回 {}，
+    闸门退化为纯计数（见 _coverage_gate）。
+    """
+    df: dict = {}
+    if not tokens:
+        return df
+    try:
+        with db_conn(root) as conn:
+            for t in tokens:
+                like = f"%{_like_escape(t)}%"
+                n = 0
+                for tbl in ("records", "memories"):
+                    n += conn.execute(
+                        f"SELECT COUNT(*) FROM {tbl} WHERE content LIKE ? ESCAPE '\\'",
+                        (like,)).fetchone()[0]
+                df[t] = n
+    except Exception:  # noqa: BLE001 闸门是精度优化，读不了库就不加权
+        return {}
+    return df
+
+
+def _cjk_run(query: str, text: str) -> int:
+    """query 的 CJK 段与 text 的最长公共连续子串长度（<4 返回 0）。
+
+    「大迭代优化」vs 含「迭代优化」的文档 → 4（真短语命中，重试路径的合法场景）；
+    「不存在的词」vs「存在的问题」→ 0（只共享 2 字，两个不挨着的常见 bigram 冒充不了）。
+    连续 4 字重叠 = 3 个相邻 bigram 全中，是比 idf 更硬的强相关信号。
+    """
+    for seg in _CJK_ALL_RE.findall(query or ""):
+        for L in range(len(seg), 3, -1):   # 从长到短；任一 ≥4 字连续命中即强
+            for i in range(len(seg) - L + 1):
+                if seg[i:i + L] in text:
+                    return L
+    return 0
+
+
+def _latin_garbage_tokens(root: str, tokens: list) -> list:
+    """零命中的**拉丁** token（qwerty/zzz/xyzzy）——乱输/拼错的强信号。
+
+    与 CJK 词缺失的区别：「关掉」在库里没有（库用「关闭」）是说法稀缺，不是垃圾；
+    而随机拉丁串在任何语料里都不该有。判据：token 纯 ASCII 且两表 df=0。
+    fail-open：读不了库返回 []（不闸）。
+    """
+    df = _token_df(root, tokens)
+    return [t for t in tokens if df.get(t, 1) == 0 and t.isascii()]
+
+
+def _coverage_gate(root: str, rows: list, kw: str, min_match: int = 2) -> list:
+    """R4·覆盖度闸门（2026-10-17）：多 token 查询的精度修复——OR 语义保召回，覆盖度保精度。
+
+    治的病（tools/search_matrix.py 实测复现）：OR 语义 + 常见 bigram——查
+    「不存在的词qwerty」也能蹭「存在/在的」返回 5 条噪音。外部调研结论
+    （agentpatterns：「多词查询 OR 语义…后续 AND 精排或 rerank 会变得必要」）一致。
+    规则（满足其一即强候选）：
+      ① 语义背书：_semantic_sim ≥ _SEM_MIN_SIM 的 paraphrase 桥——字面词不存在时
+         （「关掉错误」→库里的「关闭错误」0.638）只能靠它活；
+      ② CJK 连续重叠 ≥4 字（_cjk_run）——「大迭代优化」命中含「迭代优化」的文档，
+         重试路径的合法场景，idf 再低也是真短语命中；
+      ③ 命中 ≥2 个不同 token 且 IDF 加权质量 ≥50%——常见词（存在/在的）蹭中天然沉底；
+      ④ df 读失败时退化为纯计数（命中 ≥2 即强）。
+    全弱候选时：查询含拉丁乱码 token（qwerty/zzz，两表零命中）→ 返回空，
+    让工具层走「拆词重查」提示；否则打 _weak 标记保留（合法但稀缺，漏比噪贵）。
+    query 分词 <3 个 → 原样返回（短查询保持宽容召回）。
+    """
+    q_tokens = list(dict.fromkeys(_tokenize(kw, max_tokens=16)))
+    if len(q_tokens) < 3:
+        return rows
+    df = _token_df(root, q_tokens)
+    idf: dict = {}
+    total_mass = 1.0
+    if df:
+        n_total = 0
+        try:
+            with db_conn(root) as conn:
+                n_total = (conn.execute("SELECT COUNT(*) FROM records WHERE " + _rec_live_sql()).fetchone()[0]
+                           + conn.execute("SELECT COUNT(*) FROM memories WHERE " + _live_sql()).fetchone()[0])
+        except Exception:  # noqa: BLE001
+            n_total = 0
+        n_total = max(1, n_total)
+        idf = {t: math.log(1.0 + (n_total - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5)) for t in q_tokens}
+        total_mass = sum(idf.values()) or 1.0
+    strong, weak = [], []
+    for r in rows:
+        if (r.get("_semantic_sim") or 0) >= _SEM_MIN_SIM:
+            strong.append(r)
+            continue
+        text = " ".join(str(r.get(k) or "") for k in ("title", "content", "project")).lower()
+        matched = [t for t in q_tokens if t.lower() in text]
+        if not matched:
+            weak.append(r)
+            continue
+        if _cjk_run(kw, text) >= 4:
+            strong.append(r)   # 真短语命中（大迭代优化→迭代优化）
+            continue
+        if idf and sum(idf[t] for t in matched) / total_mass < 0.5:
+            weak.append(r)     # 蹭中一两个常见词：idf 质量不过半
+        elif len(matched) >= min_match:
+            strong.append(r)
+        else:
+            weak.append(r)
+    if strong or not weak:
+        return strong
+    if _latin_garbage_tokens(root, q_tokens):
+        return []   # 乱输/拼错查询：0 命中比 5 条噪音好（工具层有拆词重查提示）
+    for r in weak:
+        r["_weak"] = True   # 合法但稀缺：保留并标记，调用方/用户可自行取舍
+    return weak
+
+
 def _tokenize(text: str, max_tokens: int = 64) -> list:
     """检索分词（P4.2 BM25 通道）：英文/数字按 \\w+ 词（小写），中文任意段相邻 2-gram
     （单字段保留原字）。与 _retry_bigrams 的区别：它只产出 ≥4 字长串的重试词表（原语义不动），
@@ -1528,12 +1642,14 @@ def search_records(root: str, kw: str, limit: int = 30) -> list:
         rows = _records_search_fused(root, kw, words, limit)
     else:
         rows = _records_query(root, words, limit)
+    rows = _coverage_gate(root, rows, kw)
     if rows:
         return _mark_conflicts(_fold_near_dupes(rows))   # 去重 + 矛盾标记（records 与 memories 对称）
     retry = _retry_bigrams(kw)
     if not retry:
         return []
     rows = _records_query(root, retry, limit)
+    rows = _coverage_gate(root, rows, kw)
     for r in rows:  # 放宽召回标记：真实大库里常见二字组合会命中弱相关，输出层须标注
         r["_bigram"] = True
     return _mark_conflicts(_fold_near_dupes(rows))
@@ -1561,7 +1677,11 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
         channels.setdefault(eid, {})["semantic"] = round(s, 4)
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
     for eid, _, r in sem_rows:
-        by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
+        if eid in by_id:
+            # 双通道行：词法版本可能缺 _semantic_sim，补上供覆盖度闸门判「语义背书」
+            by_id[eid].setdefault("_semantic_sim", r.get("_semantic_sim"))
+        else:
+            by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
     _apply_graph_channel(root, "record", scores, channels, by_id)  # 第四路：图遍历
     fused = []
     for mid, s in scores.items():
@@ -2966,9 +3086,13 @@ _HAS_ST = False
 # ① 查询须含中文——bge-small-zh 对 ASCII 标识符/路径/通配符查询的相似度不可信，且这类查询
 #    多为字面查找（"50_off"/"100%"/"max_size"/"a.png"），放模糊召回会破坏 LIKE 精确契约
 #    （实测 "50_off"→"50%_off" 余弦 0.642——纯阈值拦不住，必须按查询语种关断）。
-# ② 余弦 ≥ 0.45——30 条 eval 实测：语义依赖的真匹配最低 0.500（#77），噪声上限 0.402
-#    （"绝不存在的词zzz" 0.342、"100%"×无关记录 0.402）。
-_SEM_MIN_SIM = 0.45
+# ② 余弦 ≥ 0.60——2026-10-17 R4 重新标定（旧值 0.45 已随嵌入数据漂移腐烂）：
+#    17 查询实测，真查询 0.526~0.765 / 废话查询 0.559~0.640，分布重叠无分离阈值——
+#    短查询对长文档的余弦在这个模型+语料上本就是弱信号。0.60 是「剪噪声带底」不是分离器：
+#    留下的大多有语义背书价值（覆盖度闸门只信 ≥0.60 的），被剪掉的真查询有词汇路兜底
+#    （截图 冒烟 0.526、部署 漂移 0.559 两词均在库中，词汇覆盖度照样强命中）。
+#    语义路的定位因此收窄为：字面词不存在时的 paraphrase 桥（如「关掉错误」→关闭错误 0.638）。
+_SEM_MIN_SIM = 0.60
 _SEM_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 try:
     from sentence_transformers import SentenceTransformer  # 可选依赖（本机可无）
@@ -3150,7 +3274,11 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
         channels.setdefault(eid, {})["semantic"] = round(s, 4)
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
     for eid, _, r in sem_rows:
-        by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
+        if eid in by_id:
+            # 双通道行：词法版本可能缺 _semantic_sim，补上供覆盖度闸门判「语义背书」
+            by_id[eid].setdefault("_semantic_sim", r.get("_semantic_sim"))
+        else:
+            by_id.setdefault(eid, r)   # 语义独有候选（词法未召回）也能进融合
     _apply_graph_channel(root, "memory", scores, channels, by_id)  # 第四路：图遍历
     fused = []
     now = datetime.datetime.now()
@@ -3184,10 +3312,12 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
         rows = _memories_search_fused(root, query or "", words, kind, limit)
     else:
         rows = _memories_query(root, words, kind, limit)  # 回滚开关：走旧单路
+    rows = _coverage_gate(root, rows, query or "")
     if not rows and words:
         retry = _retry_bigrams(query)
         if retry:
             rows = _memories_query(root, retry, kind, limit)  # 放宽重试保持旧路径（融合外）
+            rows = _coverage_gate(root, rows, query or "")
             for r in rows:  # 同 search_records：放宽召回须可识别
                 r["_bigram"] = True
     if rows:
