@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.31"}  # v2.40.29=R1 备份升级（库+文件单一.zip）；v2.40.30=R2 建表责任下沉到 handle_message；本版=R3 记忆 BM25 对称 token 缓存（_MEM_TOK_CACHE），与记录路径对齐，800 记忆二次查询 ~3.6x 提速且 edit 失效正确
+SERVER_INFO = {"name": "agenthub", "version": "2.40.32"}  # v2.40.29=R1 备份升级（库+文件单一.zip）；v2.40.30=R2 建表责任下沉到 handle_message；v2.40.31=R3 记忆 BM25 对称 token 缓存；本版=R4 语义第三路逐行 np.dot→(N,D) 矩阵一次 (M@q) 批量点积（search_all 双路放大，N=3000 实测 ~400x）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent

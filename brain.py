@@ -3248,18 +3248,27 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
             return []
         q = qvec[0].astype("float32")
         qn = np.linalg.norm(q) + 1e-9
-        scored = []
+        # 批量矩阵点积：把所有 vec 堆成 (N,D) 矩阵，一次 (M@q) 替代逐行 np.dot + 逐行 norm
+        # （原 O(N) Python 循环 → 单次 BLAS；search_all 对 records+memories 各跑一遍，放大为 2×O(N)）。
+        vecs, kept = [], []
         for row in rows:
             v = np.frombuffer(row["vec"], dtype="float32")
             if v.shape[0] != q.shape[0]:
                 continue
-            sim = float(np.dot(q, v) / (qn * (np.linalg.norm(v) + 1e-9)))
+            vecs.append(v); kept.append(row)
+        if not vecs:
+            return []
+        M = np.stack(vecs)                                    # (N, D)
+        norms = np.linalg.norm(M, axis=1) + 1e-9
+        sims = (M @ q) / (qn * norms)                        # 向量化余弦，与逐行公式数学等价
+        scored = []
+        for row, sim in zip(kept, sims):
             if sim < _SEM_MIN_SIM:   # 门槛：弱相关的语义候选不得进融合（噪声/误召回治理）
                 continue
             r = dict(row)
             r.pop("vec", None)   # 剥掉 BLOB，保持行形态与词法路一致（几百字节/条）
             r.pop("eid", None)
-            scored.append((row["id"], sim, r))
+            scored.append((row["id"], float(sim), r))
         scored.sort(key=lambda t: -t[1])
         out = []
         for rank, (eid, sim, r) in enumerate(scored[:limit]):

@@ -2456,6 +2456,53 @@ def t_coverage_gate(fresh):
         brain._RRF_W_SEMANTIC = sem_w
 
 
+def t_semantic_batched_cosine(tmp):
+    """B4 回归：语义第三路从「逐行 np.dot+norm 循环」改为「(N,D) 矩阵一次 (M@q) 批量点积」。
+    验证：① 批量公式与旧逐行公式数值等价；② live 过滤（软删记录不得被语义召回）；
+    ③ 相似度门槛（_SEM_MIN_SIM=0.60）挡正交候选；④ 同方向最相似者排第一。
+    桩掉 embedding 模型（_ensure_emb/_encode）以确定性隔离本改动。"""
+    import numpy as np
+    rng = np.random.default_rng(0)
+    DIM = 64
+    q = rng.standard_normal(DIM).astype("float32")
+    M = rng.standard_normal((2000, DIM)).astype("float32")
+    qn = np.linalg.norm(q) + 1e-9
+    old = [float(np.dot(q, v) / (qn * (np.linalg.norm(v) + 1e-9))) for v in M]
+    norms = np.linalg.norm(M, axis=1) + 1e-9
+    new = (M @ q) / (qn * norms)
+    assert np.max(np.abs(np.array(old) - new)) < 1e-5, "批量余弦与逐行不等价"
+
+    root = str(Path(tmp) / "hub_sem")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    brain._init_emb_table(root)
+    DIM2 = 8
+    add_ids = [brain.add_record(root, "sem项目", "zcode", "2026-01-01", f"t{i}", f"内容{i} 语义测试")
+               for i in range(6)]
+    with brain.db_conn(root) as c:
+        c.execute("UPDATE records SET status='deleted' WHERE id=?", (add_ids[5],))
+        for idx, rid in enumerate(add_ids):
+            vec = np.zeros(DIM2, dtype="float32"); vec[idx] = 1.0
+            c.execute("INSERT OR REPLACE INTO embeddings(entity, eid, vec, model, dim, updated) "
+                      "VALUES(?,?,?,?,?,?)", ("records", rid, vec.tobytes(), "fake", DIM2, "2026-01-01"))
+    ensure_emb_save, encode_save = brain._ensure_emb, brain._encode
+    try:
+        brain._ensure_emb = lambda: True
+        def fake_encode(texts):
+            v = np.zeros(DIM2, dtype="float32"); v[fake_encode.spike] = 1.0
+            return np.stack([v for _ in texts])
+        brain._encode = fake_encode
+        fake_encode.spike = 0  # 与 id1 同向 → 仅 id1 命中（id2-5 正交被门槛挡、id6 软删）
+        r1 = brain._semantic_rank(root, "语义测试 查询", "records", limit=10)
+        assert [t[0] for t in r1] == [add_ids[0]], [t[0] for t in r1]
+        fake_encode.spike = 5  # 与软删的 id6 同向 → 仍空（软删过滤）
+        assert len(brain._semantic_rank(root, "语义测试 查询", "records", limit=10)) == 0
+        fake_encode.spike = 7  # 与任何记录都不共线 → 门槛挡下，空
+        assert len(brain._semantic_rank(root, "语义测试 查询", "records", limit=10)) == 0
+    finally:
+        brain._ensure_emb, brain._encode = ensure_emb_save, encode_save
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2487,6 +2534,7 @@ def main():
     case("数据完整性（前缀剥离/重复检测/合并需confirm/归属保留/对抗参）", lambda: t_data_integrity(tmp))
     case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
+    case("B4·语义第三路批量矩阵点积（数值等价/软删过滤/门槛/最相似优先）", lambda: t_semantic_batched_cosine(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
