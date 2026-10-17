@@ -26,6 +26,22 @@ def build_fake_hub(root: Path):
     (root / "_hub").mkdir(parents=True, exist_ok=True)
 
 
+def t_regression_suite_coverage():
+    """守卫：`ops.REGRESSION_SUITES` 必须 == 源码目录里实际的 adv_*.py。
+
+    2026-10-17 复盘抓到：这份清单长期停在 9 套，adv_api（第 10 套）与 adv_cli（第 11 套）
+    **都没被纳进自动巡检**——新建套件不登记等于白建，`hub_ops_run regression` 会静默少跑，
+    而所有人都以为它在跑全套。此守卫让「漏登记 / 登记了不存在的套件」当场红。
+    """
+    src = Path(__file__).parent
+    actual = {p.name for p in src.glob("adv_*.py")}
+    listed = set(ops.REGRESSION_SUITES)
+    missing = actual - listed        # 目录里有、清单没登记 → 巡检会静默少跑
+    ghost = listed - actual          # 清单登记了、文件不存在 → 巡检会白跑报错
+    assert not missing, f"这些回归套件未被 registration 巡检登记（会静默少跑）：{sorted(missing)}"
+    assert not ghost, f"清单登记了不存在的套件：{sorted(ghost)}"
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="agenthub_adv_ops_"))
     build_fake_hub(tmp)
@@ -42,6 +58,13 @@ def main():
     r = ops.run_check("py_compile", str(proj))
     check("py_compile 抓出语法错误", not r["ok"] and "bad.py" in "".join(r["detail"]), str(r["summary"]))
     check("py_compile 排除 __pycache__", all("__pycache__" not in d for d in r["detail"]), str(r["detail"]))
+
+    # ---- 守卫：回归套件必须全部登记进巡检（漏登记 = 静默少跑）
+    try:
+        t_regression_suite_coverage()
+        check("回归套件登记完整（ops.REGRESSION_SUITES == 目录里实际 adv_*.py）", True)
+    except AssertionError as e:
+        check("回归套件登记完整（ops.REGRESSION_SUITES == 目录里实际 adv_*.py）", False, str(e))
     check("py_compile 输出精简（detail≤8）", len(r["detail"]) <= 8)
 
     (proj / "clean.py").write_text("y = 2\n", encoding="utf-8")

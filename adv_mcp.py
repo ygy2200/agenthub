@@ -1978,6 +1978,24 @@ def t_structured_log(root):
             os.environ["AGENTHUB_LOG"] = saved
 
 
+def t_readme_changelog_sync(root):
+    """回归：README 版本历史表必须包含当前 SERVER_INFO 版本。
+
+    这是本项目的**复发漏洞**——改代码时只改 SERVER_INFO、忘了同步 README，
+    已在两次独立复盘里各抓到一次断档（第一次缺 v2.40.27/.28，第二次缺 v2.40.29~.39
+    共 11 个版本）。补录只能治标，让回归替人盯住才治本：以后漏一次就红。
+    """
+    readme = Path(__file__).parent / "README.md"
+    text = readme.read_text(encoding="utf-8")
+    ver = m.SERVER_INFO["version"]
+    assert f"| v{ver} |" in text, (
+        f"README 版本历史表缺 v{ver} —— 改了 SERVER_INFO 就要同步 changelog"
+        f"（本项目已两次断档，此断言就是为了防止第三次）")
+    # 顺带守住版本号格式本身：必须是 x.y.z 三段数字（避免手滑写成 2.40 或 2.40.39.1）
+    import re as _re
+    assert _re.fullmatch(r"\d+\.\d+\.\d+", ver), f"版本号格式异常：{ver!r}"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -2045,6 +2063,8 @@ def main():
          lambda: t_confirm_blast_radius(fresh_hub(tmp, "hub_b3")))
     case("B8·结构化可观测日志（默认关闭零副作用/字段齐全/异常落痕/写失败不影响主链路）",
          lambda: t_structured_log(fresh_hub(tmp, "hub_b8")))
+    case("文档纪律·README 版本历史表必须含当前 SERVER_INFO 版本（防第三次 changelog 断档）",
+         lambda: t_readme_changelog_sync(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

@@ -34,7 +34,7 @@ PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一
 CHECKS = {
     "py_compile": ("编译检查 target 目录全部 .py（ast 语法解析，抓低级语法错），通用任意项目", True),
     "git_status": ("git 工作区是否干净（未提交/未跟踪清单），通用任意仓库", True),
-    "regression": ("跑 AgentHub 九套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log/adv_mywork/adv_concurrency/adv_ops（约2分钟）", True),
+    "regression": ("跑 AgentHub 十一套对抗回归 adv_brain/adv_mcp/adv_cli/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log/adv_mywork/adv_concurrency/adv_ops/adv_api（约3分钟）", True),
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
     "release": ("发布一致性：GUI exe 是否比关键源码（main/ui/core/brain/agentscore）旧 + 桌面副本是否同步——防止「改了源码没重打包」", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
@@ -327,13 +327,21 @@ def _git_status(target: Path) -> dict:
             "detail": lines[:8]}
 
 
+# 对抗回归套件清单（单一来源：`hub_ops_run regression` 就跑这些）。
+# 2026-10-13：并发/WAL 收尾；2026-10-17：补 adv_ops（此前 ops 工具箱无回归覆盖）。
+# 2026-10-17 复盘抓到：本清单长期停在 9 套，**adv_api（第 10 套）与 adv_cli（第 11 套）
+# 都没被纳进来**——新建的套件不接进巡检等于白建，回归项与新套件会各自漂移。
+# 守一条规矩：新增 adv_*.py 套件时必须同时改这里；adv_ops 有守卫盯着目录里的实际文件。
+REGRESSION_SUITES = ["adv_brain.py", "adv_mcp.py", "adv_cli.py", "adv_agenthub.py",
+                     "adv_e2e_schema.py", "adv_report.py", "adv_auto_log.py",
+                     "adv_mywork.py", "adv_concurrency.py", "adv_ops.py", "adv_api.py"]
+
+
 def _regression(target: Path) -> dict:
     if not (target / "adv_brain.py").is_file():
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 adv_brain.py）", "detail": []}
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
-    suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py",
-              "adv_report.py", "adv_auto_log.py", "adv_mywork.py",
-              "adv_concurrency.py", "adv_ops.py"]  # 2026-10-13：并发/WAL 收尾；2026-10-17：补 adv_ops（此前 ops 工具箱无回归覆盖，计数断言还停留在 14）
+    suites = list(REGRESSION_SUITES)
     detail, fails, cost = [], [], 0.0
     for s in suites:
         t0 = time.perf_counter()
