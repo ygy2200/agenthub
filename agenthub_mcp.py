@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.25"}  # v2.40.24=退出竞态根因修复；本版=数据卫生：元信息占比拆解（按 kind+零唤起对照，防「61.8%」误读为灌水）+ 归档重复记忆 #176（被 #180 取代）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.26"}  # v2.40.25=数据卫生；本版=守卫补缺（lesson #177）：记录四段式软提示+record_quality 度量（实测基线 22%）+ CORE_TOOLS 腐烂守卫；ops enum 动态同步已核实
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -497,7 +497,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
-        out = f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}"
+        out = f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}{_template_nudge(content, rt)}"
         # 写入时踩坑拦截：新记录与库内 lesson/fact 相似 → 当场弹出核对
         # （"大脑拦住重复踩坑"的落地时机——比开工推送更贴近踩坑瞬间）
         try:
@@ -2360,6 +2360,26 @@ def _example_hint(tname: str) -> str:
     if i < 0:
         return ""
     return " 正确示例：" + d[i + 2:].split("。")[0].strip()
+
+
+def _template_nudge(content: str, rt: str) -> str:
+    """R7·四段式模板软提示（2026-10-17）：work_log 缺段时只在回显点一句。
+
+    铁律「content 含 目的/做了什么/验证结果/如何回滚」实测遵守率仅 48%
+    （近 200 条 active 记录四段俱全率，缺目的 46%/缺回滚 22%）——没有守卫的
+    标准必然腐烂（教训 #177）。设计：不阻断（todo/note/crystal/decision 不
+    适用四段式）、不污染存储内容（提示只进工具回显）、列明缺哪段——下一条
+    补上，比事后盘点便宜。measurement 见 ops 检查项 record_quality。
+    """
+    if rt and rt not in ("work_log", ""):
+        return ""
+    miss = [k for k, pat in (("目的", "目的"), ("做了什么", "做了什么"),
+                             ("验证结果", "验证"), ("如何回滚", "回滚"))
+            if not re.search(pat, content or "")]
+    if not miss:
+        return ""
+    return (f"（模板提示：铁律四段=目的/做了什么/验证结果/如何回滚，本条缺"
+            f"{'、'.join(miss)}段——记录已存，下一条补上）")
 
 
 def _required_missing(tname: str, args: dict) -> list:

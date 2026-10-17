@@ -62,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.25"
+    assert r["serverInfo"]["version"] == "2.40.26"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1889,6 +1889,27 @@ def t_error_msg_three_part(root):
     assert "content" in out and "缺失" in out and "例：" in out, out
 
 
+def t_template_nudge(root):
+    """R7·四段式模板软提示（2026-10-17）：缺段只在回显点一句，不阻断、不污染存储。
+
+    背景：铁律四段式实测遵守率仅 48%（近 200 条）——标准没有度量与提示必然腐烂。
+    """
+    root = str(root)
+    out = m.call_tool("hub_log_work", {"project": "模板测试-项目", "agent": "zcode",
+                                       "content": "目的：x\n做了什么：y\n验证结果：z\n如何回滚：w"}, root)
+    assert "模板提示" not in out, out   # 四段俱全不提示
+    out = m.call_tool("hub_log_work", {"project": "模板测试-项目", "agent": "zcode",
+                                       "content": "随手记了一条"}, root)
+    assert "模板提示" in out and "验证结果" in out and "如何回滚" in out, out
+    # 存储内容不被污染（提示只进回显，不进 records.content）
+    rows = brain.search_records(root, "随手记了一条")
+    assert rows and "模板提示" not in (rows[0].get("content") or ""), rows[0]["content"][:80]
+    # todo 类型不适用四段式，不提示
+    out = m.call_tool("hub_log_work", {"project": "模板测试-项目", "agent": "zcode",
+                                       "content": "待办：后续验证", "record_type": "todo"}, root)
+    assert "模板提示" not in out, out
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -1951,6 +1972,7 @@ def main():
          lambda: t_round13_int_params_central(root))
     case("R3·错误信息三件套（必填/项目不存在/枚举/未知工具/坏根/缺content 均带示例或核对路径）",
          lambda: t_error_msg_three_part(root))
+    case("R7·四段式模板软提示（缺段回显/不污染存储/todo 不提示）", lambda: t_template_nudge(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

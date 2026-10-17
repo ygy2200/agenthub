@@ -54,6 +54,7 @@ CHECKS = {
     "stdout_guard": ("stdout 污染守卫（2026-10-13）：MCP stdio 协议下任何 print 落到 stdout 都会让客户端 JSON-RPC 解析失败、工具全消失——外部检索列的头号致命缺陷。扫描 MCP 进程加载的模块", True),
     "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
     "desc_quality": ("工具描述质量守卫（2026-10-17）：核心工具描述必须含示例+使用时机+必填参数说明，全部工具描述不得过短——描述是 agent 的 UI，缺示例准确率掉约 18 个点（外部调研 72%→90%，tsecurity/agentpatterns/cloudappi 三处一致）", False),
+    "record_quality": ("记录模板遵守率（2026-10-17 R7）：近 90 天 work_log 四段式（目的/做了什么/验证结果/如何回滚）俱全率+缺段分布——铁律没有守卫必然腐烂（实测基线仅 48%）。只测不拦，软提示在 hub_log_work 回显", False),
 }
 
 
@@ -101,6 +102,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _schema_drift()
     elif name == "desc_quality":
         r = _desc_quality()
+    elif name == "record_quality":
+        r = _record_quality(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -558,7 +561,7 @@ _TIMING_MARKS = ("开工", "收尾", "先", "必", "别", "勿", "不要", "找�
                  "怀疑", "判断", "确认", "想知道", "要开", "定期", "定时")
 
 
-def _desc_quality(src: str = "") -> dict:
+def _desc_quality(src: str = "", check_core_stale: bool = True) -> dict:
     """工具描述质量守卫：防「描述随功能增加而静默腐烂」（本仓教训 #177 的落地）。
 
     标准：
@@ -567,6 +570,8 @@ def _desc_quality(src: str = "") -> dict:
          必填参数个个有 description。
     新工具漏配任何一条，此检查项即报出——没有守卫的标准必然腐烂。
     src 参数仅供对抗测试注入变异源码；缺省读真实 agenthub_mcp.py。
+    check_core_stale：CORE_TOOLS 引用不存在工具的腐烂检查——只对真实源码有意义
+    （合成源码里当然没有真核心工具，会误报，故测试时关掉）。
     """
     import ast  # noqa: PLC0415
     if not src:
@@ -610,6 +615,9 @@ def _desc_quality(src: str = "") -> dict:
             if name:
                 tools[name] = (desc or "", props, required)
     bad = []
+    stale_core = sorted(CORE_TOOLS - set(tools)) if check_core_stale else []
+    if stale_core:
+        bad.append(f"CORE_TOOLS 引用不存在的工具（常量腐烂=守卫对这些工具静默失效）：{stale_core}")
     for name, (desc, props, required) in sorted(tools.items()):
         if len(desc) < 25:
             bad.append(f"{name}: 描述过短（{len(desc)} 字 <25）")
@@ -628,6 +636,54 @@ def _desc_quality(src: str = "") -> dict:
     return {"ok": True,
             "summary": f"{len(tools)} 个工具描述达标（核心 {len(CORE_TOOLS)} 个：示例+时机+参数说明齐全）",
             "detail": []}
+
+
+def _record_quality(root: str) -> dict:
+    """R7·记录模板遵守率（2026-10-17）：近 90 天 active work_log 的四段式俱全率。
+
+    为什么值得一个检查项：铁律「content 含 目的/做了什么/验证结果/如何回滚」
+    写在规范里，但 2026-10-17 实测近 200 条记录四段俱全率仅 48%（缺目的 46%/
+    缺回滚 22%）——标准没有度量就没有遵守（教训 #177 同族：没有守卫的标准
+    必然腐烂）。配套软提示已进 hub_log_work 回显（缺段时点一句，不阻断）。
+    判读：率低≠要刷数据，是提醒后续记录补段；todo/note/crystal 等类型不适用
+    四段式，不在统计口径内。
+    """
+    import re  # noqa: PLC0415
+    if not root or not Path(root).is_dir():
+        return {"ok": False, "summary": "record_quality 需要 root（数据根目录）", "detail": []}
+    brain = _import_brain()
+    try:
+        with brain.db_conn(root) as conn:
+            rows = conn.execute(
+                "SELECT agent, content FROM records WHERE status='active' "
+                "AND (record_type='work_log' OR record_type='' OR record_type IS NULL) "
+                "AND date >= date('now', '-90 days')").fetchall()
+    except Exception as e:  # noqa: BLE001 老库可能没有 record_type 列
+        return {"ok": False, "summary": f"读取记录失败：{e}", "detail": []}
+    if not rows:
+        return {"ok": True, "summary": "近 90 天无 work_log 记录（口径外或空库）", "detail": []}
+    parts = (("目的", "目的"), ("做了什么", "做了什么"), ("验证结果", "验证"), ("如何回滚", "回滚"))
+    full = 0
+    miss = {k: 0 for k, _ in parts}
+    by_agent: dict = {}
+    for r in rows:
+        txt = r["content"] or ""
+        lack = [k for k, pat in parts if not re.search(pat, txt)]
+        if not lack:
+            full += 1
+        for k in lack:
+            miss[k] += 1
+        a = r["agent"] or "未知"
+        stat = by_agent.setdefault(a, {"n": 0, "full": 0})
+        stat["n"] += 1
+        stat["full"] += 0 if lack else 1
+    n = len(rows)
+    rate = full * 100 // n
+    detail = [f"缺「{k}」{v} 条（{v * 100 // n}%）" for k, v in miss.items() if v]
+    detail += [f"{a}: {s['full']}/{s['n']}" for a, s in sorted(by_agent.items(), key=lambda x: -x[1]["n"])[:5]]
+    return {"ok": rate >= 60,
+            "summary": f"四段式俱全率 {rate}%（{full}/{n}，近90天 work_log；软提示已进 hub_log_work 回显）",
+            "detail": detail[:8]}
 
 
 def _date_health(root: str) -> dict:
