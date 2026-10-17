@@ -5352,12 +5352,25 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
     toks = [(r["id"], r["kind"], r["content"], _tokens(r["content"])) for r in rows]
     out = []
     for i in range(len(toks)):
+        ta = toks[i][3]
+        if not ta:
+            continue              # 空词集：与任何 j 的 sim 恒为 0，整行跳过（等价，省一层）
+        sa = len(ta)
         for j in range(i + 1, len(toks)):
-            ta, tb = toks[i][3], toks[j][3]
-            if not ta or not tb:
+            tb = toks[j][3]
+            if not tb:
+                continue
+            sb = len(tb)
+            # Jaccard 上界短路（B5）：|A∩B| <= min(|A|,|B|) 且 |A∪B| >= max(|A|,|B|)
+            # → sim <= min/max。上界够不到阈值就不必做 set 交/并——那是 O(N²) 里最贵的一步，
+            # 也是 hub_metacognition（dup_pairs）在大库上的主开销。只跳「数学上不可能达阈值」
+            # 的对，结果集合与迭代顺序完全不变（可回归比对）。
+            lo, hi = (sa, sb) if sa < sb else (sb, sa)
+            if lo / hi < threshold:
                 continue
             inter = len(ta & tb)
-            sim = inter / len(ta | tb) if ta | tb else 0.0
+            # |A∪B| = |A|+|B|-|A∩B|：不必构造并集（省一次 O(|A|+|B|) 建集，纯等价代数替换）
+            sim = inter / (sa + sb - inter)
             if sim >= threshold:
                 out.append({"a": toks[i][0], "b": toks[j][0], "sim": round(sim, 2),
                             "verdict": _verdict(toks[i][2], toks[j][2], toks[i][1] == toks[j][1]),

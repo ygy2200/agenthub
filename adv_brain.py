@@ -2503,6 +2503,48 @@ def t_semantic_batched_cosine(tmp):
         brain._ensure_emb, brain._encode = ensure_emb_save, encode_save
 
 
+def t_similar_memories_bound(tmp):
+    """B5 回归：similar_memories 两两 Jaccard 加「上界短路」+「|∪|=|A|+|B|-|∩| 免建并集」。
+    两者都是纯等价变换——只跳过数学上不可能达阈值的对、不构造并集集合，结果必须逐字段一致。
+    验证：与未优化的参考实现在多种阈值/limit 下完全一致（含 limit 早退分支与高阈值全剪枝分支）。"""
+    import random
+    root = str(Path(tmp) / "hub_b5")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    rng = random.Random(7)
+    words = ["代理", "端口", "冲突", "内存", "缓存", "索引", "迁移", "备份", "检索", "语义"]
+    for i in range(220):
+        n = rng.choice([3, 5, 12, 30, 60])      # 长度差异大 → 上界剪枝空间大
+        brain.add_memory(root, "".join(rng.choice(words) for _ in range(n)) + f" 第{i}条",
+                         kind="note", agent="zcode", project="p")
+
+    def ref_impl(threshold, limit):
+        with brain.db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, kind, content FROM memories WHERE " + brain._live_sql() + " ORDER BY id")]
+        toks = [(r["id"], r["kind"], r["content"], brain._tokens(r["content"])) for r in rows]
+        out = []
+        for i in range(len(toks)):
+            for j in range(i + 1, len(toks)):
+                ta, tb = toks[i][3], toks[j][3]
+                if not ta or not tb:
+                    continue
+                inter = len(ta & tb)
+                sim = inter / len(ta | tb) if ta | tb else 0.0
+                if sim >= threshold:
+                    out.append({"a": toks[i][0], "b": toks[j][0], "sim": round(sim, 2),
+                                "verdict": brain._verdict(toks[i][2], toks[j][2], toks[i][1] == toks[j][1]),
+                                "content_a": toks[i][2][:80], "content_b": toks[j][2][:80]})
+                if len(out) >= max(1, min(limit, 50)):
+                    return out
+        out.sort(key=lambda x: -x["sim"])
+        return out
+
+    for thr, lim in ((0.55, 50), (0.55, 3), (0.9, 50)):
+        assert brain.similar_memories(root, thr, lim) == ref_impl(thr, lim), f"不一致 thr={thr} limit={lim}"
+    assert brain.similar_memories(root, 1.5, 50) == [], "阈值>1 应全部剪枝为空"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2535,6 +2577,7 @@ def main():
     case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
     case("B4·语义第三路批量矩阵点积（数值等价/软删过滤/门槛/最相似优先）", lambda: t_semantic_batched_cosine(tmp))
+    case("B5·相似记忆两两 Jaccard 上界短路（等价免建并集/多阈值/limit 早退一致）", lambda: t_similar_memories_bound(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
