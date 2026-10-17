@@ -1578,15 +1578,23 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
         return []
     docs = []
     for r in rows:
-        toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]),
-                         max_tokens=2000)  # doc 侧不截断：截了长记忆后半无法命中（复盘实锤）
-        docs.append((r, Counter(toks), len(toks)))
+        ckey = (root, r["id"])
+        ent = _MEM_TOK_CACHE.get(ckey)
+        if ent is None:
+            toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]),
+                             max_tokens=2000)  # doc 侧不截断：截了长记忆后半无法命中（复盘实锤）
+            ent = (Counter(toks), len(toks))
+            _MEM_TOK_CACHE[ckey] = ent
+        docs.append((r, ent[0], ent[1]))
     return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
 
 
 _RECORDS_TOK_CACHE: dict = {}  # (root, record_id) → (Counter, dl)：记录内容不可变（只增不改），缓存进程内安全
 # 1559 条全文分词 ~300ms/查询（搜索页同步调用，用户抱怨过慢）→ 缓存后首查之外 <10ms
 # key 必须含 root——不同库的 id 空间独立（adv 多 tmp 库实测串库：id=1 在各库是不同内容）
+
+_MEM_TOK_CACHE: dict = {}  # (root, memory_id) → (Counter, dl)：与 _RECORDS_TOK_CACHE 对称；
+# 记忆可被 edit_memory 改写 content/tags → 其 text_changed 分支负责 pop 失效，避免 BM25 命中旧文本
 
 
 def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
@@ -3495,6 +3503,7 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
                      (*args, _now(), mid))
         _revision(conn, mid, "edit", before, _snapshot(conn, mid), agent)
         if text_changed:
+            _MEM_TOK_CACHE.pop((root, mid), None)  # 文本改了，BM25 token 缓存必须失效（否则命中旧文本）
             # 文本变更 → 同步语义索引（否则语义路拿着旧文本做相似度，编辑等于没生效）
             row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
                                (mid,)).fetchone()
