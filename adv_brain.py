@@ -2573,6 +2573,54 @@ def t_schema_version(tmp):
     assert brain.schema_version(hub)["drift"] == ""
 
 
+def t_sentinel_exit_hook(tmp):
+    """B12 回归：哨兵退出钩子。
+    此前 atexit **双重注册**（_close_sentinels 带 checkpoint；_close_all_sentinels 只 close），
+    而 atexit 是 LIFO——后注册的先跑并清空 _SENTINELS，导致带 checkpoint 的那个在真实退出时
+    空转，**WAL checkpoint 从未执行**。这个 bug 一直没暴露，是因为回归里直接调 _close_sentinels()
+    绕过了 atexit 顺序（测试绿、线上漏）。
+    验证：①不再存在第二个钩子（否则 checkpoint 又被架空）；②触发唯一钩子后 -wal/-shm 无残留。"""
+    assert not hasattr(brain, "_close_all_sentinels"), \
+        "又出现了第二个哨兵清理钩子——它会在 atexit 中先跑并架空带 checkpoint 的那个"
+    root = str(Path(tmp) / "hub_sentinel")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    brain.add_memory(root, "B12 哨兵退出收尾测试", kind="note", agent="zcode")
+    db = Path(brain.db_path(root))
+    brain._close_sentinels()          # 模拟进程退出时的收尾
+    leftovers = [p.name for p in db.parent.iterdir()
+                 if p.name.startswith(db.name + "-")]
+    assert not leftovers, f"退出收尾后仍残留 WAL 旁文件：{leftovers}"
+    # 收尾后库仍可写（不能被自己的收尾逻辑搞成只读/占用）
+    brain.add_memory(root, "收尾后仍可写", kind="note", agent="zcode")
+
+
+def t_env_override_paths(tmp):
+    """B6 回归：硬编码的机器专属绝对路径可被环境变量覆盖（默认值不变）。
+    验证：设 AGENTHUB_ROOT / HERMES_HOME 后模块内的路径常量随之改变，取消后回落默认。
+    ——换机器不用改码，这是可移植性的最低门槛。"""
+    import importlib
+    import agentscore
+    import auto_log
+    saved_root = os.environ.get("AGENTHUB_ROOT")
+    saved_home = os.environ.get("HERMES_HOME")
+    try:
+        os.environ["HERMES_HOME"] = "X:/elsewhere/hermes"
+        os.environ["AGENTHUB_ROOT"] = "X:/elsewhere/brainroot"
+        ag = importlib.reload(agentscore)
+        al = importlib.reload(auto_log)
+        assert "X:/elsewhere/hermes" in ag.HERMES_INDEX, ag.HERMES_INDEX
+        assert al._FALLBACK_ROOT == "X:/elsewhere/brainroot", al._FALLBACK_ROOT
+    finally:
+        for k, v in (("AGENTHUB_ROOT", saved_root), ("HERMES_HOME", saved_home)):
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+        importlib.reload(agentscore)   # 恢复默认，避免污染后续用例
+        importlib.reload(auto_log)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2607,6 +2655,9 @@ def main():
     case("B4·语义第三路批量矩阵点积（数值等价/软删过滤/门槛/最相似优先）", lambda: t_semantic_batched_cosine(tmp))
     case("B5·相似记忆两两 Jaccard 上界短路（等价免建并集/多阈值/limit 早退一致）", lambda: t_similar_memories_bound(tmp))
     case("B11·schema 版本登记与降级检测（幂等/downgrade 不抹证据/低版本升级）", lambda: t_schema_version(tmp))
+    case("B12·哨兵退出钩子唯一且真做 checkpoint（防第二个钩子架空/WAL 无残留/收尾后仍可写）",
+         lambda: t_sentinel_exit_hook(tmp))
+    case("B6·硬编码路径可被环境变量覆盖（AGENTHUB_ROOT/HERMES_HOME，默认值不变）", lambda: t_env_override_paths(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))

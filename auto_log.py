@@ -26,7 +26,9 @@ import core  # noqa: E402
 
 PROJECT_NAME = "ZCode会话轨迹-自动捕获"
 MAX_PREVIEW = 200
-_FALLBACK_ROOT = r"D:\agent资料\zcode项目记录"
+# B6：默认仍是本机路径，但允许 AGENTHUB_ROOT 覆盖——这台机器的绝对路径不该烧进代码里
+# （换机器/换盘/给别人用时，不改码就能指到正确的大脑根）。
+_FALLBACK_ROOT = (os.environ.get("AGENTHUB_ROOT") or r"D:\agent资料\zcode项目记录").strip()
 # 本 hook 的归属 agent。默认 zcode（它是 ZCode 的 Stop hook），
 # 但允许 env 覆盖——若日后复制给别家 agent 用，设 AGENTHUB_AGENT 即可，不必改码。
 # （2026-10-10：此前硬编码 "zcode"，一旦被复用就会给别家记录错标归属。）

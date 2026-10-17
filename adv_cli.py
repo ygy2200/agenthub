@@ -120,9 +120,12 @@ def t_cli_readonly(tmp):
     assert rc == 0, (rc, out[:200])
     rc, out = _capture(cli.cmd_discover, root)
     assert rc == 0, (rc, out[:200])
-    # release 是一致性只读检查（比较 exe 与源码时间戳），不写任何东西
+    # release 是一致性检查（比较 exe 与源码时间戳，不写任何东西）——它的返回值本身
+    # 就是结论（0=一致 / 非0=该重打包了），刚改完源码没打包时必然非 0，所以这里
+    # 只守「不抛异常 + 给出明确结论」，不能断言恒为 0（那是把发布门禁当成稳定契约）。
     rc, out = _capture(cli.cmd_release, root)
-    assert rc == 0, (rc, out[:200])
+    assert out.strip(), "release 无任何输出"
+    assert "exe" in out, out[:200]
 
 
 def t_cli_bad_args(tmp):
@@ -153,7 +156,8 @@ def main():
     case("B7·codec 三格式读写往返（insert/幂等重复插入/remove/重复删除）", lambda: t_codec_roundtrip(tmp))
     case("B7·codec detect_format 按扩展名判格式（json/jsonc/toml/yaml/yml）", lambda: t_codec_detect(tmp))
     case("B7·codec 原子写不留 .tmp 残骸且写后可读", lambda: t_codec_atomic(tmp))
-    case("B7·cli 只读命令（status/tools/call/discover/release 均 0 且有输出）", lambda: t_cli_readonly(tmp))
+    case("B7·cli 只读命令（status/tools/call/discover 返回 0 且有输出；release 不抛且有结论）",
+         lambda: t_cli_readonly(tmp))
     case("B7·cli 坏参拒绝（无参/未知子命令/未知工具均非零）", lambda: t_cli_bad_args(tmp))
     print()
     if FAILED:

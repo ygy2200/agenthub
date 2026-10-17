@@ -279,7 +279,9 @@ def _join_home(home: str, rels: list) -> list:
 
 # ---------------------------------------------------------------- 技能市场
 
-HERMES_INDEX = "D:/hermes/Hermes Agent CN Desktop/bundled-skills/index-cache/anthropics_skills_skills_.json"
+# B6：本机绝对路径不再烧死——设 HERMES_HOME 即可指向别处（换机器/换安装位置时不用改码）。
+_HERMES_HOME = (os.environ.get("HERMES_HOME") or "D:/hermes/Hermes Agent CN Desktop").strip()
+HERMES_INDEX = _HERMES_HOME + "/bundled-skills/index-cache/anthropics_skills_skills_.json"
 
 
 def load_local_market() -> list:

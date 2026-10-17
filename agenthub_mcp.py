@@ -39,7 +39,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.37"}  # v2.40.29=R1 备份升级；v2.40.30=R2 建表下沉 handle_message；v2.40.31=R3 记忆 BM25 token 缓存；v2.40.32=R4 语义批量矩阵点积；v2.40.33=R5 Jaccard 上界短路；v2.40.34=R6 确认闸门破坏半径分级；v2.40.35=R7 结构化可观测；v2.40.36=R8 schema 版本登记+降级检测；本版=R9 新增第 11 套回归 adv_cli.py（codec 三格式读写往返/幂等重复插入/原子写无残骸 + cli 只读命令与坏参拒绝；明确不测 deploy/refresh/onboard 等会改真实配置的命令）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.38"}  # v2.40.29=R1 备份升级；v2.40.30=R2 建表下沉 handle_message；v2.40.31=R3 记忆 BM25 token 缓存；v2.40.32=R4 语义批量矩阵点积；v2.40.33=R5 Jaccard 上界短路；v2.40.34=R6 确认闸门破坏半径分级；v2.40.35=R7 结构化可观测；v2.40.36=R8 schema 版本+降级检测；v2.40.37=R9 第 11 套回归 adv_cli；本版=R10 收尾：B12 删除架空的第二个哨兵 atexit 钩子（LIFO 导致带 wal_checkpoint 的那个从未在真实退出时执行，只留 close——正是 -wal/-shm 残留事故形状）+ B6 硬编码路径可被 AGENTHUB_ROOT/HERMES_HOME 覆盖
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent

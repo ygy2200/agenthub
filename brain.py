@@ -160,18 +160,12 @@ def release_root(root: str) -> None:
             pass
 
 
-def _close_all_sentinels() -> None:
-    with _SENTINEL_LOCK:
-        items = list(_SENTINELS.items())
-        _SENTINELS.clear()
-    for _k, c in items:
-        try:
-            c.close()
-        except Exception:
-            pass
-
-
-atexit.register(_close_all_sentinels)
+# B12：此处**曾是双重注册**——下面还有个 _close_all_sentinels 也注册了 atexit。
+# atexit 是 LIFO（后注册先执行），于是「只 close 不做 checkpoint」的那个先跑并清空
+# _SENTINELS 字典，等轮到本函数时字典已空 → **checkpoint 在真实退出时从未执行过**，
+# 只留下 close。这正好是上面注释里警告的 ruvnet/ruflo#3397 事故形状（-wal/-shm 残留
+# 会拒掉其他进程的首次写入）。之所以一直没暴露：回归里是**直接调用** _close_sentinels()，
+# 绕过了 atexit 顺序，所以测试绿而线上漏。现已删除第二个钩子，保证退出走带 checkpoint 的这条路。
 
 
 @contextmanager
