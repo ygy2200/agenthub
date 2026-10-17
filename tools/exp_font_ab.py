@@ -50,8 +50,8 @@ def shoot():
     ok = pm.save(p)
     print(("saved " if ok else "FAILED ") + p, flush=True)
     print(f"DPR={w.devicePixelRatioF()} logicalDpi={w.logicalDpi()}", flush=True)
-    os._exit(0)
+    ui._hard_exit(0)
 
 
 QTimer.singleShot(3500, shoot)
-os._exit(app.exec())
+ui._hard_exit(app.exec())

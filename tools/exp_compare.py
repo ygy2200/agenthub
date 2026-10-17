@@ -70,9 +70,9 @@ def shoot():
     proc.kill()
     print("exe 已硬杀", flush=True)
     # 源码窗口直接硬退（不触发 closeEvent 保存几何）
-    os._exit(0)
+    ui._hard_exit(0)
 
 
 QTimer.singleShot(2200, shoot)
 rc = app.exec()
-os._exit(0)
+ui._hard_exit(0)

@@ -97,4 +97,4 @@ for _i in range(3):
     trig.append("✓" if ok3 else "✗")
 print("连续滚底触发：", " ".join(trig) if trig else "(已全部加载)", flush=True)
 print("box 顶层项数（日期组+尾部）:", tl.box.count(), flush=True)
-os._exit(0)
+ui._hard_exit(0)

@@ -124,7 +124,7 @@ def _check(factor: str) -> int:
     # 本项目的既定解法见 window._hard_exit：flush 后 os._exit 跳过全部析构回调。
     sys.stdout.flush()
     sys.stderr.flush()
-    os._exit(1 if bad else 0)
+    ui._hard_exit(1 if bad else 0)
 
 
 def main() -> int:

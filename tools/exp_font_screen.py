@@ -64,8 +64,8 @@ def cap():
     p = os.path.join(OUT, f"fs-{MODE}-{W}x{H}.png")
     crop.save(p)
     print(f"saved {p}  DPR={w.devicePixelRatioF()} dpiX={w.logicalDpiX()}", flush=True)
-    os._exit(0)
+    ui._hard_exit(0)
 
 
 QTimer.singleShot(3000, shoot)
-os._exit(app.exec())
+ui._hard_exit(app.exec())

@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.23"}  # v2.40.22=错误三件套；本版=检索精度：IDF 加权覆盖度闸门（治常见 bigram 蹭中）+ 语义准入线 0.45→0.60 重标定 + 融合处 _semantic_sim 补传
+SERVER_INFO = {"name": "agenthub", "version": "2.40.24"}  # v2.40.23=检索精度闸门；本版=退出竞态根因修复：window.py 双 _hard_exit 定义静默遮蔽（TerminateProcess 正解沦为死代码）合并为单定义 + 全仓库 GUI 脚本禁裸 os._exit + 退出守卫
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent

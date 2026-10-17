@@ -419,20 +419,34 @@ def _register_note_hotkey(w):
     return _unregister
 
 
-def _hard_exit(rc):
-    """带存活 detached 线程的退出路径专用：os._exit 走 Windows 进程终止时仍会
-    触发线程终止+Qt TLS（QThreadStorage）清理，在半死线程上下文偶发 access
-    violation（faulthandler 实证，smoke 6 跑 3 中）；TerminateProcess 跳过全部
-    DLL 卸载回调，实测 10+ 次无段错误。非 win32 或调用失败时回退 os._exit。"""
+def _hard_exit(code: int = 0):
+    """强制退出兜底（qfw item view 已知退出挂起坑 + detached 线程段错误）：先 flush、
+    关窗，再 TerminateProcess 硬杀——跳过全部 DLL 卸载回调与线程终止时的 Qt TLS
+    （QThreadStorage）清理，后者在半死线程上下文偶发 access violation（faulthandler
+    实证：smoke 6 跑 3 中、layout_stress 8 连跑 2 中），TerminateProcess 实测 10+
+    次无段错误。硬退不走 atexit/缓冲区 flush，重定向到文件时崩溃前的 print 全丢在
+    缓冲区（smoke_ui 2026-10-12 实测教训），故先 flush。非 win32 或调用失败回退
+    os._exit。run_gui 收尾、tools/ 脚本、smoke_ui、layout_stress 都靠它。
+
+    历史坑（2026-10-17 R5 揪出）：本文件曾有两个 _hard_exit——本 TerminateProcess
+    版被下方一个裸 os._exit 版静默遮蔽（后定义胜），「文档化的修复」沦为死代码，
+    全部调用方实际用的是弱版。已合并为本定义；adv_agenthub 退出守卫（仓库内禁裸
+    os._exit，window.py 定义处除外）防复发。"""
+    try:
+        sys.stdout.flush()
+        sys.stderr.flush()
+        QApplication.instance().closeAllWindows()
+    except Exception:
+        pass
     if sys.platform == "win32":
         try:
             import ctypes
             k32 = ctypes.windll.kernel32
             k32.GetCurrentProcess.restype = ctypes.c_void_p
-            k32.TerminateProcess(ctypes.c_void_p(k32.GetCurrentProcess()), rc)
+            k32.TerminateProcess(ctypes.c_void_p(k32.GetCurrentProcess()), code)
         except Exception:
             pass
-    os._exit(rc)
+    os._exit(code)
 
 
 def _setup_app_font(app):
@@ -469,21 +483,6 @@ def _setup_app_font(app):
 
 
 _THEME_LISTENER = None  # 系统主题监听（auto 模式联动用；进程级保引用，防 GC 回收 QThread）
-
-
-def _hard_exit(code: int = 0):
-    """强制退出兜底（qfw item view 已知退出挂起坑）：关窗后直接 os._exit 退进程，
-    顺带消 detached 线程段错误。run_gui 收尾、tools/ 脚本、smoke_ui 都靠它。
-
-    先 flush 再 _exit：os._exit 不走 atexit/缓冲区 flush，重定向到文件时
-    崩溃/失败前的 print 全丢在缓冲区（smoke_ui 2026-10-12 实测教训）。"""
-    try:
-        sys.stdout.flush()
-        sys.stderr.flush()
-        QApplication.instance().closeAllWindows()
-    except Exception:
-        pass
-    os._exit(code)
 
 
 def run_gui():

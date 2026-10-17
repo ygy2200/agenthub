@@ -40,7 +40,7 @@ def check():
     for kw in ('d3d', 'dxcompiler', 'Qt6', 'opengl'):
         hit = [n for n in names if kw.lower() in n.lower()]
         print(f'  [{kw}]:', hit[:10], flush=True)
-    os._exit(0)
+    ui._hard_exit(0)
 
 
 QTimer.singleShot(3000, check)

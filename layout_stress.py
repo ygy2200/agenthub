@@ -10,9 +10,16 @@
 """
 import os
 import sys
+import tempfile
 
 os.environ['QT_QPA_PLATFORM'] = 'offscreen'
-sys.path.insert(0, r'D:\agent资料\zcode项目记录\AgentHub-多agent文件统一管理\AgentHub')
+
+# 2026-10-17 R5：间歇性退出段错误取证（3 连跑 1 次 exit=139，输出已完整=退出竞态）。
+# 与 smoke_ui.py 同一病原；faulthandler 落盘崩溃点，修完再摘。
+import faulthandler
+faulthandler.enable(open(os.path.join(tempfile.gettempdir(), "AgentHub-stress-fault.log"),
+                        "a", encoding="utf-8"))
+sys.path.insert(0, str(os.path.dirname(os.path.abspath(__file__))))  # 回归器子进程 cwd 无关
 
 from PySide6.QtWidgets import QApplication, QScrollArea
 app = QApplication([])
@@ -89,4 +96,9 @@ if risky:
 else:
     print("压扁 / 横向溢出风险清零")
 sys.stdout.flush()
-os._exit(0)
+# R5（2026-10-17）：退出走 window._hard_exit（TerminateProcess），不用裸 os._exit。
+# 病因：os._exit 的 Windows 进程终止仍会触发线程终止+Qt TLS 清理，与半死线程竞态——
+# 间歇性 access violation（faulthandler 实证：本脚本 8 连跑 2 中；smoke 6 跑 3 中同病原）。
+# window._hard_exit 跳过全部 DLL 卸载回调，实测 10+ 次无段错误。曾试过先收 worker 再
+# os._exit——无效（崩在 ExitProcess 的 TLS 清理，不在 worker），已回退该写法。
+_winmod._hard_exit(0)

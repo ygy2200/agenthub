@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import shutil
 import sys
 import tempfile
@@ -396,10 +397,45 @@ def t_agents_detect(tmp):
     assert len(names) == len(set(names))
 
 
+def t_exit_guard():
+    """R5·退出守卫（2026-10-17）：GUI 脚本禁止裸 os._exit，必须走 window._hard_exit。
+
+    治的病（本轮实测）：layout_stress.py 用裸 os._exit，离屏退出时间歇性 access
+    violation（faulthandler 实证 8 连跑 2 中）；更糟的是 window.py 曾有两个
+    _hard_exit 定义——TerminateProcess 正解版被后面一个裸 os._exit 版静默遮蔽，
+    「文档化的修复」沦为死代码，全部调用方用的都是弱版（同一文件后定义胜）。
+    这是「标准写进注释≠落地」的活例：没有守卫，每个新脚本都会重新引入裸 os._exit
+    （tools/ 下 5 个脚本全中，其中 dpi_regression 注释里知道正解却仍用裸版）。
+    规则：凡 import ui/window 的 .py（GUI 上下文，有 TLS 竞态风险）出现裸
+    os._exit( 即失败；window.py 是唯一定义处，豁免。不 import ui/window 的
+    纯 ctypes 探针（exp_probe_alive）无 Qt 对象，天然豁免。
+    """
+    root = Path(__file__).resolve().parent
+    bad = []
+    for f in sorted(list(root.glob("*.py")) + list((root / "tools").glob("*.py"))):
+        if f.name in ("window.py",) or f.name.startswith("adv_"):
+            continue
+        src = f.read_text(encoding="utf-8", errors="replace")
+        if "os._exit(" not in src:
+            continue
+        if not (re.search(r"^\s*(import ui|import window|from ui import|from window import)",
+                          src, re.M)):
+            continue   # 无 GUI 上下文（不建 Qt 对象），无 TLS 竞态，豁免
+        for i, ln in enumerate(src.splitlines(), 1):
+            if ln.lstrip().startswith("os._exit("):
+                bad.append(f"{f.name}:{i}")
+    assert not bad, f"裸 os._exit（应改用 ui._hard_exit，防退出 TLS 竞态段错误）：{bad}"
+    # 反向锚：window.py 必须仍是唯一定义处，且定义体内含 TerminateProcess
+    win = (root / "window.py").read_text(encoding="utf-8")
+    assert win.count("def _hard_exit") == 1, "window.py 的 _hard_exit 定义数变了（曾出现双定义静默遮蔽）"
+    assert "TerminateProcess" in win, "_hard_exit 丢了 TerminateProcess 硬杀（退化成 os._exit 弱版）"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_adv_")
     print(f"临时目录：{tmp}\n")
     case("项目名注入攻击（23 种）", t_name_injection)
+    case("R5·退出守卫（GUI 脚本禁裸 os._exit / _hard_exit 单定义+TerminateProcess）", t_exit_guard)
     case("畸形工作记录解析", t_malformed_records)
     case("agent 白名单提取", t_agent_whitelist)
     case("真实记录格式（deepseek段头/段内日期兜底）", t_realistic_formats)
