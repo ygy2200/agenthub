@@ -3152,12 +3152,27 @@ def _ensure_emb() -> bool:
         return _EMB_READY
 
 
+_QUERY_VEC_CACHE: dict = {}   # R8：query 向量缓存（2026-10-17）——records/memories 两路各编一次同一 query 浪费一半语义耗时；agent 重复搜索同样命中。进程级，封顶 64 条防无界增长。
+
+
 def _encode(texts: list) -> object | None:
-    """批量编码（L2 归一化，余弦=点积）。无模型 / 异常 → None。"""
+    """批量编码（L2 归一化，余弦=点积）。无模型 / 异常 → None。
+
+    R8：单条 query 走进程级缓存——语义路对 records/memories 各调用一次，同一 query
+    编码两次纯浪费（实测单次编码 ~23ms，占 search_all 293ms 的 16%）。批量（>1）与
+    写入路径不查缓存（向量要落库，缓存无意义）。
+    """
     if not _ensure_emb():
         return None
     try:
-        return _EMB.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        if len(texts) == 1 and texts[0] in _QUERY_VEC_CACHE:
+            return _QUERY_VEC_CACHE[texts[0]]
+        out = _EMB.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        if len(texts) == 1:
+            if len(_QUERY_VEC_CACHE) >= 64:
+                _QUERY_VEC_CACHE.clear()   # 简单封顶：清空重来（查询空间小，命中率损失可忽略）
+            _QUERY_VEC_CACHE[texts[0]] = out
+        return out
     except Exception:
         return None
 
