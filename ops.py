@@ -34,7 +34,7 @@ PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一
 CHECKS = {
     "py_compile": ("编译检查 target 目录全部 .py（ast 语法解析，抓低级语法错），通用任意项目", True),
     "git_status": ("git 工作区是否干净（未提交/未跟踪清单），通用任意仓库", True),
-    "regression": ("跑 AgentHub 六套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log（约1分钟）", True),
+    "regression": ("跑 AgentHub 九套对抗回归 adv_brain/adv_mcp/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log/adv_mywork/adv_concurrency/adv_ops（约2分钟）", True),
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
     "release": ("发布一致性：GUI exe 是否比关键源码（main/ui/core/brain/agentscore）旧 + 桌面副本是否同步——防止「改了源码没重打包」", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
@@ -53,6 +53,7 @@ CHECKS = {
     "date_health": ("日期格式健康（2026-10-13）：date-only 列（记录日期/决策回顾日/任务截止/记忆有效期）是否全是 YYYY-MM-DD——格式一歪，「到期提醒」会静默不提醒（v2.40.13 修的就是这个静默失效）", False),
     "stdout_guard": ("stdout 污染守卫（2026-10-13）：MCP stdio 协议下任何 print 落到 stdout 都会让客户端 JSON-RPC 解析失败、工具全消失——外部检索列的头号致命缺陷。扫描 MCP 进程加载的模块", True),
     "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
+    "desc_quality": ("工具描述质量守卫（2026-10-17）：核心工具描述必须含示例+使用时机+必填参数说明，全部工具描述不得过短——描述是 agent 的 UI，缺示例准确率掉约 18 个点（外部调研 72%→90%，tsecurity/agentpatterns/cloudappi 三处一致）", False),
 }
 
 
@@ -98,6 +99,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _stdout_guard(t)
     elif name == "schema_drift":
         r = _schema_drift()
+    elif name == "desc_quality":
+        r = _desc_quality()
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -327,7 +330,7 @@ def _regression(target: Path) -> dict:
     env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
     suites = ["adv_brain.py", "adv_mcp.py", "adv_agenthub.py", "adv_e2e_schema.py",
               "adv_report.py", "adv_auto_log.py", "adv_mywork.py",
-              "adv_concurrency.py"]  # 2026-10-13：并发/WAL 收尾（外部已知缺陷防线）
+              "adv_concurrency.py", "adv_ops.py"]  # 2026-10-13：并发/WAL 收尾；2026-10-17：补 adv_ops（此前 ops 工具箱无回归覆盖，计数断言还停留在 14）
     detail, fails, cost = [], [], 0.0
     for s in suites:
         t0 = time.perf_counter()
@@ -536,6 +539,95 @@ def _schema_drift() -> dict:
             "summary": (f"{len(declared)} 个带 action enum 的工具全部与分发代码一致"
                         if not bad else f"{len(bad)} 处 schema 漂移（声明了没实现）"),
             "detail": bad[:8]}
+
+
+# 工具描述标准（2026-10-17 R2）：描述是 agent 的 UI。外部调研三处独立结论一致——
+# 含示例的工具描述把调用准确率从 ~72% 推到 ~90%（tsecurity.de / agentpatterns.ai /
+# cloudappi.net MCP 设计指南），且必须写清「何时用/何时别用」。核心 = 日常主干 29 个。
+CORE_TOOLS = frozenset({
+    "hub_get_project", "hub_get_rules", "hub_get_progress", "hub_list_projects",
+    "hub_health", "hub_list_todos", "hub_list_agents", "hub_list_errors",
+    "hub_env_set", "hub_env_list", "hub_audit", "hub_create_project",
+    "hub_todo_done", "hub_search_files", "hub_search", "hub_get_record",
+    "hub_heartbeat", "hub_undo", "hub_ops_list", "hub_ops_run", "hub_log_work",
+    "hub_memory_read", "hub_report_error", "hub_memory_write", "hub_search_tools",
+    "hub_call_tool", "hub_status", "hub_distill", "hub_error_close",
+})
+# 使用时机/负向指引的标记词（核心工具描述至少命中一个）
+_TIMING_MARKS = ("开工", "收尾", "先", "必", "别", "勿", "不要", "找不到",
+                 "怀疑", "判断", "确认", "想知道", "要开", "定期", "定时")
+
+
+def _desc_quality(src: str = "") -> dict:
+    """工具描述质量守卫：防「描述随功能增加而静默腐烂」（本仓教训 #177 的落地）。
+
+    标准：
+      ① 全部工具：描述非空且 ≥ 25 字；
+      ② CORE_TOOLS：≥ 40 字、必含「例」示例、必含使用时机/负向指引、
+         必填参数个个有 description。
+    新工具漏配任何一条，此检查项即报出——没有守卫的标准必然腐烂。
+    src 参数仅供对抗测试注入变异源码；缺省读真实 agenthub_mcp.py。
+    """
+    import ast  # noqa: PLC0415
+    if not src:
+        src = (Path(__file__).resolve().parent / "agenthub_mcp.py").read_text(encoding="utf-8")
+    tree = ast.parse(src)
+    tools: dict = {}
+    for node in ast.walk(tree):
+        if not (isinstance(node, ast.Assign) and any(
+                isinstance(t, ast.Name) and t.id == "TOOLS" for t in node.targets)):
+            continue
+        for item in ast.walk(node.value):
+            if not isinstance(item, ast.Dict):
+                continue
+            name = desc = None
+            props: dict = {}
+            required: list = []
+            for k, v in zip(item.keys, item.values):
+                if not isinstance(k, ast.Constant):
+                    continue
+                if k.value == "name" and isinstance(v, ast.Constant):
+                    name = v.value
+                elif k.value == "description" and isinstance(v, ast.Constant):
+                    desc = v.value
+                elif k.value == "inputSchema" and isinstance(v, ast.Dict):
+                    for pk, pv in zip(v.keys, v.values):
+                        if not isinstance(pk, ast.Constant):
+                            continue
+                        if pk.value == "properties" and isinstance(pv, ast.Dict):
+                            for kk, vv in zip(pv.keys, pv.values):
+                                if not isinstance(kk, ast.Constant):
+                                    continue
+                                pd = ""
+                                if isinstance(vv, ast.Dict):
+                                    for k3, v3 in zip(vv.keys, vv.values):
+                                        if (isinstance(k3, ast.Constant) and k3.value == "description"
+                                                and isinstance(v3, ast.Constant)):
+                                            pd = v3.value
+                                props[kk.value] = pd
+                        elif pk.value == "required" and isinstance(pv, (ast.List, ast.Tuple)):
+                            required = [c.value for c in pv.elts if isinstance(c, ast.Constant)]
+            if name:
+                tools[name] = (desc or "", props, required)
+    bad = []
+    for name, (desc, props, required) in sorted(tools.items()):
+        if len(desc) < 25:
+            bad.append(f"{name}: 描述过短（{len(desc)} 字 <25）")
+        if name in CORE_TOOLS:
+            if len(desc) < 40:
+                bad.append(f"{name}: 核心工具描述 {len(desc)} 字 <40")
+            if "例" not in desc:
+                bad.append(f"{name}: 缺示例（六要素之一，准确率 72%→90% 的杠杆）")
+            if not any(k in desc for k in _TIMING_MARKS):
+                bad.append(f"{name}: 缺使用时机/负向指引（何时用/何时别用）")
+            miss = [p for p in required if not props.get(p)]
+            if miss:
+                bad.append(f"{name}: 必填参数无 description：{','.join(miss)}")
+    if bad:
+        return {"ok": False, "summary": f"{len(bad)} 项描述不达标（修 agenthub_mcp.py 的 TOOLS）", "detail": bad[:8]}
+    return {"ok": True,
+            "summary": f"{len(tools)} 个工具描述达标（核心 {len(CORE_TOOLS)} 个：示例+时机+参数说明齐全）",
+            "detail": []}
 
 
 def _date_health(root: str) -> dict:

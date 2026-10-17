@@ -189,7 +189,22 @@ def main():
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
-    check("检查项共 14 个", len(ops.CHECKS) == 14, str(list(ops.CHECKS)))  # +ponytail_gate / +coverage_gate
+    check("检查项共 22 个", len(ops.CHECKS) == 22, str(list(ops.CHECKS)))  # 14=+ponytail/coverage；22=+db_health/graph_health/date_health/stdout_guard/schema_drift/desc_quality
+
+    # ---- desc_quality 工具描述守卫（2026-10-17 R2）：双向验证——真源码必须过，注入四种坏写法必须挂
+    dq = ops.run_check("desc_quality", "", str(tmp))
+    check("desc_quality 真实源码通过", dq["ok"] is True, str(dq)[:200])
+    good = 'TOOLS = [{"name": "hub_demo", "description": "用于演示的工具描述，开工时调用，包含足够长度与示例：例：hub_demo(x=某值)，足够四十字了吧啊啊", "inputSchema": {"type": "object", "properties": {"x": {"type": "string", "description": "参数说明"}}, "required": ["x"]}}]'
+    r = ops._desc_quality(good)
+    check("desc_quality 合格样本通过", r["ok"] is True, str(r)[:200])
+    r = ops._desc_quality('TOOLS = [{"name": "hub_demo", "description": "短", "inputSchema": {"type": "object", "properties": {}}}]')
+    check("desc_quality 拦截过短描述", r["ok"] is False and "过短" in str(r["detail"]), str(r)[:160])
+    r = ops._desc_quality('TOOLS = [{"name": "hub_search", "description": "跨项目全文搜索工作记录记忆文件名，找历史踩坑决策记录时用，必须带具体词，开工前先查，长度超过四十个字符的一条普通描述文字", "inputSchema": {"type": "object", "properties": {}}}]')
+    check("desc_quality 拦截核心工具缺示例", r["ok"] is False and "缺示例" in str(r["detail"]), str(r)[:160])
+    r = ops._desc_quality('TOOLS = [{"name": "hub_search", "description": "搜索用。例：hub_search(keyword=某词)", "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string"}}, "required": ["keyword"]}}]')
+    check("desc_quality 拦截必填参数无说明", r["ok"] is False and "无 description" in str(r["detail"]), str(r)[:160])
+    r = ops._desc_quality('TOOLS = [{"name": "hub_zzz_new", "description": "一个新工具的普通长度描述文本用于测试守卫是否放行非核心工具的一条说明文字啊", "inputSchema": {"type": "object", "properties": {}}}]')
+    check("desc_quality 非核心工具只查长度", r["ok"] is True, str(r)[:160])
 
     print()
     if FAILED:
