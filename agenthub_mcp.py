@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.29"}  # v2.40.28=R11 反馈报告假阳性修复；本版=R1 十轮体验迭代：X3 备份从「仅 SQLite 库」升级为「一致性库快照+磁盘项目文件树」单一 .zip 还原单元（修复只备库、还原丢源文件的坑），backup_verify/backup_list 向后兼容旧 .db
+SERVER_INFO = {"name": "agenthub", "version": "2.40.30"}  # v2.40.29=R1 备份升级（库+文件单一.zip）；本版=R2 建表责任下沉到 handle_message 公共分发入口：REST api.py 不再绕过 ensure_schema，全新根首请求自愈（修复 no such table）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2681,6 +2681,11 @@ def handle_message(msg: dict, root: str) -> dict | None:
     is_notification = mid is None
     params = msg.get("params") or {}
 
+    # 建表责任下沉到公共分发入口：stdio 的 serve() 与原 REST api.py 都经 handle_message 分发，
+    # 此前 ensure_schema 只挂在 serve() 里，api.py 直接调 handle_message 会绕过——
+    # 全新根目录首请求即 no such table（代码部署了但真实库还没建表）。现每请求幂等自愈，两端共用同一道守卫。
+    brain.ensure_schema(root)
+
     if method == "initialize":
         req_ver = params.get("protocolVersion", PROTOCOL_VERSION)
         return {"jsonrpc": "2.0", "id": mid,
@@ -2815,7 +2820,6 @@ def serve(root: str, fixed: bool = False, agent: str = "", profile: str = "") ->
             if live and live != root:
                 root = live
                 log(f"根目录已切换：{root}")
-                brain.ensure_schema(root)
         try:
             msg = json.loads(raw)
         except json.JSONDecodeError as e:

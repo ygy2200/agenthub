@@ -172,12 +172,26 @@ def t_api_call_iserror():
         httpd.server_close()
 
 
+def t_rest_selfheal_fresh_root():
+    """R2：REST 分发入口自愈——全新根目录（未 init_db）经 api._call_tool → handle_message
+    必须自己 ensure_schema，首请求不能 no such table。
+    修复前：ensure_schema 只挂在 serve() 里，api.py 直接调 handle_message 会绕过，首请求炸。"""
+    import tempfile as _tf  # noqa: PLC0415
+    root = str(Path(_tf.mkdtemp()) / "hub_fresh")
+    Path(root).mkdir(parents=True, exist_ok=True)  # 目录在，但库/表尚未建
+    # 直接走 REST 分发路径（不经过 init_db）
+    text, is_error = api._call_tool(root, "hub_health", {})
+    assert not is_error, ("hub_health 应当自愈成功", text[:200])
+    assert "no such" not in text, ("首请求不应缺表/缺列", text[:200])
+
+
 def main() -> int:
     print("=== adv_api：REST API 桥 + Web 仪表盘（X2） ===")
     case("只读面（仪表盘/工具清单/五路由/只读工具/404·400）", t_api_readonly)
     case("写守卫（默认403 / 开启后无token仍403 / 带token才通）", t_api_write_guard)
     case("工具清单一致性（名不重复 / WRITE_TOOLS ⊆ TOOLS）", t_tool_list_consistency)
     case("Round9·REST桥透传isError（业务失败422/成功200/纯文本兼容）", t_api_call_iserror)
+    case("R2·REST分发自愈（全新根首请求不no such table）", t_rest_selfheal_fresh_root)
     failed = globals().get("_FAILED", [])
     print()
     if failed:
