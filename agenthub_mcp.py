@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.33"}  # v2.40.29=R1 备份升级（库+文件单一.zip）；v2.40.30=R2 建表责任下沉 handle_message；v2.40.31=R3 记忆 BM25 对称 token 缓存；v2.40.32=R4 语义批量矩阵点积；本版=R5 similar_memories 两两 Jaccard 上界短路 + |∪|=|A|+|B|-|∩| 免建并集（N=600 实测 4.68x，结果逐字段等价），提速 hub_metacognition
+SERVER_INFO = {"name": "agenthub", "version": "2.40.34"}  # v2.40.29=R1 备份升级；v2.40.30=R2 建表下沉 handle_message；v2.40.31=R3 记忆 BM25 token 缓存；v2.40.32=R4 语义批量矩阵点积；v2.40.33=R5 Jaccard 上界短路；本版=R6 确认闸门破坏半径分级：新增 HIGH_BLAST_TOOLS 高危子集 + AGENTHUB_STRICT_CONFIRM 严格模式开关（默认关闭，保持「不传即执行」历史语义，避免打断 6 个 agent 日常写入）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2567,6 +2567,37 @@ WRITE_TOOLS = {
     "hub_graph",  # Y3：build 会重写结构边（幂等派生数据），仍过闸门保持一致性
 }
 
+# B3 破坏半径分级：WRITE_TOOLS 里「不可逆 / 批量 / 跨项目影响」的高危子集。
+# 判定口径（不是按名字猜，按副作用）:①不可逆或难撤销（归档/合并/隔离）②批量改写既有数据
+# （重建索引/重写结构边/批量写技能索引）③会自行触发一串动作（playbook/trigger）。
+# 日常低危写入（log_work/note/memory_write/heartbeat/checkpoint/claim/task_* 等）不在其中——
+# 给它们也上严格确认只会把 agent 的每次心跳都卡住，是负优化。
+HIGH_BLAST_TOOLS = {
+    "hub_archive_project",  # 归档项目：整项目退出活跃视图
+    "hub_consolidate",      # 合并记忆组：改写既有记忆内容（不可逆）
+    "hub_quarantine",       # 隔离：把可疑内容移出检索
+    "hub_playbook",         # 跑流程：会真执行一串动作（备份/写记录/发信号/建项目）
+    "hub_trigger",          # 自动化：未经确认的自动触发=事故源
+    "hub_graph",            # build 重写全量结构边
+    "hub_flush_index",      # 重建索引
+    "hub_undo",             # 撤销：恢复旧状态，本身即写且会覆盖当前状态
+    "hub_export",           # 导出/备份：写磁盘文件
+}
+
+# 严格确认模式（B3，默认关闭=保持历史行为「不传 confirm 即执行」）：
+# 现状是「默认执行」而非「默认确认」——直接翻转默认会打断 6 个接入 agent 的日常写入
+# （实测回归里高危工具 60+ 处调用全都不带 confirm），故做成可开关而非硬改默认。
+# 开启：环境变量 AGENTHUB_STRICT_CONFIRM=1 → 高危工具必须显式 confirm=true 才执行。
+def _strict_confirm() -> bool:
+    return str(os.environ.get("AGENTHUB_STRICT_CONFIRM", "")).strip().lower() not in ("", "0", "false", "no", "off")
+
+
+def _input_required(mid, text: str) -> dict:
+    """return-and-resume 响应（P3-1 契约单一来源）：服务端不阻塞等待，也不主动回调。"""
+    return {"jsonrpc": "2.0", "id": mid,
+            "result": {"resultType": "input_required", "isError": False,
+                       "content": [{"type": "text", "text": text}]}}
+
 
 def visible_tools() -> list:
     """当前 profile 下 tools/list 的可见切片（admin=全量；藏起≠禁用，仍可直接调用）。"""
@@ -2717,11 +2748,16 @@ def handle_message(msg: dict, root: str) -> dict | None:
             args = {}
         # P3-1 人工确认闸门：写操作显式 confirm=false → return-and-resume（不执行、不阻塞、不回调）
         if tname in WRITE_TOOLS and args.get("confirm") is False:
-            return {"jsonrpc": "2.0", "id": mid,
-                    "result": {"resultType": "input_required", "isError": False,
-                               "content": [{"type": "text", "text": (
+            return _input_required(mid,
                                    f"调用未执行：{tname} 是写操作。人工确认后重发并传 confirm=true。"
-                                   "（return-and-resume：服务端不阻塞等待，也不会主动回调。）")}]}}
+                                   "（return-and-resume：服务端不阻塞等待，也不会主动回调。）")
+        # B3 破坏半径分级：严格模式下高危工具必须显式 confirm=true 才执行（默认关闭，
+        # 保持「不传即执行」的历史语义——见 HIGH_BLAST_TOOLS / _strict_confirm 注释）
+        if _strict_confirm() and tname in HIGH_BLAST_TOOLS and args.get("confirm") is not True:
+            return _input_required(mid,
+                                   f"调用未执行：{tname} 属高破坏半径操作（不可逆/批量/跨项目）。"
+                                   "严格确认模式下必须显式传 confirm=true 才执行；"
+                                   "也可用 dry_run=true 先预演（return-and-resume，服务端不阻塞）。")
         # P3-1 dry_run：写操作预演（不落库、不审计）
         if tname in WRITE_TOOLS and args.get("dry_run") is True:
             preview = ", ".join(f"{k}={str(v)[:60]}" for k, v in args.items()

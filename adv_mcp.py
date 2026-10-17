@@ -62,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.33"
+    assert r["serverInfo"]["version"] == "2.40.34"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1910,6 +1910,39 @@ def t_template_nudge(root):
     assert "模板提示" not in out, out
 
 
+def t_confirm_blast_radius(root):
+    """B3 回归：确认闸门破坏半径分级（HIGH_BLAST_TOOLS + 严格模式开关）。
+    默认保持「不传 confirm 即执行」的历史语义——实测回归里高危工具 60+ 处调用全都不带
+    confirm，直接翻转默认会打断 6 个接入 agent 的日常写入，故做成可开关而非硬改默认。
+    验证：①分级集合是 WRITE_TOOLS 子集（不凭空造名）；②默认模式下高危不传 confirm 照常
+    执行（防回归）；③严格模式下高危不传 confirm → input_required；④显式 confirm=true
+    放行；⑤严格模式下低危写入（hub_note）不受影响（否则每次心跳都被卡死）。"""
+    assert m.HIGH_BLAST_TOOLS <= m.WRITE_TOOLS, m.HIGH_BLAST_TOOLS - m.WRITE_TOOLS
+    saved = os.environ.get("AGENTHUB_STRICT_CONFIRM")
+    try:
+        os.environ.pop("AGENTHUB_STRICT_CONFIRM", None)
+        r = resp_ok(m.handle_message(
+            rpc("tools/call", {"name": "hub_flush_index", "arguments": {}}), str(root)))
+        assert r.get("resultType") != "input_required", "默认模式下高危工具不应被拦（会打断现有 agent）"
+        os.environ["AGENTHUB_STRICT_CONFIRM"] = "1"
+        r2 = resp_ok(m.handle_message(
+            rpc("tools/call", {"name": "hub_flush_index", "arguments": {}}), str(root)))
+        assert r2.get("resultType") == "input_required", r2
+        assert "高破坏半径" in r2["content"][0]["text"], r2
+        r3 = resp_ok(m.handle_message(
+            rpc("tools/call", {"name": "hub_flush_index", "arguments": {"confirm": True}}), str(root)))
+        assert r3.get("resultType") != "input_required", r3
+        assert "hub_note" not in m.HIGH_BLAST_TOOLS
+        r4 = resp_ok(m.handle_message(
+            rpc("tools/call", {"name": "hub_note", "arguments": {"content": "B3 分级测试笔记"}}), str(root)))
+        assert r4.get("resultType") != "input_required", r4
+    finally:
+        if saved is None:
+            os.environ.pop("AGENTHUB_STRICT_CONFIRM", None)
+        else:
+            os.environ["AGENTHUB_STRICT_CONFIRM"] = saved
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -1973,6 +2006,8 @@ def main():
     case("R3·错误信息三件套（必填/项目不存在/枚举/未知工具/坏根/缺content 均带示例或核对路径）",
          lambda: t_error_msg_three_part(root))
     case("R7·四段式模板软提示（缺段回显/不污染存储/todo 不提示）", lambda: t_template_nudge(root))
+    case("B3·确认闸门破坏半径分级（默认不打断/严格模式高危需显式confirm/低危不受影响）",
+         lambda: t_confirm_blast_radius(fresh_hub(tmp, "hub_b3")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
