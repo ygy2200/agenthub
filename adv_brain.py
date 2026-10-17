@@ -2371,9 +2371,14 @@ def t_batchB_metacognition(tmp):
     assert brain.init_db(rs) == ""
     mc = brain.metacognition(rs)
     need = ("coverage_blindspots", "low_confidence", "dup_pairs",
-            "pending_decisions", "meta_ratio", "live_total", "governance")
+            "pending_decisions", "meta_ratio", "live_total", "governance",
+            "meta_breakdown")
     assert all(k in mc for k in need), mc.keys()
     assert mc["live_total"] == 0 and mc["dup_pairs"] == 0
+    # R6：元信息拆解字段自洽（空库：零唤起 meta=非 meta=0）
+    mb = mc["meta_breakdown"]
+    assert mb["zero_use_meta"] == 0 and mb["zero_use_non_meta"] == 0, mb
+    assert isinstance(mb["by_kind"], dict)
 
     # 覆盖盲区：有记录、零记忆的项目
     brain.add_record(rs, "无记忆项目A", "zcode", "2026-10-01", "r1", "只为造记录")
@@ -2392,6 +2397,14 @@ def t_batchB_metacognition(tmp):
 
     # 与治理统计一致
     assert brain.metacognition(rs)["governance"]["live"] == brain.memory_governance_stats(rs)["live"]
+
+    # R6：元信息拆解实质计数——一条 meta（含「大脑」）+一条非 meta，均零唤起
+    brain.add_memory(rs, "大脑记忆库的检索延迟实测", "fact", agent="zcode")
+    brain.add_memory(rs, "与系统无关的纯业务经验", "lesson", agent="zcode")
+    mb2 = brain.metacognition(rs)["meta_breakdown"]
+    assert mb2["zero_use_meta"] >= 1 and mb2["zero_use_non_meta"] >= 1, mb2
+    fk = mb2["by_kind"].get("fact", {})
+    assert fk.get("meta", 0) >= 1 and fk.get("total", 0) >= 1, mb2["by_kind"]
 
 
 def t_coverage_gate(fresh):

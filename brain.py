@@ -3413,6 +3413,21 @@ def metacognition(root: str) -> dict:
             "SELECT id, project, date, title FROM records WHERE status='active' "
             "AND content LIKE '%决策记录%' AND date!='' AND date < ? "
             "ORDER BY date DESC LIMIT 8", (cutoff,))]
+        # R6（2026-10-17）：元信息占比拆解——裸数字「61.8%」吓人但不可解读。按 kind 拆
+        # + 零唤起对照，让「是不是灌水」一眼可判。实测结论：meta 唤起分布与非 meta
+        # 持平（各 4 条零唤起），高唤起的全是规则/踩坑类真知识；占比高是因为本项目
+        # 的工作产品就是大脑本身（project 类 78% meta 合理）——不追数，防误读。
+        meta_sql = ("content LIKE '%AgentHub%' OR content LIKE '%hub\\_%' ESCAPE '\\' "
+                    "OR content LIKE '%大脑%'")
+        by_kind = {r[0]: {"meta": r[1], "total": r[2]} for r in conn.execute(
+            f"SELECT kind, SUM(CASE WHEN {meta_sql} THEN 1 ELSE 0 END), COUNT(*) "
+            f"FROM memories WHERE {_live_sql()} GROUP BY kind")}
+        zero_meta = conn.execute(
+            f"SELECT COUNT(*) FROM memories WHERE {_live_sql()} "
+            f"AND use_count=0 AND ({meta_sql})").fetchone()[0]
+        zero_nonmeta = conn.execute(
+            f"SELECT COUNT(*) FROM memories WHERE {_live_sql()} "
+            f"AND use_count=0 AND NOT ({meta_sql})").fetchone()[0]
     blindspots = sorted(
         [{"project": p, "records": n, "memories": proj_mem.get(p, 0)}
          for p, n in proj_rec.items() if not proj_mem.get(p)],
@@ -3424,6 +3439,8 @@ def metacognition(root: str) -> dict:
         "pending_decisions": [{"id": r["id"], "project": r["project"], "date": r["date"],
                                "title": r["title"]} for r in dec_rows],
         "meta_ratio": round(meta * 100 / max(1, total), 1),
+        "meta_breakdown": {"by_kind": by_kind, "zero_use_meta": zero_meta,
+                           "zero_use_non_meta": zero_nonmeta},
         "live_total": total,
         "governance": memory_governance_stats(root),
     }

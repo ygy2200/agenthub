@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.24"}  # v2.40.23=检索精度闸门；本版=退出竞态根因修复：window.py 双 _hard_exit 定义静默遮蔽（TerminateProcess 正解沦为死代码）合并为单定义 + 全仓库 GUI 脚本禁裸 os._exit + 退出守卫
+SERVER_INFO = {"name": "agenthub", "version": "2.40.25"}  # v2.40.24=退出竞态根因修复；本版=数据卫生：元信息占比拆解（按 kind+零唤起对照，防「61.8%」误读为灌水）+ 归档重复记忆 #176（被 #180 取代）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -691,6 +691,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                  f"· 现行记忆 {g['live']}（取代 {g['superseded']} / 过期 {g['expired']} / 作废 {g['retired']}）"
                  f"，证据覆盖 {g['evidence_coverage']:.0%}，平均置信 {g['avg_confidence']}",
                  f"· 元信息占比 {mc['meta_ratio']}% · 疑似矛盾对 {mc['dup_pairs']}"]
+        mb = mc.get("meta_breakdown") or {}
+        if mb.get("by_kind"):
+            kinds = "、".join(
+                f"{k} {v['meta'] * 100 // max(1, v['total'])}%"
+                for k, v in sorted(mb["by_kind"].items(), key=lambda x: -x[1]["total"]))
+            lines.append(f"   元信息拆解（{kinds}）——本项目记忆本就是造大脑的过程知识，"
+                         f"占比高≠灌水；零唤起 meta {mb.get('zero_use_meta', 0)} 条 vs "
+                         f"非 meta {mb.get('zero_use_non_meta', 0)} 条，持平即健康")
         if mc["coverage_blindspots"]:
             lines.append("· 覆盖盲区（有记录、零记忆，最该沉淀）：")
             for b in mc["coverage_blindspots"][:5]:
