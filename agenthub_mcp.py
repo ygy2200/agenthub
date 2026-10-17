@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.21"}  # v2.40.20=错误闭环 hub_error_close；本版=描述体系升级：29 个核心工具按六要素重写（用途/时机/负向/示例/参数）+ desc_quality 守卫 + adv_ops 补进回归
+SERVER_INFO = {"name": "agenthub", "version": "2.40.22"}  # v2.40.21=描述体系升级；本版=错误三件套：必填缺失自动挂描述里的示例（同源不漂移）/项目不存在带核对路径/未知工具带搜索示例
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -182,7 +182,7 @@ def _snippet(content: str, words: list, width: int = 76) -> str:
 def call_tool(name: str, arguments: dict, root: str) -> str:
     """执行一个工具，返回文本结果。抛异常时由协议层转为 isError 并自动登记错误。"""
     if not root or not os.path.isdir(root):
-        return f"错误：AgentHub 根目录不存在：{root}"
+        return f"错误：AgentHub 根目录不存在：{root}（检查 ~/.agenthub/config.json 的 root 指向，或启动时用 --root 指定数据根目录）"
     # 集中式必填校验（MCP 官方 / mcpcat.io：执行前按声明 schema 校验入参，防把失败当成功）。
     # 无害性论证（2026-10-13）：仅判「键缺失」不判空值（空值由下游工具自身「错误：」文案处理）；
     # 豁免 agent（进程锁定身份 apply_server_agent 已兜底，强制要求会误杀 6 个已接入 agent 的正常调用）；
@@ -190,7 +190,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     miss = _required_missing(name, arguments)
     if miss:
         need = "、".join(_effective_required(name))
-        return f"错误：必填参数 {'、'.join(miss)} 缺失（{name} 需要：{need}）"
+        return f"错误：必填参数 {'、'.join(miss)} 缺失（{name} 需要：{need}）{_example_hint(name)}"
     # 集中式整数入参校验（Round 13）：声明为整数的字段坏类型给清晰错误，
     # 不再由各工具 try/except 静默回落默认值（静默回落=模型以为参数生效了）。
     bad_int = _bad_int_param(name, arguments)
@@ -238,7 +238,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         if not inner or inner == "hub_call_tool":
             return "错误：name 必填，且不能是 hub_call_tool 本身（防递归）"
         if inner not in {t["name"] for t in TOOLS}:
-            return f"错误：未知工具 {inner}（用 hub_search_tools 搜索可用工具）"
+            return f"错误：未知工具 {inner}（用 hub_search_tools 搜索可用工具，如 hub_search_tools(keyword=\"错误\")）"
         if inner in WRITE_TOOLS and iargs.get("dry_run") is True:
             return f"dry_run（未执行）：{inner} 预演（经 hub_call_tool）；去掉 dry_run 后正式执行。"
         out = call_tool(inner, iargs, root)
@@ -428,7 +428,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         proj = brain.get_project(root, pname)
         if not proj:
             close = [p["name"] for p in brain.list_projects(root, 200) if pname.lower() in p["name"].lower()][:8]
-            return f"错误：项目不存在：{pname}。相近项目：{'、'.join(close) if close else '无'}"
+            return (f"错误：项目不存在：{pname}。相近项目：{'、'.join(close) if close else '无'}。"
+                    "项目目录名须与磁盘目录名一致（「对象-问题」结构），先用 hub_list_projects 核对准确名；"
+                    "例：hub_get_project(project=\"AgentHub-多agent文件统一管理\")")
         out = [f"项目：{proj['name']}", f"归属:{proj['agent'] or '未知'}  最近活动：{proj['last_active'] or '无'}",
                "", "最近记录："]
         for r in proj["records"]:
@@ -464,7 +466,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         # P1-2 record_type：可选枚举，非法当场拒收（其余字段缺省自动推断）
         rt = str(arguments.get("record_type") or "").strip()
         if rt and rt not in brain.RECORD_TYPES:
-            return f"错误：record_type 只能是 {'/'.join(brain.RECORD_TYPES)}（收到 {rt!r}）"
+            return (f"错误：record_type 只能是 {'/'.join(brain.RECORD_TYPES)}（收到 {rt!r}）。"
+                    "例：record_type=\"work_log\"（含决策段时传 decision，或省略自动推断）")
         # 技能原生化·阶段2：硬门禁（主人拍板「直接阻断」）。只拦判得准的检查项——
         # Ponytail 粗筛只提示不拦（包名≠导入名会误报），误伤正常开发比漏拦更贵。
         waive = str(arguments.get("waive", "") or "").strip()
@@ -592,7 +595,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if name == "hub_note":
         content = str(arguments.get("content", "")).strip()
         if not content:
-            return "错误：content 必填——人说的原话/随记内容"
+            return "错误：content 必填——人说的原话/随记内容。例：hub_note(content=\"主人说：记一下…\")"
         try:
             nid = brain.add_note(
                 root, content,
@@ -1872,7 +1875,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"   #{n['id']} {n['ts'][:10]}{mood} {n['content'][:70]}")
         return "\n".join(lines)
 
-    return f"错误：未知工具 {name}（用 hub_search_tools 搜索可用工具）"
+    return f"错误：未知工具 {name}（用 hub_search_tools 搜索可用工具，如 hub_search_tools(keyword=\"错误\")）"
 
 
 TOOLS = [
@@ -1902,7 +1905,7 @@ TOOLS = [
                      "required": ["project", "agent", "content"]}},
     {"name": "hub_search", "description": "跨项目全文搜索工作记录/记忆/文件名。找历史踩坑/决策/记录时用——keyword 必须带具体词（项目名/组件名/错误类型，如 \"CS2 卡死 显存\"），空泛词（\"问题\"/\"工具\"）只会召回噪声，单字大概率零命中；中文长串零命中时自动 2-gram 放宽。命中行带 #id，精读用 hub_get_record。例：hub_search(keyword=\"ops_run 执行异常\")",
      "inputSchema": {"type": "object", "properties": {"keyword": {"type": "string", "description": "具体关键词（项目名/组件名/错误类型），2-4 个词组合效果最好"}}, "required": ["keyword"]}},
-    {"name": "hub_note", "description": "记入人的随记（顿悟/想法/摘录，主人第一人称思想）——主人说\"记一下：XXX\"时调用；content 必填，tags/link/mood 可选。随记与工作经验（memories）分层但检索互通",
+    {"name": "hub_note", "description": "记入人的随记（顿悟/想法/摘录，主人第一人称思想）——主人说\"记一下：XXX\"时调用；content 必填，tags/link/mood 可选。随记与工作经验（memories）分层但检索互通。例：hub_note(content=\"主人说：记一下…\", tags=\"顿悟\")",
      "inputSchema": {"type": "object",
                      "properties": {"content": {"type": "string", "description": "随记内容（人说的原话或整理后的想法）"},
                                     "tags": {"type": "string", "description": "标签，逗号分隔（如：顿悟,架构）"},
@@ -2330,6 +2333,23 @@ def _effective_required(tname: str) -> list:
             return [p for p in (t["inputSchema"].get("required") or [])
                     if p not in _REQUIRED_EXEMPT_PARAMS]
     return []
+
+
+def _example_hint(tname: str) -> str:
+    """从工具自己的描述里摘「例：…」拼进错误文案。
+
+    错误信息三件套（外部最佳实践：tsecurity.de / agentpatterns.io）——
+    什么错了 / 期望什么 / 正确输入示例。示例从 TOOLS 描述里现取，与描述同源
+    不漂移；R2 起核心工具描述全部带示例，这里直接复用。
+    """
+    t = next((x for x in TOOLS if x["name"] == tname), None)
+    if not t:
+        return ""
+    d = t.get("description", "")
+    i = d.find("例：")
+    if i < 0:
+        return ""
+    return " 正确示例：" + d[i + 2:].split("。")[0].strip()
 
 
 def _required_missing(tname: str, args: dict) -> list:

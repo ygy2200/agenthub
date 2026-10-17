@@ -62,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.21"
+    assert r["serverInfo"]["version"] == "2.40.22"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1860,6 +1860,35 @@ def t_playbook_upgrade(tmp):
     assert isinstance(brain.playbook_runs(rs), list)
 
 
+def t_error_msg_three_part(root):
+    """R3·错误信息三件套（什么错了/期望什么/正确示例）——外部最佳实践落地验证。
+
+    依据：tsecurity.de / agentpatterns.io「Error messages are recovery instructions」——
+    错误必须能被模型自我纠正，不含示例的错误浪费整轮对话。注入坏输入，断言每条
+    错误都带可行动信息（含示例或核对路径）。
+    """
+    root = str(root)
+    # ① 必填缺失 → 自动带该工具描述里的示例（同源不漂移）
+    out = m.call_tool("hub_log_work", {"agent": "zcode"}, root)
+    assert "缺失" in out and "project" in out and "正确示例" in out, out
+    # ② 项目不存在 → 相近项目 + 核对方式 + 示例
+    out = m.call_tool("hub_get_project", {"project": "不存在的项目-XYZ"}, root)
+    assert "不存在" in out and "hub_list_projects" in out and "例：" in out, out
+    # ③ record_type 非法 → 合法值 + 示例（该校验先于项目存在性，顺序稳定）
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                       "content": "x", "record_type": "bogus"}, root)
+    assert "只能是" in out and "work_log" in out and "例：" in out, out
+    # ④ 未知工具 → 搜索指引 + 具体搜索示例
+    out = m.call_tool("hub_no_such_tool", {}, root)
+    assert "未知工具" in out and "hub_search_tools" in out and "keyword=" in out, out
+    # ⑤ 根目录不存在 → 排查指引（config.json / --root）
+    out = m.call_tool("hub_health", {}, "/no/such/dir")
+    assert "根目录不存在" in out and "config.json" in out, out
+    # ⑥ 随记 content 缺失 → 集中必填校验先于分发，断言可行动信息（缺失+示例）
+    out = m.call_tool("hub_note", {"tags": "x"}, root)
+    assert "content" in out and "缺失" in out and "例：" in out, out
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -1920,6 +1949,8 @@ def main():
          lambda: t_round12_date_normalize(root))
     case("Round13·18工具整数入参不再静默回落（集中校验+漂移守卫+supersedes语义）",
          lambda: t_round13_int_params_central(root))
+    case("R3·错误信息三件套（必填/项目不存在/枚举/未知工具/坏根/缺content 均带示例或核对路径）",
+         lambda: t_error_msg_three_part(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
