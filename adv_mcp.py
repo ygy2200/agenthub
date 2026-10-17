@@ -62,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.34"
+    assert r["serverInfo"]["version"] == "2.40.35"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1943,6 +1943,41 @@ def t_confirm_blast_radius(root):
             os.environ["AGENTHUB_STRICT_CONFIRM"] = saved
 
 
+def t_structured_log(root):
+    """B8 回归：结构化可观测（AGENTHUB_LOG → 每次工具调用落一行 JSONL）。
+    验证：①默认关闭零副作用（未设环境变量绝不落文件，否则常驻 server 会被拖慢/撑爆磁盘）
+    ②开启后字段齐全（ts/tool/ms/ok/err_kind/agent/root）③异常路径也落痕（err_kind 非空）
+    ——观测不到服务端异常的可观测性是假的 ④日志写失败不得拖垮主链路（观测 = 旁路）。"""
+    log = Path(root) / "mcp_events.jsonl"
+    saved = os.environ.get("AGENTHUB_LOG")
+    try:
+        os.environ.pop("AGENTHUB_LOG", None)
+        resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_health", "arguments": {}}), str(root)))
+        assert not log.exists(), "未设 AGENTHUB_LOG 却落了日志（默认必须关闭）"
+        os.environ["AGENTHUB_LOG"] = str(log)
+        resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_health",
+                                                    "arguments": {"agent": "adv"}}), str(root)))
+        lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()]
+        assert lines, "开启后未落任何日志"
+        rec = lines[-1]
+        for k in ("ts", "tool", "ms", "ok", "err_kind", "agent", "root"):
+            assert k in rec, f"缺字段 {k}: {rec}"
+        assert rec["tool"] == "hub_health" and rec["ok"] is True and rec["agent"] == "adv", rec
+        assert rec["ms"] >= 0, rec
+        m.handle_message(rpc("tools/call", {"name": "hub_get_record",
+                                            "arguments": {"record_id": "not-an-int"}}), str(root))
+        lines = [json.loads(x) for x in log.read_text(encoding="utf-8").splitlines() if x.strip()]
+        assert any(x["err_kind"] for x in lines), f"异常路径未落痕/err_kind 全空: {lines}"
+        os.environ["AGENTHUB_LOG"] = str(Path(root) / "no_such_dir" / "x.jsonl")
+        r = resp_ok(m.handle_message(rpc("tools/call", {"name": "hub_health", "arguments": {}}), str(root)))
+        assert "error" not in r, "日志写失败竟导致调用失败（观测绝不能影响主链路）"
+    finally:
+        if saved is None:
+            os.environ.pop("AGENTHUB_LOG", None)
+        else:
+            os.environ["AGENTHUB_LOG"] = saved
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -2008,6 +2043,8 @@ def main():
     case("R7·四段式模板软提示（缺段回显/不污染存储/todo 不提示）", lambda: t_template_nudge(root))
     case("B3·确认闸门破坏半径分级（默认不打断/严格模式高危需显式confirm/低危不受影响）",
          lambda: t_confirm_blast_radius(fresh_hub(tmp, "hub_b3")))
+    case("B8·结构化可观测日志（默认关闭零副作用/字段齐全/异常落痕/写失败不影响主链路）",
+         lambda: t_structured_log(fresh_hub(tmp, "hub_b8")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

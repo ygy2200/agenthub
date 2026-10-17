@@ -14,6 +14,7 @@ import json
 import os
 import re
 import sys
+import time
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -38,7 +39,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.34"}  # v2.40.29=R1 备份升级；v2.40.30=R2 建表下沉 handle_message；v2.40.31=R3 记忆 BM25 token 缓存；v2.40.32=R4 语义批量矩阵点积；v2.40.33=R5 Jaccard 上界短路；本版=R6 确认闸门破坏半径分级：新增 HIGH_BLAST_TOOLS 高危子集 + AGENTHUB_STRICT_CONFIRM 严格模式开关（默认关闭，保持「不传即执行」历史语义，避免打断 6 个 agent 日常写入）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.35"}  # v2.40.29=R1 备份升级；v2.40.30=R2 建表下沉 handle_message；v2.40.31=R3 记忆 BM25 token 缓存；v2.40.32=R4 语义批量矩阵点积；v2.40.33=R5 Jaccard 上界短路；v2.40.34=R6 确认闸门破坏半径分级；本版=R7 结构化可观测：tools/call 埋点（成功/业务失败/异常三路径）+ AGENTHUB_LOG=<路径> 才落 JSONL（默认关闭，零开销零噪音；观测失败一律静默，绝不拖垮主链路）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2599,6 +2600,27 @@ def _input_required(mid, text: str) -> dict:
                        "content": [{"type": "text", "text": text}]}}
 
 
+def _log_call(root, tname: str, args: dict, t0: float, ok: bool = True, err_kind: str = "") -> None:
+    """B8 结构化可观测：每次工具调用落一行 JSONL（每行 = 一条结构化事件，便于 grep/jq/后续聚合）。
+    字段：ts / tool / ms / ok / err_kind / agent / root。
+    默认**关闭**（AGENTHUB_LOG 未设 → 函数首行即返回，零开销、零噪音）；
+    设 AGENTHUB_LOG=<文件路径> 才落盘。为什么不默认开：常驻 server 写日志会无上限增长且
+    拖慢每次调用，而绝大多数场景不需要——按需开、用完关，才是本地优先工具该有的默认。
+    铁律：观测绝不能影响主链路——任何失败一律静默（不抛、不写 stdout、不污染协议流）。"""
+    path = os.environ.get("AGENTHUB_LOG", "").strip()
+    if not path:
+        return
+    try:
+        rec = {"ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
+               "tool": tname, "ms": round((time.perf_counter() - t0) * 1000, 2),
+               "ok": bool(ok), "err_kind": err_kind,
+               "agent": str(args.get("agent") or ""), "root": str(root)}
+        with open(path, "a", encoding="utf-8") as f:
+            f.write(json.dumps(rec, ensure_ascii=False) + "\n")
+    except Exception:  # noqa: BLE001
+        pass
+
+
 def visible_tools() -> list:
     """当前 profile 下 tools/list 的可见切片（admin=全量；藏起≠禁用，仍可直接调用）。"""
     allow = PROFILES.get(SERVER_PROFILE)
@@ -2766,6 +2788,7 @@ def handle_message(msg: dict, root: str) -> dict | None:
                     "result": {"content": [{"type": "text", "text": (
                         f"dry_run（未执行）：{tname} 预演通过，将写入 → {preview or '(无参数)'}\n"
                         "未落任何库；去掉 dry_run 后正式执行。")}], "isError": False}}
+        _t0 = time.perf_counter()   # B8 埋点起点（AGENTHUB_LOG 未设时 _log_call 首行即返回，开销≈0）
         try:
             text = call_tool(tname, args, root)
             is_err = _is_error_text(text)
@@ -2781,6 +2804,7 @@ def handle_message(msg: dict, root: str) -> dict | None:
             result = {"content": [{"type": "text", "text": text}], "isError": is_err}
             if structured is not None:
                 result["structuredContent"] = structured
+            _log_call(root, tname, args, _t0, ok=not is_err, err_kind="tool_error" if is_err else "")
             return {"jsonrpc": "2.0", "id": mid, "result": result}
         except Exception as e:  # noqa: BLE001  工具错误以 isError 返回，不断连，并自动落库错误登记
             # 模型侧只给稳定可行动文案（含异常类型，不含原始堆栈/SQL/路径——MCP 官方 wati.io
@@ -2802,6 +2826,9 @@ def handle_message(msg: dict, root: str) -> dict | None:
                                 project=str(args.get("project") or ""))
             except Exception:  # noqa: BLE001 登记失败不影响协议响应
                 pass
+            # B8：异常路径同样落痕——观测不到服务端异常的可观测性是假的（这类正是最该被看见的）
+            _log_call(root, tname, args, _t0, ok=False,
+                      err_kind="input_type" if input_err else "exception")
             return {"jsonrpc": "2.0", "id": mid,
                     "result": {"content": [{"type": "text", "text": text}],
                                "isError": True}}
