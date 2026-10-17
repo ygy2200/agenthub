@@ -38,7 +38,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.19"}  # v2.40.18=配色逻辑轮3；本版=UI逻辑轮4：修「流水撤销打错对象」（选中较早竟撤最新）→ 新增 brain.undo_record 按 id 撤销
+SERVER_INFO = {"name": "agenthub", "version": "2.40.20"}  # v2.40.19=UI逻辑轮4；本版=错误闭环：新增 hub_error_close（MCP 侧关错——此前只有 GUI 能关，agent 只能报不能关，导致僵尸错误堆积）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -993,6 +993,28 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append(f"  回滚方式：{e['undo']}")
         return "\n".join(lines)
 
+    if name == "hub_error_close":
+        agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
+        try:
+            eid = int(arguments.get("error_id"))
+        except (TypeError, ValueError):
+            return ("错误：error_id 必须是整数 id（如 12）——取自 hub_list_errors 输出的 #N。"
+                    "先调 hub_list_errors(status=\"open\") 核对，不要猜。")
+        if eid <= 0:
+            return "错误：error_id 必须是正整数（如 12）。先调 hub_list_errors(status=\"open\") 核对未关闭错误的 id。"
+        cur = next((e for e in brain.error_list(root) if e["id"] == eid), None)
+        if cur is None:
+            return (f"错误：未找到 id={eid} 的错误。当前全部错误登记用 hub_list_errors 查看"
+                    "（输出行首 #N 即 id，新在前）。")
+        if cur["status"] == "fixed":
+            return f"错误 #{eid} 已是关闭状态，无需重复关（hub_list_errors 可见全部）。"
+        note = str(arguments.get("note", "")).strip()[:200]
+        err = brain.error_set_status(root, eid, "fixed")
+        if err:
+            return f"错误：{err}"
+        brain.journal_add(root, agent, "关闭错误", target=f"errors#{eid}", note=note)
+        return f"已关闭错误 #{eid}（{agent}）" + (f"：{note}" if note else "")
+
     if name == "hub_undo":
         agent = str(arguments.get("agent", "")).strip()
         if not agent:
@@ -1942,6 +1964,12 @@ TOOLS = [
                      "required": ["title"]}},
     {"name": "hub_list_errors", "description": "查询错误登记（可按 status=open/fixed 过滤），排查历史问题用",
      "inputSchema": {"type": "object", "properties": {"status": {"type": "string", "enum": ["open", "fixed"]}}}},
+    {"name": "hub_error_close", "description": "关闭一条已修复的错误登记（open→fixed）。修完 bug 后必须调用——只登记不关闭会让未关闭列表堆积僵尸错误、淹没真故障（本大脑曾积压 8 条僵尸）。没修完别关（留着提醒后来人）；error_id 取自 hub_list_errors 输出的 #N，不要猜。例：hub_error_close(error_id=12, note=\"整数入参坏类型已修\")",
+     "inputSchema": {"type": "object",
+                     "properties": {"error_id": {"type": "integer", "description": "错误 id（hub_list_errors 输出里的 #N，如 12）"},
+                                    "note": {"type": "string", "description": "怎么修的/为什么关（一句话，进流水可追溯）"},
+                                    "agent": {"type": "string", "description": "你的 agent 名（进流水）"}},
+                     "required": ["error_id"]}},
     {"name": "hub_undo", "description": "撤销你（agent）最近一条经 hub_log_work 写入的记录段（原文自动备份，操作进流水）",
      "inputSchema": {"type": "object",
                      "properties": {"agent": {"type": "string", "description": "你的 agent 名（只能撤自己的）"}},
@@ -2328,6 +2356,7 @@ _INT_PARAMS = {
     "hub_distill": ("limit",),
     "hub_duplicates": ("min_len",),
     "hub_env_list": ("limit",),
+    "hub_error_close": ("error_id",),
     "hub_events": ("limit", "since_id"),
     "hub_export": ("limit",),
     "hub_get_progress": ("limit",),
@@ -2468,7 +2497,7 @@ _LAST_SKILL_NOTE: dict = {}
 # 写工具清单（P3-1）：dry_run 预演、confirm 闸门、写后审计三者都按它判定
 WRITE_TOOLS = {
     "hub_log_work", "hub_create_project", "hub_note", "hub_memory_write", "hub_heartbeat",
-    "hub_report_error", "hub_undo", "hub_archive_project", "hub_todo_done", "hub_env_set",
+    "hub_report_error", "hub_error_close", "hub_undo", "hub_archive_project", "hub_todo_done", "hub_env_set",
     "hub_ops_run", "hub_handoff", "hub_report", "hub_flush_index",
     "hub_task_add", "hub_task_update", "hub_claim", "hub_crystallize", "hub_event_write",
     "hub_skill_sync",  # 技能原生化：写索引（走 dry_run/confirm 闸门）

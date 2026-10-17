@@ -62,14 +62,14 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.19"
+    assert r["serverInfo"]["version"] == "2.40.20"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
     assert {"hub_list_projects", "hub_log_work", "hub_memory_read", "hub_memory_write",
             "hub_get_progress", "hub_list_skills", "hub_list_mcps", "hub_search",
             "hub_get_project", "hub_create_project", "hub_get_rules", "hub_heartbeat",
-            "hub_report_error", "hub_list_errors", "hub_undo", "hub_list_agents",
+            "hub_report_error", "hub_list_errors", "hub_error_close", "hub_undo", "hub_list_agents",
             "hub_list_todos", "hub_health", "hub_todo_done", "hub_env_set", "hub_env_list",
             "hub_search_files", "hub_distill", "hub_get_record", "hub_duplicates", "hub_report",
             "hub_handoff", "hub_status", "hub_user_profile", "hub_note", "hub_note_read",
@@ -79,7 +79,7 @@ def t_protocol(root):
             "hub_next", "hub_crystallize",
             "hub_event_write", "hub_events",
             "hub_skill_match", "hub_skill_sync"} <= names, names
-    assert len(names) == 68  # X3+X4=65，Y1+Y2+Y3（2026-10-13）+playbook/trigger/graph=68（X5 走 CLI 不加工具）
+    assert len(names) == 69  # 68=X3+X4+Y1+Y2+Y3+playbook/trigger/graph；69=+hub_error_close（2026-10-17 错误闭环：MCP 侧关错，治僵尸堆积）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -566,6 +566,24 @@ def t_errors_flow(root):
     # title 必填
     out = m.call_tool("hub_report_error", {"agent": "x", "title": " "}, root)
     assert "必填" in out
+    # hub_error_close（2026-10-17）：MCP 侧关错闭环——修完必须关，否则僵尸堆积
+    out = m.call_tool("hub_report_error", {"agent": "x", "title": "待关闭的错误"}, root)
+    assert "已登记" in out
+    cid = max(e["id"] for e in brain.error_list(root))
+    out = m.call_tool("hub_error_close", {"error_id": "abc"}, root)
+    assert "必须是整数" in out, out
+    out = m.call_tool("hub_error_close", {"error_id": -1}, root)
+    assert "正整数" in out, out
+    out = m.call_tool("hub_error_close", {"error_id": 999999}, root)
+    assert "未找到" in out, out
+    out = m.call_tool("hub_error_close", {"error_id": cid, "agent": "zcode", "note": "已修"}, root)
+    assert "已关闭错误" in out and f"#{cid}" in out, out
+    out = m.call_tool("hub_error_close", {"error_id": cid}, root)
+    assert "已是关闭状态" in out, out
+    out = m.call_tool("hub_list_errors", {"status": "open"}, root)
+    assert "待关闭的错误" not in out
+    out = m.call_tool("hub_list_errors", {"status": "fixed"}, root)
+    assert "待关闭的错误" in out
 
 
 def t_undo_log(root):
