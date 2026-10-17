@@ -2545,6 +2545,34 @@ def t_similar_memories_bound(tmp):
     assert brain.similar_memories(root, 1.5, 50) == [], "阈值>1 应全部剪枝为空"
 
 
+def t_schema_version(tmp):
+    """B11 回归：schema 版本登记（meta.schema_version）+ 降级检测。
+    验证：①建库后版本被登记成当前；②幂等——重复 ensure_schema 版本号不动；
+    ③库版本高于代码（旧代码跑新库）→ drift=downgrade 且**不被覆盖抹掉证据**；
+    ④库版本低于代码 → 升级到当前。登记失败绝不影响建表主链路。"""
+    hub = str(Path(tmp) / "hub_sv")
+    Path(hub).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(hub)
+    assert brain.schema_version(hub)["db"] == brain.SCHEMA_VERSION, brain.schema_version(hub)
+    assert brain.schema_version(hub)["drift"] == ""
+    for _ in range(3):
+        brain.ensure_schema(hub)
+    assert brain.schema_version(hub)["db"] == brain.SCHEMA_VERSION, "重复 ensure_schema 破坏了幂等"
+    with brain.db_conn(hub) as c:
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','999')")
+    brain._SCHEMA_VER_SYNCED.discard(hub)      # 越过进程内缓存，强制重跑登记逻辑
+    brain.ensure_schema(hub)
+    st = brain.schema_version(hub)
+    assert st["drift"] == "downgrade", st
+    assert st["db"] == 999, f"降级证据被覆盖了（应保留 999）：{st}"
+    with brain.db_conn(hub) as c:
+        c.execute("INSERT OR REPLACE INTO meta(key,value) VALUES('schema_version','0')")
+    brain._SCHEMA_VER_SYNCED.discard(hub)
+    brain.ensure_schema(hub)
+    assert brain.schema_version(hub)["db"] == brain.SCHEMA_VERSION, "低版本未升级"
+    assert brain.schema_version(hub)["drift"] == ""
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2578,6 +2606,7 @@ def main():
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
     case("B4·语义第三路批量矩阵点积（数值等价/软删过滤/门槛/最相似优先）", lambda: t_semantic_batched_cosine(tmp))
     case("B5·相似记忆两两 Jaccard 上界短路（等价免建并集/多阈值/limit 早退一致）", lambda: t_similar_memories_bound(tmp))
+    case("B11·schema 版本登记与降级检测（幂等/downgrade 不抹证据/低版本升级）", lambda: t_schema_version(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))

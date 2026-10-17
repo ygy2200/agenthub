@@ -601,6 +601,51 @@ def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, recor
     conn.execute(f"UPDATE agents SET {','.join(sets)} WHERE name=?", args)
 
 
+SCHEMA_VERSION = 1
+# B11 schema 版本号。约定：新增表/列/迁移时 **+1**，并在本注释里记一笔：
+#   v1 = 基线（本登记落地的时刻；此前所有迁移都靠幂等的 _migrate_columns 逐列 PRAGMA 试探，
+#        能补列但没有版本号——无法回答「这个库现在是哪个版本」「是不是降级运行了」）。
+# 故意**不**替换 _migrate_columns：它已幂等且被大量回归覆盖，推翻重来风险远大于收益。
+# 这里只补缺口的一环——版本登记 + 降级检测。
+
+_SCHEMA_VER_SYNCED: set = set()  # 进程内只登记一次的 root 集合（ensure_schema 每请求都被调用，不能每次查库）
+
+
+def schema_version(root: str) -> dict:
+    """B11 只读：本库的 schema 版本状态。
+    返回 {"version": 代码版本, "db": 库记录版本(未登记为 None), "drift": "downgrade"/""}。
+    drift='downgrade' = 库版本高于代码版本 → **旧代码跑新库**（会读错列/漏新表），必须能举证。"""
+    try:
+        with db_conn(root) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key='schema_version'").fetchone()
+    except Exception:  # noqa: BLE001  表还没建/库不可读：只读观测不得抛
+        return {"version": SCHEMA_VERSION, "db": None, "drift": ""}
+    raw = row["value"] if row else None
+    db_v = int(raw) if raw is not None and str(raw).lstrip("-").isdigit() else None
+    drift = "downgrade" if (db_v is not None and db_v > SCHEMA_VERSION) else ""
+    return {"version": SCHEMA_VERSION, "db": db_v, "drift": drift}
+
+
+def _sync_schema_version(root: str) -> None:
+    """B11：把当前 SCHEMA_VERSION 登记进 meta。契约：
+    ① 幂等——已登记且同版本则不动；② 降级运行（库 > 代码）**保留库里的高版本不覆盖**，
+       让 schema_version() 能持续报 downgrade（否则一次就把证据抹了）；
+    ③ 绝不抛异常——版本登记失败不影响建表/补列主链路。"""
+    if root in _SCHEMA_VER_SYNCED:      # 进程内热路径短路（R2 后 ensure_schema 每请求都跑）
+        return
+    try:
+        st = schema_version(root)
+        if st["drift"] == "downgrade" or st["db"] == SCHEMA_VERSION:
+            return
+        with db_conn(root) as conn:
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                         ("schema_version", str(SCHEMA_VERSION)))
+    except Exception:  # noqa: BLE001
+        pass
+    finally:
+        _SCHEMA_VER_SYNCED.add(root)
+
+
 def ensure_schema(root: str) -> str:
     """仅建表 + 增量补列（毫秒级，不跑文件迁移）：MCP server 启动/根目录切换时调用。
     防"代码已部署但真实库缺新表/新列"——v2.5.2 的 distill_seen 上轮只在测试库验证过，
@@ -618,6 +663,7 @@ def ensure_schema(root: str) -> str:
         _migrate_columns(root)
         _backfill_tag_schema(root)
         _pb_seed(root)  # 只补缺失 + 进程内只查一次（ensure_schema 被高频调用，不能每次扫库）
+        _sync_schema_version(root)  # B11：登记版本（同样进程内一次；失败静默，不影响建表）
         return ""
     except sqlite3.Error as e:
         return f"大脑 schema 初始化失败：{e}"
