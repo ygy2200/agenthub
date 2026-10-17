@@ -3161,8 +3161,18 @@ def _init_emb_table(root: str, conn=None) -> None:
         else:
             with db_conn(root) as c:
                 c.execute(ddl)
-    except Exception:
-        pass
+    except Exception as e:  # noqa: BLE001
+        # fail-open 保留（语义路是可选能力，建不了表就跳过，绝不能拖垮主链路），
+        # 但**绝不静默**——此前这里裸 `except: pass`，把「根目录不存在 / 库打不开」这类
+        # 真因整个吞掉，症状表现为下游莫名其妙的 "no such table: embeddings"，
+        # 与真因毫无关联，排查成本极高（R4 写语义回归时实锤踩到）。
+        # 留痕到 stderr（不污染 stdout 协议流），与 MCP 层 [agenthub][tool-error] 同风格。
+        try:
+            sys.stderr.write(f"[agenthub][emb-table] 向量表不可用（{type(e).__name__}）：{e}"
+                             f" —— 语义检索自动跳过，其余功能不受影响\n")
+            sys.stderr.flush()
+        except Exception:  # noqa: BLE001  留痕本身失败也不许抛
+            pass
 
 
 def _ensure_emb() -> bool:

@@ -2621,6 +2621,35 @@ def t_env_override_paths(tmp):
         importlib.reload(auto_log)
 
 
+def t_emb_table_no_silent_fail(tmp):
+    """回归：_init_emb_table 建表失败必须**留痕**，不能静默。
+    此前是裸 `except: pass`——把「根目录不存在 / 库打不开」这类真因整个吞掉，
+    症状却表现为下游莫名其妙的 "no such table: embeddings"（与真因无关，极难排查，
+    R4 写语义回归时实锤踩到）。
+    验证：①仍然 fail-open（不抛异常，语义是可选能力，不能拖垮主链路）；
+    ②stderr 有留痕且带真因关键词。"""
+    import contextlib
+    import io
+    bad_root = str(Path(tmp) / "no" / "such" / "dir")
+    assert not os.path.isdir(bad_root)
+    buf = io.StringIO()
+    with contextlib.redirect_stderr(buf):        # ① 不抛
+        brain._init_emb_table(bad_root)
+    err = buf.getvalue()
+    assert "emb-table" in err, f"建表失败却零留痕（又把异常静默吞了）：{err!r}"
+    assert "unable to open" in err or "no such" in err or "不存在" in err, \
+        f"留痕里没有真因，等于没留：{err!r}"
+    # 正常路径：建表成功时不该有任何噪音（注意 _init_emb_table 自己不建父目录，
+    # 那是 ensure_schema 的职责，所以这里必须先 ensure_schema 才是「正常路径」）
+    good = str(Path(tmp) / "hub_emb")
+    Path(good).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(good)
+    buf2 = io.StringIO()
+    with contextlib.redirect_stderr(buf2):
+        brain._init_emb_table(good)
+    assert buf2.getvalue() == "", f"建表成功却有噪音输出：{buf2.getvalue()!r}"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2658,6 +2687,8 @@ def main():
     case("B12·哨兵退出钩子唯一且真做 checkpoint（防第二个钩子架空/WAL 无残留/收尾后仍可写）",
          lambda: t_sentinel_exit_hook(tmp))
     case("B6·硬编码路径可被环境变量覆盖（AGENTHUB_ROOT/HERMES_HOME，默认值不变）", lambda: t_env_override_paths(tmp))
+    case("补缺·_init_emb_table 建表失败不再静默（fail-open 保留 + stderr 带真因留痕）",
+         lambda: t_emb_table_no_silent_fail(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))
     case("记忆衰减（越老越低/访问越多越高/breadth恒等/坏参不崩/冷判定）", lambda: t_retention_decay(tmp))
     case("记忆反馈通道（升档封顶/落地板/非法枚举/坏id）", lambda: t_salience_feedback(tmp))
