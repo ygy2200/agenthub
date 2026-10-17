@@ -2156,6 +2156,19 @@ def t_export_history(tmp):
     assert verr == "" and "records 1" in vmsg and "memories 1" in vmsg, (verr, vmsg)
     assert len(brain.backup_list(root)) == 1
     assert "不存在" in brain.backup_verify(root, str(Path(tmp) / "nope.db"))[0]
+    # R1：备份必须覆盖磁盘文件（否则还原会丢源文件）—— 单库备份的历史坑
+    proj = Path(root) / "甲-问题" / "output"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "交付.md").write_text("重要源文件", encoding="utf-8")
+    err2, bpath2 = brain.backup_db(root)
+    assert err2 == "" and bpath2.endswith(".zip"), (err2, bpath2)
+    import zipfile as _zf
+    with _zf.ZipFile(bpath2) as z:
+        names = z.namelist()
+    assert "brain.db" in names, names[:5]
+    assert any("甲-问题/output/交付.md" in n.replace("\\", "/") for n in names), names[:10]
+    # 旧 .db 备份仍可被识别/校验（向后兼容）
+    assert any(b["kind"] == "zip" for b in brain.backup_list(root))
     # —— X3 导出 ——
     e1, p1 = brain.export_all(root, "markdown")
     assert e1 == "" and Path(p1).exists(), (e1, p1)

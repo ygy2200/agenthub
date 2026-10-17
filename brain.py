@@ -4879,10 +4879,12 @@ def export_all(root: str, fmt: str = "markdown", limit: int = 5000) -> tuple:
 
 
 def backup_db(root: str, dest: str = "") -> tuple:
-    """X3 备份：走 sqlite3 官方 backup API（**不用 shutil 复制文件**——WAL 模式下
-    主库文件里还没 checkpoint，直接 copy 出来的备份会丢数据：2026-10-12 实测，
-    copy 出的库 records=0 而源库有数据，是「假备份」）。backup API 会把 WAL 一并纳入。
-    只读语义不变（不改动源）。dest 可指定目录（不存在则建）。返回 (错误或 "", 路径)。"""
+    """X3 备份：① 先走 sqlite3 官方 backup API 取**含 WAL 的一致性库快照**（**不用
+    shutil 复制文件**——WAL 未 checkpoint 时 copy 出的库会丢数据，2026-10-12 实测假备份）；
+    ② 再把这个一致库 + 整个磁盘项目文件树打包成单个 .zip（排除运营目录 backup/__pycache__/.git
+    与库文件本体）。单一还原单元，避免「只备库、还原丢源文件」。dest 可指定目录（不存在则建）。
+    返回 (错误或 "", zip 路径)。旧 .db 备份仍可被 backup_verify/backup_list 识别。"""
+    import zipfile
     src = db_path(root)
     if not src.exists():
         return "源库不存在", ""
@@ -4892,51 +4894,109 @@ def backup_db(root: str, dest: str = "") -> tuple:
     except OSError as e:
         return f"备份目录创建失败：{e}", ""
     stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
-    path = out_dir / f"brain-{stamp}.db"
+    zip_path = out_dir / f"brain-{stamp}.zip"
+    tmp = out_dir / f".tmp-brain-{stamp}.db"
     s_conn = d_conn = None
     try:
+        # ① 一致性库快照（含 WAL）
         s_conn = sqlite3.connect(str(src), timeout=5)
-        d_conn = sqlite3.connect(str(path), timeout=5)
-        s_conn.backup(d_conn)  # 官方 backup API：含 WAL，原子一致快照
+        d_conn = sqlite3.connect(str(tmp), timeout=5)
+        s_conn.backup(d_conn)
         d_conn.close()
         s_conn.close()
-    except sqlite3.Error as e:
+        # ② 打包：库快照 + 磁盘文件树
+        root_p = Path(root)
+        EXCLUDE_DIRS = {"backup", "__pycache__", ".git"}
+        EXCLUDE_FILES = {src.name, src.name + "-wal", src.name + "-shm", tmp.name}
+        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+            zf.write(tmp, arcname="brain.db")  # 一致库放根
+            n_files = 0
+            for p in root_p.rglob("*"):
+                if p.is_dir():
+                    continue
+                rel = p.relative_to(root_p)
+                if any(part in EXCLUDE_DIRS for part in rel.parts):
+                    continue
+                if rel.name in EXCLUDE_FILES:
+                    continue
+                zf.write(p, arcname=str(rel).replace("\\", "/"))
+                n_files += 1
+        tmp.unlink(missing_ok=True)
+    except (sqlite3.Error, OSError, zipfile.BadZipFile) as e:
         for c in (d_conn, s_conn):
             try:
                 if c:
                     c.close()
             except sqlite3.Error:
                 pass
+        try:
+            tmp.unlink(missing_ok=True)
+        except OSError:
+            pass
+        try:
+            zip_path.unlink(missing_ok=True)
+        except OSError:
+            pass
         return f"备份失败：{e}", ""
-    return "", str(path)
+    return "", str(zip_path)
 
 
 def backup_list(root: str) -> list:
-    """X3 备份清单（新在前）：路径/大小/修改时间。"""
+    """X3 备份清单（新在前）：路径/大小/修改时间/kind（zip=库+文件，db=仅库）。"""
     d = db_path(root).parent / "backup"
     if not d.exists():
         return []
     out = []
-    for p in d.glob("brain-*.db"):
+    for p in list(d.glob("brain-*.db")) + list(d.glob("brain-*.zip")):
         st = p.stat()
         out.append({"path": str(p), "size": st.st_size,
                     "mtime": datetime.datetime.fromtimestamp(
-                        st.st_mtime).strftime("%Y-%m-%d %H:%M")})
+                        st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                    "kind": "zip" if p.suffix == ".zip" else "db"})
     out.sort(key=lambda x: x["path"], reverse=True)
     return out
 
 
 def backup_verify(root: str, path: str) -> tuple:
     """X3 校验备份：只读打开 + 关键表计数（不写、不恢复——恢复是人的手工动作）。
+    支持 .zip（库+文件，逐项校验完整性并报告文件数）与旧 .db（仅库）。
     返回 (错误或 "", 摘要)。"""
+    import zipfile
+    import tempfile
     p = Path(path).expanduser()
     if not p.exists():
         return f"备份文件不存在：{p}", ""
     try:
+        if p.suffix == ".zip":
+            with zipfile.ZipFile(p) as zf:
+                if zf.testzip() is not None:
+                    return "压缩包损坏（testzip 失败）", ""
+                names = zf.namelist()
+                if "brain.db" not in names:
+                    return "备份缺少 brain.db（不是有效的 AgentHub 备份）", ""
+                data = zf.read("brain.db")
+            tf = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+            tf.write(data)
+            tf.close()
+            try:
+                conn = sqlite3.connect(f"file:{tf.name}?mode=ro", uri=True, timeout=5)
+                got = {}
+                for tbl in ("records", "memories", "projects"):
+                    try:
+                        got[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                    except sqlite3.Error:
+                        got[tbl] = -1
+                conn.close()
+            finally:
+                try:
+                    Path(tf.name).unlink(missing_ok=True)
+                except OSError:
+                    pass
+            n_files = sum(1 for n in names if n != "brain.db")
+            return "", ("备份可读：DB(" + " · ".join(f"{k} {v}" for k, v in got.items())
+                        + f") · 文件 {n_files} 个")
+        # 旧 .db 备份（仅库）
         conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
-    except sqlite3.Error as e:
-        return f"打不开备份：{e}", ""
-    try:
         got = {}
         for tbl in ("records", "memories", "projects"):
             try:
@@ -4944,7 +5004,7 @@ def backup_verify(root: str, path: str) -> tuple:
             except sqlite3.Error:
                 got[tbl] = -1
         conn.close()
-    except sqlite3.Error as e:
+    except (sqlite3.Error, zipfile.BadZipFile, OSError) as e:
         return f"读取备份失败：{e}", ""
     return "", "备份可读：" + " · ".join(f"{k} {v}" for k, v in got.items())
 
@@ -5708,7 +5768,7 @@ _BUILTIN_PLAYBOOKS = [
          {"key": "deploy", "title": "部署一致性（源码 vs ~/.agenthub）", "action": "ops_check",
           "args": {"name": "deploy_diff"}},
          {"key": "exe", "title": "exe 是否比源码旧", "action": "ops_check", "args": {"name": "release"}},
-         {"key": "backup", "title": "备份数据库", "action": "backup", "args": {}},
+         {"key": "backup", "title": "备份大脑（库+文件）", "action": "backup", "args": {}},
          {"key": "log", "title": "落一条发布记录", "action": "log_work",
           "args": {"title": "发布流程自动执行",
                    "content": "playbook release 执行结果：语法={{out.syntax}}｜部署={{out.deploy}}｜exe={{out.exe}}｜备份={{out.backup}}"}},
@@ -5745,7 +5805,7 @@ _BUILTIN_PLAYBOOKS = [
      "steps": [
          {"key": "syntax", "title": "语法检查", "action": "ops_check", "args": {"name": "py_compile"}},
          {"key": "deploy", "title": "部署一致性", "action": "ops_check", "args": {"name": "deploy_diff"}},
-         {"key": "backup", "title": "备份数据库", "action": "backup", "args": {}},
+         {"key": "backup", "title": "备份大脑（库+文件）", "action": "backup", "args": {}},
          {"key": "distill", "title": "看一眼蒸馏候选并决定是否沉淀", "action": "manual",
           "note": "跑 hub_distill，有「目的」结论的用 hub_memory_write 沉淀（系统不替你判断价值）"},
          {"key": "log", "title": "落交付记录", "action": "log_work",
@@ -5757,7 +5817,7 @@ _BUILTIN_PLAYBOOKS = [
          {"key": "agents", "title": "各 agent 接入状态", "action": "ops_check", "args": {"name": "agents"}},
          {"key": "rules", "title": "规则执行体检（闸门是否真跑）", "action": "ops_check",
           "args": {"name": "rules_health"}},
-         {"key": "backup", "title": "备份数据库", "action": "backup", "args": {}},
+         {"key": "backup", "title": "备份大脑（库+文件）", "action": "backup", "args": {}},
      ]},
 ]
 
