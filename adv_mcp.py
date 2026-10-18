@@ -62,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.40"
+    assert r["serverInfo"]["version"] == "2.40.41"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2026,6 +2026,41 @@ def t_tool_annotations(root):
         "端到端输出里高危工具没带 destructiveHint"
 
 
+_SCHEMA_BASELINE = Path(__file__).parent / "tool_schema_baseline.json"
+
+
+def t_tool_schema_compat(root):
+    """C2 回归：工具 schema 只允许**加法式**变更（新增可选参数是安全的）。
+    静默删除/改名/改类型的参数是 MCP 的真实事故——客户端在会话开始时就缓存了
+    tools/list 的 schema，服务端原地改参数会让它们静默失败（Microsoft Learn server
+    事故：单个参数重命名挂掉 2–5% 客户端）。
+    基线 `tool_schema_baseline.json` 是「参数下限」：可以加，不可以减/改。
+    确需破坏性变更时，必须**显式更新基线文件**并说明——这就是「显式确认」的落点。"""
+    assert _SCHEMA_BASELINE.is_file(), f"缺基线文件 {_SCHEMA_BASELINE}"
+    base = json.loads(_SCHEMA_BASELINE.read_text(encoding="utf-8"))
+    problems = []
+    for t in m.TOOLS:
+        name = t["name"]
+        sch = t.get("inputSchema") or {}
+        props = sch.get("properties") or {}
+        cur = {k: (v or {}).get("type", "") for k, v in props.items()}
+        cur_req = set(sch.get("required") or [])
+        if name not in base:
+            problems.append(f"{name}: 新工具，需补进基线")
+            continue
+        b = base[name]
+        for k, ty in b["props"].items():
+            if k not in cur:
+                problems.append(f"{name}: 参数 {k} 被删除（客户端会静默失败）")
+            elif cur[k] != ty:
+                problems.append(f"{name}.{k}: 类型 {ty} → {cur[k]}（客户端传旧类型会失败）")
+        for k in set(b["required"]) - cur_req:
+            problems.append(f"{name}: 必填 {k} 被降级为可选（旧调用可能缺参）")
+        for k in cur_req - set(b["required"]):
+            problems.append(f"{name}: 新增必填 {k}（旧客户端不传会被拦）")
+    assert not problems, "工具 schema 出现非加法式变更：\n  " + "\n  ".join(problems[:15])
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -2097,6 +2132,8 @@ def main():
          lambda: t_readme_changelog_sync(root))
     case("C1·MCP 工具 annotations（只读放行/高危 destructiveHint/幂等/端到端输出带注解）",
          lambda: t_tool_annotations(root))
+    case("C2·工具 schema 兼容（只允许加法式变更；删参数/改类型/新增必填一律拦）",
+         lambda: t_tool_schema_compat(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

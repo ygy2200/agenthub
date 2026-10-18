@@ -39,7 +39,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.40"}  # v2.40.29–.39=上一轮十轮（备份/守卫下沉/性能/闸门/可观测/schema 版本/哨兵）；本版=R1（第二轮）·C1 补 MCP 工具 annotations：69 个工具此前**全部无 annotations**，host 会退回「每次都问用户」的保守默认；现按既有集合单一来源派生注入 readOnlyHint(35)/destructiveHint(9,=HIGH_BLAST)/idempotentHint(10)——确认 UX 交给 host 按规范决定，不再靠服务端改默认（上一轮 B3 走了弯路）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.41"}  # v2.40.29–.39=上一轮十轮；v2.40.40=R1 补工具 annotations；本版=R2·C2 工具 schema 兼容守卫：新增 tool_schema_baseline.json 作为「参数下限」基线，回归只允许加法式变更——删参数/改类型/必填降级或新增必填一律拦（Microsoft Learn server 事故：单个参数重命名静默挂掉 2–5% 客户端）；确需破坏性变更须显式更新基线
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
