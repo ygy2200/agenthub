@@ -2650,6 +2650,35 @@ def t_emb_table_no_silent_fail(tmp):
     assert buf2.getvalue() == "", f"建表成功却有噪音输出：{buf2.getvalue()!r}"
 
 
+def t_ghost_memory_candidates(tmp):
+    """C4 回归：ghost memory（幽灵记忆）检测——高相似但**没有取代关系**的记忆对。
+    验证：①无取代关系的高相似对**会被报出**（这是幽灵：多版本共存没人裁决）；
+    ②标了 supersedes 的对**必须被排除**（已治理，不该再报）；
+    ③低相似的不报（不制造噪音）。只报不裁是本系统一贯立场，此处不验证裁决。"""
+    root = str(Path(tmp) / "hub_ghost")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    base = "系统代理端口实际是 7890 用于本地调试"
+    a = brain.add_memory(root, base + " 甲", kind="fact", agent="zcode", project="p")
+    b = brain.add_memory(root, base + " 乙", kind="fact", agent="zcode", project="p")
+    unrelated = brain.add_memory(root, "课表导出格式讨论与液压传动考试安排",
+                                 kind="note", agent="zcode", project="other")
+    # ① 未标取代 → 应被报为幽灵候选
+    cand = brain.ghost_memory_candidates(root, threshold=0.3, limit=20)
+    ids = [{p["a"], p["b"]} for p in cand]
+    assert {a, b} in ids, f"未标取代的高相似对未被报出：{cand}"
+    # 不相关记忆不该被拉进来
+    assert not any(unrelated in s for s in ids), f"无关记忆被误报：{ids}"
+    # ② 标上取代关系 → 必须被排除
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE memories SET superseded_by=? WHERE id=?", (b, a))
+    cand2 = brain.ghost_memory_candidates(root, threshold=0.3, limit=20)
+    ids2 = [{p["a"], p["b"]} for p in cand2]
+    assert {a, b} not in ids2, f"已标取代的对不该再报（已治理）：{cand2}"
+    # ③ 高阈值下不制造噪音
+    assert brain.ghost_memory_candidates(root, threshold=1.5, limit=20) == []
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2687,6 +2716,8 @@ def main():
     case("B12·哨兵退出钩子唯一且真做 checkpoint（防第二个钩子架空/WAL 无残留/收尾后仍可写）",
          lambda: t_sentinel_exit_hook(tmp))
     case("B6·硬编码路径可被环境变量覆盖（AGENTHUB_ROOT/HERMES_HOME，默认值不变）", lambda: t_env_override_paths(tmp))
+    case("C4·ghost memory 检测（未标取代的高相似对必报/已标取代必排除/不误报无关）",
+         lambda: t_ghost_memory_candidates(tmp))
     case("补缺·_init_emb_table 建表失败不再静默（fail-open 保留 + stderr 带真因留痕）",
          lambda: t_emb_table_no_silent_fail(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))

@@ -5453,6 +5453,39 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
     return out
 
 
+def ghost_memory_candidates(root: str, threshold: float = 0.55, limit: int = 10) -> list:
+    """C4：潜在 **ghost memory**（幽灵记忆）检测——高相似但**没有取代关系**的记忆对。
+
+    为什么需要它：业界给这个失效模式起了名字（llms3，2026-07）——生产中最常见的记忆故障
+    **不是「忘了」，而是「记住太多版本」**：旧的/当前的/过渡态事实共存，被一起检索出来，
+    模型自信地从混合物里综合出错误结论。A-TMA 给检索证据打 current/historical 状态标签后，
+    冲突准确率 +0.240、temporal F1 0.030→0.171——说明「标出哪个版本是现行的」极有价值。
+
+    AgentHub 本来就有解药：`supersedes` 取代链让旧版退出检索（`_live_sql()` 过滤）。
+    **但前提是有人真的标了 supersedes**——没标的就会变成幽灵。本函数把「内容高度相似
+    却又互无取代关系」的对挑出来（= 多个版本共存且没人裁决），**只报不裁**：
+    最终由 agent/用户决定谁取代谁（与 similar_memories 的一贯立场一致）。
+    """
+    pairs = similar_memories(root, threshold=threshold, limit=200)
+    if not pairs:
+        return []
+    try:
+        with db_conn(root) as conn:
+            sup = {r["id"]: (r["superseded_by"] or 0)
+                   for r in conn.execute("SELECT id, superseded_by FROM memories")}
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for p in pairs:
+        a, b = p["a"], p["b"]
+        if sup.get(a) == b or sup.get(b) == a:
+            continue      # 已有取代关系 → 已治理，不是幽灵
+        out.append(p)
+        if len(out) >= max(1, min(int(limit), 50)):
+            break
+    return out
+
+
 def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit: int = 3) -> list:
     """写入时踩坑拦截：新记录 content 的 bigram 词集 vs 库内 lesson/fact 记忆与 open 错误登记，
     Jaccard ≥ threshold 视为"可能正在重蹈已记录的坑"。阈值 0.15 为真实库实测标定：
