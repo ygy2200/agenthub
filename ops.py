@@ -57,6 +57,7 @@ CHECKS = {
     "desc_quality": ("工具描述质量守卫（2026-10-17）：核心工具描述必须含示例+使用时机+必填参数说明，全部工具描述不得过短——描述是 agent 的 UI，缺示例准确率掉约 18 个点（外部调研 72%→90%，tsecurity/agentpatterns/cloudappi 三处一致）", False),
     "record_quality": ("记录模板遵守率（2026-10-17 R7）：近 90 天 work_log 四段式（目的/做了什么/验证结果/如何回滚）俱全率+缺段分布——铁律没有守卫必然腐烂（实测基线仅 48%）。只测不拦，软提示在 hub_log_work 回显", False),
     "profile_surface": ("被动上下文预算（2026-10-18 R8，C7）：tools/list 每会话推一次，是被动 token 成本——外部研究（wavespeed：模型过 ~40 工具开始退化；上下文爆炸 5 server×12 tool×800 token≈48k）。实测三档 profile 工具数与序列化体积，admin 超预算即 warn，防工具描述无声膨胀。R8 评估结论：默认保持 admin（切 worker 只省 3.8K tok 却藏起 5 个在用工具，不划算）", False),
+    "stale_health": ("陈旧健康（2026-10-18 R3，D3）：① 硬不变量——已标 superseded_by 的旧事实不得被检索返回（泄漏=检索管线回归）；② 陈旧 fact 清单（写入 >45 天且零唤起 → 该复核候选）。由来：外部研究一致把 staleness rate 列为记忆系统第一指标（persistence≠truth）。不发明真相预言机，只让泄漏可抓、陈旧可见", False),
 }
 
 # C7 被动上下文预算（R8 标定）：admin 面 tools/list 的估算 token 上限。
@@ -116,6 +117,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _record_quality(root)
     elif name == "profile_surface":
         r = _profile_surface()
+    elif name == "stale_health":
+        r = _stale_health(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -784,6 +787,59 @@ def _ghost_memory(root: str) -> dict:
             "summary": f"{total} 组疑似幽灵（记忆 {len(mem_pairs)} + 记录 {len(rec_pairs)}，"
                        "多版本共存未裁决，需人工指定谁取代谁——也可能是同日多次真实运行，摆出来供判断）",
             "detail": detail[:8]}
+
+
+def _stale_health(root: str) -> dict:
+    """陈旧健康（D3/R3，2026-10-18）：① supersede 泄漏硬不变量；② 陈旧 fact 清单。
+
+    由来：外部研究一致把 **staleness rate** 列为记忆系统第一指标（「persistence ≠ truth」
+    ——旧事实安静变假是生产最常见失效）。本检查**不发明「真相预言机」**（系统无法知道
+    外部世界何时变了），只做两件可验证的事：
+      ① 已标 superseded_by 的旧事实**不得被检索返回**（_live_sql 的结构保证；任何泄漏 =
+         检索管线回归，硬不变量）；
+      ② 写入 >45 天且零唤起的 fact → 「该复核」候选清单（只报不裁）。
+    """
+    import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
+    if not root:
+        return {"ok": False, "summary": "大脑库根目录未配置", "detail": []}
+    # ① 泄漏抽查（最多 5 条已取代记忆，用内容前缀做查询探针）
+    try:
+        with brain.db_conn(root) as conn:
+            sup = [dict(r) for r in conn.execute(
+                "SELECT id, content FROM memories WHERE superseded_by IS NOT NULL AND superseded_by != 0 LIMIT 5")]
+        leaks = []
+        for mcode in sup:
+            kw = (mcode["content"] or "").strip()[:12]
+            if not kw:
+                continue
+            ids = [r["id"] for r in brain.search_memories(root, kw, "", 5, count_hits=False)]
+            if mcode["id"] in ids:
+                leaks.append(mcode["id"])
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"泄漏检测失败（{type(e).__name__}）：{e}", "detail": []}
+    # ② 陈旧 fact 清单（>45 天零唤起）
+    try:
+        with brain.db_conn(root) as conn:
+            stale = [dict(r) for r in conn.execute(
+                "SELECT id, substr(content,1,60) c FROM memories WHERE kind='fact' AND status='active' "
+                "AND (superseded_by IS NULL OR superseded_by=0) AND updated < datetime('now','-45 days') "
+                "AND (use_count IS NULL OR use_count=0) ORDER BY updated LIMIT 8")]
+            total_fact = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE kind='fact' AND status='active'").fetchone()[0]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"陈旧清单读取失败：{e}", "detail": []}
+    if leaks:
+        return {"ok": False,
+                "summary": f"⚠ supersede 泄漏 {len(leaks)} 条（已取代的旧事实仍被检索返回——硬不变量破坏）",
+                "detail": [f"泄漏记忆 #{i}（检索管线回归，查 _live_sql/语义路过滤）" for i in leaks][:8]}
+    detail = [f"陈旧 fact #{r['id']}（45+ 天零唤起，该复核）：{r['c']}" for r in stale[:8]]
+    if stale:
+        pct = len(stale) * 100 // max(1, total_fact)
+        return {"ok": True,
+                "summary": f"无 supersede 泄漏；{len(stale)} 条陈旧 fact 待复核"
+                           f"（占 active fact {total_fact} 条的 {pct}%）",
+                "detail": detail}
+    return {"ok": True, "summary": "无 supersede 泄漏、无陈旧 fact 待复核", "detail": []}
 
 
 def _date_health(root: str) -> dict:

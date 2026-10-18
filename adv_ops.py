@@ -114,6 +114,37 @@ def main():
     r = ops.run_check("profile_surface")
     check("profile_surface 恢复后不误报", r["ok"], str(r["summary"]))
 
+    # ---- D3/R3 陈旧健康（干净✓ / 陈旧可见✓ / 泄漏必抓✓）
+    import brain as _b3
+    stale_root = str(tmp / "hub_stale")
+    Path(stale_root).mkdir(parents=True, exist_ok=True)
+    _b3.ensure_schema(stale_root)
+    r = ops.run_check("stale_health", root=stale_root)
+    check("stale_health 已注册且干净库通过", r["ok"] and "无 supersede 泄漏" in r["summary"],
+          str(r["summary"]))
+    # 陈旧可见：一条 60 天前写入且零唤起的 fact
+    _old = _b3.add_memory(stale_root, "环境事实：旧端口是 7000（历史配置）", kind="fact", agent="zcode")
+    with _b3.db_conn(stale_root) as _c3:
+        _c3.execute("UPDATE memories SET updated='2026-08-01T00:00:00' WHERE id=?", (_old,))
+    r = ops.run_check("stale_health", root=stale_root)
+    check("stale_health 陈旧 fact 可见（只报不裁，ok 仍为 True）",
+          r["ok"] and "1 条陈旧 fact" in r["summary"] and f"#{_old}" in "".join(r["detail"]),
+          str(r["summary"]))
+    # 泄漏必抓：把检索返回里塞进一条"已取代"记忆 → 必须 ok=False（模拟检索管线回归）
+    _new = _b3.add_memory(stale_root, "环境事实：新端口是 7001（现行配置）", kind="fact", agent="zcode")
+    with _b3.db_conn(stale_root) as _c3:
+        _c3.execute("UPDATE memories SET superseded_by=? WHERE id=?", (_new, _old))
+    _orig = _b3.search_memories
+    _b3.search_memories = lambda *a, **k: [{"id": _old}, {"id": _new}]   # 模拟泄漏
+    try:
+        r = ops.run_check("stale_health", root=stale_root)
+        check("stale_health 泄漏必抓（已取代旧事实被检索返回即红）",
+              (not r["ok"]) and "泄漏" in r["summary"], str(r["summary"]))
+    finally:
+        _b3.search_memories = _orig
+    r = ops.run_check("stale_health", root=stale_root)
+    check("stale_health 恢复检索后转绿（真实管线无泄漏）", r["ok"], str(r["summary"]))
+
     # ---- 守卫：回归套件必须全部登记进巡检（漏登记 = 静默少跑）
     try:
         t_regression_suite_coverage()
