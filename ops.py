@@ -50,7 +50,7 @@ CHECKS = {
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
     "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
     "graph_health": ("知识图谱健康（2026-10-13）：结构边数/已连条目/孤岛数/最大簇——孤岛变多=该补标签的信号，边归零=图谱接线坏了", False),
-    "ghost_memory": ("幽灵记忆检测（2026-10-18，C4）：内容高度相似却互无 supersedes 取代关系的记忆对——多版本事实共存、没人裁决，检索时会被一起捞出来让模型从混合物里综合（业界称 ghost memory）。只报不裁，交给 agent/用户决定谁取代谁", False),
+    "ghost_memory": ("幽灵候选检测（2026-10-18，C4；同日晚扩展 records）：内容高度相似却互无 supersedes 取代关系的**记忆对+记录对**——多版本事实共存、没人裁决，检索时会被一起捞出来让模型从混合物里综合（业界称 ghost memory）。记录口径：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚。只报不裁，交给 agent/用户决定谁取代谁", False),
     "date_health": ("日期格式健康（2026-10-13）：date-only 列（记录日期/决策回顾日/任务截止/记忆有效期）是否全是 YYYY-MM-DD——格式一歪，「到期提醒」会静默不提醒（v2.40.13 修的就是这个静默失效）", False),
     "stdout_guard": ("stdout 污染守卫（2026-10-13）：MCP stdio 协议下任何 print 落到 stdout 都会让客户端 JSON-RPC 解析失败、工具全消失——外部检索列的头号致命缺陷。扫描 MCP 进程加载的模块", True),
     "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
@@ -750,27 +750,40 @@ def _profile_surface() -> dict:
 
 
 def _ghost_memory(root: str) -> dict:
-    """幽灵记忆检测（只读，C4 / 2026-10-18）：高相似却无取代关系的记忆对。
+    """幽灵候选检测（只读，C4 / 2026-10-18；2026-10-18 晚扩展 records）：高相似却无取代关系的
+    **记忆对 + 记录对**。
 
     为什么单列一项：AgentHub 的解药是 supersedes 取代链（旧版自动退出 `_live_sql()` 检索），
-    **但前提是有人真的标了 supersedes**——没标的高相似记忆就是幽灵：旧/当前/过渡态共存，
+    **但前提是有人真的标了 supersedes**——没标的高相似条目就是幽灵：旧/当前/过渡态共存，
     检索时被一起捞出，模型自信地从混合物里综合出错误结论。业界数据（A-TMA，2026-07）：
     给检索证据打状态标签后冲突准确率 +0.240、temporal F1 0.030→0.171。
     本项**只报不裁**——谁取代谁是 agent/用户的判断，系统负责把候选摆出来。
+    记录版口径（brain.similar_records）：近 90 天、同项目内比、剥四段式模板头、
+    排除 migrated 拆分记录与 auto-hook 会话锚（实测这两类占满 top 命中，是噪音不是幽灵）；
+    真实库首跑抓到 10-13 release playbook 的 5 条运行日志簇（同日两次真实运行，
+     adjudicated 为 distinct runs、非重复——侦测器负责摆出来，判断留给人）。
     """
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
     if not root:
         return {"ok": False, "summary": "大脑库根目录未配置", "detail": []}
     try:
-        pairs = brain.ghost_memory_candidates(root, threshold=0.55, limit=10)
+        mem_pairs = brain.ghost_memory_candidates(root, threshold=0.55, limit=10)
+        rec_pairs = brain.ghost_record_candidates(root, threshold=0.55, limit=10)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"检测失败（{type(e).__name__}）：{e}", "detail": []}
-    if not pairs:
-        return {"ok": True, "summary": "无幽灵记忆候选（高相似记忆都已标明取代关系）", "detail": []}
-    detail = [f"#{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['verdict']}）："
-              f"{p['content_a'][:40]} ‖ {p['content_b'][:40]}" for p in pairs[:8]]
-    return {"ok": False, "summary": f"{len(pairs)} 组疑似幽灵记忆（多版本共存未裁决，需人工指定谁取代谁）",
-            "detail": detail}
+    total = len(mem_pairs) + len(rec_pairs)
+    if not total:
+        return {"ok": True, "summary": "无幽灵候选（高相似记忆/记录都已标明取代关系）", "detail": []}
+    detail = [f"记忆 #{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['verdict']}）："
+              f"{p['content_a'][:40]} ‖ {p['content_b'][:40]}" for p in mem_pairs[:6]]
+    detail += [f"记录 #{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['project'][:16]} {p['date_a']}）："
+               f"{p['title_a'][:30]} ‖ {p['title_b'][:30]}" for p in rec_pairs[:8 - len(detail)]]
+    if len(detail) < total:
+        detail.append(f"…（还有 {total - len(detail)} 组，调 limit 或直接查库看全）")
+    return {"ok": False,
+            "summary": f"{total} 组疑似幽灵（记忆 {len(mem_pairs)} + 记录 {len(rec_pairs)}，"
+                       "多版本共存未裁决，需人工指定谁取代谁——也可能是同日多次真实运行，摆出来供判断）",
+            "detail": detail[:8]}
 
 
 def _date_health(root: str) -> dict:

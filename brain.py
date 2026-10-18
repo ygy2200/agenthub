@@ -5494,6 +5494,111 @@ def ghost_memory_candidates(root: str, threshold: float = 0.55, limit: int = 10)
     return out
 
 
+def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
+                    days: int = 90, project: str = "") -> list:
+    """记录版两两 Jaccard 相似度检测（与 similar_memories 同构；C4 遗留项，2026-10-18 补）。
+
+    为什么单写一个而不是并入 similar_memories：records 与 memories 的**比较语义不同**——
+    ① **同项目内比较**：记录带 project 维度，不同项目出现相同表述多是合理复用（模板头/
+       通用结论），跨项目全比只制造噪音；要比单个项目传 project=，缺省按项目分组各自比；
+    ② **只扫近 days 天**（默认 90）：records 体量远大于 memories（真实库 1398 vs 204），
+       全量 O(N²) 不值当，且「同一内容被重复记录」本质是近期现象；
+    ③ 只算 active 且未被取代的（_live_sql 同款过滤）——被 supersede 的旧版不该再参与
+       「谁和谁像」的裁决；
+    ④ 相似度用 **title + content** 拼接（记忆版只用 content）：记录标题是「目的」行的
+       自动摘要，同一轮工作被记两遍时标题往往也同源，是有效信号。
+    ⑤ **剥四段式模板头**（2026-10-18 实测后加）：【目的】【做了什么】【验证结果】【如何回滚】
+       在每条 work_log 里都有，不剥掉等于给所有记录对发一份「基础相似度」——短记录光靠
+       共享脚手架就能越过阈值。剥的是脚手架不是内容，与记忆版「只用 content」同精神。
+    ⑥ **排除两类机器模板记录**（实测后加）：`migrated:*` 源（历史迁移按小节拆 工作记录.md，
+       标题小节名，同标题对是语料 boilerplate）；标题含「（auto-hook）」的会话边界锚
+       （Stop hook 每轮响应末记一条，同一 session 跨天anchors是设计使然、且整条都是
+       模板+少量变量）。auto 源的**流程结果**记录（如 playbook release 自动日志）保留——
+       「同一流程重复记几条」正是最典型的真 ghost（真实库实测抓到 3 组）。
+    返回 [{a, b, sim, project, verdict, agent_a, agent_b, date_a, date_b,
+          title_a, title_b, content_a, content_b}]，按 sim 降序。
+    """
+    _AUTO_HOOK_MARK = "（auto-hook）"
+
+    def _sub_tokens(title: str, content: str) -> set:
+        """剥【…】段头后分词——记录的内容脚手架（四段式）不参与相似度，只比实质。"""
+        return _tokens(re.sub(r"【[^】]*】", " ", f"{title} {content}"))
+
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, project, agent, date, title, content FROM records WHERE "
+            + _live_sql() + " AND date >= date('now', ?) AND source NOT LIKE 'migrated:%' "
+            "ORDER BY id", (f"-{int(days)} days",))]
+    if project:
+        rows = [r for r in rows if r["project"] == project]
+    rows = [r for r in rows if _AUTO_HOOK_MARK not in (r["title"] or "")]
+    by_proj: dict = {}
+    for r in rows:
+        by_proj.setdefault(r["project"], []).append(r)
+    out = []
+    for _proj, items in by_proj.items():
+        toks = [(r, _sub_tokens(r["title"], r["content"])) for r in items]
+        for i in range(len(toks)):
+            ra, ta = toks[i]
+            if not ta:
+                continue
+            sa = len(ta)
+            for j in range(i + 1, len(toks)):
+                rb, tb = toks[j]
+                if not tb:
+                    continue
+                sb = len(tb)
+                # Jaccard 上界短路（与 similar_memories 同款，B5）：数学上不可能达阈值
+                # 就不做 set 交/并——records 体量大，这一步是 O(N²) 里最贵的操作。
+                lo, hi = (sa, sb) if sa < sb else (sb, sa)
+                if lo / hi < threshold:
+                    continue
+                inter = len(ta & tb)
+                sim = inter / (sa + sb - inter)   # |A∪B|=|A|+|B|-|A∩B|，免建并集
+                if sim >= threshold:
+                    out.append({"a": ra["id"], "b": rb["id"], "sim": round(sim, 2),
+                                "project": ra["project"],
+                                "verdict": _verdict(f"{ra['title']} {ra['content']}",
+                                                    f"{rb['title']} {rb['content']}",
+                                                    ra.get("record_type", "") == rb.get("record_type", "")),
+                                "agent_a": ra["agent"], "agent_b": rb["agent"],
+                                "date_a": ra["date"], "date_b": rb["date"],
+                                "title_a": ra["title"][:60], "title_b": rb["title"][:60],
+                                "content_a": ra["content"][:80], "content_b": rb["content"][:80]})
+                if len(out) >= max(1, min(int(limit), 50)):
+                    out.sort(key=lambda x: -x["sim"])
+                    return out
+    out.sort(key=lambda x: -x["sim"])
+    return out
+
+
+def ghost_record_candidates(root: str, threshold: float = 0.55, limit: int = 10) -> list:
+    """C4 遗留项（2026-10-18 补）：**记录版** ghost 检测——高相似却互无取代关系的记录对。
+
+    ghost_memory_candidates 只查 memories，但 records 同样有 superseded_by 双时相列、
+    同样会「记住太多版本」（同一轮工作被记两条、旧版没标取代关系——检索/时间线里两版
+    并存，模型从混合物里综合）。口径与记忆版一致：近 90 天、同项目内比。只报不裁。
+    """
+    pairs = similar_records(root, threshold=threshold, limit=200)
+    if not pairs:
+        return []
+    try:
+        with db_conn(root) as conn:
+            sup = {r["id"]: (r["superseded_by"] or 0)
+                   for r in conn.execute("SELECT id, superseded_by FROM records")}
+    except Exception:  # noqa: BLE001
+        return []
+    out = []
+    for p in pairs:
+        a, b = p["a"], p["b"]
+        if sup.get(a) == b or sup.get(b) == a:
+            continue      # 已有取代关系 → 已治理，不是幽灵
+        out.append(p)
+        if len(out) >= max(1, min(int(limit), 50)):
+            break
+    return out
+
+
 def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit: int = 3) -> list:
     """写入时踩坑拦截：新记录 content 的 bigram 词集 vs 库内 lesson/fact 记忆与 open 错误登记，
     Jaccard ≥ threshold 视为"可能正在重蹈已记录的坑"。阈值 0.15 为真实库实测标定：

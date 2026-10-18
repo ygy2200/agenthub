@@ -2680,6 +2680,68 @@ def t_ghost_memory_candidates(tmp):
     assert brain.ghost_memory_candidates(root, threshold=1.5, limit=20) == []
 
 
+def t_ghost_record_candidates(tmp):
+    """C4 遗留项回归（2026-10-18 晚）：**记录版** ghost 检测——高相似却无取代关系的记录对。
+    ghost_memory_candidates 只查 memories，但 records 同样有 superseded_by、同样会
+    「记住太多版本」。验证：① 未标取代的高相似记录对会被报出；② 标 superseded_by 后
+    必须被排除；③ **两类机器模板记录不报**（migrated 拆分记录 / auto-hook 会话锚——
+    实测这两类占满 top 命中，是结构性噪音不是幽灵）；④ 剥四段式模板头：只差脚手架、
+    实质不同的两条不互报（模板给所有记录对发「基础相似度」是这个检测器最大的假阳性源）。
+    """
+    root = str(Path(tmp) / "hub_ghost_rec")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    proj = "测试-记录幽灵"
+    # 两条实质相同、只差日期与模板脚手架的记录（四段式头一致，内容同）
+    body = "部署漂移清掉三处 brain.py 版本一致 回归全绿 发布检查通过"
+    ra = brain.add_record(root, proj, "workbuddy", "2026-10-15", "发布收尾",
+                          f"【目的】收尾\n【做了什么】{body}\n【验证结果】全绿\n【如何回滚】revert")
+    rb = brain.add_record(root, proj, "workbuddy", "2026-10-16", "发布收尾",
+                          f"【目的】收尾\n【做了什么】{body}\n【验证结果】全绿\n【如何回滚】revert")
+    # 实质不同（脚手架相同）→ 剥了模板头后相似度应远低于阈值，不互报
+    rc = brain.add_record(root, proj, "workbuddy", "2026-10-16", "检索精度",
+                          "【目的】提召回\n【做了什么】IDF 加权闸门重标定 0.45 到 0.60\n"
+                          "【验证结果】废话查询五条降到两条\n【如何回滚】改回常量")
+    # ① 未标取代 → 应被报为幽灵候选
+    cand = brain.ghost_record_candidates(root, threshold=0.55, limit=20)
+    ids = [{p["a"], p["b"]} for p in cand]
+    assert {ra, rb} in ids, f"未标取代的高相似记录对未被报出：{cand}"
+    assert not any(rc in s for s in ids), f"实质不同的记录被误报（模板头没剥干净？）：{ids}"
+    # ② 标上取代关系 → 必须被排除
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET superseded_by=? WHERE id=?", (rb, ra))
+    cand2 = brain.ghost_record_candidates(root, threshold=0.55, limit=20)
+    assert {ra, rb} not in [{p["a"], p["b"]} for p in cand2], f"已标取代的对不该再报：{cand2}"
+    # ③ 两类机器模板记录不报（直接写库造源，绕过 add_record 的默认源）
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET superseded_by=NULL WHERE id=?", (ra,))
+        conn.execute("INSERT INTO records(project,agent,date,title,content,source,status) "
+                     "VALUES(?,?,?,?,?, 'migrated:工作记录.md:99', 'active')",
+                     (proj, "zcode", "2026-10-10", "如何回滚", body + " 迁移拆分记录甲"))
+        conn.execute("INSERT INTO records(project,agent,date,title,content,source,status) "
+                     "VALUES(?,?,?,?,?, 'migrated:工作记录.md:99', 'active')",
+                     (proj, "zcode", "2026-10-10", "如何回滚", body + " 迁移拆分记录乙"))
+        conn.execute("INSERT INTO records(project,agent,date,title,content,source,status) "
+                     "VALUES(?,?,?,?,?, 'auto', 'active')",
+                     (proj, "zcode", "2026-10-11", "2026-10-11（auto-hook）· 会话 sess_x 轨迹锚点",
+                      f"【目的】会话边界自动捕获\n【做了什么】会话 sess_x 结束一轮响应\n"
+                      f"【验证结果】无\n【如何回滚】删"))
+        conn.execute("INSERT INTO records(project,agent,date,title,content,source,status) "
+                     "VALUES(?,?,?,?,?, 'auto', 'active')",
+                     (proj, "zcode", "2026-10-12", "2026-10-12（auto-hook）· 会话 sess_x 轨迹锚点",
+                      f"【目的】会话边界自动捕获\n【做了什么】会话 sess_x 结束一轮响应\n"
+                      f"【验证结果】无\n【如何回滚】删"))
+    cand3 = brain.ghost_record_candidates(root, threshold=0.55, limit=20)
+    got = {p["a"] for p in cand3} | {p["b"] for p in cand3}
+    with brain.db_conn(root) as conn:
+        mig = [r[0] for r in conn.execute("SELECT id FROM records WHERE source LIKE 'migrated:%'")]
+        hook = [r[0] for r in conn.execute("SELECT id FROM records WHERE title LIKE '%（auto-hook）%'")]
+    assert not (got & set(mig)), f"migrated 拆分记录不该进候选：{cand3}"
+    assert not (got & set(hook)), f"auto-hook 会话锚不该进候选：{cand3}"
+    # ④ 高阈值零噪音
+    assert brain.ghost_record_candidates(root, threshold=1.5, limit=20) == []
+
+
 def t_intercept_hot_path_cached(tmp):
     """B10 回归：写入热路径（log_work → similar_lessons_for）用独立 token 缓存提速。
     此前它每次都对全库 lesson/fact 重新分词——每写一条记录就重算几百条记忆，
@@ -2777,6 +2839,8 @@ def main():
     case("B6·硬编码路径可被环境变量覆盖（AGENTHUB_ROOT/HERMES_HOME，默认值不变）", lambda: t_env_override_paths(tmp))
     case("C4·ghost memory 检测（未标取代的高相似对必报/已标取代必排除/不误报无关）",
          lambda: t_ghost_memory_candidates(tmp))
+    case("C4 遗留·ghost 记录检测（未标取代必报/已标必排除/机器模板两类不报/剥模板头）",
+         lambda: t_ghost_record_candidates(tmp))
     case("B10·写入热路径拦截扫描复用 token 缓存（结果等价/缓存生效/短内容短路）",
          lambda: t_intercept_hot_path_cached(tmp))
     case("补缺·_init_emb_table 建表失败不再静默（fail-open 保留 + stderr 带真因留痕）",

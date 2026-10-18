@@ -77,6 +77,25 @@ def main():
     r2 = ops.run_check("ghost_memory", root=ghost_root)
     check("ghost_memory 标取代后转绿（已治理不再报）", r2["ok"], str(r2["summary"]))
 
+    # ---- C4 遗留项：ghost 检查项的 records 侧（2026-10-18 晚扩展）
+    #    记忆侧三态上面已验证；这里验记录侧接线：注入两条高相似未标取代的 work_log →
+    #    检查项必须把它们和记忆候选一起报出来（summary 含「记录」计数）→ 标 superseded_by 转绿。
+    import brain as _brain2
+    _proj = "测试-记录幽灵"
+    _body = "部署漂移清掉三处 版本一致 回归全绿 发布检查通过"
+    _ra = _brain2.add_record(ghost_root, _proj, "zcode", "2026-10-15", "发布收尾",
+                             f"【目的】收尾\n【做了什么】{_body}\n【验证结果】全绿\n【如何回滚】revert")
+    _rb = _brain2.add_record(ghost_root, _proj, "zcode", "2026-10-16", "发布收尾",
+                             f"【目的】收尾\n【做了什么】{_body}\n【验证结果】全绿\n【如何回滚】revert")
+    _r1 = ops.run_check("ghost_memory", root=ghost_root)
+    check("ghost_memory 记录侧接线（注入高相似记录即抓，且与记忆候选分开计数）",
+          (not _r1["ok"]) and "记录" in _r1["summary"] and f"#{_ra}" in "".join(_r1["detail"]),
+          str(_r1["summary"]))
+    with _brain2.db_conn(ghost_root) as _c2:
+        _c2.execute("UPDATE records SET superseded_by=? WHERE id=?", (_rb, _ra))
+    _r2 = ops.run_check("ghost_memory", root=ghost_root)
+    check("ghost_memory 记录标取代后不再报（已治理）", _r2["ok"], str(_r2["summary"]))
+
     # ---- R8·C7 被动上下文预算（真实源在预算内 / 描述膨胀即 warn / 恢复后不误报）
     r = ops.run_check("profile_surface")
     check("profile_surface 已注册且真实源在预算内",
