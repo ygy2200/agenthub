@@ -77,6 +77,24 @@ def main():
     r2 = ops.run_check("ghost_memory", root=ghost_root)
     check("ghost_memory 标取代后转绿（已治理不再报）", r2["ok"], str(r2["summary"]))
 
+    # ---- R8·C7 被动上下文预算（真实源在预算内 / 描述膨胀即 warn / 恢复后不误报）
+    r = ops.run_check("profile_surface")
+    check("profile_surface 已注册且真实源在预算内",
+          r["ok"] and "reader" in "".join(r["detail"]) and "admin" in r["summary"], str(r["summary"]))
+    check("profile_surface detail ≤ 8 行", len(r["detail"]) <= 8)
+    import agenthub_mcp as _m
+    _orig_tools = _m.TOOLS
+    try:
+        _m.TOOLS = _orig_tools + [{"name": "hub_bloat_probe", "description": "膨" * 60000,
+                                   "inputSchema": {"properties": {}}}]
+        r = ops.run_check("profile_surface")
+        check("profile_surface 描述膨胀超预算即 warn（被动面失控可见）",
+              (not r["ok"]) and "超预算" in r["summary"], str(r["summary"]))
+    finally:
+        _m.TOOLS = _orig_tools
+    r = ops.run_check("profile_surface")
+    check("profile_surface 恢复后不误报", r["ok"], str(r["summary"]))
+
     # ---- 守卫：回归套件必须全部登记进巡检（漏登记 = 静默少跑）
     try:
         t_regression_suite_coverage()

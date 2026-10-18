@@ -56,7 +56,14 @@ CHECKS = {
     "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
     "desc_quality": ("工具描述质量守卫（2026-10-17）：核心工具描述必须含示例+使用时机+必填参数说明，全部工具描述不得过短——描述是 agent 的 UI，缺示例准确率掉约 18 个点（外部调研 72%→90%，tsecurity/agentpatterns/cloudappi 三处一致）", False),
     "record_quality": ("记录模板遵守率（2026-10-17 R7）：近 90 天 work_log 四段式（目的/做了什么/验证结果/如何回滚）俱全率+缺段分布——铁律没有守卫必然腐烂（实测基线仅 48%）。只测不拦，软提示在 hub_log_work 回显", False),
+    "profile_surface": ("被动上下文预算（2026-10-18 R8，C7）：tools/list 每会话推一次，是被动 token 成本——外部研究（wavespeed：模型过 ~40 工具开始退化；上下文爆炸 5 server×12 tool×800 token≈48k）。实测三档 profile 工具数与序列化体积，admin 超预算即 warn，防工具描述无声膨胀。R8 评估结论：默认保持 admin（切 worker 只省 3.8K tok 却藏起 5 个在用工具，不划算）", False),
 }
+
+# C7 被动上下文预算（R8 标定）：admin 面 tools/list 的估算 token 上限。
+# 基线（2026-10-18 实测）：reader 7 工具 ~1.4K / worker 51 ~15.5K / admin 69 ~19.3K。
+# 取基线 +25% 余量：正常的功能增补（新工具/描述微调）不会误伤，
+# 但描述膨胀（动辄半个屏幕的 description）或工具数失控会立刻可见。
+PROFILE_SURFACE_BUDGET = 24000
 
 
 def run_check(name: str, target: str = "", root: str = "") -> dict:
@@ -107,6 +114,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _desc_quality()
     elif name == "record_quality":
         r = _record_quality(root)
+    elif name == "profile_surface":
+        r = _profile_surface()
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -694,6 +703,49 @@ def _record_quality(root: str) -> dict:
     detail += [f"{a}: {s['full']}/{s['n']}" for a, s in sorted(by_agent.items(), key=lambda x: -x[1]["n"])[:5]]
     return {"ok": rate >= 60,
             "summary": f"四段式俱全率 {rate}%（{full}/{n}，近90天 work_log；软提示已进 hub_log_work 回显）",
+            "detail": detail[:8]}
+
+
+def _est_tokens(text: str) -> int:
+    """粗估 token：CJK 约 1 字 1 token，ASCII 约 4 字符 1 token（主流 BPE 量级）。"""
+    cjk = sum(1 for c in text if "\u4e00" <= c <= "\u9fff" or c in "，。；：、（）「」【】")
+    return cjk + (len(text) - cjk) // 4
+
+
+def _profile_surface() -> dict:
+    """R8·C7 被动上下文预算：tools/list 每会话推一次，是被动的 token 成本。
+
+    外部研究（wavespeed·MCP 生产环境实战）：模型**过 ~40 个工具开始退化**、
+    上下文爆炸（5 server×12 tool×800 token≈48k）。本大脑 69 工具、默认 admin 全量，
+    此前没有任何度量盯着这个「被动面」——本项补上：实测三档 profile 的工具数与
+    序列化体积，admin 估算 token 超 PROFILE_SURFACE_BUDGET 即 warn。
+    **只测不拦**：默认 profile 是产品决策（R8 已用真实使用数据评估：切 worker
+    只省 3.8K tok 却藏起 5 个在用工具，含 hub_create_project——不划算），
+    此检查只负责让「面」的变化可见：描述膨胀/工具失控会立刻在这里冒出来。
+    """
+    try:
+        import agenthub_mcp as m  # noqa: PLC0415  延迟导入：ops 被 agenthub_mcp 依赖，运行时导入无环
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"profile_surface 无法加载 agenthub_mcp：{e}", "detail": []}
+    rows, orig = [], m.SERVER_PROFILE
+    try:
+        for name in ("reader", "worker", "admin"):
+            m.SERVER_PROFILE = name
+            tools = m.visible_tools()
+            payload = json.dumps({"tools": tools}, ensure_ascii=False)
+            rows.append((name, len(tools), len(payload), _est_tokens(payload)))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"profile_surface 测量失败：{e}", "detail": []}
+    finally:
+        m.SERVER_PROFILE = orig
+    admin_name, admin_n, admin_chars, admin_tok = rows[-1]
+    ok = admin_tok <= PROFILE_SURFACE_BUDGET
+    detail = [f"{n}: {c} 工具 / {ch:,} 字符 / ~{tk:,} tok" for n, c, ch, tk in rows]
+    detail.append(f"预算 {PROFILE_SURFACE_BUDGET:,} tok（R8 基线 19.3K +25% 余量；"
+                  "reader 7/worker 51/admin 69 工具）")
+    verdict = "✓ 预算内" if ok else "⚠ 超预算——工具描述可能在膨胀，检查新增工具的描述篇幅"
+    return {"ok": ok,
+            "summary": f"被动上下文预算：admin ~{admin_tok:,} tok（{admin_n} 工具）{verdict}",
             "detail": detail[:8]}
 
 

@@ -132,17 +132,41 @@ def test_badge_column_fits_longest_agent_name(qapp, hub_root):
     abort（exit 127，无任何输出）**。2026-10-16 复盘实测：本测试最初漏了 fixture，
     只有当别的测试先建好 app 时才侥幸跑过；单独 `pytest path::test` 静默死亡，
     等于守卫在"单跑"场景下失效。带 fixture 后两种跑法都真跑。
+
+    2026-10-18 R8 修**测试环境伪象误报**（发布门禁 gui 层红）：QT_QPA_PLATFORM=offscreen
+    下 Qt 把应用默认字体解析成宽拉丁回退体 "Sans Serif"——"Claude Code" 量出 132px
+    （需 152px），而生产（windows 插件，应用默认字体 = Windows UI 字体 Microsoft
+    YaHei UI）同字符串只要 73px（需 93px；d5b36b3 引入本守卫时的基线 ~94px 同源）。
+    即：**生产从来不裁切（108 ≥ 93，余量 15px），是守卫在拿测试环境的回退体误判生产
+    布局**。修法：度量字体钉到生产字体；该字体家族不在本机时明确 skip——不拿回退体
+    误报，也不静默放行（守卫测不了目标条件时应发声，而不是假装通过）。
     """
-    from PySide6.QtGui import QFontMetrics
+    from PySide6.QtGui import QFont, QFontDatabase, QFontMetrics
     import brain
     import tokens
     import uikit
 
     brain.init_db(hub_root)
     tokens.apply_theme("dark")
-    f = QFontMetrics(uikit.badge("claude", "").font())
+    # 生产字体 = Windows UI 字体（windows 平台插件下应用默认字体即它；见上方根因）。
+    # offscreen 的字体库默认不含它（全解析成宽拉丁回退体）——显式把生产字体文件
+    # 加载进本进程字体库再度量；加载不到（非 Windows / 字体被裁）才 skip：
+    # 守卫要**真跑**（跑不了要发声），不要假装通过、也不要拿回退体误报。
+    if "Microsoft YaHei UI" not in QFontDatabase.families():
+        import os
+        for _p in ("C:/Windows/Fonts/msyh.ttc", "C:/Windows/Fonts/msyh.ttf"):
+            if os.path.exists(_p):
+                QFontDatabase.addApplicationFont(_p)
+                break
+    if "Microsoft YaHei UI" not in QFontDatabase.families():
+        import pytest
+        pytest.skip("生产字体 Microsoft YaHei UI 不在本机且无法从 C:/Windows/Fonts 加载——"
+                    "无法在生产条件下度量徽章宽度；换取回退体会误报，故跳过而非放行/误报")
+    prod_font = QFont("Microsoft YaHei UI")
+    prod_font.setPointSize(9)
+    f = QFontMetrics(prod_font)
     for name in ("Claude Code", "WorkBuddy", "ZCode"):
         need = f.horizontalAdvance(name) + 2 * tokens.SPACE_S + 4   # padding + 余量
         assert uikit.BADGE_COL_W >= need, (
-            f"徽章列宽 {uikit.BADGE_COL_W} 放不下「{name}」（需 {need}px）——"
+            f"徽章列宽 {uikit.BADGE_COL_W} 放不下「{name}」（生产字体下需 {need}px）——"
             "请调大 uikit.BADGE_COL_W 或给徽章加 tooltip")
