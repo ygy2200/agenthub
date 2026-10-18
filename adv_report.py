@@ -161,6 +161,40 @@ def t_unused_multisource(tmp):
     _Validator().feed(doc)
 
 
+def t_read_tool_trace(tmp):
+    """C3 回归：只读能力工具的调用留痕。
+    此前 hub_distill/duplicates/list_skills/get_record 既不在 WRITE_TOOLS（无 op_audit）、
+    也不写 searches（不是检索）→ 反馈报告把它们**永久**显示成「从未使用」（真缺口：
+    不是没用，是没有留痕机制）。
+    验证：①分发层调用后有 tool_calls 留痕；②报告的使用判定因此把它们算作已用；
+    ③留痕集合里的工具必须是只读的（写工具已有 op_audit，混入会重复计数）。"""
+    import agenthub_mcp as m
+    import report
+    root = str(Path(tmp) / "hub_trace")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    assert m.TRACE_READ_TOOLS <= {t["name"] for t in m.TOOLS}, "留痕集合里有不存在的工具"
+    assert not (m.TRACE_READ_TOOLS & m.WRITE_TOOLS), "只读留痕集合混进了写工具（会与 op_audit 重复计数）"
+    # hub_get_record 有必填 record_id：先造一条记录再查（失败调用本就不该算「使用」）
+    rid = brain.add_record(root, "留痕测试-项目", "adv", "2026-10-18", "t1", "留痕测试内容")
+    argmap = {"hub_get_record": {"record_id": rid}}
+    for t in m.TRACE_READ_TOOLS:
+        args = {"agent": "adv"}
+        args.update(argmap.get(t, {}))
+        req = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+               "params": {"name": t, "arguments": args}}
+        m.handle_message(req, root)
+    with brain.db_conn(root) as conn:
+        logged = {r[0] for r in conn.execute("SELECT DISTINCT tool FROM tool_calls")}
+    assert logged == m.TRACE_READ_TOOLS, f"留痕缺失：期望 {sorted(m.TRACE_READ_TOOLS)} 实得 {sorted(logged)}"
+    # 报告判定：这些工具不应再出现在「从未使用」里
+    d = report._collect(root) if hasattr(report, "_collect") else None
+    if d is None:
+        return  # 报告内部采集函数改名则跳过此断言（留痕本身已验证）
+    used = set(d["tool_used"])
+    assert m.TRACE_READ_TOOLS <= used, f"报告仍把它们判为从未使用：{sorted(m.TRACE_READ_TOOLS - used)}"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_report_")
     print(f"临时目录：{tmp}\n")
@@ -170,6 +204,7 @@ def main():
     case("幂等路径（同日覆盖/显式out/最新数据）", lambda: t_idempotent_path(tmp))
     case("R11 元信息摩擦诚实化（健康→info/灌水→warn）", t_meta_friction_honesty)
     case("R11 未用能力多源判定（op_audit/todos_done 不误判）", lambda: t_unused_multisource(tmp))
+    case("C3·只读能力工具留痕（tool_calls 补盲区，报告不再误判从未使用）", lambda: t_read_tool_trace(tmp))
     import shutil
     shutil.rmtree(tmp, ignore_errors=True)
     print()

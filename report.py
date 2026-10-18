@@ -70,6 +70,10 @@ def _collect(root: str) -> dict:
             tused[r[0]] = tused.get(r[0], 0) + r[1]
         for r in conn.execute("SELECT tool, COUNT(*) n FROM op_audit GROUP BY tool"):
             tused[r[0]] = tused.get(r[0], 0) + r[1]
+        # C3：第三源——只读能力工具的调用留痕（distill/duplicates/list_skills/get_record
+        # 既不写 op_audit 也不写 searches，没有这一源会被永久误判「从未使用」）
+        for r in conn.execute("SELECT tool, COUNT(*) n FROM tool_calls GROUP BY tool"):
+            tused[r[0]] = tused.get(r[0], 0) + r[1]
         d["tool_used"] = tused
     return d
 

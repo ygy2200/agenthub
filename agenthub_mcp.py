@@ -39,7 +39,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.41"}  # v2.40.29–.39=上一轮十轮；v2.40.40=R1 补工具 annotations；本版=R2·C2 工具 schema 兼容守卫：新增 tool_schema_baseline.json 作为「参数下限」基线，回归只允许加法式变更——删参数/改类型/必填降级或新增必填一律拦（Microsoft Learn server 事故：单个参数重命名静默挂掉 2–5% 客户端）；确需破坏性变更须显式更新基线
+SERVER_INFO = {"name": "agenthub", "version": "2.40.42"}  # v2.40.29–.39=上一轮十轮；v2.40.40=R1 annotations；v2.40.41=R2 schema 兼容守卫；本版=R3·C3 只读能力工具留痕：新增 tool_calls 表 + brain.log_tool_call + TRACE_READ_TOOLS，补上 op_audit(只写) 与 searches(只检索) 都覆盖不到的盲区——hub_distill/duplicates/list_skills/get_record 此前被反馈报告**永久**误判为「从未使用」（不是没用，是没有留痕机制）；report 的使用判定加第三源
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2668,6 +2668,15 @@ IDEMPOTENT_TOOLS = {
     "hub_export",           # 同参数重跑产出等价备份
     "hub_sentry",           # 巡检+广播，重跑是刷新而非叠加
 }
+# C3：需要留痕的**只读能力型**工具——它们既不在 WRITE_TOOLS（没有 op_audit），
+# 也不写 searches（不是检索），于是反馈报告永远把它们显示成「从未使用」。
+# 只列低频能力工具，不列 health/next/status 这类高频心跳面（避免每次心跳多一次写）。
+TRACE_READ_TOOLS = {
+    "hub_distill",       # 蒸馏候选
+    "hub_duplicates",    # 数据完整性检测
+    "hub_list_skills",   # 技能库对齐
+    "hub_get_record",    # 记录精读
+}
 # openWorldHint（是否触达本机之外的开放世界）：本大脑是**本地优先、零依赖**，全部 69 个工具
 # 经核查均不访问外部网络（hub_asset_find 查的是本地台账，v2.40 后不再爬 accat.top），
 # 故**刻意一个都不标**——标了反而误导 host 去做额外的外网风险提示。
@@ -2832,6 +2841,9 @@ def handle_message(msg: dict, root: str) -> dict | None:
             is_err = _is_error_text(text)
             if tname in WRITE_TOOLS and not is_err:
                 _audit_write(root, tname, args, text)
+            elif tname in TRACE_READ_TOOLS and not is_err:
+                # C3：只读能力工具此前无任何留痕 → 反馈报告永远显示「从未使用」
+                brain.log_tool_call(root, tname, str(args.get("agent") or ""))
             if is_err:
                 # 服务端留痕（MCP 官方/ mcpcat 建议：内部记录完整错误，模型侧只给可行动文案，
                 # 不把堆栈/SQL 直接塞回模型）。写 stderr，不污染 stdout 协议流。

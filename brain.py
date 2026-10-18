@@ -320,6 +320,16 @@ CREATE TABLE IF NOT EXISTS todos_done (
     agent TEXT DEFAULT "",
     ts TEXT
 );
+-- C3：只读能力工具的调用留痕。**为什么单独一张表**：op_audit 语义是「写操作审计」，
+-- searches 语义是「检索日志」——而 hub_distill/duplicates/list_skills/get_record 这类
+-- 只读**能力型**工具两个源都不写，于是反馈报告永远把它们显示成「从未使用」（真缺口：
+-- 不是没用，是没有留痕机制）。语义混进 op_audit 会污染审计，故独立成表。
+CREATE TABLE IF NOT EXISTS tool_calls (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    tool TEXT DEFAULT ""
+);
 CREATE TABLE IF NOT EXISTS op_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT DEFAULT "",
@@ -1770,6 +1780,18 @@ def audit_list(root: str, limit: int = 20) -> list:
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM op_audit ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 200)),))]
+
+
+def log_tool_call(root: str, tool: str, agent: str = "") -> None:
+    """C3：只读能力工具的调用留痕（补 op_audit 与 searches 都覆盖不到的盲区）。
+    只给低频的「能力型」只读工具用——高频只读工具（health/next/status 等心跳面）
+    不记，避免每次心跳都多一次写。fail-open：留痕失败绝不影响调用本身。"""
+    try:
+        with db_conn(root) as conn:
+            conn.execute("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
+                         (_now(), _norm_agent(agent) or "", tool))
+    except Exception:  # noqa: BLE001
+        pass
 
 
 def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:
