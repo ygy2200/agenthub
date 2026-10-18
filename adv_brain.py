@@ -13,6 +13,7 @@ import sqlite3
 import sys
 import tempfile
 import threading
+from collections import Counter
 from pathlib import Path
 
 import brain
@@ -2679,6 +2680,64 @@ def t_ghost_memory_candidates(tmp):
     assert brain.ghost_memory_candidates(root, threshold=1.5, limit=20) == []
 
 
+def t_intercept_hot_path_cached(tmp):
+    """B10 回归：写入热路径（log_work → similar_lessons_for）用独立 token 缓存提速。
+    此前它每次都对全库 lesson/fact 重新分词——每写一条记录就重算几百条记忆，
+    与 R3 修的记忆 BM25 完全同构。
+    验证：①结果与未优化参考实现**逐字段一致**（含免建并集的代数替换）；
+    ②缓存确实生效；③**防串味**：相似度缓存不得污染 BM25 的 _MEM_TOK_CACHE
+    （两者键同型但内容不同——前者 set/仅 content，后者 Counter/含 tags+project，
+     实测共用会让 BM25 读到 set 而 AttributeError，回归当场抓住）；
+    ④短内容 <4 token 时短路不变。"""
+    root = str(Path(tmp) / "hub_b10")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    words = ["代理", "端口", "冲突", "内存", "缓存", "索引", "迁移", "备份", "检索", "语义"]
+    for i in range(60):
+        n = [3, 5, 12, 30, 60][i % 5]
+        brain.add_memory(root, "".join(words[(i + k) % 10] for k in range(n)) + f" 第{i}条",
+                         kind="lesson" if i % 2 else "fact", agent="zcode", project="p")
+    q = "代理 端口 冲突 内存 缓存 检索"
+
+    def ref_impl(content, threshold=0.15, limit=3):
+        toks = brain._tokens(content)
+        if len(toks) < 4:
+            return []
+        with brain.db_conn(root) as conn:
+            rows = [{"id": r["id"], "kind": r["kind"], "content": r["content"]} for r in conn.execute(
+                "SELECT id, kind, content FROM memories WHERE " + brain._live_sql()
+                + " AND kind IN ('lesson','fact')")]
+            rows += [{"id": -r["id"], "kind": "error", "content": f"{r['title']} {r['detail']}"}
+                     for r in conn.execute("SELECT id, title, detail FROM errors WHERE status='open'")]
+        out = []
+        for r in rows:
+            ot = brain._tokens(r["content"])
+            if not ot:
+                continue
+            sim = len(toks & ot) / len(toks | ot)
+            if sim >= threshold:
+                out.append({"id": r["id"], "kind": r["kind"], "sim": round(sim, 2),
+                            "content": r["content"][:80]})
+        out.sort(key=lambda x: -x["sim"])
+        return out[:max(1, min(limit, 5))]
+
+    brain._MEM_TOK_CACHE.clear(); brain._SIM_TOK_CACHE.clear()
+    assert ref_impl(q) == brain.similar_lessons_for(root, q), "结果与参考实现不一致"
+    with brain.db_conn(root) as conn:
+        ids = [r["id"] for r in conn.execute(
+            "SELECT id FROM memories WHERE " + brain._live_sql() + " LIMIT 5")]
+    assert any((root, i) in brain._SIM_TOK_CACHE for i in ids), "相似度缓存未生效"
+    # ③ 防串味：相似度缓存里的值必须是 set，且不得被写进 BM25 的 _MEM_TOK_CACHE
+    for k, v in brain._SIM_TOK_CACHE.items():
+        assert isinstance(v, set), f"_SIM_TOK_CACHE 存了非 set：{type(v)}"
+        if k in brain._MEM_TOK_CACHE:
+            assert isinstance(brain._MEM_TOK_CACHE[k][0], Counter), \
+                "BM25 缓存被相似度路径污染（存成了 set）"
+    # 两条路径都要仍能跑（BM25 读的是 Counter）
+    assert isinstance(brain.search_memories(root, "代理 端口"), list)
+    assert brain.similar_lessons_for(root, "短") == []
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -2718,6 +2777,8 @@ def main():
     case("B6·硬编码路径可被环境变量覆盖（AGENTHUB_ROOT/HERMES_HOME，默认值不变）", lambda: t_env_override_paths(tmp))
     case("C4·ghost memory 检测（未标取代的高相似对必报/已标取代必排除/不误报无关）",
          lambda: t_ghost_memory_candidates(tmp))
+    case("B10·写入热路径拦截扫描复用 token 缓存（结果等价/缓存生效/短内容短路）",
+         lambda: t_intercept_hot_path_cached(tmp))
     case("补缺·_init_emb_table 建表失败不再静默（fail-open 保留 + stderr 带真因留痕）",
          lambda: t_emb_table_no_silent_fail(tmp))
     case("体检诚实指标（有用率/读写比/元信息占比/空库不崩）", lambda: t_health_honesty(tmp))

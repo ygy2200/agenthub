@@ -1646,6 +1646,13 @@ _RECORDS_TOK_CACHE: dict = {}  # (root, record_id) → (Counter, dl)：记录内
 _MEM_TOK_CACHE: dict = {}  # (root, memory_id) → (Counter, dl)：与 _RECORDS_TOK_CACHE 对称；
 # 记忆可被 edit_memory 改写 content/tags → 其 text_changed 分支负责 pop 失效，避免 BM25 命中旧文本
 
+# B10：(root, memory_id) → set(_tokens(content))——**只给相似度计算用**（similar_lessons_for /
+# similar_memories / ghost_memory_candidates）。刻意与 _MEM_TOK_CACHE 分开：那个存 Counter 且
+# 内容含 tags+project，这里只含 content 且是 set；共用一个键会让两条路径互相污染
+# （实测 AttributeError: 'set' object has no attribute 'keys'，回归当场抓住）。
+# 失效同理由 edit_memory 的 text_changed 分支负责（两处一起 pop）。
+_SIM_TOK_CACHE: dict = {}
+
 
 def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
     """records 表的 BM25 通道（P4.3b）：匹配面 title+content+project（与 _records_query 一致）。
@@ -3585,6 +3592,7 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
         _revision(conn, mid, "edit", before, _snapshot(conn, mid), agent)
         if text_changed:
             _MEM_TOK_CACHE.pop((root, mid), None)  # 文本改了，BM25 token 缓存必须失效（否则命中旧文本）
+            _SIM_TOK_CACHE.pop((root, mid), None)  # B10：相似度缓存同理（否则命中旧文本的相似度）
             # 文本变更 → 同步语义索引（否则语义路拿着旧文本做相似度，编辑等于没生效）
             row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
                                (mid,)).fetchone()
@@ -5502,10 +5510,25 @@ def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit:
                  for r in conn.execute("SELECT id, title, detail FROM errors WHERE status='open'")]
     out = []
     for r in rows:
-        ot = _tokens(r["content"])
+        # B10 收尾：写入热路径每次 log_work 都要扫全库 lesson/fact——不缓存就等于
+        # 每写一条记录就把几百条记忆重新分词一遍。**刻意用独立缓存 `_SIM_TOK_CACHE`
+        # 而不是复用 BM25 的 `_MEM_TOK_CACHE`**：后者存的是 (Counter, dl)、内容来自
+        # `content+tags+project` 拼接；这里只用 content 且类型是 set。共用一个键会
+        # 让两条路径互相污染（实测：set 存进去后 BM25 读不到 Counter → AttributeError，
+        # 回归当场抓住）。失效机制与 _MEM_TOK_CACHE 对称（edit_memory 的 text_changed 分支）。
+        if r["kind"] == "error":
+            # errors 是**合成行**（title+detail 拼的、负 id、status 会变），不占缓存
+            ot = _tokens(r["content"])
+        else:
+            skey = (root, r["id"])
+            ot = _SIM_TOK_CACHE.get(skey)
+            if ot is None:
+                ot = _tokens(r["content"])
+                _SIM_TOK_CACHE[skey] = ot
         if not ot:
             continue
-        sim = len(toks & ot) / len(toks | ot)
+        # |A∪B| = |A|+|B|-|A∩B|：免建并集（R5 同款代数替换）
+        sim = len(toks & ot) / (len(toks) + len(ot) - len(toks & ot))
         if sim >= threshold:
             out.append({"id": r["id"], "kind": r["kind"], "sim": round(sim, 2),
                         "content": r["content"][:80]})
