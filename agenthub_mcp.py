@@ -14,7 +14,9 @@ import json
 import os
 import re
 import sys
+import threading
 import time
+from collections import deque
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
@@ -39,7 +41,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.45"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；本版=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价
+SERVER_INFO = {"name": "agenthub", "version": "2.40.46"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2593,6 +2595,79 @@ def _strict_confirm() -> bool:
     return str(os.environ.get("AGENTHUB_STRICT_CONFIRM", "")).strip().lower() not in ("", "0", "false", "no", "off")
 
 
+# ---------------------------------------------------------------- C6 速率限制 / 循环保护
+# 为什么要加：外部检索（wavespeed·MCP 生产环境实战）把「无限流：agent 进循环就失控」
+# 列为 MCP 生产常见存根——本大脑此前无任何节流，一个卡进重试循环的调用方可以无限 hammer。
+# 威胁模型是「失控的调用方」：MCP stdio / REST api.py / cli.py 三条生产路径全部经
+# handle_message 的 tools/call 分发，在这一层设闸即全覆盖（GUI 走 actions 层不经此路，
+# 且人类点击速度本就低于任何合理阈值，不在威胁模型内）。
+# 设计：进程内滑动窗口（时间戳 deque），两级配额——
+#   ① 单工具 per-agent：默认 600 次 / 60s。正常 agent 一个会话对同一工具几十次顶天；
+#      以 10 次/秒卡死的循环 60 秒内即被拦下；
+#   ② 单 agent 全工具合计：默认 2000 次 / 60s。防「每个工具都只调一点点」的分散型失控。
+# 全部阈值环境变量可调；AGENTHUB_RATE_LIMIT=off 整体关闭（回归/压测用）。
+# 被拦的调用**不计入窗口**（它没有执行，再拦一次没有意义），返回 isError 业务错误
+# （「错误：」开头，与全库 50+ 失败站点同约定，模型能看懂并停止重试），不抛异常不断连。
+# REST 走 ThreadingHTTPServer，故窗口操作加锁；锁只护这个 dict，临界区纳秒级。
+_RATE_LOCK = threading.Lock()
+_RATE_WINDOWS: dict = {}
+
+
+def _rate_env_int(name: str, default: int) -> int:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        v = int(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def _rate_env_float(name: str, default: float) -> float:
+    raw = str(os.environ.get(name, "")).strip()
+    if not raw:
+        return default
+    try:
+        v = float(raw)
+    except ValueError:
+        return default
+    return v if v > 0 else default
+
+
+def _rate_limit_on() -> bool:
+    return str(os.environ.get("AGENTHUB_RATE_LIMIT", "1")).strip().lower() not in ("0", "false", "no", "off")
+
+
+def _rate_check(agent: str, tool: str) -> str:
+    """速率检查：返回空=放行（并计数）；非空=被拦的业务错误文案（不计数）。"""
+    if not _rate_limit_on():
+        return ""
+    window = _rate_env_float("AGENTHUB_RATE_WINDOW", 60.0)
+    tool_max = _rate_env_int("AGENTHUB_RATE_TOOL_MAX", 600)
+    agent_max = _rate_env_int("AGENTHUB_RATE_AGENT_MAX", 2000)
+    now = time.monotonic()
+    tool_key = ("tool", agent, tool)
+    agent_key = ("agent", agent)
+    with _RATE_LOCK:
+        if len(_RATE_WINDOWS) > 4096:  # 轻量防膨胀：砍掉已空转的桶（agent×tool 有界，正常远到不了）
+            for k in [k for k, dq in _RATE_WINDOWS.items() if not dq]:
+                del _RATE_WINDOWS[k]
+        for key, limit, label in ((tool_key, tool_max, f"单工具上限 {tool_max}"),
+                                  (agent_key, agent_max, f"单 agent 全工具上限 {agent_max}")):
+            dq = _RATE_WINDOWS.setdefault(key, deque())
+            while dq and now - dq[0] >= window:
+                dq.popleft()
+            if len(dq) >= limit:
+                return (f"错误：触发速率限制（工具 {tool}，agent={agent or '-'}）："
+                        f"{window:.0f} 秒内已达{label}次，疑似调用方陷入循环。"
+                        "请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / "
+                        "AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。")
+        _RATE_WINDOWS[tool_key].append(now)
+        _RATE_WINDOWS[agent_key].append(now)
+    return ""
+
+
 def _input_required(mid, text: str) -> dict:
     """return-and-resume 响应（P3-1 契约单一来源）：服务端不阻塞等待，也不主动回调。"""
     return {"jsonrpc": "2.0", "id": mid,
@@ -2835,6 +2910,14 @@ def handle_message(msg: dict, root: str) -> dict | None:
                     "result": {"content": [{"type": "text", "text": (
                         f"dry_run（未执行）：{tname} 预演通过，将写入 → {preview or '(无参数)'}\n"
                         "未落任何库；去掉 dry_run 后正式执行。")}], "isError": False}}
+        # C6 速率限制 / 循环保护（失控调用方止损）：放行才计数，被拦即返回业务错误
+        _rate_agent = str(args.get("agent") or SERVER_AGENT or "-")
+        _rl = _rate_check(_rate_agent, tname)
+        if _rl:
+            sys.stderr.write(f"[agenthub][rate-limit] {tname} agent={_rate_agent} :: {_rl[:160]}\n")
+            sys.stderr.flush()
+            return {"jsonrpc": "2.0", "id": mid,
+                    "result": {"content": [{"type": "text", "text": _rl}], "isError": True}}
         _t0 = time.perf_counter()   # B8 埋点起点（AGENTHUB_LOG 未设时 _log_call 首行即返回，开销≈0）
         try:
             text = call_tool(tname, args, root)

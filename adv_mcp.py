@@ -12,7 +12,11 @@ import re
 import subprocess
 import sys
 import tempfile
+import time
+from collections import deque
 from pathlib import Path
+
+import contextlib
 
 import agenthub_mcp as m
 import brain
@@ -62,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.45"
+    assert r["serverInfo"]["version"] == "2.40.46"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2061,6 +2065,98 @@ def t_tool_schema_compat(root):
     assert not problems, "工具 schema 出现非加法式变更：\n  " + "\n  ".join(problems[:15])
 
 
+@contextlib.contextmanager
+def _rate_env(**kw):
+    """临时改速率限制环境变量，退出即还原（回归自己不能被限流器误伤）。"""
+    old = {k: os.environ.get(k) for k in kw}
+    for k, v in kw.items():
+        if v is None:
+            os.environ.pop(k, None)
+        else:
+            os.environ[k] = str(v)
+    try:
+        yield
+    finally:
+        for k, v in old.items():
+            if v is None:
+                os.environ.pop(k, None)
+            else:
+                os.environ[k] = v
+
+
+def t_rate_limit_loop_guard(root):
+    """C6 回归：速率限制/循环保护——外部检索点名的生产常见存根「无限流：agent 进循环
+    可无限调用」，本大脑此前无任何节流。断言面：默认阈值放行日常频次 / 单工具超限即拦
+    （可行动文案）/ 被拦不计额 / 窗口过期恢复 / 单 agent 全工具二级配额 / off 开关 /
+    反向验证（关掉限流器后同一超限场景必须放行——证明断言测的是限流器不是摆设）。"""
+    def call(name="hub_health"):
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": {}}), str(root))
+        assert "error" not in r, r
+        return r["result"]
+
+    m._RATE_WINDOWS.clear()
+    try:
+        # ① 默认阈值（600/60s）下正常频次全部放行——日常 agent 与回归自身不受影响
+        for _ in range(5):
+            assert call()["isError"] is False
+
+        # ② 单工具超限即拦（阈值调到 3：第 4 次必须被拦，且文案可行动）
+        m._RATE_WINDOWS.clear()
+        with _rate_env(AGENTHUB_RATE_TOOL_MAX=3):
+            for _ in range(3):
+                assert call()["isError"] is False
+            r = call()
+            assert r["isError"] is True, r
+            assert "速率限制" in r["content"][0]["text"], r
+            # ③ 被拦不计额：连拦 10 次后，桶里仍只有放行的 3 个时间戳
+            #    （被拦的调用没有执行，计入窗口只会让恢复更难——口径写进 agenthub_mcp 注释）
+            for _ in range(10):
+                assert call()["isError"] is True
+            assert len(m._RATE_WINDOWS[("tool", "-", "hub_health")]) == 3, \
+                "被拦的调用不该计入窗口"
+
+        # ④ 窗口过期恢复：把时间戳改老（模拟窗口滑过，不靠 sleep），立即放行
+        m._RATE_WINDOWS.clear()
+        with _rate_env(AGENTHUB_RATE_TOOL_MAX=2):
+            assert call()["isError"] is False
+            assert call()["isError"] is False
+            assert call()["isError"] is True
+            aged = deque(time.monotonic() - 61 for _ in m._RATE_WINDOWS[("tool", "-", "hub_health")])
+            m._RATE_WINDOWS[("tool", "-", "hub_health")] = aged
+            assert call()["isError"] is False
+
+        # ⑤ 单 agent 全工具二级配额：两个不同工具合计到顶，第 3 次（换工具也逃不掉）被拦
+        m._RATE_WINDOWS.clear()
+        with _rate_env(AGENTHUB_RATE_TOOL_MAX=100, AGENTHUB_RATE_AGENT_MAX=2):
+            assert call()["isError"] is False
+            assert call("hub_status")["isError"] is False
+            r = call("hub_health")
+            assert r["isError"] is True and "全工具" in r["content"][0]["text"], r
+
+        # ⑥ off 开关：整体关闭后打满也不拦，且不建窗口桶（零副作用）
+        m._RATE_WINDOWS.clear()
+        with _rate_env(AGENTHUB_RATE_LIMIT="off"):
+            for _ in range(10):
+                assert call()["isError"] is False
+            assert not m._RATE_WINDOWS, "off 时不该建窗口桶"
+
+        # ⑦ 反向验证：把限流器关掉，② 的超限场景必须放行——否则说明断言测的不是限流
+        m._RATE_WINDOWS.clear()
+        orig = m._rate_limit_on
+        m._rate_limit_on = lambda: False
+        try:
+            with _rate_env(AGENTHUB_RATE_TOOL_MAX=1):
+                for _ in range(4):
+                    assert call()["isError"] is False
+        finally:
+            m._rate_limit_on = orig
+    finally:
+        m._RATE_WINDOWS.clear()
+        for k in ("AGENTHUB_RATE_TOOL_MAX", "AGENTHUB_RATE_AGENT_MAX",
+                  "AGENTHUB_RATE_LIMIT", "AGENTHUB_RATE_WINDOW"):
+            os.environ.pop(k, None)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -2134,6 +2230,8 @@ def main():
          lambda: t_tool_annotations(root))
     case("C2·工具 schema 兼容（只允许加法式变更；删参数/改类型/新增必填一律拦）",
          lambda: t_tool_schema_compat(root))
+    case("C6·速率限制/循环保护（默认放行/单工具超限即拦/被拦不计额/窗口恢复/off开关/agent级配额/反向验证）",
+         lambda: t_rate_limit_loop_guard(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
