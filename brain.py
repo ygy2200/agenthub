@@ -542,6 +542,20 @@ CREATE TABLE IF NOT EXISTS triggers (
     created TEXT DEFAULT ""
 );
 CREATE INDEX IF NOT EXISTS idx_trig_event ON triggers(on_event, enabled);
+-- D1/R2（2026-10-18）写工具幂等键：agent 重试是必然（网络超时/循环重发），
+-- 不幂等的写工具让「超时重试」变成「重复记账」——外部研究一致点名这是写工具
+-- 第一优先项（CallSphere/Thomas De Vos/datarekha）。语义：同 (agent, key) 同
+-- 内容 → 重放首次结果；同键不同内容 → 冲突拒收（digest 防键复用）。
+CREATE TABLE IF NOT EXISTS idem_keys (
+    agent TEXT NOT NULL,
+    key TEXT NOT NULL,
+    tool TEXT NOT NULL,
+    digest TEXT NOT NULL,
+    result TEXT NOT NULL,
+    ref INTEGER,
+    ts TEXT NOT NULL,
+    PRIMARY KEY (agent, key)
+);
 """
 
 
@@ -5657,6 +5671,55 @@ def ghost_record_candidates(root: str, threshold: float = 0.55, limit: int = 10)
         if len(out) >= max(1, min(int(limit), 50)):
             break
     return out
+
+
+# ---------------------------------------------------------------- D1/R2：写工具幂等键
+# 为什么需要：agent 重试是必然事件（网络超时/循环重发/模型以为失败又发一次），
+# 而不幂等的写工具会把重试变成重复记账——外部检索一致点名这是写工具第一优先项
+# （CallSphere「最高优先级就是写工具幂等」；Thomas De Vos「超时=证据缺失≠失败」；
+# datarekha「duplicate-call test 尤其有价值」）。AgentHub 的 log_work/memory_write
+# 此前每次调用都产生新记录，超时重试即重复记录。
+# 语义（默认完全兼容——键不传就走原路径）：
+#   ① 同 (agent, key) 同内容 → 原样返回首次结果（重放），不重复执行；
+#   ② 同 (agent, key) 不同内容 → 冲突拒收（digest 防键复用，见 Thomas De Vos）；
+#   ③ key 按 agent 分命名空间（不同 agent 的同字符串 key 互不干扰）；
+#   ④ 保留期 7 天（典型重试窗口），存储时顺带清理过期键。
+IDEM_RETENTION_DAYS = 7
+
+
+def idem_digest(parts: dict) -> str:
+    """内容指纹：同一 (agent, key) 携带不同内容 = 键复用冲突，拒收而非静默重放。"""
+    import hashlib  # noqa: PLC0415
+    blob = json.dumps(parts, sort_keys=True, ensure_ascii=False)
+    return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
+
+
+def idem_lookup(root: str, agent: str, key: str, digest: str):
+    """查幂等键。返回 None=未见/已过期（放行）/ str=首次结果（重放）/ 'conflict'=同键不同内容。
+
+    时间窗过滤是**查询侧的硬约束**（R2 回归抓到的自引入 bug）：只靠 store 时的 DELETE
+    清理不够——库安静一阵后过期键仍会被重放（实测：把 ts 改老后同键照样返回首次结果）。
+    语义上「保留期」就是「重放窗口」：超过 7 天的同键视为新操作。"""
+    with db_conn(root) as conn:
+        r = conn.execute("SELECT digest, result FROM idem_keys "
+                         "WHERE agent=? AND key=? AND ts >= datetime('now', ?)",
+                         (agent, key, f"-{IDEM_RETENTION_DAYS} days")).fetchone()
+    if not r:
+        return None
+    if r["digest"] != digest:
+        return "conflict"
+    return r["result"]
+
+
+def idem_store(root: str, agent: str, key: str, digest: str, tool: str,
+               result: str, ref: int = 0) -> None:
+    """记 键→首次结果（INSERT OR REPLACE：并发下同键只留一条；顺带按保留期清理）。"""
+    with db_conn(root) as conn:
+        conn.execute("DELETE FROM idem_keys WHERE ts < datetime('now', ?)",
+                     (f"-{IDEM_RETENTION_DAYS} days",))
+        conn.execute("INSERT OR REPLACE INTO idem_keys(agent,key,tool,digest,result,ref,ts) "
+                     "VALUES(?,?,?,?,?,?,?)",
+                     (agent, key, tool, digest, result, ref or None, _now()))
 
 
 def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit: int = 3) -> list:

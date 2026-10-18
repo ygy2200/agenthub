@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.51"
+    assert r["serverInfo"]["version"] == "2.40.52"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2084,6 +2084,52 @@ def _rate_env(**kw):
                 os.environ[k] = v
 
 
+def t_idem_key(hub):
+    """D1/R2 回归：写工具**幂等键**——「超时重试=重复记账」是 agent 的必然故障面
+    （外部研究一致点名的写工具第一优先项：CallSphere/Thomas De Vos/datarekha）。
+    验证：① 无键调用行为不变（兼容性由其它用例覆盖）；② 同 agent+键+内容重试 →
+    原样重放首次结果、记录条数不变；③ 同键配不同内容 → 冲突拒收、不落写（防键复用）；
+    ④ 不同 agent 的同字符串键互不干扰（命名空间）；⑤ memory_write / note 同样生效。"""
+    import brain as _b
+    rs = str(hub)
+    base = {"project": "幂等-测试", "agent": "zcode",
+            "content": "【目的】幂等\n【做了什么】写一次\n【验证结果】ok\n【如何回滚】删",
+            "idem_key": "k1"}
+    r1 = m.call_tool("hub_log_work", dict(base), rs)
+    assert "records#" in r1, r1
+    n1 = _b.records_count(rs, project="幂等-测试")
+    # ② 重试同键同内容 → 原样重放，不新增
+    r2 = m.call_tool("hub_log_work", dict(base), rs)
+    assert r2.startswith(r1) and "幂等重放" in r2, f"未重放首次结果：{r2[:120]}"
+    assert _b.records_count(rs, project="幂等-测试") == n1, "重试不该新增记录（重复记账）"
+    # ③ 同键不同内容 → 冲突拒收（digest 防键复用）
+    bad = dict(base, content=base["content"] + "（内容已变）")
+    r3 = m.call_tool("hub_log_work", bad, rs)
+    assert r3.startswith("错误：") and "不同内容" in r3, r3
+    assert _b.records_count(rs, project="幂等-测试") == n1, "冲突拒收不该落写"
+    # ④ 不同 agent 同键 → 互不干扰
+    other = dict(base, agent="dsh")
+    r4 = m.call_tool("hub_log_work", other, rs)
+    assert "records#" in r4, r4
+    assert _b.records_count(rs, project="幂等-测试") == n1 + 1
+    # ⑤ 其它两个内容类写工具同样生效
+    ma = {"content": "幂等键测试记忆：重试不重复写入", "kind": "fact", "agent": "zcode",
+          "idem_key": "m1"}
+    r5 = m.call_tool("hub_memory_write", dict(ma), rs)
+    assert "已写入大脑记忆" in r5, r5
+    r6 = m.call_tool("hub_memory_write", dict(ma), rs)
+    assert "幂等重放" in r6 and r6.startswith(r5), r6
+    na = {"content": "幂等随记：重试不重复", "idem_key": "n1"}
+    r7 = m.call_tool("hub_note", dict(na), rs)
+    r8 = m.call_tool("hub_note", dict(na), rs)
+    assert "随记 #" in r7 and "幂等重放" in r8 and r8.startswith(r7), (r7[:80], r8[:80])
+    # ⑥ 过期键不重放（保留期 7 天）：把键的 ts 改老 → 同键视为新操作
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE idem_keys SET ts='2020-01-01T00:00:00' WHERE agent='zcode' AND key IN ('m1','n1')")
+    r9 = m.call_tool("hub_memory_write", dict(ma), rs)
+    assert "已写入大脑记忆" in r9 and "幂等重放" not in r9, f"过期键被重放：{r9[:120]}"
+
+
 def t_rate_limit_loop_guard(root):
     """C6 回归：速率限制/循环保护——外部检索点名的生产常见存根「无限流：agent 进循环
     可无限调用」，本大脑此前无任何节流。断言面：默认阈值放行日常频次 / 单工具超限即拦
@@ -2232,6 +2278,8 @@ def main():
          lambda: t_tool_schema_compat(root))
     case("C6·速率限制/循环保护（默认放行/单工具超限即拦/被拦不计额/窗口恢复/off开关/agent级配额/反向验证）",
          lambda: t_rate_limit_loop_guard(root))
+    case("D1·写工具幂等键（重试原样重放不重复记/同键异内容拒收/agent 命名空间/过期不重放/memory+note 同效）",
+         lambda: t_idem_key(fresh_hub(tmp, "hub_idem")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

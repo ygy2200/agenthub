@@ -41,7 +41,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.51"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.52"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -180,6 +180,59 @@ def _snippet(content: str, words: list, width: int = 76) -> str:
     head = "…" if start > 0 else ""
     tail = "…" if start + width < len(text) else ""
     return f"{head}{frag}{tail}"
+
+
+# ---------------------------------------------------------------- D1/R2：写工具幂等键接线
+# 为什么需要：agent 重试是必然事件（网络超时/循环重发/模型以为失败又发一次），而不幂等
+# 的写工具会把重试变成重复记账——外部检索一致点名这是写工具第一优先项（CallSphere：
+# 「最高优先级就是写工具幂等」；Thomas De Vos：「超时=证据缺失≠失败」；datarekha：
+# 「duplicate-call test 尤其有价值」）。语义（brain.idem_* 层）：
+#   ① 同 (agent, key) 同内容 → 原样重放首次结果，不重复执行；
+#   ② 同 (agent, key) 不同内容 → 冲突拒收（digest 防键复用）；
+#   ③ 键按 agent 分命名空间；保留期 7 天。
+# 默认完全兼容：idem_key 不传就走原路径，现有调用零影响。
+def _idem_fields(tool: str, arguments: dict) -> dict:
+    """按工具挑**参与指纹**的字段——指纹必须覆盖「写入结果由什么决定」，不覆盖
+    max_chars/dry_run 之类不影响写入结果的参数（否则调用方换个截断预算就被误判冲突）。
+    date 缺省按处理器的同日兜底先解析（否则隔夜重试会被误判成不同内容）。"""
+    if tool == "hub_log_work":
+        keys = ("project", "content", "context", "options", "decision", "tradeoffs",
+                "record_type", "review_date")
+        fields = {k: arguments.get(k) for k in keys}
+        fields["date"] = arguments.get("date") or datetime.date.today().isoformat()
+        return fields
+    if tool == "hub_memory_write":
+        keys = ("content", "mode", "kind", "tags", "project", "supersedes",
+                "valid_until", "confidence", "evidence", "maturity")
+        return {k: arguments.get(k) for k in keys}
+    keys = ("content", "tags", "link", "mood", "source")   # hub_note
+    return {k: arguments.get(k) for k in keys}
+
+
+def _idem_precheck(root: str, tool: str, arguments: dict, agent: str):
+    """写前查幂等键。返回 None=放行；返回 str=直接回给调用方（重放结果或冲突错误）。"""
+    key = str(arguments.get("idem_key") or "").strip()
+    if not key:
+        return None
+    if len(key) > 64:
+        return "错误：idem_key 过长（≤64 字符）——它是去重标识不是载荷"
+    digest = brain.idem_digest(_idem_fields(tool, arguments))
+    hit = brain.idem_lookup(root, agent, key, digest)
+    if hit == "conflict":
+        return (f"错误：幂等键 {key!r} 已被本 agent 用于**不同内容**的写入（防键复用）——"
+                "重试请携原内容，新写入请换新键")
+    if hit:
+        return hit + "\n（幂等重放：首次结果原样返回，未重复执行）"
+    return None
+
+
+def _idem_store(root: str, tool: str, arguments: dict, agent: str, out: str, ref: int = 0) -> None:
+    """写成功后记 键→首次结果（失败不记——没写成就没有可重放的结果）。"""
+    key = str(arguments.get("idem_key") or "").strip()
+    if not key:
+        return
+    brain.idem_store(root, agent, key, brain.idem_digest(_idem_fields(tool, arguments)),
+                     tool, out, ref)
 
 
 def call_tool(name: str, arguments: dict, root: str) -> str:
@@ -493,6 +546,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         ok, rdate = _norm_date(arguments.get("review_date"), "review_date")
         if not ok:
             return rdate
+        # D1/R2 幂等键：超时重试不重复记（同 agent+key+内容 → 重放首次结果）
+        pre = _idem_precheck(root, "hub_log_work", arguments, agent)
+        if pre:
+            return pre
         rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
                                   context=ctx, options=opts, decision=dec, tradeoffs=tro,
                                   record_type=rt,
@@ -530,6 +587,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 continue
             mark = "√" if f["status"] == "fired" else "×"
             out += f"\n[自动化] {mark} #{f['id']} {f['name']}：{(f.get('text') or '')[:90]}"
+        _idem_store(root, "hub_log_work", arguments, agent, out, rec_id)
         return out
 
     if name == "hub_create_project":
@@ -601,6 +659,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         content = str(arguments.get("content", "")).strip()
         if not content:
             return "错误：content 必填——人说的原话/随记内容。例：hub_note(content=\"主人说：记一下…\")"
+        _note_agent = _guess_agent(root)
+        pre = _idem_precheck(root, "hub_note", arguments, _note_agent)
+        if pre:
+            return pre
         try:
             nid = brain.add_note(
                 root, content,
@@ -610,10 +672,12 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 source="human" if str(arguments.get("source", "human")) != "web" else "web")
         except ValueError as e:
             return f"错误：{e}"
-        core.journal(root, _guess_agent(root), "note_append", f"brain:notes#{nid}")
+        core.journal(root, _note_agent, "note_append", f"brain:notes#{nid}")
         mood = f"（{arguments.get('mood')}）" if arguments.get("mood") else ""
-        return (f"已记入随记 #{nid}{mood}——人的思想已进大脑，所有 agent 检索可见；"
-                f"GUI「随记」页随时回看")
+        out = (f"已记入随记 #{nid}{mood}——人的思想已进大脑，所有 agent 检索可见；"
+               f"GUI「随记」页随时回看")
+        _idem_store(root, "hub_note", arguments, _note_agent, out, nid)
+        return out
 
     if name == "hub_note_read":
         nid = str(arguments.get("note_id", "")).strip()
@@ -769,6 +833,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                   kind=kind if kind in brain.KINDS else "", agent=agent)
                 core.journal(root, agent, "memory_overwrite", f"brain:memories#{rows[0]['id']}")
                 return f"已更新大脑记忆 #{rows[0]['id']}"
+        pre = _idem_precheck(root, "hub_memory_write", arguments, agent)
+        if pre:
+            return pre
         mid = brain.add_memory(root, content, kind, tags, project, agent, pinned,
                               supersedes=supersedes, valid_until=valid_until,
                               confidence=confidence, evidence=evidence,
@@ -781,7 +848,9 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             extra += f"，有效期至 {valid_until}"
         if evidence:
             extra += f"，证据链 {evidence}"
-        return f"已写入大脑记忆 #{mid}（{brain.KIND_CN.get(kind, kind)}），所有 agent 可读可检索{extra}"
+        out = f"已写入大脑记忆 #{mid}（{brain.KIND_CN.get(kind, kind)}），所有 agent 可读可检索{extra}"
+        _idem_store(root, "hub_memory_write", arguments, agent, out, mid)
+        return out
 
     if name == "hub_heartbeat":
         agent = str(arguments.get("agent", "")).strip()
@@ -2706,12 +2775,20 @@ def visible_tools() -> list:
 
 
 # 统一字段注入：所有工具支持 max_chars；写工具额外支持 dry_run / confirm（契约单一来源）
+# D1/R2：内容类写工具额外支持 idem_key（幂等键，可选——重试不重复记）
+IDEM_TOOLS = {"hub_log_work", "hub_memory_write", "hub_note"}
 for _t in TOOLS:
     _props = _t.setdefault("inputSchema", {}).setdefault("properties", {})
     _props.setdefault("max_chars", {
         "type": "integer",
         "description": f"结果字符预算（默认 {DEFAULT_MAX_CHARS}；0=不截断）。超预算截断并在文末标注，"
                        "完整内容在 structuredContent"})
+    if _t["name"] in IDEM_TOOLS:
+        _props.setdefault("idem_key", {
+            "type": "string",
+            "description": "幂等键（可选，≤64 字符）：重试/重发同一操作时携同一个键——服务端不重复执行、"
+                           "原样返回首次结果（治「超时后重复记账」）；同键配不同内容会被拒收（防键复用）。"
+                           "例：idem_key=\"log-2026-10-18-r2\""})
     if _t["name"] in WRITE_TOOLS:
         _props.setdefault("dry_run", {"type": "boolean",
                                       "description": "true=只预演不执行（不落库）"})
