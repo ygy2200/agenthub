@@ -2747,9 +2747,9 @@ def t_intercept_hot_path_cached(tmp):
     此前它每次都对全库 lesson/fact 重新分词——每写一条记录就重算几百条记忆，
     与 R3 修的记忆 BM25 完全同构。
     验证：①结果与未优化参考实现**逐字段一致**（含免建并集的代数替换）；
-    ②缓存确实生效；③**防串味**：相似度缓存不得污染 BM25 的 _MEM_TOK_CACHE
-    （两者键同型但内容不同——前者 set/仅 content，后者 Counter/含 tags+project，
-     实测共用会让 BM25 读到 set 而 AttributeError，回归当场抓住）；
+    ②缓存确实生效；③**防串味/结构隔离**（R11 重构后升级）：相似度缓存经 typed 门面
+    写入，对 BM25 命名空间不可见——「键同型缓存共用」这个 bug 类（R6 实测：set 存进
+    存 Counter 的命名空间后 BM25 AttributeError）从「靠注释+断言防」变成「API 上不可能表达」；
     ④短内容 <4 token 时短路不变。"""
     root = str(Path(tmp) / "hub_b10")
     Path(root).mkdir(parents=True, exist_ok=True)
@@ -2783,18 +2783,26 @@ def t_intercept_hot_path_cached(tmp):
         out.sort(key=lambda x: -x["sim"])
         return out[:max(1, min(limit, 5))]
 
-    brain._MEM_TOK_CACHE.clear(); brain._SIM_TOK_CACHE.clear()
+    brain._TOK_CACHE.clear()
     assert ref_impl(q) == brain.similar_lessons_for(root, q), "结果与参考实现不一致"
     with brain.db_conn(root) as conn:
         ids = [r["id"] for r in conn.execute(
             "SELECT id FROM memories WHERE " + brain._live_sql() + " LIMIT 5")]
-    assert any((root, i) in brain._SIM_TOK_CACHE for i in ids), "相似度缓存未生效"
-    # ③ 防串味：相似度缓存里的值必须是 set，且不得被写进 BM25 的 _MEM_TOK_CACHE
-    for k, v in brain._SIM_TOK_CACHE.items():
-        assert isinstance(v, set), f"_SIM_TOK_CACHE 存了非 set：{type(v)}"
-        if k in brain._MEM_TOK_CACHE:
-            assert isinstance(brain._MEM_TOK_CACHE[k][0], Counter), \
+    tc_sim = brain._TOK_CACHE.sim_items()
+    assert any(k[1] in ids for k in tc_sim), "相似度缓存未生效"
+    # ③ 防串味（R11 重构后升级为**结构隔离**断言）：sim 命名空间的值必须都是 set；
+    #    且经 typed 门面写 sim 对 BM25 命名空间不可见——「键同型缓存共用」这个 bug
+    #    类从「靠注释+断言防」变成「API 上不可能表达」
+    for v in tc_sim.values():
+        assert isinstance(v, set), f"sim 命名空间存了非 set：{type(v)}"
+    tc_mem = brain._TOK_CACHE.mem_bm25_items()
+    for k in tc_sim:
+        if k in tc_mem:
+            assert isinstance(tc_mem[k][0], Counter), \
                 "BM25 缓存被相似度路径污染（存成了 set）"
+    brain._TOK_CACHE.put_sim(root, ids[0], {"探针"})
+    assert brain._TOK_CACHE.get_mem_bm25(root, ids[0]) is None, \
+        "sim 写入竟出现在 BM25 命名空间（typed 门面失效）"
     # 两条路径都要仍能跑（BM25 读的是 Counter）
     assert isinstance(brain.search_memories(root, "代理 端口"), list)
     assert brain.similar_lessons_for(root, "短") == []

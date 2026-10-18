@@ -1628,30 +1628,90 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
         return []
     docs = []
     for r in rows:
-        ckey = (root, r["id"])
-        ent = _MEM_TOK_CACHE.get(ckey)
+        ent = _TOK_CACHE.get_mem_bm25(root, r["id"])
         if ent is None:
             toks = _tokenize(" ".join([r["content"] or "", r["tags"] or "", r["project"] or ""]),
                              max_tokens=2000)  # doc 侧不截断：截了长记忆后半无法命中（复盘实锤）
             ent = (Counter(toks), len(toks))
-            _MEM_TOK_CACHE[ckey] = ent
+            _TOK_CACHE.put_mem_bm25(root, r["id"], ent)
         docs.append((r, ent[0], ent[1]))
     return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
 
 
-_RECORDS_TOK_CACHE: dict = {}  # (root, record_id) → (Counter, dl)：记录内容不可变（只增不改），缓存进程内安全
+class _TokenCache:
+    """进程内分词缓存统一层（R11，2026-10-18 重构）——终结「三个键同型的裸 dict 靠注释区分」。
+
+    由来（R6 踩坑，记忆 #219）：BM25 的 mem 缓存存 (Counter,dl)、内容含 tags+project；
+    相似度缓存存 set、只用 content。我曾因「键都是 (root,id)」判定可复用，set 存进前者后
+    BM25 读到就 AttributeError——**键同型不等于缓存可共用**，值与内容语义都得看。
+    裸 dict + 注释的防线依赖「下一个人真的读注释」；重构为 typed 门面后，三个命名空间
+    外部不可见，只能经各自的 get/put 访问，从结构上不可能串味。
+
+    三个命名空间（注意 mem_bm25 与 records_bm25 的 **id 空间互相独立**——
+    memory #5 与 record #5 是不同实体，所以必须是不同命名空间而非同 dict 加前缀）：
+      mem_bm25     (root, memory_id) → (Counter, dl)  记忆 BM25，content+tags+project
+      records_bm25 (root, record_id) → (Counter, dl)  记录 BM25，title+content+project
+      sim          (root, memory_id) → set            相似度，仅 content
+
+    失效：invalidate(root, memory_id) 一并 pop mem_bm25 + sim——edit_memory 的
+    text_changed 分支是唯一调用点（改一处=两个命名空间都失效，不会漏）。
+    records 内容只增不改，不设失效入口（record 的 supersede 是行级软删、不进分词缓存键）。
+    key 必须含 root：不同库的 id 空间独立（adv 多 tmp 库实测串库：id=1 在各库是不同内容）。
+    """
+    __slots__ = ("_mem_bm25", "_records_bm25", "_sim")
+
+    def __init__(self) -> None:
+        self._mem_bm25: dict = {}
+        self._records_bm25: dict = {}
+        self._sim: dict = {}
+
+    # ---- mem_bm25：(Counter, dl)
+    def get_mem_bm25(self, root: str, mid: int):
+        return self._mem_bm25.get((root, mid))
+
+    def put_mem_bm25(self, root: str, mid: int, entry) -> None:
+        self._mem_bm25[(root, mid)] = entry
+
+    # ---- records_bm25：(Counter, dl)
+    def get_records_bm25(self, root: str, rid: int):
+        return self._records_bm25.get((root, rid))
+
+    def put_records_bm25(self, root: str, rid: int, entry) -> None:
+        self._records_bm25[(root, rid)] = entry
+
+    # ---- sim：set（相似度专用，与上面两个 BM25 命名空间结构隔离）
+    def get_sim(self, root: str, mid: int):
+        return self._sim.get((root, mid))
+
+    def put_sim(self, root: str, mid: int, toks: set) -> None:
+        self._sim[(root, mid)] = toks
+
+    # ---- 失效（单一入口）：记忆文本改了，BM25 与相似度两个命名空间一起作废
+    def invalidate(self, root: str, mid: int) -> None:
+        self._mem_bm25.pop((root, mid), None)
+        self._sim.pop((root, mid), None)
+
+    def sizes(self) -> tuple:
+        """三命名空间条目数（回归/诊断用）。"""
+        return len(self._mem_bm25), len(self._records_bm25), len(self._sim)
+
+    def clear(self) -> None:
+        """三命名空间全清（回归隔离用——测试间不共享缓存状态）。"""
+        self._mem_bm25.clear()
+        self._records_bm25.clear()
+        self._sim.clear()
+
+    def sim_items(self) -> dict:
+        """sim 命名空间 (key → set) 快照（回归断言用，只读副本）。"""
+        return dict(self._sim)
+
+    def mem_bm25_items(self) -> dict:
+        """mem_bm25 命名空间 (key → (Counter, dl)) 快照（回归断言用，只读副本）。"""
+        return dict(self._mem_bm25)
+
+
+_TOK_CACHE = _TokenCache()
 # 1559 条全文分词 ~300ms/查询（搜索页同步调用，用户抱怨过慢）→ 缓存后首查之外 <10ms
-# key 必须含 root——不同库的 id 空间独立（adv 多 tmp 库实测串库：id=1 在各库是不同内容）
-
-_MEM_TOK_CACHE: dict = {}  # (root, memory_id) → (Counter, dl)：与 _RECORDS_TOK_CACHE 对称；
-# 记忆可被 edit_memory 改写 content/tags → 其 text_changed 分支负责 pop 失效，避免 BM25 命中旧文本
-
-# B10：(root, memory_id) → set(_tokens(content))——**只给相似度计算用**（similar_lessons_for /
-# similar_memories / ghost_memory_candidates）。刻意与 _MEM_TOK_CACHE 分开：那个存 Counter 且
-# 内容含 tags+project，这里只含 content 且是 set；共用一个键会让两条路径互相污染
-# （实测 AttributeError: 'set' object has no attribute 'keys'，回归当场抓住）。
-# 失效同理由 edit_memory 的 text_changed 分支负责（两处一起 pop）。
-_SIM_TOK_CACHE: dict = {}
 
 
 def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
@@ -1666,13 +1726,12 @@ def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
         return []
     docs = []
     for r in rows:
-        ckey = (root, r["id"])
-        ent = _RECORDS_TOK_CACHE.get(ckey)
+        ent = _TOK_CACHE.get_records_bm25(root, r["id"])
         if ent is None:
             toks = _tokenize(" ".join([r["title"] or "", r["content"] or "", r["project"] or ""]),
                              max_tokens=2000)
             ent = (Counter(toks), len(toks))
-            _RECORDS_TOK_CACHE[ckey] = ent
+            _TOK_CACHE.put_records_bm25(root, r["id"], ent)
         docs.append((r, ent[0], ent[1]))
     return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
 
@@ -3591,8 +3650,9 @@ def edit_memory(root: str, mid: int, content: str = "", kind: str = "", tags: st
                      (*args, _now(), mid))
         _revision(conn, mid, "edit", before, _snapshot(conn, mid), agent)
         if text_changed:
-            _MEM_TOK_CACHE.pop((root, mid), None)  # 文本改了，BM25 token 缓存必须失效（否则命中旧文本）
-            _SIM_TOK_CACHE.pop((root, mid), None)  # B10：相似度缓存同理（否则命中旧文本的相似度）
+            # 文本改了，BM25 与相似度两个命名空间的 token 缓存必须一起失效（否则命中旧文本）——
+            # 统一缓存层的单一失效入口，改这一处即两个命名空间都作废（不会漏一个）
+            _TOK_CACHE.invalidate(root, mid)
             # 文本变更 → 同步语义索引（否则语义路拿着旧文本做相似度，编辑等于没生效）
             row = conn.execute("SELECT content, tags, project FROM memories WHERE id=?",
                                (mid,)).fetchone()
@@ -5616,20 +5676,17 @@ def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit:
     out = []
     for r in rows:
         # B10 收尾：写入热路径每次 log_work 都要扫全库 lesson/fact——不缓存就等于
-        # 每写一条记录就把几百条记忆重新分词一遍。**刻意用独立缓存 `_SIM_TOK_CACHE`
-        # 而不是复用 BM25 的 `_MEM_TOK_CACHE`**：后者存的是 (Counter, dl)、内容来自
-        # `content+tags+project` 拼接；这里只用 content 且类型是 set。共用一个键会
-        # 让两条路径互相污染（实测：set 存进去后 BM25 读不到 Counter → AttributeError，
-        # 回归当场抓住）。失效机制与 _MEM_TOK_CACHE 对称（edit_memory 的 text_changed 分支）。
+        # 每写一条记录就把几百条记忆重新分词一遍。走统一缓存层的 sim 命名空间
+        # （与 BM25 命名空间结构隔离——R6 踩坑：曾因键同型复用 BM25 缓存，set 存进
+        # 存 Counter 的命名空间后 AttributeError；现由 _TokenCache typed 门面保证不可能）。
         if r["kind"] == "error":
             # errors 是**合成行**（title+detail 拼的、负 id、status 会变），不占缓存
             ot = _tokens(r["content"])
         else:
-            skey = (root, r["id"])
-            ot = _SIM_TOK_CACHE.get(skey)
+            ot = _TOK_CACHE.get_sim(root, r["id"])
             if ot is None:
                 ot = _tokens(r["content"])
-                _SIM_TOK_CACHE[skey] = ot
+                _TOK_CACHE.put_sim(root, r["id"], ot)
         if not ot:
             continue
         # |A∪B| = |A|+|B|-|A∩B|：免建并集（R5 同款代数替换）

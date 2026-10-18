@@ -230,13 +230,27 @@ def serve(root: str, port: int = 8787, allow_write: bool = False,
 
 def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
                   open_browser: bool = False) -> int:
-    """CLI 入口：阻塞运行（Ctrl+C 停止）。返回退出码。"""
+    """CLI 入口：阻塞运行（Ctrl+C / Ctrl+Break 停止）。返回退出码。"""
     # 同 cli.main：Windows OEM codepage 下中文重定向会 UnicodeEncodeError 崩掉
     for _stream in (sys.stdout, sys.stderr):
         try:
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001
             pass
+    # Windows 上 Ctrl+C（SIGINT）之外，Ctrl+Break（SIGBREAK）是另一个常用「停下来」手势
+    # （无窗口/计划任务场景尤其）——此前只有 KeyboardInterrupt 一条优雅路径，Ctrl+Break
+    # 直接硬杀、finally 里的 server_close 不跑（端口占用残留到 OS 回收）。接进同一条
+    # 优雅路径：handler 抛 KeyboardInterrupt，被下面的 except 接住。设置失败（非
+    # Windows / 非主线程 / 无权）静默跳过——不影响原有 Ctrl+C 行为。
+    try:
+        import signal  # noqa: PLC0415
+
+        def _sigbreak_stop(*_a):
+            raise KeyboardInterrupt
+
+        signal.signal(signal.SIGBREAK, _sigbreak_stop)
+    except (ImportError, ValueError, OSError, AttributeError):
+        pass
     try:
         httpd, real_port, token = serve(root, port, allow_write, open_browser)
     except OSError as e:

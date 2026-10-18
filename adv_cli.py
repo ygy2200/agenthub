@@ -187,21 +187,26 @@ def _wait_http(url: str, timeout: float = 20.0) -> int:
 
 
 def _fake_adapter_hub(tmp, name="hub_onboard", agent="测试甲", with_mcp=True,
-                      profile="worker", preexisting='{"mcpServers": {"other": {"command": "x"}}}'):
+                      profile="worker", preexisting='{"mcpServers": {"other": {"command": "x"}}}',
+                      layout="standard"):
     """造一个 tmp 大脑根 + config.agents.json 假适配器：onboard 的所有写入目标
     （MCP 配置 / 引导文件）都指向 tmp 内路径——这是 load_agent_adapters 设计好的
-    扩展点（「改此文件即可增删 agent，零改码」），不是 monkeypatch 黑客技巧。"""
+    扩展点（「改此文件即可增删 agent，零改码」），不是 monkeypatch 黑客技巧。
+    layout：standard=json / toml_codex / yaml / bundle_dsh（bundle 按设计拒写）。
+    配置文件名按 layout 给对扩展名（codec 的格式探测认扩展名，别给人家添堵）。"""
+    ext = {"standard": "json", "toml_codex": "toml", "yaml": "yaml", "bundle_dsh": "json"}[layout]
     root = Path(tmp) / name
     root.mkdir(parents=True, exist_ok=True)
+    cfg = root / f"mcp.{ext}"
     a = {"agent": agent, "channel": "instr_file", "instr_path": str(root / "instr.md")}
     if with_mcp:
-        a["mcp"] = {"path": str(root / "mcp.json"), "layout": "standard"}
+        a["mcp"] = {"path": str(cfg), "layout": layout}
         if profile:
             a["mcp"]["profile"] = profile
     (root / core.AGENTS_CONFIG_NAME).write_text(
         json.dumps({"agents": [a]}, ensure_ascii=False), encoding="utf-8")
-    if with_mcp and preexisting:
-        (root / "mcp.json").write_text(preexisting, encoding="utf-8")
+    if with_mcp and preexisting is not None:
+        cfg.write_text(preexisting, encoding="utf-8")
     return root
 
 
@@ -215,11 +220,12 @@ def t_onboard_tmp_redirect(tmp):
     ④ 重复 onboard 幂等（不重复插条目、不重复注入引导块）。
     """
     root = _fake_adapter_hub(tmp)
+    cfg = root / "mcp.json"
     rc, out = _capture(cli.cmd_onboard, str(root), "测试甲")
     assert rc == 0, out
-    cfg = json.loads((root / "mcp.json").read_text(encoding="utf-8"))
-    assert cfg["mcpServers"].get("other"), "外科式编辑必须保留既有条目"
-    entry = cfg["mcpServers"]["agenthub"]
+    data = json.loads(cfg.read_text(encoding="utf-8"))
+    assert data["mcpServers"].get("other"), "外科式编辑必须保留既有条目"
+    entry = data["mcpServers"]["agenthub"]
     args = " ".join(entry.get("args") or [])
     assert "--agent" in args and "测试甲" in args, f"--agent 未落进配置：{entry}"
     assert "--profile" in args and "worker" in args, f"--profile 未落进配置：{entry}"
@@ -232,8 +238,8 @@ def t_onboard_tmp_redirect(tmp):
     # 幂等：第二次不重复插条目、不重复注入
     rc2, _ = _capture(cli.cmd_onboard, str(root), "测试甲")
     assert rc2 == 0
-    cfg2 = json.loads((root / "mcp.json").read_text(encoding="utf-8"))
-    assert set(cfg2["mcpServers"]) == set(cfg["mcpServers"]), "第二次 onboard 重复插了条目"
+    data2 = json.loads(cfg.read_text(encoding="utf-8"))
+    assert set(data2["mcpServers"]) == set(data["mcpServers"]), "第二次 onboard 重复插了条目"
     n_marks = instr.count("agenthub:begin")
     instr2 = (root / "instr.md").read_text(encoding="utf-8")
     assert instr2.count("agenthub:begin") == n_marks, "第二次 onboard 重复注入了引导块"
@@ -264,6 +270,47 @@ def t_onboard_rejections(tmp):
     assert not (root3 / "mcp.json").exists(), "无 mcp 段的适配器不该被造出 MCP 配置"
     assert "agenthub:begin" in (root3 / "instr.md").read_text(encoding="utf-8"), \
         "无 mcp 段的适配器也必须注入引导"
+
+
+def t_onboard_multi_layout(tmp):
+    """C8 遗留：onboard 只覆盖 standard json 一种 layout——补 toml_codex / yaml 两种
+    可写 layout 的端到端 + bundle_dsh 的拒写断言。三种格式的外科编辑由 codec 承担
+    （三格式往返早有覆盖），这里验 onboard 侧接线：条目落对 section、--agent/--profile
+    落对、既有条目保留、备份照旧。"""
+    # —— toml_codex（Codex 的 config.toml）
+    root_t = _fake_adapter_hub(tmp, name="hub_onb_toml", layout="toml_codex",
+                               preexisting="[mcp_servers.other]\ncommand = 'x'\n")
+    rc, out = _capture(cli.cmd_onboard, str(root_t), "测试甲")
+    assert rc == 0, out
+    cfg_t = root_t / "mcp.toml"
+    txt = cfg_t.read_text(encoding="utf-8")
+    assert codec.contains(str(cfg_t), "agenthub", ["mcp_servers"]), f"toml 条目未落进 mcp_servers：{txt}"
+    assert codec.contains(str(cfg_t), "other", ["mcp_servers"]), "toml 既有条目没保留"
+    assert "--profile" in txt and "worker" in txt and "测试甲" in txt, txt
+    assert list(root_t.glob("mcp.toml.bak-*")), "toml 改写前必须备份"
+    assert "agenthub:begin" in (root_t / "instr.md").read_text(encoding="utf-8")
+
+    # —— yaml（hermes 的 config.yaml）
+    root_y = _fake_adapter_hub(tmp, name="hub_onb_yaml", layout="yaml",
+                               preexisting="mcp_servers:\n  other:\n    command: x\n")
+    rc, out = _capture(cli.cmd_onboard, str(root_y), "测试甲")
+    assert rc == 0, out
+    cfg_y = root_y / "mcp.yaml"
+    assert codec.contains(str(cfg_y), "agenthub", ["mcp_servers"]), \
+        f"yaml 条目未落进 mcp_servers：{cfg_y.read_text(encoding='utf-8')}"
+    assert codec.contains(str(cfg_y), "other", ["mcp_servers"]), "yaml 既有条目没保留"
+    txt_y = cfg_y.read_text(encoding="utf-8")
+    assert "--profile" in txt_y and "worker" in txt_y and "测试甲" in txt_y, txt_y
+    assert list(root_y.glob("mcp.yaml.bak-*")), "yaml 改写前必须备份"
+
+    # —— bundle_dsh（DSH 的 MCP 由 bundle 提供）：设计上拒写，但引导照注
+    root_b = _fake_adapter_hub(tmp, name="hub_onb_bundle", layout="bundle_dsh", preexisting=None)
+    rc, out = _capture(cli.cmd_onboard, str(root_b), "测试甲")
+    assert rc == 0, out
+    assert "bundle" in out and "✗" in out, f"bundle 必须明确拒写：{out}"
+    assert not (root_b / "mcp.json").exists(), "bundle 拒写时不该造出配置文件"
+    assert "agenthub:begin" in (root_b / "instr.md").read_text(encoding="utf-8"), \
+        "bundle agent 的引导仍要注入（MCP 不可自动写不影响引导）"
 
 
 def t_serve_subprocess(tmp):
@@ -346,6 +393,42 @@ def t_serve_subprocess(tmp):
         p2.wait(timeout=10)
 
 
+def t_serve_graceful_stop(tmp):
+    """C8 遗留：serve 的**优雅停止**覆盖。此前只断言 terminate 能停（硬杀）——优雅路径
+    （KeyboardInterrupt → 「已停止」 → finally 的 server_close）没覆盖，而硬杀时
+    server_close 不跑、端口占用残留到 OS 回收。R11 给 serve_forever 接了 SIGBREAK
+    （Windows 上 Ctrl+Break 与 Ctrl+C 同一条优雅路径，见 api.py 注释）。用
+    CREATE_NEW_PROCESS_GROUP + CTRL_BREAK_EVENT 复现，断言三件事：退出码 0、
+    打印「已停止」、**端口可被立即重用**（server_close 真跑了的直接证据）。"""
+    import brain
+    import signal
+    root = Path(tmp) / "hub_serve_stop"
+    root.mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(str(root))
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    port = _free_port()
+    p = subprocess.Popen([sys.executable, "-u", "cli.py", "--root", str(root), "serve", "--port", str(port)],
+                         stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
+                         text=True, encoding="utf-8", env=env, cwd=str(Path(__file__).parent),
+                         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP)
+    try:
+        assert _wait_http(f"http://127.0.0.1:{port}/") == 200, "服务未就绪"
+        p.send_signal(signal.CTRL_BREAK_EVENT)
+        rc = p.wait(timeout=15)
+        out = p.stdout.read()
+        assert rc == 0, f"优雅停止应退出码 0（收到 {rc}）：{out[-300:]}"
+        assert "已停止" in out, f"优雅停止必须打印「已停止」：{out[-300:]}"
+        s = socket.socket()   # 端口可立即重用 = server_close 真跑了
+        try:
+            s.bind(("127.0.0.1", port))
+        finally:
+            s.close()
+    finally:
+        if p.poll() is None:
+            p.terminate()
+            p.wait(timeout=10)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_cli_")
     print(f"临时目录：{tmp}\n")
@@ -359,8 +442,12 @@ def main():
          lambda: t_onboard_tmp_redirect(tmp))
     case("C8·onboard 拒绝路径（未知agent/坏JSON拒写且原样保留/无mcp段只注入引导）",
          lambda: t_onboard_rejections(tmp))
+    case("C8 遗留·onboard 多 layout（toml/yaml 端到端落对section+保留既有+备份/bundle 拒写但引导照注）",
+         lambda: t_onboard_multi_layout(tmp))
     case("C8·cmd_serve 真实子进程（端口绑定/仪表盘/只读默认写403/allow-write token闸门/可停止）",
          lambda: t_serve_subprocess(tmp))
+    case("C8 遗留·serve 优雅停止（SIGBREAK=Ctrl+Break 同优雅路径：退出码0/已停止/端口可重用）",
+         lambda: t_serve_graceful_stop(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
