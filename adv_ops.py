@@ -59,6 +59,24 @@ def main():
     check("py_compile 抓出语法错误", not r["ok"] and "bad.py" in "".join(r["detail"]), str(r["summary"]))
     check("py_compile 排除 __pycache__", all("__pycache__" not in d for d in r["detail"]), str(r["detail"]))
 
+    # ---- C4 出口：ghost_memory 检查项（干净✓ / 注入即抓✓ / 标取代后转绿✓）
+    ghost_root = str(tmp / "hub_ghost")   # 独立 tmp 根，别去碰真实大脑库
+    import brain as _brain
+    Path(ghost_root).mkdir(parents=True, exist_ok=True)
+    _brain.ensure_schema(ghost_root)
+    r0 = ops.run_check("ghost_memory", root=ghost_root)
+    check("ghost_memory 检查项已注册且干净库通过", r0["ok"], str(r0["summary"]))
+    _base = "系统代理端口实际是 7890 用于本地调试环境"
+    _a = _brain.add_memory(ghost_root, _base + " 甲", kind="fact", agent="zcode", project="p")
+    _b = _brain.add_memory(ghost_root, _base + " 乙", kind="fact", agent="zcode", project="p")
+    r1 = ops.run_check("ghost_memory", root=ghost_root)
+    check("ghost_memory 注入幽灵即抓（多版本共存未裁决）", (not r1["ok"]) and "幽灵" in r1["summary"],
+          str(r1["summary"]))
+    with _brain.db_conn(ghost_root) as _c:
+        _c.execute("UPDATE memories SET superseded_by=? WHERE id=?", (_b, _a))
+    r2 = ops.run_check("ghost_memory", root=ghost_root)
+    check("ghost_memory 标取代后转绿（已治理不再报）", r2["ok"], str(r2["summary"]))
+
     # ---- 守卫：回归套件必须全部登记进巡检（漏登记 = 静默少跑）
     try:
         t_regression_suite_coverage()
@@ -212,7 +230,13 @@ def main():
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
-    check("检查项共 23 个", len(ops.CHECKS) == 23, str(list(ops.CHECKS)))  # 14=+ponytail/coverage；22=+db/graph/date/stdout/schema/desc；23=+record_quality
+    # 计数改成「单调不降」口径，不再写死：写死数字已腐烂过多次（14→22→23→24），
+    # 每次加检查项都要改它，忘了就红——而红的含义还被稀释成噪音。
+    # 现在守的是**不倒退**：数量不得低于历史最高，且新项必须有非空描述。
+    _n = len(ops.CHECKS)
+    check(f"检查项数量未倒退（当前 {_n}，历史最高 23）", _n >= 23, f"只有 {_n} 个")
+    for k, v in ops.CHECKS.items():
+        check(f"检查项 {k} 描述非空", bool((v[0] or "").strip()))
 
     # ---- desc_quality 工具描述守卫（2026-10-17 R2）：双向验证——真源码必须过，注入四种坏写法必须挂
     dq = ops.run_check("desc_quality", "", str(tmp))

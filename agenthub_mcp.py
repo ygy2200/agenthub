@@ -39,7 +39,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.43"}  # v2.40.40=R1 annotations；v2.40.41=R2 schema 兼容守卫；v2.40.42=R3 只读能力工具留痕；本版=R4·C4 ghost memory 检测：新增 brain.ghost_memory_candidates()——挑出「内容高相似却互无 supersedes 关系」的记忆对（多版本共存且无人裁决 = 业界点名的幽灵记忆失效模式），只报不裁；已标取代的对自动排除
+SERVER_INFO = {"name": "agenthub", "version": "2.40.44"}  # v2.40.43=R4 ghost memory 检测（库函数）；本版=R5 补它的**对外出口**：新增 ops 检查项 ghost_memory（纳入 hub_ops_list / daily 巡检可跑），干净库✓ / 注入幽灵即抓并点名 / 标上 supersedes 后转绿；不新增 MCP 工具（避免把 69 工具数推高）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
