@@ -39,7 +39,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.39"}  # v2.40.29=R1 备份升级；…（中段见 git log）；v2.40.38=R10 收尾（哨兵 atexit + 路径可覆盖）；本版=R10 补缺：_init_emb_table 建表失败不再 `except: pass` 静默吞异常——真因（根目录不存在/库打不开）被吞后症状变成下游莫名其妙的 no such table: embeddings，极难排查；现保留 fail-open 不抛，但 stderr 留痕带真因
+SERVER_INFO = {"name": "agenthub", "version": "2.40.40"}  # v2.40.29–.39=上一轮十轮（备份/守卫下沉/性能/闸门/可观测/schema 版本/哨兵）；本版=R1（第二轮）·C1 补 MCP 工具 annotations：69 个工具此前**全部无 annotations**，host 会退回「每次都问用户」的保守默认；现按既有集合单一来源派生注入 readOnlyHint(35)/destructiveHint(9,=HIGH_BLAST)/idempotentHint(10)——确认 UX 交给 host 按规范决定，不再靠服务端改默认（上一轮 B3 走了弯路）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -2643,6 +2643,44 @@ for _t in TOOLS:
         _props.setdefault("confirm", {"type": "boolean",
                                       "description": "写操作显式确认；传 false 时返回 input_required 且不执行"
                                                      "（return-and-resume，服务端不阻塞不回调）"})
+
+
+# ---------------------------------------------------------------- MCP 工具 annotations（C1）
+# 为什么要补：MCP 规范里 host（客户端）靠 annotations 决定确认 UX——只读工具放行、
+# destructiveHint=true 的弹确认。**省略 annotations 会让 host 退回保守默认（每次都问），
+# 用户烦了就直接把 server 关掉**（menuagentic《Building MCP Servers in Practice》把它列为
+# 首个常见错误）。这也是上一轮 B3 的**正解**：确认该由 host 按元数据决定，而不是服务端
+# 自己造 AGENTHUB_STRICT_CONFIRM 开关去改默认（那会打断 6 个 agent 的日常写入）。
+# 只写 true 的项（false 是规范默认值，写出来只会平白增大 schema 体积）。
+# 三个集合都从既有单一来源派生，不新增第二份清单：
+#   readOnlyHint     = 不在 WRITE_TOOLS（不改数据）
+#   destructiveHint  = HIGH_BLAST_TOOLS（不可逆/批量/跨项目）
+#   idempotentHint   = 重复调用无额外影响（UPSERT/重建/覆盖写）
+IDEMPOTENT_TOOLS = {
+    "hub_skill_sync",       # UPSERT 技能索引，重跑覆盖不新增
+    "hub_graph",            # build 重写结构边（幂等派生数据）
+    "hub_flush_index",      # 重建语义索引
+    "hub_checkpoint",       # 同 task_id 覆盖保存
+    "hub_env_set",          # 同键覆盖
+    "hub_view",             # 关注/取关重复设置结果一致
+    "hub_skill_stats",      # 重算统计量
+    "hub_error_close",      # 重复关闭返回 0（已关无副作用）
+    "hub_export",           # 同参数重跑产出等价备份
+    "hub_sentry",           # 巡检+广播，重跑是刷新而非叠加
+}
+# openWorldHint（是否触达本机之外的开放世界）：本大脑是**本地优先、零依赖**，全部 69 个工具
+# 经核查均不访问外部网络（hub_asset_find 查的是本地台账，v2.40 后不再爬 accat.top），
+# 故**刻意一个都不标**——标了反而误导 host 去做额外的外网风险提示。
+for _t in TOOLS:
+    _ann = {}
+    if _t["name"] not in WRITE_TOOLS:
+        _ann["readOnlyHint"] = True
+    if _t["name"] in HIGH_BLAST_TOOLS:
+        _ann["destructiveHint"] = True
+    if _t["name"] in IDEMPOTENT_TOOLS:
+        _ann["idempotentHint"] = True
+    if _ann:
+        _t["annotations"] = _ann
 
 
 # ---------------------------------------------------------------- MCP 协议层

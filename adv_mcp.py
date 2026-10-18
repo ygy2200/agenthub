@@ -62,7 +62,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.39"
+    assert r["serverInfo"]["version"] == "2.40.40"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -1996,6 +1996,36 @@ def t_readme_changelog_sync(root):
     assert _re.fullmatch(r"\d+\.\d+\.\d+", ver), f"版本号格式异常：{ver!r}"
 
 
+def t_tool_annotations(root):
+    """C1 回归：MCP 工具 annotations（host 靠它决定确认 UX——省略会让 host 退回
+    「每次都问用户」的保守默认，用户烦了就把 server 关掉）。
+    验证：①非写工具必有 readOnlyHint；②HIGH_BLAST_TOOLS 全部带 destructiveHint；
+    ③只读与破坏性互斥、只读标幂等无意义；④派生集合关系成立（不出现第二份清单）；
+    ⑤端到端 tools/list 输出里确实带 annotations（不只存在于内存对象）。"""
+    for t in m.TOOLS:
+        ann = t.get("annotations") or {}
+        name = t["name"]
+        if name not in m.WRITE_TOOLS:
+            assert ann.get("readOnlyHint") is True, f"只读工具 {name} 缺 readOnlyHint"
+            assert not ann.get("destructiveHint"), f"{name} 只读却标破坏性"
+            assert not ann.get("idempotentHint"), f"{name} 是只读，标幂等无意义"
+        else:
+            assert not ann.get("readOnlyHint"), f"写工具 {name} 不该标 readOnlyHint"
+    for name in m.HIGH_BLAST_TOOLS:
+        ann = next(x for x in m.TOOLS if x["name"] == name).get("annotations") or {}
+        assert ann.get("destructiveHint") is True, f"高危工具 {name} 缺 destructiveHint"
+    assert m.HIGH_BLAST_TOOLS <= m.WRITE_TOOLS, "高危集合必须是写工具子集"
+    assert m.IDEMPOTENT_TOOLS <= m.WRITE_TOOLS, "幂等标注只应对写工具有意义"
+    tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
+    assert tools, "tools/list 返回空"
+    ro = [t for t in tools if t["name"] not in m.WRITE_TOOLS]
+    assert ro and all((t.get("annotations") or {}).get("readOnlyHint") for t in ro), \
+        "端到端输出里只读工具没带 readOnlyHint"
+    hb = [t for t in tools if t["name"] in m.HIGH_BLAST_TOOLS]
+    assert hb and all((t.get("annotations") or {}).get("destructiveHint") for t in hb), \
+        "端到端输出里高危工具没带 destructiveHint"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
@@ -2065,6 +2095,8 @@ def main():
          lambda: t_structured_log(fresh_hub(tmp, "hub_b8")))
     case("文档纪律·README 版本历史表必须含当前 SERVER_INFO 版本（防第三次 changelog 断档）",
          lambda: t_readme_changelog_sync(root))
+    case("C1·MCP 工具 annotations（只读放行/高危 destructiveHint/幂等/端到端输出带注解）",
+         lambda: t_tool_annotations(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
