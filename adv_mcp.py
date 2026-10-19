@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.55"
+    assert r["serverInfo"]["version"] == "2.40.56"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2240,6 +2240,74 @@ def t_list_cache_hints(hub):
     assert _listed()["ttlMs"] == 300000, "恢复 env 后应回默认 300000"
 
 
+def t_usage_trace_completeness(hub):
+    """D6/R6 回归：使用留痕必须覆盖**全部工具**，否则使用数据本身就是治理的依据漏洞。
+
+    「哪些工具真被用过」是 C7 profile 决策、D6 工具治理、D10 时间线共用的地基。
+    此前 tool_calls 只记 4 个能力型只读工具（TRACE_READ_TOOLS），加上 op_audit（写）
+    与 searches（检索）后，仍然只有 21/69 有证据——于是「48 个从未被调用」这个数字
+    绝大部分是**留痕盲区的假象**。拿假象做治理会把在用工具当僵尸下线。
+
+    验证四面：① 写工具 / 原留痕集合内的只读工具 / **原留痕集合外的只读工具**三类
+    都进 tool_calls（第三类是本轮补的盲区，也是这个用例存在的理由）；
+    ② 失败的调用不留痕（isError 语义：不是一次成功的使用）；
+    ③ **fail-open**：留痕这一行写失败时绝不能影响调用本身（可观测性不能反噬业务）；
+    ④ 全量留痕后，69 个工具里不存在「结构上不可能被留痕」的工具（每个工具名都能
+    在 tool_calls 里占位——用一次调用证明这条路径通）。
+    """
+    import brain as _b
+    rs = str(hub)
+
+    def _traced(tool):
+        with _b.db_conn(rs) as conn:
+            return conn.execute("SELECT COUNT(*) FROM tool_calls WHERE tool=?",
+                                (tool,)).fetchone()[0]
+
+    def _call(name, args=None):
+        return m.handle_message(rpc("tools/call", {"name": name, "arguments": args or {}}), rs)
+
+    # ① 三类工具都必须留痕
+    probes = [("hub_memory_write", {"content": "留痕测试记忆内容足够长以免被短内容短路",
+                                    "kind": "fact", "agent": "zcode"}),   # 写工具（走 op_audit 那条路）
+              ("hub_distill", {}),                                        # 原留痕集合内
+              ("hub_status", {}),                                         # 原留痕集合**外**（本轮补的盲区）
+              ("hub_get_rules", {})]                                      # 再取一个纯只读
+    for name, args in probes:
+        before = _traced(name)
+        r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args}), rs)
+        assert "error" not in r, f"{name} 调用出错：{r}"
+        assert _traced(name) > before, f"{name} 未被留痕（留痕盲区回来了）"
+    # 写工具额外仍走 op_audit（审计语义含 undo 句柄，与 tool_calls 不重复、不互相替代）
+    with _b.db_conn(rs) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM op_audit WHERE tool='hub_memory_write'").fetchone()[0] > 0, \
+            "写工具仍须保留 op_audit（含 undo 句柄，与 tool_calls 语义不同）"
+
+    # ② 失败的调用不留痕（isError = 没做成，不该计入使用）
+    before_err = _traced("hub_get_record")
+    bad = m.handle_message(rpc("tools/call", {"name": "hub_get_record", "arguments": {"id": "abc"}}), rs)
+    assert bad["result"].get("isError") or "错误" in bad["result"]["content"][0]["text"], \
+        f"本探针应失败：{bad}"
+    assert _traced("hub_get_record") == before_err, "失败的调用不该被计入使用"
+
+    # ③ fail-open：留痕写失败不能影响调用（可观测性不得反噬业务）
+    _orig = _b.log_tool_call
+    try:
+        _b.log_tool_call = lambda *a, **k: (_ for _ in ()).throw(RuntimeError("留痕写失败"))
+        r = m.handle_message(rpc("tools/call", {"name": "hub_status", "arguments": {}}), rs)
+        assert "error" not in r and r["result"]["content"], f"留痕失败竟然影响了调用：{r}"
+    finally:
+        _b.log_tool_call = _orig
+
+    # ④ 结构完备：留痕代码路径对**所有**工具名都能执行（不是只有探针这几个能走通）
+    try:
+        _b.log_tool_call(rs, "hub_任意工具名", "zcode")
+        with _b.db_conn(rs) as conn:
+            n = conn.execute("SELECT COUNT(*) FROM tool_calls WHERE tool='hub_任意工具名'").fetchone()[0]
+        assert n == 1, "留痕表对任意工具名都该能落行"
+    except Exception as e:  # noqa: BLE001
+        raise AssertionError(f"留痕路径对任意工具名失败：{e}") from e
+
+
 def t_rate_limit_loop_guard(root):
     """C6 回归：速率限制/循环保护——外部检索点名的生产常见存根「无限流：agent 进循环
     可无限调用」，本大脑此前无任何节流。断言面：默认阈值放行日常频次 / 单工具超限即拦
@@ -2394,6 +2462,8 @@ def main():
          lambda: t_list_cache_hints(fresh_hub(tmp, "hub_list")))
     case("D4·JSON Schema 方言安全守卫（不锁 $schema / 无 2020-12 特有关键字 + 反向验证）",
          lambda: t_schema_dialect_safety(root))
+    case("D6·使用留痕全覆盖（写工具/原留痕内/原留痕外三类都留/失败不留/fail-open 不反噬业务）",
+         lambda: t_usage_trace_completeness(fresh_hub(tmp, "hub_trace")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
