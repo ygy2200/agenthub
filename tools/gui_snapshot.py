@@ -157,7 +157,13 @@ def capture(update_shots: bool = False) -> dict:
                 "title": title,
                 "widget_count": len(widgets),
                 "class_count": dict(Counter(type(wd).__name__ for wd in widgets)),
-                "texts": sorted(set(texts))[:60],      # 只看去重后的静态文案
+            # **不要截断**：曾经用 `sorted(...)[:60]` 只留前 60 条，结果 z 开头的文案
+            # （如种子数据里的 agent 名 'zcode'）恰好排在最后——页面文案数在 60 附近
+            # 正常波动时，它就时有时无，守卫开始报假「文案消失」。（2026-10-19 实测：
+            # 连采两次都有 zcode，但比对报消失，就是因为基线那次刚好没被截断掉。）
+            # **排序后截断 = 让截断边界落在字母序上**，而字母序与「内容是否稳定」毫无
+            # 关系；要么不截断，要么按稳定性排序。这里文案量本就不大，直接不截断。
+            "texts": sorted(set(texts)),
                 "min_h": min([wd.minimumHeight() for wd in widgets] or [0]),
             }
             if update_shots:
