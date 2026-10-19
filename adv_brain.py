@@ -2243,6 +2243,127 @@ def t_gap_note(tmp):
         assert got == want, f"判定不符：{note[:40]!r} want={want} got={got}"
 
 
+def t_ghost_pair_demotion(tmp):
+    """R3 回归：检索结果内**同事实多版本**的对内降序（_demote_older_versions）。
+
+    治的问题：ghost 对（高相似、无人标 supersedes 的两版）被一起返回时，BM25/LIKE
+    分数不看时间——旧版常排在新版之前（stale_eval ③ 基线 50%），模型从混合物里综合。
+    外部研究（llms3）：生产最常见记忆故障不是「忘了」是「记住太多版本」。
+
+    为什么不是全局 recency 项：P4.4 三档实测 β>0 全局掉分（0.878→0.842）——
+    新旧不该全局影响排序，「同一事实的两版谁在前」才该管。所以本功能的正确性判据
+    不是「旧的一定靠后」，而是**「只动对内顺序，其余相对位置不变」**。
+
+    验证面：
+    ① 置信裁决（版本分胜负）→ 旧版标 `_older_version_of` 且沉到新版之后；
+    ② **只动对内顺序**：与对子无关的行，相对顺序逐一不变（防借尸还魂成全局 recency）；
+    ③ 不置信（版本+质量全打平）→ 不动不标（只标不裁立场，R5 的降级路径）；
+    ④ 三版链 A<B<C：最新版升顶、两块旧版沉底，链式也成立；
+    ⑤ 纯函数不写库（行集不变，只多标注键）；
+    ⑥ 与 _fold_near_dupes 的刻度边界：≥0.85 的仍先被折叠（折叠优先），
+       0.55–0.85 之间才走降序——两个刻度不串。"""
+    root = str(Path(tmp) / "hub_demote")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+
+    def _mk(content, **kw):
+        return int(brain.add_memory(root, content, kind="fact", agent="zcode",
+                                    project="降序测试", **kw))
+
+    def _set(mid, **cols):
+        cols.setdefault("updated", brain._now())
+        with brain.db_conn(root) as conn:
+            conn.execute("UPDATE memories SET " + ", ".join(f"{k}=?" for k in cols)
+                         + " WHERE id=?", list(cols.values()) + [mid])
+
+    # 数据口径（实测 Jaccard 矩阵定稿，防「太相似被折叠/太不像不成对」两坑）：
+    #   ghost 对 0.733（≥0.55 成对、<0.85 不被折）；tie 对 0.684；三版链两两 0.765；
+    #   陪衬互 <0.4 且与对子 <0.41——降序只许发生在对子内部。
+    old_v, new_v = "环境事实：代理端口是 7890（本机配置 旧记录）", \
+                   "环境事实：代理端口是 7891（本机配置 新记录）"
+    t_old, t_new = "2026-01-01T00:00:00", "2026-06-01T00:00:00"
+    FILLERS = ["代理端口 排查笔记：三月一次超时故障的根因定位过程记录",
+               "代理端口 操作手册：证书轮换与端口转发的配合方式说明",
+               "代理端口 复盘归档：上半年网络层变更的汇总与结论"]
+
+    # ② 真对照 hub：只有陪衬没有对子——降序后陪衬相对顺序必须与它一致
+    root_c = str(Path(tmp) / "hub_demote_ctrl")
+    Path(root_c).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root_c)
+    for t in FILLERS:
+        brain.add_memory(root_c, t, kind="fact", agent="zcode", project="降序测试")
+    order_ctrl = [r["id"] for r in brain.search_memories(root_c, "代理端口", "", 20,
+                                                         count_hits=False)]
+    assert len(order_ctrl) == 3, f"对照 hub 构造失败：{order_ctrl}"
+    # 对照 hub 的 id 按创建序即 FILLERS 下标（id 1,2,3 ← FILLERS[0,1,2]）
+    ctrl_idx = [cid - 1 for cid in order_ctrl]
+
+    # ① 主 hub：一对 ghost + 同内容陪衬
+    old = _mk(old_v); _set(old, created=t_old, updated=t_old)
+    new = _mk(new_v); _set(new, created=t_new, updated=t_new)
+    f_ids = [_mk(t) for t in FILLERS]
+    rows = brain.search_memories(root, "代理端口", "", 20, count_hits=False)
+    ids = [r["id"] for r in rows]
+    assert new in ids and old in ids, f"ghost 对没都召回：{ids}"
+    i_new, i_old = ids.index(new), ids.index(old)
+    assert i_new < i_old, f"旧版仍排在新版之前（R3 未生效）：new@{i_new} old@{i_old}"
+    row_old = next(r for r in rows if r["id"] == old)
+    assert row_old.get("_older_version_of") == new, f"旧版缺现行版标注：{row_old.get('_older_version_of')}"
+    row_new = next(r for r in rows if r["id"] == new)
+    assert "_older_version_of" not in row_new, "新版不该被标旧"
+
+    # ② 只动对内顺序：陪衬相对顺序与「没有 ghost 对时」逐一一致（换算成 FILLERS 下标比）
+    order_with = [f_ids.index(i) for i in ids if i in f_ids]
+    assert order_with == ctrl_idx, f"陪衬相对顺序被扰动（变成了全局重排）：{order_with} vs {ctrl_idx}"
+    # 函数级再证：非对子行稳定、不写库（行集只许多标注键）
+    snap = [(r["id"], r["content"][:20]) for r in rows]
+    out = brain._demote_older_versions([dict(r) for r in rows])
+    assert [(r["id"], r["content"][:20]) for r in out] == snap, "行集被改（只许排序+标注）"
+    assert [f_ids.index(r["id"]) for r in out if r["id"] in f_ids] == ctrl_idx, \
+        "函数级也对陪衬顺序有副作用"
+
+    # ③ 不置信路径：版本+质量全打平 → 不动不标
+    tie_a = _mk("环境事实：备份目录是 D:/backup-old（本机配置 甲种表述）")
+    _set(tie_a, created=t_old, updated=t_old)
+    tie_b = _mk("环境事实：备份目录是 D:/backup-old（本机配置 丙种写法）")
+    _set(tie_b, created=t_old, updated=t_old)
+    rows_t = brain.search_memories(root, "备份目录", "", 30, count_hits=False)
+    ids_t = [r["id"] for r in rows_t]
+    assert tie_a in ids_t and tie_b in ids_t, f"tie 对没都召回（可能被折叠）：{ids_t}"
+    for r in rows_t:
+        if r["id"] in (tie_a, tie_b):
+            assert "_older_version_of" not in r, f"全打平不该被降序：{r['id']}"
+
+    # ④ 三版链：A 最旧、C 最新，两两 0.765 成对
+    chain_a = _mk("环境事实：服务端口是 8787（本机配置 初版 三月写入）")
+    _set(chain_a, created="2026-02-01T00:00:00", updated="2026-02-01T00:00:00")
+    chain_b = _mk("环境事实：服务端口是 8787（本机配置 修订 五月写入）")
+    _set(chain_b, created="2026-04-01T00:00:00", updated="2026-04-01T00:00:00")
+    chain_c = _mk("环境事实：服务端口是 8787（本机配置 现行 八月写入）")
+    _set(chain_c, created="2026-08-01T00:00:00", updated="2026-08-01T00:00:00")
+    rows_c = brain.search_memories(root, "服务端口", "", 30, count_hits=False)
+    ids_c = [r["id"] for r in rows_c]
+    assert {chain_a, chain_b, chain_c} <= set(ids_c), f"三版没都召回：{ids_c}"
+    assert ids_c.index(chain_c) < ids_c.index(chain_b) < ids_c.index(chain_a), \
+        f"三版链没排对：{ids_c}"
+
+    # ⑥ 折叠优先 + 版本感知留存：≥0.85 的几乎一模一样，先被 _fold_near_dupes 折掉；
+    #    且折的是同事实两版时留**新的**（原实现按分留，实测把旧版当现行版留下）
+    near1 = _mk("代理端口是 7890 这是本机长期生效的环境事实")
+    _set(near1, created=t_old, updated=t_old)
+    near2 = _mk("代理端口是 7890 这是本机长期生效的环境事实。")
+    _set(near2, created=t_new, updated=t_new)
+    rows_n = brain.search_memories(root, "代理端口是 7890", "", 30, count_hits=False)
+    got = {r["id"] for r in rows_n if r["id"] in (near1, near2)}
+    assert len(got) == 1, f"0.85 以上的该被折叠成 1 条，实际 {len(got)} 条"
+    kept = next(r for r in rows_n if r["id"] in got)
+    assert kept["id"] == near2, f"同事实两版折叠竟留下旧版：kept={kept['id']} want={near2}"
+    assert kept.get("_folded_older") == near1, f"折叠缺旧版回溯：{kept.get('_folded_older')}"
+    assert kept.get("_dup_n") == 1, f"_dup_n 计数错：{kept.get('_dup_n')}"
+    assert not any(r.get("_older_version_of") for r in rows_n if r["id"] in got), \
+        "折叠场景不该再出降序标注（两个刻度串了）"
+
+
 def t_usage_timeline(tmp):
     """D10/R4：四源统一使用时间线 + 窗口聚合。
     覆盖：合并倒序 / source 标记 / agent 与 tool 过滤（tool 过滤时 journal 不计——
@@ -3077,6 +3198,7 @@ def main():
     case("X3+X4 导出备份与时间机器（备份含WAL不丢数据/变更史三源合并）", lambda: t_export_history(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     case("D10 使用时间线（四源合并倒序/agent·tool 过滤口径/days 窗口/零命中与重复查询/last_seen 活校验/只读不改数）", lambda: t_usage_timeline(tmp))
+    case("R3 ghost 对内降序（旧版沉底+标注/只动对内顺序/不置信不动/三版链/不写库/折叠优先刻度不串）", lambda: t_ghost_pair_demotion(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

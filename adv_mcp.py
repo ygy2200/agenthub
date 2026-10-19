@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.60"
+    assert r["serverInfo"]["version"] == "2.40.61"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2469,6 +2469,45 @@ def t_usage_timeline_surface(hub):
     assert before == after, f"只读工具写了非 tool_calls 表：{before} → {after}"
 
 
+def t_ghost_demotion_surface(hub):
+    """R3 回归：同事实多版本处置在 MCP 面的**可见性**——brain 层排序对了还不够，
+    读的人（LLM）必须能从文案看出「这条是旧版/那条折了旧版」，否则降序只是隐形重排。
+
+    覆盖：① ghost 对（0.55–0.85）→ 输出里旧版行带「旧版，现行版为 #N」、新版行不带；
+    ② 近重复（≥0.85 折叠）→ 留存行带「已折叠旧版 #N」；
+    ③ 标注不破坏既有行格式（#id/[kind]/内容仍在，isError=False）。"""
+    import brain as _b
+    rs = str(hub)
+    t_old, t_new = "2026-01-01T00:00:00", "2026-06-01T00:00:00"
+
+    def _mk(content, ts):
+        mid = int(_b.add_memory(rs, content, kind="fact", agent="zcode", project="p"))
+        with _b.db_conn(rs) as conn:
+            conn.execute("UPDATE memories SET created=?, updated=? WHERE id=?", (ts, ts, mid))
+        return mid
+
+    old = _mk("环境事实：代理端口是 7890（本机配置 旧记录）", t_old)
+    new = _mk("环境事实：代理端口是 7891（本机配置 新记录）", t_new)
+    r = m.handle_message(rpc("tools/call", {"name": "hub_memory_read",
+                                            "arguments": {"query": "代理端口"}}), rs)["result"]
+    assert not r.get("isError"), r["content"][0]["text"][:200]
+    text = r["content"][0]["text"]
+    line_old = next(l for l in text.splitlines() if f"#{old} " in l)
+    line_new = next(l for l in text.splitlines() if f"#{new} " in l)
+    assert "旧版" in line_old and f"现行版为 #{new}" in line_old, f"旧版行缺标注：{line_old}"
+    assert "旧版" not in line_new, f"新版行被误标：{line_new}"
+
+    # ② 近重复折叠的可见性
+    n1 = _mk("代理端口是 7890 这是本机长期生效的环境事实", t_old)
+    n2 = _mk("代理端口是 7890 这是本机长期生效的环境事实。", t_new)
+    r2 = m.handle_message(rpc("tools/call", {"name": "hub_memory_read",
+                                             "arguments": {"query": "代理端口是 7890"}}), rs)["result"]
+    text2 = r2["content"][0]["text"]
+    kept_line = next(l for l in text2.splitlines() if f"#{n2} " in l)
+    assert f"已折叠旧版 #{n1}" in kept_line, f"折叠缺回溯标注：{kept_line}"
+    assert f"#{n1} " not in text2.replace(kept_line, ""), "被折掉的旧版不该单独成行"
+
+
 def t_error_taxonomy(root):
     """D8/R8 回归：**错误分类学**——三桶（transient / permanent / ambiguous）。
 
@@ -2693,6 +2732,8 @@ def main():
          lambda: t_memory_supersede_exit(fresh_hub(tmp, "hub_supersede")))
     case("D10·hub_usage_timeline 工具面（worker切片/只读契约/两视图/未知view回落/整数守卫/过滤透传/只读不改数）",
          lambda: t_usage_timeline_surface(fresh_hub(tmp, "hub_usage_surface")))
+    case("R3·多版本处置可见性（ghost对旧版行标注现行版/近重复折叠留新版+回溯/行格式不破）",
+         lambda: t_ghost_demotion_surface(fresh_hub(tmp, "hub_demote_surface")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

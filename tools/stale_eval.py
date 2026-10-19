@@ -23,6 +23,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import sys
 import tempfile
 from pathlib import Path
@@ -65,18 +66,28 @@ STABLE = [
 
 def build_eval_hub() -> tuple[str, dict]:
     """合成标注集：10 组三形态（superseded 对 / ghost 对 / 静默过期单条）+ 6 条稳定对照。
-    返回 (root, 标注信息)。用独立的 tmp 根，绝不碰真实库。"""
+    返回 (root, 标注信息)。用独立的 tmp 根，绝不碰真实库。
+
+    旧版必须**回拨时间戳**（2026-10-19 R3 修）：add_memory 连续两写只差同一秒，
+    版本信号（updated→created）完全打平 → _adjudicate 走「完全打平」分支返回
+    confident=False → 按设计不降序，③ recency 基线被人为钉在 50%，测的不是系统
+    是合成数据的失真。真实的版本共存必然有时间差（事实是后来才变的），
+    旧版回拨 30 天才是被测现象的忠实建模。"""
     tmp = Path(tempfile.mkdtemp(prefix="stale_eval_")) / "hub"
     tmp.mkdir(parents=True)
     brain.init_db(str(tmp))
     root = str(tmp)
     annotation = {"superseded": [], "ghost": [], "silent": []}
+    stale_ts = (datetime.datetime.now() - datetime.timedelta(days=30)).isoformat(timespec="seconds")
     for i, (topic, old_v, new_v) in enumerate(TOPICS):
         # 三形态按 i 轮转：i%3==0 superseded / 1 ghost / 2 silent
         form = ("superseded", "ghost", "silent")[i % 3]
         old_txt = f"环境事实：{topic}是 {old_v}（{topic} 本机配置）"
         old_id = brain.add_memory(root, old_txt, kind="fact", agent="zcode",
                                   project="陈旧评估", tags=topic)
+        with brain.db_conn(root) as conn:  # 旧版回拨：版本信号可分辨（见 docstring）
+            conn.execute("UPDATE memories SET created=?, updated=? WHERE id=?",
+                         (stale_ts, stale_ts, old_id))
         if form in ("superseded", "ghost"):
             new_id = brain.add_memory(root, f"环境事实：{topic}是 {new_v}（{topic} 本机配置）",
                                       kind="fact", agent="zcode", project="陈旧评估", tags=topic)

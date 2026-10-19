@@ -2996,6 +2996,84 @@ _FOLD_THRESHOLD = 0.85  # 检索结果内近重复折叠阈值（bigram Jaccard�
 # 业界定位（theneuralbase「Conflicting memories」）：**冲突检测是检索后处理步骤——
 # 取回之后、进上下文之前**，而不是等 LLM 自己发现（那样行为不确定且不可审计）。
 _CONFLICT_SIM = 0.55  # 检索结果矛盾检测的**包含度**阈值（见 _mark_conflicts 为何不用 Jaccard）
+# 同事实多版本对内降序的相似度阈值：与 ghost 检测（similar_memories/ghost_memory_candidates）
+# 同口径同值——「疑似同一事实的两版」在这套系统里已经有公认刻度，不另立一套。
+_GHOST_SIM = 0.55
+
+
+def _demote_older_versions(rows: list, threshold: float = 0.0) -> list:
+    """R3：检索结果内**同事实多版本**的对内降序（旧版按「世代」沉底 + 标注指向现行版）。
+
+    治什么：ghost 对（内容高度相似、又没人标 supersedes 的两版）会被一起返回，而
+    BM25/LIKE 分数**不看时间**——旧版常排在较新版之前，stale_eval ③ recency 只有
+    50%，模型从混合物里综合出四不像。业界给这个失效模式起了名字（llms3）：
+    「记住太多版本」比「忘了」更常见。
+
+    为什么不是全局 recency 项：P4.4 三档实测 β>0 全局掉分（0.878→0.842）——
+    新旧不该全局影响排序，「同一事实的多版本谁在前」才该管。本函数**只动版本间顺序**：
+    非对子行的相对位置逐一不变（这是回归里双 hub 对照死守的判据）。
+
+    为什么是降序而不是折叠：fold 的门槛是 0.85（「几乎一模一样」）；这里是 0.55
+    （「疑似同一事实」），误判代价不对称——宁可双亮相 + 标注指向，不可替用户藏起来。
+    `_adjudicate` 不给置信结论（版本打平 / 质量冲突）时**不动**：那是「只标不裁」的
+    既有立场（R5），系统不假装知道旧的那条就一定错。
+
+    世代数（为什么不是简单的「沉底」）：三版链 A<B<C 时 B 既是 C 的旧版、又是 A 的
+    新版——二值标记会把 A、B 一起沉底且保持原相对顺序，A 仍可能排在 B 前（链式
+    不传递）。改为沿「A 旧于 B」边取**最长路径**：C 世代 0、B 世代 1、A 世代 2，
+    按 (世代, 原下标) 稳定排序——同世代内仍保持原相对顺序，跨世代才重排。
+    判定环理论上存在（质量 tiebreak 的石头剪刀布），迭代次数按行数封顶，不会打转。
+
+    实现口径与 `_fold_near_dupes` 完全同源（同一 `_tokens`、同一 Jaccard、同一上界
+    短路），只是阈值与动作不同——两套相似度刻度是这个库里最容易漂的东西，能复用就复用。
+    """
+    thr = threshold or _GHOST_SIM
+    if thr <= 0 or len(rows) < 2:
+        return rows
+    toks = [(i, _tokens(r.get("content") or r.get("title") or "")) for i, r in enumerate(rows)]
+    edges: list = []          # (旧 id, 新 id)——旧的那条输给新的一条
+    for i in range(len(rows)):
+        ta = toks[i][1]
+        if not ta:
+            continue
+        for j in range(i + 1, len(rows)):
+            tb = toks[j][1]
+            if not tb:
+                continue
+            sa, sb = len(ta), len(tb)
+            lo, hi = (sa, sb) if sa < sb else (sb, sa)
+            if lo / hi < thr:      # 上界短路（同 similar_memories 的 B5）
+                continue
+            inter = len(ta & tb)
+            sim = inter / (sa + sb - inter)
+            if sim < thr:
+                continue
+            adj = _adjudicate(rows[i], rows[j], _MEM_VERS, _MEM_QUALS)
+            if not adj.get("confident"):
+                continue          # 只标不裁立场：不置信就不动顺序
+            keep_id, drop_id = adj["keep"], adj["drop"]
+            if keep_id == drop_id:
+                continue
+            edges.append((drop_id, keep_id))
+            for k in (i, j):      # 旧的那条：标注指向现行版（行内字典可变，不动数据）
+                if rows[k]["id"] == drop_id:
+                    rows[k]["_older_version_of"] = keep_id
+                    break
+    if not edges:
+        return rows
+    # 世代数：沿「旧于」边的最长路径（链式 A<B<C → 0/1/2）；环由迭代封顶兜住
+    gen = {r["id"]: 0 for r in rows}
+    for _ in range(len(rows)):
+        changed = False
+        for loser, winner in edges:
+            if gen[loser] < gen[winner] + 1:
+                gen[loser] = gen[winner] + 1
+                changed = True
+        if not changed:
+            break
+    # 稳定排序：世代升序，同世代保持原相对顺序（Python sort 稳定，这是选它的理由）
+    order = sorted(range(len(rows)), key=lambda k: (gen[rows[k]["id"]], k))
+    return [rows[k] for k in order]
 
 
 def _mark_conflicts(rows: list, threshold: float = 0.0) -> list:
@@ -3035,7 +3113,7 @@ def _mark_conflicts(rows: list, threshold: float = 0.0) -> list:
 
 
 def _fold_near_dupes(rows: list, threshold: float = 0.0) -> list:
-    """检索结果内近重复折叠：同一件事的多条只保留分最高的那条。
+    """检索结果内近重复折叠：同一件事的多条只保留一条。
 
     为什么需要：库里必然有近似重复（M7 整合提案就是实证），一起返回时同一个事实在上下文里
     占好几个位置，既费 token 又把真相关的条目挤出 limit。业界混合检索流水线把它列为
@@ -3044,7 +3122,13 @@ def _fold_near_dupes(rows: list, threshold: float = 0.0) -> list:
     折叠=不返回，但在保留行上留 `_dup_n`（折了几条）——信息不丢，事后可查。
     阈值取高（0.85）：只折"几乎一模一样"的。宁可漏折，不可误折——
     误折会让 agent 少看到一条真不同的事实，这比多看一条重复贵得多。
-    """
+
+    R3 增量（版本感知留存）：折的是**同一事实的两版**时，留**新的**那版，不是留分数高的。
+    原实现按融合分留——而近重复文本对同一查询的词法命中几乎一致，分数先后基本任意，
+    实测把旧版当现行版留在上下文里（stale_eval「同步间隔」对：sim=0.88 被折叠，
+    留下的竟是 30 天前的旧值）。版本信号不可分辨时（同秒双写、质量全同）维持原行为，
+    与 _demote_older_versions 的「不置信不动」是同一条纪律。保留行带 `_folded_older`
+    （被折掉的旧版 id）——折叠也要可追溯，不能只剩一个计数。"""
     thr = threshold or _FOLD_THRESHOLD
     if thr <= 0 or len(rows) < 2:
         return rows
@@ -3061,7 +3145,18 @@ def _fold_near_dupes(rows: list, threshold: float = 0.0) -> list:
                 hit = i
                 break
         if hit >= 0:
-            kept[hit]["_dup_n"] = int(kept[hit].get("_dup_n") or 0) + 1
+            k = kept[hit]
+            dup_n = int(k.get("_dup_n") or 0) + 1
+            adj = (_adjudicate(r, k, _MEM_VERS, _MEM_QUALS)
+                   if (r.get("id") and k.get("id")) else {})
+            if adj.get("confident") and adj.get("drop") == k.get("id"):
+                # 留新退旧：新行顶替留存位（_dup_n 结转——折掉的都是同一事实的其余版本）
+                r["_dup_n"] = dup_n
+                r["_folded_older"] = k.get("id")
+                kept[hit] = r
+                kept_toks[hit] = t
+            else:
+                k["_dup_n"] = dup_n
             continue
         kept.append(r)
         kept_toks.append(t)
@@ -3645,6 +3740,7 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
     if rows:
         rows = _fold_near_dupes(rows)   # 折叠在计唤起之前：被折掉的没进上下文，不该算唤起
         rows = _mark_conflicts(rows)    # 矛盾标记（业界：取回后、进上下文前检测，别让 LLM 自己发现）
+        rows = _demote_older_versions(rows)  # R3：同事实多版本对内降序（旧版沉底+标注，只动对内顺序）
     if rows and words and count_hits:
         now = _now()
         _bump_access(root, [r["id"] for r in rows], now)
