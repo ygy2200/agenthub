@@ -2742,6 +2742,105 @@ def t_ghost_record_candidates(tmp):
     assert brain.ghost_record_candidates(root, threshold=1.5, limit=20) == []
 
 
+def t_ghost_adjudication(tmp):
+    """D5/R5 回归：**确定性裁决建议**——LLM 做语义识别、确定性代码做选择的落地。
+
+    研究依据（ranksquire，2026-05）：「Don't Ask the LLM to Track Freshness」——让模型
+    判断「哪条最新」是错的分工（模型看得见语义、看不见时钟），应该让模型识别「这几条
+    在说同一件事」、让代码做选择。专家系统 revival 那篇给的数据：单跳 67.2→78.0。
+
+    本库的分工已经是这样（similar_* 用词法相似度做识别），缺的是「选谁」这一步——
+    D5 之前只报不裁且不给建议。本用例验证建议的**确定性与诚实度**：
+    ① 较新的那条被建议为保留（recency）；② 版本信号完全打平时用质量信号 tiebreak；
+    ③ **质量与版本冲突时降级**（旧的那条更可信 → confident=False 且说明冲突点，
+       不假装知道真相）；④ 完全打平 → 回退 id 序且标不确定；
+    ⑤ **确定性**：输入对调顺序、重复调用，结果必须完全一致（这条要是飘了，
+       那它就变成了「让模型投票」的第二来源）；
+    ⑥ ghost_*_candidates 每对都带 suggestion 且不写任何数据（只报不裁立场不变）。"""
+    root = str(Path(tmp) / "hub_adjudicate")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+
+    def _mk(content, **kw):
+        """写一条记忆，返回其 **id**（不是 row——后续 UPDATE 要按 id 定位）。"""
+        return int(brain.add_memory(root, content, kind="fact", agent="zcode",
+                                    project="裁决测试", **kw))
+
+    def _set(mid, **cols):
+        cols.setdefault("updated", brain._now())
+        with brain.db_conn(root) as conn:
+            conn.execute("UPDATE memories SET " + ", ".join(f"{k}=?" for k in cols)
+                         + " WHERE id=?", list(cols.values()) + [mid])
+
+    body = "代理端口是 7890 这是本机长期生效的环境事实 不要写成别的值"
+    base = dict(created="2026-01-01T00:00:00", updated="2026-01-01T00:00:00")
+    # ① recency：两条质量相同、B 更新 → 留 B
+    a = _mk(body); _set(a, **base)
+    b = _mk(body); _set(b, created="2026-06-01T00:00:00", updated="2026-06-01T00:00:00")
+    s = brain._adjudicate(_reload(root, a), _reload(root, b), brain._MEM_VERS, brain._MEM_QUALS)
+    assert s["keep"] == b and s["drop"] == a, f"recency 规则错了：{s}"
+    assert s["basis"] == "recency" and s["confident"], f"该自信时却降级了：{s}"
+    # ⑤ 确定性：对调参数顺序结果必须镜像一致（keep/drop 不变，rule/basis 不变）
+    s2 = brain._adjudicate(_reload(root, b), _reload(root, a), brain._MEM_VERS, brain._MEM_QUALS)
+    assert (s2["keep"], s2["drop"]) == (s["keep"], s["drop"]), f"参数对调后结论变了：{s} vs {s2}"
+    assert s2["basis"] == s["basis"] and s2["rule"] == s["rule"], f"依据文案不稳：{s} vs {s2}"
+
+    # ② 版本打平 → 质量 tiebreak（confidence 高者胜）
+    c = _mk(body + " 变体甲")
+    _set(c, created="2026-03-01T00:00:00", updated="2026-03-01T00:00:00", confidence=0.9)
+    d = _mk(body + " 变体乙")
+    _set(d, created="2026-03-01T00:00:00", updated="2026-03-01T00:00:00", confidence=0.2)
+    s3 = brain._adjudicate(_reload(root, c), _reload(root, d), brain._MEM_VERS, brain._MEM_QUALS)
+    assert s3["keep"] == c and s3["basis"] == "tiebreak-quality", f"质量 tiebreak 错了：{s3}"
+    assert s3["rule"] == "置信度", f"tiebreak 依据标签应落到具体列：{s3}"
+
+    # ③ 冲突降级：旧的那条有完整证据链、新的没有 → 仍按 recency 建议但标不确定
+    e = _mk(body + " 有证据的旧版")
+    _set(e, created="2026-02-01T00:00:00", updated="2026-02-01T00:00:00",
+         confidence=0.95, evidence="r:ab6807a")
+    f = _mk(body + " 无证据的草稿")
+    _set(f, created="2026-09-01T00:00:00", updated="2026-09-01T00:00:00", confidence=0.1)
+    s4 = brain._adjudicate(_reload(root, e), _reload(root, f), brain._MEM_VERS, brain._MEM_QUALS)
+    assert s4["keep"] == f and s4["drop"] == e, f"recency 应压过质量信号（建议）：{s4}"
+    assert not s4["confident"], f"质量与版本冲突时必须降级为不确定：{s4}"
+    assert "自信" not in s4["note"] and s4["note"], f"降级要给出可行动的说明：{s4}"
+
+    # ④ 完全打平 → 回退 id 序且不自信
+    g = _mk(body + " 完全同质子")
+    h = _mk(body + " 完全同质子")
+    _set(g, created="2026-04-01T00:00:00", updated="2026-04-01T00:00:00")
+    _set(h, created="2026-04-01T00:00:00", updated="2026-04-01T00:00:00")
+    s5 = brain._adjudicate(_reload(root, g), _reload(root, h), brain._MEM_VERS, brain._MEM_QUALS)
+    assert s5["basis"] == "tiebreak-id" and not s5["confident"], f"完全打平该标不确定：{s5}"
+    assert s5["keep"] == max(g, h), f"打平时应回退 id 序（留大 id）：{s5}"
+
+    # ⑥ ghost_*_candidates 带 suggestion 且不改数据（只报不裁）
+    before = _snapshot(root)
+    pairs = brain.ghost_memory_candidates(root, threshold=0.55, limit=50)
+    assert pairs, "本用例造了多组高相似对，应当检出"
+    for p in pairs:
+        sg = p.get("suggestion") or {}
+        assert sg.get("keep") in (p["a"], p["b"]), f"建议必须落在对内的两条上：{p}"
+        assert sg.get("drop") in (p["a"], p["b"]) and sg["drop"] != sg["keep"], f"keep/drop 非法：{p}"
+        assert sg.get("rule"), f"必须说明依据（不透明的建议没价值）：{p}"
+    assert _snapshot(root) == before, "ghost 检测不得写任何数据（只报不裁立场）"
+
+
+def _reload(root, mid):
+    with brain.db_conn(root) as conn:
+        return dict(conn.execute(
+            "SELECT id, created, updated, use_count, pinned, confidence, evidence, maturity "
+            "FROM memories WHERE id=?", (int(mid),)).fetchone())
+
+
+def _snapshot(root):
+    """记忆表的轻量指纹（用于断言「只读操作没有副作用」）。"""
+    with brain.db_conn(root) as conn:
+        rows = conn.execute(
+            "SELECT id, updated, superseded_by, use_count, status FROM memories ORDER BY id").fetchall()
+    return [tuple(r) for r in rows]
+
+
 def t_intercept_hot_path_cached(tmp):
     """B10 回归：写入热路径（log_work → similar_lessons_for）用独立 token 缓存提速。
     此前它每次都对全库 lesson/fact 重新分词——每写一条记录就重算几百条记忆，
@@ -2849,6 +2948,8 @@ def main():
          lambda: t_ghost_memory_candidates(tmp))
     case("C4 遗留·ghost 记录检测（未标取代必报/已标必排除/机器模板两类不报/剥模板头）",
          lambda: t_ghost_record_candidates(tmp))
+    case("D5·确定性裁决建议（recency/质量tiebreak/冲突降级/完全打平/对调不变/只报不裁不写库）",
+         lambda: t_ghost_adjudication(tmp))
     case("B10·写入热路径拦截扫描复用 token 缓存（结果等价/缓存生效/短内容短路）",
          lambda: t_intercept_hot_path_cached(tmp))
     case("补缺·_init_emb_table 建表失败不再静默（fail-open 保留 + stderr 带真因留痕）",

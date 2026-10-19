@@ -99,7 +99,7 @@ def _top_ids(root: str, query: str, limit: int = 5) -> list:
 
 def measure(root: str, ann: dict) -> dict:
     res = {"leak": [], "mixture": [], "recency_ok": 0, "recency_total": 0,
-           "silent_flagged": 0, "silent_total": 0}
+           "silent_flagged": 0, "silent_total": 0, "sugg_ok": 0, "sugg_total": 0}
     # ① supersede 泄漏：查询命中旧版（已被取代）即泄漏
     for p in ann["superseded"]:
         ids = _top_ids(root, p["topic"])
@@ -123,6 +123,17 @@ def measure(root: str, ann: dict) -> dict:
             row = conn.execute("SELECT valid_until FROM memories WHERE id=?", (p["old"],)).fetchone()
             if row and (row["valid_until"] or "") and row["valid_until"] <= brain._now()[:10]:
                 res["silent_flagged"] += 1
+    # ⑤ 裁决建议正确率（D5）：ghost 对必须被检出，且建议留「较新的那条」。
+    #    这一步是确定性计算的，所以基线应当是 **100%**（不是统计数字）——任何非 100%
+    #    都意味着 _adjudicate 的规则或其信号接线错了，跟数据分布无关。
+    sugg_map = {frozenset((p["a"], p["b"])): (p.get("suggestion") or {})
+                for p in brain.ghost_memory_candidates(root, threshold=0.55, limit=100)}
+    for p in ann["ghost"]:
+        s = sugg_map.get(frozenset((p["old"], p["new"])))
+        if s:
+            res["sugg_total"] += 1
+            if s.get("keep") == p["new"] and s.get("drop") == p["old"]:
+                res["sugg_ok"] += 1
     return res
 
 
@@ -136,6 +147,7 @@ def main() -> int:
     mix_rate = len(res["mixture"]) / max(1, n_ghost)
     rec_rate = res["recency_ok"] / max(1, res["recency_total"])
     flag_rate = res["silent_flagged"] / max(1, res["silent_total"])
+    sugg_rate = res["sugg_ok"] / max(1, res["sugg_total"])
     print("=== 过期值服务率（stale-value serving rate）===")
     print(f"① supersede 泄漏率：{len(res['leak'])}/{n_sup} = {leak_rate:.0%}"
           f"（硬不变量，期望 0%）" + ("" if not res["leak"] else f"  ← 泄漏：{res['leak']}"))
@@ -145,10 +157,12 @@ def main() -> int:
           "（ghost 对里较新版排前——D5 确定性裁决的基线）")
     print(f"④ 静默过期可检出率：{res['silent_flagged']}/{res['silent_total']} = {flag_rate:.0%}"
           "（无后继旧事实被陈旧信号标出的比例——期望被标，现状预计 0%：这正是待补的能力）")
+    print(f"⑤ 裁决建议正确率（D5）：{res['sugg_ok']}/{res['sugg_total']} = {sugg_rate:.0%}"
+          "（ghost 对的建议是否选中较新版——确定性计算，应当恒等于 100%，非统计数字）")
     if not keep:
         import shutil
         shutil.rmtree(Path(root).parent, ignore_errors=True)
-    return 1 if res["leak"] else 0
+    return 1 if (res["leak"] or res["sugg_ok"] != res["sugg_total"]) else 0
 
 
 if __name__ == "__main__":

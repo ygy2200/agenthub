@@ -72,6 +72,14 @@ def main():
     r1 = ops.run_check("ghost_memory", root=ghost_root)
     check("ghost_memory 注入幽灵即抓（多版本共存未裁决）", (not r1["ok"]) and "幽灵" in r1["summary"],
           str(r1["summary"]))
+    # ---- D5 出口：每对必须附确定性裁决建议（只报不裁，但把「谁退谁留」算出来摆在面前）
+    _sug = [d for d in r1["detail"] if "建议留" in d]
+    check("ghost_memory 每对附确定性裁决建议（依据可解释）",
+          bool(_sug) and all(("依据：" in d) for d in _sug), str(r1["detail"][:2]))
+    _pairs12 = {(_a, _b), (_b, _a)}
+    _ok12 = all(any(f"建议留 #{keep}、退 #{drop}" in d for keep, drop in _pairs12)
+                for d in _sug)
+    check("建议落在对内的两条上且 keep/drop 互斥", _ok12, str(_sug[:1]))
     with _brain.db_conn(ghost_root) as _c:
         _c.execute("UPDATE memories SET superseded_by=? WHERE id=?", (_b, _a))
     r2 = ops.run_check("ghost_memory", root=ghost_root)

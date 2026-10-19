@@ -763,8 +763,12 @@ def _ghost_memory(root: str) -> dict:
     本项**只报不裁**——谁取代谁是 agent/用户的判断，系统负责把候选摆出来。
     记录版口径（brain.similar_records）：近 90 天、同项目内比、剥四段式模板头、
     排除 migrated 拆分记录与 auto-hook 会话锚（实测这两类占满 top 命中，是噪音不是幽灵）；
-    真实库首跑抓到 10-13 release playbook 的 5 条运行日志簇（同日两次真实运行，
-     adjudicated 为 distinct runs、非重复——侦测器负责摆出来，判断留给人）。
+    真实库首跑抓到 10-13 release playbook 的 5 条运行日志簇（经研判是同日两次真实运行、
+    非重复记录——侦测器负责摆出来，判断留给人）。
+
+    D5 增量（2026-10-19）：detail 每对额外附**确定性裁决建议**（`p['suggestion']`）——
+    「较新的一条留、较旧的一条退」由代码按固定规则算出（不是模型采样），并在质量信号
+    与版本信号冲突时明确降级为「建议仅供参考」。立场仍是只报不裁：建议不写任何数据。
     """
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
     if not root:
@@ -777,16 +781,39 @@ def _ghost_memory(root: str) -> dict:
     total = len(mem_pairs) + len(rec_pairs)
     if not total:
         return {"ok": True, "summary": "无幽灵候选（高相似记忆/记录都已标明取代关系）", "detail": []}
-    detail = [f"记忆 #{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['verdict']}）："
-              f"{p['content_a'][:40]} ‖ {p['content_b'][:40]}" for p in mem_pairs[:6]]
-    detail += [f"记录 #{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['project'][:16]} {p['date_a']}）："
-               f"{p['title_a'][:30]} ‖ {p['title_b'][:30]}" for p in rec_pairs[:8 - len(detail)]]
+    low_conf = 0
+    detail = []
+    for p in mem_pairs[:6]:
+        s = p.get("suggestion") or {}
+        if s and not s.get("confident"):
+            low_conf += 1
+        line = (f"记忆 #{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['verdict']}）："
+                f"{p['content_a'][:40]} ‖ {p['content_b'][:40]}")
+        detail.append(line + _suggest_line(s))
+    for p in rec_pairs[:8 - len(detail)]:
+        s = p.get("suggestion") or {}
+        if s and not s.get("confident"):
+            low_conf += 1
+        line = (f"记录 #{p['a']} ↔ #{p['b']}（相似 {p['sim']}，{p['project'][:16]} {p['date_a']}）："
+                f"{p['title_a'][:30]} ‖ {p['title_b'][:30]}")
+        detail.append(line + _suggest_line(s))
     if len(detail) < total:
         detail.append(f"…（还有 {total - len(detail)} 组，调 limit 或直接查库看全）")
+    tail = f"；其中 {low_conf} 组的建议仅供参考（新版并不更可信，请人工看一眼）" if low_conf else ""
     return {"ok": False,
             "summary": f"{total} 组疑似幽灵（记忆 {len(mem_pairs)} + 记录 {len(rec_pairs)}，"
-                       "多版本共存未裁决，需人工指定谁取代谁——也可能是同日多次真实运行，摆出来供判断）",
+                       "多版本共存未裁决——也可能是同日多次真实运行，摆出来供判断）"
+                       f"{tail}；每组已附谁退谁留的确定性建议，裁决仍由人做",
             "detail": detail[:8]}
+
+
+def _suggest_line(s: dict) -> str:
+    """把 suggestion 落成一行可执行的中文（给 agent/用户看，不改任何数据）。"""
+    if not s or not s.get("keep"):
+        return ""
+    flag = "" if s.get("confident") else "⚠"
+    return (f" → {flag}建议留 #{s['keep']}、退 #{s['drop']}（依据：{s['rule']}"
+            + (f"；{s['note']}" if s.get("note") else "") + "）")
 
 
 def _stale_health(root: str) -> dict:

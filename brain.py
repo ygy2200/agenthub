@@ -5497,6 +5497,121 @@ def _verdict(ca: str, cb: str, kind_same: bool) -> str:
     return "疑似重复" if kind_same else "相关"
 
 
+# ---------------------------------------------------------------- D5·确定性裁决建议
+
+def _adjudicate(ma: dict, mb: dict, vers: list, quals: list) -> dict:
+    """D5 核心：两条共存的相似条目，确定性给出「谁留谁退」的建议。
+
+    外部研究给的正解模式是 **「LLM 做语义识别、确定性代码做选择」**
+    （ranksquire 引 Stats：单跳 67.2→78.0）——落到本库：`similar_*` 已经用与模型无关
+    的词法相似度完成了「这几条在说同一件事」的识别，「选谁」这一步必须是确定性的：
+    同样输入永远同样输出，不依赖采样温度、不依赖调用次数、不依赖谁先被检索到。
+
+    **分层规则**（关键取舍：版本信号与质量信号冲突时**不覆盖，而是降级**）：
+      ① **版本信号**（调用方给的 vers 序列，从强到弱）：谁新谁是现行的。这是 ghost
+         的定义决定的——多版本共存场景里，最新版本才是现行的。
+      ② **质量信号**（quals，从强到弱）：只在版本信号**完全打平**时做 tiebreak。
+      ③ **二者冲突**（旧的那条质量更高：三个月前带完整证据链的结论 vs 昨天写的草稿）
+         → 不假装知道真相：`confident=False` 并把冲突点写进 note，交给 agent/用户。
+         系统不知道外部世界何时变的，「诚实标出来」比「猜一个」强。
+
+    参数 vers/quals 为 [(取值函数, 标签), ...]，由调用方按各自表的列语义提供
+    （memories 与 records 的版本/质量语义不同，不可互相抄）。
+
+    返回 {keep, drop, rule, basis, confident, note}。
+    """
+    def _vec(m, specs):
+        return [f(m) for f, _ in specs]
+
+    va, vb = _vec(ma, vers), _vec(mb, vers)
+    qa, qb = _vec(ma, quals), _vec(mb, quals)
+    if va != vb:
+        keep_m, drop_m = (ma, mb) if va > vb else (mb, ma)
+        rule = next((lab for (f, lab), x, y in zip(vers, va, vb) if x != y), "版本序")
+        confident, note = True, ""
+        # ③ 冲突检测：胜出者（新的那条）质量反而更弱 → 降级为「需人工看一眼」
+        if _rank_of(keep_m, drop_m, quals) < 0:
+            confident = False
+            note = (f"#{drop_m.get('id')} 更旧但更可信（{_why(drop_m, keep_m, quals)}）；"
+                    f"选 #{keep_m.get('id')} 的依据只有「更晚写入」——现实也许相反，请人工裁决")
+        basis = "recency"
+    else:
+        # ② 版本信号打平 → 用质量信号 tiebreak
+        cmp = _cmp(qa, qb)
+        keep_m, drop_m = (ma, mb) if cmp >= 0 else (mb, ma)
+        rule = (next((lab for (f, lab), x, y in zip(quals, qa, qb) if x != y), "")
+                if cmp else "")
+        if cmp:
+            confident, note, basis = True, "", "tiebreak-quality"
+        else:
+            # 版本与质量信号都完全一致 → 用 id 做最终兜底：确定性仍需成立（不能靠遍历顺序）
+            ia, ib = int(ma.get("id") or 0), int(mb.get("id") or 0)
+            if ia == ib:
+                return {"keep": ia, "drop": ib, "rule": "同 id（不应发生）",
+                        "basis": "degenerate", "confident": False,
+                        "note": "两条 id 相同，无法裁决"}
+            keep_m, drop_m = (ma, mb) if ia > ib else (mb, ma)
+            rule = "完全打平（回退 id 序）"
+            confident, note, basis = False, "两条版本与质量信号完全一致——任选一条保留即可", "tiebreak-id"
+    return {"keep": int(keep_m.get("id") or 0), "drop": int(drop_m.get("id") or 0),
+            "rule": rule, "basis": basis, "confident": confident, "note": note}
+
+
+# memories 的版本/质量信号定义（不可与 records 互抄——两表的列语义不同）：
+#   版本：updated 为主（改写过 = 承载最新认知），created 兜底，id 最终 tiebreak
+#   ISO 时间串的字典序 == 时间序，直接比字符串即可（避免解析开销与时区坑）
+#   质量：confidence（0-1）→ 有无 evidence（有证据链更可信）→ maturity → use_count → pinned
+# 注意：id **刻意不在** vers 里——它只是完全打平时的最终兜底。若把 id 塞进版本信号，
+# 两条同时写入的记忆会因为 id 不同永远「不打平」，质量 tiebreak 就永远不会触发（2026-10-19
+# 实测：正是这个 bug 让 _MEM_QUALS 全程失效）。
+_MEM_VERS = [(lambda m: str(m.get("updated") or ""), "最后更新"),
+             (lambda m: str(m.get("created") or ""), "创建时间")]
+_MEM_QUALS = [(lambda m: float(m.get("confidence") or 0), "置信度"),
+              (lambda m: 1 if (m.get("evidence") or "").strip() else 0, "证据链"),
+              (lambda m: str(m.get("maturity") or ""), "成熟度"),
+              (lambda m: int(m.get("use_count") or 0), "调用次数"),
+              (lambda m: 1 if m.get("pinned") else 0, "置顶")]
+
+# records 的版本/质量信号（语义独立于 memories）：
+#   版本：created（入库时刻）→ date（记录标称日期，二者常不同：补记昨天的工作
+#         时 date 是昨天、created 是今天）→ id。records 没有 updated 列。
+#   质量：非 migrated 源（迁移拆分记录标题=小节名、语义完整性差）→ 非 auto-hook
+#         （模板锚点几乎无信息量）→ 有 record_type（被分类过）→ 内容长度（长记录
+#         通常信息更全）——长度是弱信号，放最后，仅作 tiebreak 用。
+_REC_VERS = [(lambda r: str(r.get("created") or ""), "入库时间"),
+             (lambda r: str(r.get("date") or ""), "记录日期")]
+_REC_QUALS = [(lambda r: 0 if str(r.get("source") or "").startswith("migrated:") else 1, "非迁移来源"),
+              (lambda r: 0 if "auto-hook" in str(r.get("title") or "") else 1, "非会话锚点"),
+              (lambda r: 1 if str(r.get("record_type") or "").strip() else 0, "已分类"),
+              (lambda r: int(r.get("n_chars") or 0), "内容长度")]
+
+
+def _cmp(xs: list, ys: list) -> int:
+    """逐元素字典序比较，返回 -1/0/1；类型不可比时退化为字符串比较（保证确定性、永不抛）。"""
+    for x, y in zip(xs, ys):
+        try:
+            if x != y:
+                return -1 if x < y else 1
+        except TypeError:
+            sx, sy = str(x), str(y)
+            if sx != sy:
+                return -1 if sx < sy else 1
+    return 0
+
+
+def _rank_of(a: dict, b: dict, quals: list) -> int:
+    """a 相对 b 的质量序：-1=a 更弱，0=持平，1=a 更强。"""
+    return _cmp([f(a) for f, _ in quals], [f(b) for f, _ in quals])
+
+
+def _why(a: dict, b: dict, quals: list) -> str:
+    """把「为什么 a 比 b 更可信」落成一句人话（标签来自调用方给的 quals）。"""
+    for f, lab in quals:
+        if f(a) != f(b):
+            return f"{lab}更高"
+    return "各项质量信号均更高"
+
+
 def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
     """巩固：两两 Jaccard 相似度检测疑似重复/矛盾记忆（bigram 分词，<=500 条时全算）。
     返回 [{a, b, sim, verdict, content_a, content_b}]——verdict 为裁决辅助建议，最终由 agent/用户裁决。"""
@@ -5547,6 +5662,10 @@ def ghost_memory_candidates(root: str, threshold: float = 0.55, limit: int = 10)
     **但前提是有人真的标了 supersedes**——没标的就会变成幽灵。本函数把「内容高度相似
     却又互无取代关系」的对挑出来（= 多个版本共存且没人裁决），**只报不裁**：
     最终由 agent/用户决定谁取代谁（与 similar_memories 的一贯立场一致）。
+
+    D5 增量（2026-10-19）：每对额外带 `suggestion`——由**确定性代码**给出的
+    「谁留谁退」建议（见 `_adjudicate`）。「只报不裁」的立场没变：建议存在与否
+    都不改数据；它的价值是把 agent 从「自己想」压到「看一眼确认/改一下」。
     """
     pairs = similar_memories(root, threshold=threshold, limit=200)
     if not pairs:
@@ -5555,6 +5674,9 @@ def ghost_memory_candidates(root: str, threshold: float = 0.55, limit: int = 10)
         with db_conn(root) as conn:
             sup = {r["id"]: (r["superseded_by"] or 0)
                    for r in conn.execute("SELECT id, superseded_by FROM memories")}
+            meta = {r["id"]: dict(r) for r in conn.execute(
+                "SELECT id, created, updated, use_count, pinned, confidence, evidence, "
+                "maturity FROM memories")}
     except Exception:  # noqa: BLE001
         return []
     out = []
@@ -5562,6 +5684,9 @@ def ghost_memory_candidates(root: str, threshold: float = 0.55, limit: int = 10)
         a, b = p["a"], p["b"]
         if sup.get(a) == b or sup.get(b) == a:
             continue      # 已有取代关系 → 已治理，不是幽灵
+        ma, mb = meta.get(a), meta.get(b)
+        if ma and mb:  # 元数据缺一边（理论不可能）→ 宁可不给建议也不瞎给
+            p["suggestion"] = _adjudicate(ma, mb, _MEM_VERS, _MEM_QUALS)
         out.append(p)
         if len(out) >= max(1, min(int(limit), 50)):
             break
@@ -5660,6 +5785,9 @@ def ghost_record_candidates(root: str, threshold: float = 0.55, limit: int = 10)
         with db_conn(root) as conn:
             sup = {r["id"]: (r["superseded_by"] or 0)
                    for r in conn.execute("SELECT id, superseded_by FROM records")}
+            meta = {r["id"]: dict(r) for r in conn.execute(
+                "SELECT id, created, date, record_type, source, project, agent, "
+                "length(content) AS n_chars FROM records")}
     except Exception:  # noqa: BLE001
         return []
     out = []
@@ -5667,6 +5795,9 @@ def ghost_record_candidates(root: str, threshold: float = 0.55, limit: int = 10)
         a, b = p["a"], p["b"]
         if sup.get(a) == b or sup.get(b) == a:
             continue      # 已有取代关系 → 已治理，不是幽灵
+        ma, mb = meta.get(a), meta.get(b)
+        if ma and mb:
+            p["suggestion"] = _adjudicate(ma, mb, _REC_VERS, _REC_QUALS)
         out.append(p)
         if len(out) >= max(1, min(int(limit), 50)):
             break
