@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.53"
+    assert r["serverInfo"]["version"] == "2.40.54"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2130,6 +2130,116 @@ def t_idem_key(hub):
     assert "已写入大脑记忆" in r9 and "幂等重放" not in r9, f"过期键被重放：{r9[:120]}"
 
 
+def t_schema_dialect_safety(root):
+    """D4/R4 回归：JSON Schema **方言安全守卫**——把「刻意不声明 $schema」守成事实。
+
+    背景：MCP 2026-07-28 的 inputSchema 用 JSON Schema 2020-12。本大脑对外仍报
+    2024-11-05（六个接入），且实测 69 个工具的 inputSchema **零方言特有构造**
+    （无 $defs / prefixItems / dependentSchemas / unevaluated* / $dynamic*），属两种
+    方言的公共子集——不声明 $schema 时客户端按各自默认方言校验都能通过 = 最大兼容。
+    一旦有人（或某次「顺手现代化」）引入 2020-12 特有关键字、或硬写一行
+    "$schema": ".../draft/2020-12/schema"，只认 draft-07 的接入会当场拒整个工具列表。
+
+    验证三面：① 不出现任何 $schema 声明（当前有意选择）；
+    ② 不出现任一 2020-12 特有关键字（把命中的关键字列全，方便修的人直接看是哪些）；
+    ③ **反向验证**：把 $schema 声明和一个毒关键字分别注入到副本的不同深度，
+    本守卫必须都抓到（守卫自己失灵 = 静默失效，这是本套件的惯例）。"""
+    _2020_ONLY = ("$defs", "prefixItems", "dependentSchemas", "dependentRequired",
+                  "unevaluatedItems", "unevaluatedProperties", "$dynamicRef",
+                  "$dynamicAnchor", "contentSchema", "$vocabulary")
+
+    def _scan(tools):
+        """返回 (有无 $schema 声明, 命中的 2020-12 关键字集合)。"""
+        hit_schema, hits = False, set()
+        stack = list(tools)
+        while stack:
+            node = stack.pop()
+            if isinstance(node, dict):
+                if "$schema" in node:
+                    hit_schema = True
+                for kw in _2020_ONLY:
+                    if kw in node:
+                        hits.add(kw)
+                stack.extend(node.values())
+            elif isinstance(node, list):
+                stack.extend(node)
+        return hit_schema, hits
+
+    hs, hits = _scan(m.TOOLS)
+    assert not hs, "inputSchema 出现了 $schema 声明——会锁死客户端方言，见 agenthub_mcp.TOOLS 上方注释"
+    assert not hits, f"inputSchema 用了 2020-12 特有关键字：{sorted(hits)}（只认 draft-07 的接入会拒收）"
+    # ③ 反向验证：注入后必须被抓
+    import copy
+    poisoned = copy.deepcopy(m.TOOLS)
+    poisoned[0]["inputSchema"]["$schema"] = "https://json-schema.org/draft/2020-12/schema"
+    poisoned[1]["inputSchema"]["$defs"] = {"x": {"type": "string"}}
+    poisoned[2]["inputSchema"]["properties"]["zzz"] = {"prefixItems": [{"type": "string"}]}
+    ph, pv = _scan(poisoned)
+    assert ph and {"$defs", "prefixItems"} <= pv, f"守卫失灵：注入后未能全部抓到（{ph}, {pv}）"
+
+
+def t_list_cache_hints(hub):
+    """D4/R4 回归：tools/list 的**缓存提示 + 确定性排序**（MCP 2026-07-28 SEP-2549）。
+
+    来源：https://blog.modelcontextprotocol.io/posts/2026-07-28/ 与
+    https://modelcontextprotocol.io/specification/draft/server/utilities/caching
+    规范原话——list 响应「carry cache hints and a *deterministic order*, so clients
+    can cache tool catalogs and keep upstream prompt caches stable across reconnects」。
+    两层收益：缓存提示省掉重取（省 token/延迟），顺序稳定让上游 prompt cache 跨重连
+    不失效（本大脑工具目录 19.3K tok、每会话推一次，命中与否是实打实的钱）。
+
+    验证六面：① resultType="complete"（2026 规范对可缓存结果的要求）；
+    ② ttlMs 存在且 >= 0（规范硬约束）；③ cacheScope="private"（可见集由 --profile
+    决定=per-caller，标 public 会让共享网关串发工具目录）；
+    ④ **逐字节确定性**（同进程连调 5 次 JSON 全等——这是 prompt cache 命中的前提）；
+    ⑤ name 严格升序（不依赖 TOOLS 的声明顺序，后者随人维护而漂移）；
+    ⑥ env 可调（AGENTHUB_LIST_TTL_MS 生效且能恢复默认值）。"""
+    rs = str(hub)
+
+    def _listed():
+        return m.handle_message(rpc("tools/list"), rs)["result"]
+
+    r = _listed()
+    # ①②③ 缓存提示三件套
+    assert r.get("resultType") == "complete", f"缺 resultType（2026 可缓存要求）：{sorted(r)}"
+    assert isinstance(r.get("ttlMs"), int) and r["ttlMs"] >= 0, f"ttlMs 非法：{r.get('ttlMs')!r}"
+    assert r.get("cacheScope") == "private", f"cacheScope 应为 private：{r.get('cacheScope')!r}"
+    # ④ 逐字节确定性：连调 5 次全等（prompt cache 命中的前提）
+    blob = json.dumps(r, sort_keys=True, ensure_ascii=False)
+    for _ in range(4):
+        assert json.dumps(_listed(), sort_keys=True, ensure_ascii=False) == blob, "tools/list 非确定性"
+    # ⑤ name 严格升序 + profile 切片是保序子集
+    names_admin = [t["name"] for t in r["tools"]]
+    assert names_admin == sorted(names_admin), "admin 切片未按 name 升序"
+    assert len(names_admin) == len(set(names_admin)), "工具名有重复"
+    old_profile = m.SERVER_PROFILE
+    try:
+        m.SERVER_PROFILE = "worker"
+        rw = _listed()
+        assert rw["cacheScope"] == "private", "worker 下也该是 private"
+        names_worker = [t["name"] for t in rw["tools"]]
+        assert names_worker == sorted(names_worker), "worker 切片未按 name 升序"
+        assert set(names_worker) <= set(names_admin), "worker 不该有 admin 之外的工具"
+        # 切片是**保序子集**：顺序与全量一致（确定性 = 与切片方式无关）
+        assert names_worker == [n for n in names_admin if n in set(names_worker)], "切片顺序与全量不一致"
+        assert len(names_worker) < len(names_admin), "worker 应比 admin 少"
+    finally:
+        m.SERVER_PROFILE = old_profile
+    # ⑥ env 可调：改 TTL 立即生效，恢复后回到默认
+    old_env = os.environ.get("AGENTHUB_LIST_TTL_MS")
+    try:
+        os.environ["AGENTHUB_LIST_TTL_MS"] = "12345"
+        assert _listed()["ttlMs"] == 12345, "TTL 未随 env 生效"
+        os.environ["AGENTHUB_LIST_TTL_MS"] = "not-a-number"
+        assert _listed()["ttlMs"] == 300000, "非法 env 应回落默认"
+    finally:
+        if old_env is None:
+            os.environ.pop("AGENTHUB_LIST_TTL_MS", None)
+        else:
+            os.environ["AGENTHUB_LIST_TTL_MS"] = old_env
+    assert _listed()["ttlMs"] == 300000, "恢复 env 后应回默认 300000"
+
+
 def t_rate_limit_loop_guard(root):
     """C6 回归：速率限制/循环保护——外部检索点名的生产常见存根「无限流：agent 进循环
     可无限调用」，本大脑此前无任何节流。断言面：默认阈值放行日常频次 / 单工具超限即拦
@@ -2280,6 +2390,10 @@ def main():
          lambda: t_rate_limit_loop_guard(root))
     case("D1·写工具幂等键（重试原样重放不重复记/同键异内容拒收/agent 命名空间/过期不重放/memory+note 同效）",
          lambda: t_idem_key(fresh_hub(tmp, "hub_idem")))
+    case("D4·tools/list 缓存提示+确定性排序（2026-07-28 SEP-2549：resultType/ttlMs≥0/private/逐字节一致/切片保序/env 可调）",
+         lambda: t_list_cache_hints(fresh_hub(tmp, "hub_list")))
+    case("D4·JSON Schema 方言安全守卫（不锁 $schema / 无 2020-12 特有关键字 + 反向验证）",
+         lambda: t_schema_dialect_safety(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

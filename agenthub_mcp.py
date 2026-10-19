@@ -41,7 +41,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.53"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）；.53=第三轮 R3·D3 过期值服务率 harness：新增 tools/stale_eval.py（18 组标注事实四类指标：supersede 泄漏 0% 硬不变量 / ghost 混合率 50% / recency 排序正确率 50% / 静默过期可检出率 0%）+ ops 检查项 stale_health（泄漏硬不变量必抓 + 陈旧 fact 清单>45天零唤起，真实库跑通「无泄漏无陈旧」）
+SERVER_INFO = {"name": "agenthub", "version": "2.40.54"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）；.54=第三轮 R4·D4 MCP 2026-07-28 对齐：**部分采纳**（刻意不切协议版本——六个现有接入都报 2024-11-05，切版本号会让它们全部重协商）。采纳双向兼容的增量：① tools/list 带 resultType/ttlMs/cacheScope（SEP-2549 缓存提示，老客户端忽略未知 result 字段、新客户端省掉每会话重取；cacheScope 取 private——可见集由 --profile 决定=per-caller，标 public 会让共享网关把 A agent 的工具目录发给 B agent，cacheScope 是标签不是锁）；② **确定性排序**：visible_tools 按 name 升序（规范「deterministic order... keep upstream prompt caches stable across reconnects」——本目录 19.3K tok/会话，顺序稳定才是 prompt cache 命中的前提；TOOLS 声明顺序随人维护漂移）；③ JSON Schema 方言**有意不声明 $schema** 并加守卫：实测 69 工具零方言特有构造=两种方言公共子集，不声明对最多客户端兼容，显式声明 2020-12 会让只认 draft-07 的校验器拒整个列表；.53=第三轮 R3·D3 过期值服务率 harness：新增 tools/stale_eval.py（18 组标注事实四类指标：supersede 泄漏 0% 硬不变量 / ghost 混合率 50% / recency 排序正确率 50% / 静默过期可检出率 0%）+ ops 检查项 stale_health（泄漏硬不变量必抓 + 陈旧 fact 清单>45天零唤起，真实库跑通「无泄漏无陈旧」）
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -1960,6 +1960,14 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     return f"错误：未知工具 {name}（用 hub_search_tools 搜索可用工具，如 hub_search_tools(keyword=\"错误\")）"
 
 
+# D4（2026-10-19）JSON Schema 方言：**刻意不声明 $schema**。
+#   实测本库 69 个工具的 inputSchema 只用两种方言（draft-07 / 2020-12）的公共子集
+#   （无 $defs / prefixItems / dependentSchemas / unevaluated* / $dynamic* 等任何
+#   2020-12 特有构造）。不声明 $schema 时客户端按自己默认的方言校验，而我们的 schema
+#   在两者下都合法 = **对最多客户端兼容**；反过来显式声明 draft/2020-12 会让只认
+#   draft-07 的老校验器直接拒掉整个 schema。
+#   这属于「有意不做的对齐」，守卫在 adv_mcp.t_schema_dialect_safety：将来谁引入了
+#   方言特有关键字或硬性 $schema 声明，回归会拦并说明权衡。
 TOOLS = [
     {"name": "hub_list_projects", "description": "列出 AgentHub 全部项目（名称/最近活动/记录数）。想确认有没有某个项目、或拿准确目录名时用；项目名已知时直接 hub_get_project，不必先列表。例：hub_list_projects()",
      "inputSchema": {"type": "object", "properties": {}}},
@@ -2765,13 +2773,37 @@ def _log_call(root, tname: str, args: dict, t0: float, ok: bool = True, err_kind
         pass
 
 
+def _list_ttl_ms() -> int:
+    """tools/list 缓存提示的 TTL（D4 / 2026-07-28 SEP-2549）。
+
+    惰性读 env（与 _rate_limit_on 同惯例：测试改环境变量即时生效）。
+    0 = 立即过期（客户端每次都重取），用于自证提示真的被按 env 传出去。
+    """
+    raw = str(os.environ.get("AGENTHUB_LIST_TTL_MS", "")).strip()
+    if raw:
+        try:
+            v = int(raw)
+            if v >= 0:      # 规范：服务器 MUST 提供 >= 0 的 ttlMs；负数客户端应视为 0
+                return v
+        except ValueError:
+            pass
+    return 300000   # 5 分钟：官方 architecture 示例值；本进程内工具集恒定的保守表达
+
+
 def visible_tools() -> list:
-    """当前 profile 下 tools/list 的可见切片（admin=全量；藏起≠禁用，仍可直接调用）。"""
+    """当前 profile 下 tools/list 的可见切片（admin=全量；藏起≠禁用，仍可直接调用）。
+
+    **确定性排序（2026-07-28 与 SEP-2549 配套的硬要求）**：规范原话是 list 响应
+    「carry cache hints and a *deterministic order*, so clients can cache tool
+    catalogs and keep upstream prompt caches stable across reconnects」——缓存提示
+    只解决「要不要重取」，顺序稳定才解决「取回来能不能命中上游 prompt 缓存」。
+    按 name 升序而不是 TOOLS 的声明顺序：声明顺序是人维护的分组顺序（新工具往哪插
+    取决于当天想到哪），name 排序则对同一 (版本, profile) 组合在任何进程、任何
+    时刻产出逐字节一致的数组——跨重连的 prompt cache 才不会因顺序抖动而失效。
+    """
     allow = PROFILES.get(SERVER_PROFILE)
-    if allow is None:
-        return list(TOOLS)
-    allow = set(allow)
-    return [t for t in TOOLS if t["name"] in allow]
+    base = TOOLS if allow is None else [t for t in TOOLS if t["name"] in set(allow)]
+    return sorted(base, key=lambda t: t["name"])
 
 
 # 统一字段注入：所有工具支持 max_chars；写工具额外支持 dry_run / confirm（契约单一来源）
@@ -2961,7 +2993,17 @@ def handle_message(msg: dict, root: str) -> dict | None:
     if method == "ping":
         return {"jsonrpc": "2.0", "id": mid, "result": {}}
     if method == "tools/list":
-        return {"jsonrpc": "2.0", "id": mid, "result": {"tools": visible_tools()}}
+        # D4 / MCP 2026-07-28 SEP-2549「cacheable list results」：缓存提示是**附加字段**
+        # ——本 server 对外仍报 2024-11-05（六个现有接入都用这个版本，切版本号会让它们
+        # 全部重协商），但老客户端忽略未知 result 字段、新客户端可省掉每会话的重取：
+        # 双向兼容，零破坏。
+        # cacheScope 刻意取 **"private"** 而不是 public：可见工具集由 --profile 决定，
+        # 是 per-caller 的（一个 agent 的接入配置=一个 authorization context）。规范明确
+        # 「cacheScope 是标签不是锁」——标 public 等于允许共享网关把 A agent 的工具目录
+        # 发给 B agent，而这里正好念错就会发错，宁可保守。
+        return {"jsonrpc": "2.0", "id": mid,
+                "result": {"resultType": "complete", "tools": visible_tools(),
+                           "ttlMs": _list_ttl_ms(), "cacheScope": "private"}}
     if method == "tools/call":
         tname = params.get("name", "")
         args = params.get("arguments") or {}
