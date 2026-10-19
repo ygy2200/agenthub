@@ -1863,15 +1863,153 @@ def audit_list(root: str, limit: int = 20) -> list:
 
 
 def log_tool_call(root: str, tool: str, agent: str = "") -> None:
-    """C3：只读能力工具的调用留痕（补 op_audit 与 searches 都覆盖不到的盲区）。
-    只给低频的「能力型」只读工具用——高频只读工具（health/next/status 等心跳面）
-    不记，避免每次心跳都多一次写。fail-open：留痕失败绝不影响调用本身。"""
+    """C3→D6/R6：工具调用留痕。**全部工具**都记（R6 扩面前只有 4 个能力型只读工具记，
+    导致「48/69 从未被调用」绝大部分是留痕盲区的假象——拿假象治理会把在用工具当僵尸下线）。
+    fail-open：留痕失败绝不影响调用本身。写工具另走 op_audit（审计语义含 undo 句柄），
+    与这里的调用计数不可互相替代（一条写调用两边都有记录，是故意的：两个问题两套答案）。"""
     try:
         with db_conn(root) as conn:
             conn.execute("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
                          (_now(), _norm_agent(agent) or "", tool))
     except Exception:  # noqa: BLE001
         pass
+
+
+# ---------------------------------------------------------------- D10/R4：使用时间线
+# 为什么做：审计日志本身不是可观测性——「对日志的定时查询才是」（moltbook 生产实录：
+# 5 条固定查询在事故前就把模式捞出来）。本大脑有四张使用表（tool_calls 全工具调用 /
+# op_audit 写审计 / searches 检索 / journal 运维动作），此前面上没有统一查询：
+# 「这个工具最近谁在用什么程度」要分别查四张表再人脑合并——D10 遗留项的正式交付。
+# 边界诚实（usage_report 同款纪律）：只反映 MCP 面；GUI 直接调 brain.py 不入库。
+
+def _usage_cutoff(days: int) -> str:
+    """窗口起点（ISO 秒级）。days<=0 → 空串（调用方视为不过滤）。"""
+    if days <= 0:
+        return ""
+    return (datetime.datetime.now() - datetime.timedelta(days=int(days))).isoformat(timespec="seconds")
+
+
+def usage_timeline(root: str, days: int = 7, agent: str = "", tool: str = "",
+                   limit: int = 50) -> list:
+    """四源统一使用时间线（倒序）。每条事件带 source 字段区分来路：
+    call=tool_calls（全工具调用）/ audit=op_audit（写操作）/ search=searches（检索）/ journal（运维动作）。
+    tool 过滤只作用于三个带 tool 列的源；journal 是运维动作流（action/target，无 tool 列），
+    tool 过滤时不计入——如实标注好过静默漏掉。agent 过滤四源通用（规范化小写比对）。"""
+    cutoff = _usage_cutoff(days)
+    ag = _norm_agent(agent)
+    tl = tool.strip()
+    ev: list = []
+    with db_conn(root) as conn:
+        q = ("SELECT id, ts, agent, tool FROM tool_calls WHERE 1=1"
+             + (" AND replace(substr(ts,1,19),' ','T')>=?" if cutoff else "")
+             + (" AND agent=?" if ag else "") + (" AND tool=?" if tl else ""))
+        args: list = [x for x in (cutoff, ag, tl) if x]
+        for r in conn.execute(q + " ORDER BY id DESC LIMIT 400", args):
+            ev.append({"ts": r["ts"], "source": "call", "agent": r["agent"] or "",
+                       "subject": r["tool"], "detail": "", "id": r["id"]})
+        q = ("SELECT id, ts, agent, tool, project, summary, undo_kind, undo_ref FROM op_audit WHERE 1=1"
+             + (" AND replace(substr(ts,1,19),' ','T')>=?" if cutoff else "")
+             + (" AND agent=?" if ag else "") + (" AND tool=?" if tl else ""))
+        for r in conn.execute(q + " ORDER BY id DESC LIMIT 400", args):
+            undo = f" · undo={r['undo_kind']}#{r['undo_ref']}" if r["undo_ref"] else ""
+            proj = f" · {r['project']}" if r["project"] else ""
+            ev.append({"ts": r["ts"], "source": "audit", "agent": r["agent"] or "",
+                       "subject": r["tool"], "detail": f"{(r['summary'] or '')[:70]}{proj}{undo}",
+                       "id": r["id"]})
+        if not tl:  # journal 无 tool 列：tool 过滤时整体不计入（见 docstring）
+            q = ("SELECT id, ts, agent, action, target, note FROM journal WHERE 1=1"
+                 + (" AND replace(substr(ts,1,19),' ','T')>=?" if cutoff else "")
+                 + (" AND agent=?" if ag else ""))
+            jargs: list = [x for x in (cutoff, ag) if x]
+            for r in conn.execute(q + " ORDER BY id DESC LIMIT 400", jargs):
+                tgt = f" · {r['target']}" if r["target"] else ""
+                note = f" · {(r['note'] or '')[:50]}" if r["note"] else ""
+                ev.append({"ts": r["ts"], "source": "journal", "agent": r["agent"] or "",
+                           "subject": r["action"], "detail": f"{tgt}{note}", "id": r["id"]})
+        q = ("SELECT id, ts, agent, tool, query, hits FROM searches WHERE 1=1"
+             + (" AND replace(substr(ts,1,19),' ','T')>=?" if cutoff else "")
+             + (" AND agent=?" if ag else "") + (" AND tool=?" if tl else ""))
+        for r in conn.execute(q + " ORDER BY id DESC LIMIT 400", args):
+            ev.append({"ts": r["ts"], "source": "search", "agent": r["agent"] or "",
+                       "subject": r["tool"], "detail": f"「{(r['query'] or '')[:50]}」→{r['hits']} 命中",
+                       "id": r["id"]})
+    ev.sort(key=lambda e: (e["ts"], e["id"]), reverse=True)
+    return ev[:max(1, min(int(limit), 200))]
+
+
+def usage_stats(root: str, days: int = 7, agent: str = "", tool: str = "") -> dict:
+    """窗口内使用聚合（只读，不写任何数据）：
+    · totals：四源各自条数（journal 在 tool 过滤时不计，口径同 usage_timeline）；
+    · by_tool / by_agent：tool_calls 权威口径（R6 起全工具留痕）下的排行；
+    · last_seen：每工具最后露面时间——「零调用」断言的活校验（脚本快照会过期，这个不会）；
+    · zero_hit_searches：窗口内零命中检索——**反复出现的零命中查询=索引/描述问题的信号**，
+      比工具计数更早暴露「有需求没满足」；
+    · repeated_queries：同 agent 同 query 出现 ≥3 次——moltbook 生产实录里 retry storm 的
+      可计算代理（我们没有 args_hash，但 searches 有 query 原文，重复即信号）。
+    注意：burst 类指标（同 agent 同工具高频）**不做**——tool_calls 无参数列，
+    正常的高频只读（heartbeat/status 类）与异常重试在这张表上不可区分，做了就是噪声。"""
+    cutoff = _usage_cutoff(days)
+    ag = _norm_agent(agent)
+    tl = tool.strip()
+    out: dict = {"window_days": int(days) if days > 0 else 0, "totals": {},
+                 "by_tool": [], "by_agent": [], "last_seen": {},
+                 "zero_hit_searches": [], "repeated_queries": []}
+    with db_conn(root) as conn:
+        conds, args = [], []
+        if cutoff:
+            conds.append("replace(substr(ts,1,19),' ','T')>=?")
+            args.append(cutoff)
+        if ag:
+            conds.append("agent=?")
+            args.append(ag)
+        if tl:
+            conds.append("tool=?")
+            args.append(tl)
+        w = (" WHERE " + " AND ".join(conds)) if conds else ""
+        out["totals"]["calls"] = conn.execute(
+            f"SELECT COUNT(*) FROM tool_calls{w}", args).fetchone()[0]
+        out["totals"]["audits"] = conn.execute(
+            f"SELECT COUNT(*) FROM op_audit{w}", args).fetchone()[0]
+        out["totals"]["searches"] = conn.execute(
+            f"SELECT COUNT(*) FROM searches{w}", args).fetchone()[0]
+        jc, ja = [], []
+        if cutoff:
+            jc.append("replace(substr(ts,1,19),' ','T')>=?")
+            ja.append(cutoff)
+        if ag:
+            jc.append("agent=?")
+            ja.append(ag)
+        if not tl:  # journal 无 tool 列，tool 过滤时不计（口径同时间线）
+            out["totals"]["journal"] = conn.execute(
+                f"SELECT COUNT(*) FROM journal"
+                + ((" WHERE " + " AND ".join(jc)) if jc else ""), ja).fetchone()[0]
+        out["by_tool"] = [dict(r) for r in conn.execute(
+            f"SELECT tool, COUNT(*) n FROM tool_calls{w} GROUP BY tool ORDER BY n DESC, tool LIMIT 30",
+            args)]
+        out["by_agent"] = [dict(r) for r in conn.execute(
+            f"SELECT agent, COUNT(*) n FROM tool_calls{w} GROUP BY agent ORDER BY n DESC, agent LIMIT 30",
+            args)]
+        out["last_seen"] = {r["tool"]: r["last"] for r in conn.execute(
+            f"SELECT tool, MAX(ts) last FROM tool_calls{w} GROUP BY tool ORDER BY tool", args)}
+        zc, za = [], []
+        if cutoff:
+            zc.append("replace(substr(ts,1,19),' ','T')>=?")
+            za.append(cutoff)
+        if ag:
+            zc.append("agent=?")
+            za.append(ag)
+        if tl:
+            zc.append("tool=?")
+            za.append(tl)
+        zw = (" WHERE hits=0 AND query!=''" + (" AND " + " AND ".join(zc) if zc else ""))
+        out["zero_hit_searches"] = [dict(r) for r in conn.execute(
+            f"SELECT query, agent, COUNT(*) n, MAX(ts) last FROM searches{zw} "
+            f"GROUP BY query, agent ORDER BY n DESC, last DESC LIMIT 15", za)]
+        out["repeated_queries"] = [dict(r) for r in conn.execute(
+            f"SELECT query, agent, COUNT(*) n FROM searches"
+            + ((" WHERE query!=''" + (" AND " + " AND ".join(zc) if zc else "")) if zc else " WHERE query!=''")
+            + " GROUP BY query, agent HAVING COUNT(*)>=3 ORDER BY n DESC LIMIT 15", za)]
+    return out
 
 
 def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:

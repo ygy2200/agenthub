@@ -744,6 +744,17 @@
       "agent"
     ]
   },
+  "hub_usage_timeline": {
+    "props": {
+      "agent": "string",
+      "days": "integer",
+      "limit": "integer",
+      "max_chars": "integer",
+      "tool": "string",
+      "view": "string"
+    },
+    "required": []
+  },
   "hub_user_profile": {
     "props": {
       "max_chars": "integer"

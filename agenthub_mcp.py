@@ -41,7 +41,7 @@ import ops  # noqa: E402
 core.JOURNAL_SINK = brain.journal_add
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.59"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）；.53=第三轮 R3·D3 过期值服务率 harness：新增 tools/stale_eval.py（18 组合成标注事实，四类指标基线：supersede 泄漏 0% 硬不变量 / ghost 混合 50% / recency 排序 50% / 静默过期可检出 0%）+ 第 26 个 ops 检查项 stale_health（真实库上抽查泄漏硬不变量 + 陈旧 fact 清单 >45 天零唤起，只报不裁）；.54=第三轮 R4·D4 MCP 2026-07-28 对齐：**部分采纳**（刻意不切协议版本——六个现有接入都报 2024-11-05，切版本号会让它们全部重协商）。采纳双向兼容的增量：① tools/list 带 resultType/ttlMs/cacheScope（SEP-2549 缓存提示，老客户端忽略未知 result 字段、新客户端省掉每会话重取；cacheScope 取 private——可见集由 --profile 决定=per-caller，标 public 会让共享网关把 A agent 的工具目录发给 B agent，cacheScope 是标签不是锁）；② **确定性排序**：visible_tools 按 name 升序（规范「deterministic order... keep upstream prompt caches stable across reconnects」——本目录 19.3K tok/会话，顺序稳定才是 prompt cache 命中的前提；TOOLS 声明顺序随人维护漂移）；③ JSON Schema 方言**有意不声明 $schema** 并加守卫：实测 69 工具零方言特有构造=两种方言公共子集，不声明对最多客户端兼容，显式声明 2020-12 会让只认 draft-07 的校验器拒整个列表；.55=第三轮 R5·D5 确定性裁决辅助：ghost 检测从「只报不裁」升级为「报 + 附确定性建议」——LLM 做语义识别（similar_* 词法相似判定「这几条在说同一件事」）、确定性代码做选择（_adjudicate：版本信号→质量信号 tiebreak→id 兜底三层，冲突时降级为 confident=False 而非假装知道；语义上不用质量信号去覆盖版本信号）。memories/records 两表的信号定义各自独立（不可互抄）。建议不写任何数据。；.56=第三轮 R6·D6 工具使用治理：先修数据地基再谈治理——① **使用留痕扩到全部工具**（此前只有 4 个能力型只读工具进 tool_calls，加上 op_audit 写/searches 检索仍只有 21/69 有证据，「48 个从未被调用」绝大部分是留痕盲区的假象；按假象治理会把在用工具当僵尸下线。写工具仍额外走 op_audit：审计语义含 undo 句柄，与 tool_calls 不可互相替代。失败调用不计入使用；留痕 fail-open，绝不影响调用本身）；② 新增 tools/usage_report.py：零调用工具分三类（keep-escape 逃生舱/发现面、keep-governance 治理体检面、review 待审查）+ **边界诚实标注**（本表只反映 MCP 面，GUI 直接调 brain.py 不入库，零调用≠没人用）；③ 用大脑自带分词做**工具描述重叠**检测——研究点名的「从未被调用」两大原因（描述不清 / 与别家重叠）在本库双双被证伪：desc_quality 69 个达标、描述重叠仅 2 对且都是 set/list 互补配对而非真重叠新增第五项评测指标「裁决建议正确率 6/6=100%」（确定性计算，非统计数字）；ops ghost_memory detail 每行附「建议留 X、退 Y（依据：…）」+ 降级计数；.57=第三轮 R7·D7 GUI 结构快照基线：新增 tools/gui_snapshot.py + tests/gui/test_snapshot_baseline.py——**刻意不用像素黄金图**：R8 已证明 offscreen 下 Qt 把应用默认字体解析成宽拉丁回退体（Claude Code 132px）vs 生产微软雅黑 73px，同代码两环境截图天然不同，逐像素比必然误报。改比结构（控件类名计数+去重静态文案+最小高度）：对字体/DPI 敏感度低得多，区块消失/文案被改坏/控件数骤降照样抓住。固定字体（显式加载生产字体）/主题/窗口尺寸/种子数据，动态内容（日期时间路径id计数）采集时归一化；png 仍存但只作人工参考图、不参与自动比对。18 页基线；反向验证三态（删文案/控件数骤变/页面消失必报，完全一致零问题）；.58=第三轮 R8·D8 错误分类学：错误分三桶并告诉调用方该怎么反应——transient（限流/库锁/资源忙）可退避重试、permanent（参数非法/目标不存在/越权/键冲突）立即失败、ambiguous（超时/结果未知）不能盲重试且幂等键是解药。**单点实现不改 59 个失败站点**：各站点保持「错误：」开头约定，分类在返回处统一判定（关键词规则，兜底=ambiguous——误判代价不对称：把 transient 误判成 permanent 会让本可成功的调用被放弃，所以兜底取「未知」而非「别试了」）。分类走 structuredContent.error_kind（机器可读，不破坏既有文案约定）；提示文案差异化：permanent 不加任何「可重试」字样，另两类追加且对写工具指向 idem_key（R2 幂等键的配套：幂等解决「能不能安全重试」，分类解决「该不该重试」）。新增统一错误出口 _err_result 给「工具执行前就返回」的路径（速率限制等）使用，防分类口径漂移成两套；服务端异常也纳入三桶（入参类型错=permanent，其余=ambiguous），与业务失败日志口径统一；.59=第三轮 R9·D5 出口：新增 hub_memory_supersede（keep_id/drop_id）——两条**已存在**的记忆指定谁胜出、落进取代链。填补 R5 留下的执行路径缺口：ghost 检测给出「留 #3188、退 #3187」的建议后此前无处执行——既有 hub_memory_write(supersedes=X) 语义是「新建一条取代 X」（会多造第 3 条记忆），不是一回事。**刻意不判断谁对**（那是调用方的判断，系统只给确定性建议），执行权在人手里。参数守卫（非正整数/自己取代自己/不存在 id 全拒）+ 走 dry_run/confirm 闸门 + journal 留痕；数据保留可追溯（取代≠删除），反向再裁一次即可撤销。工具数 69→70（worker 切片内），被动上下文 19.6K→20.1K tok，仍在 24K 预算内。三个守护按设计拦下并要求显式确认：schema 兼容守卫要补基线、整数入参漂移守卫要登记 keep_id/drop_id、工具数守卫要从 69 改到 70
+SERVER_INFO = {"name": "agenthub", "version": "2.40.60"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）；.53=第三轮 R3·D3 过期值服务率 harness：新增 tools/stale_eval.py（18 组合成标注事实，四类指标基线：supersede 泄漏 0% 硬不变量 / ghost 混合 50% / recency 排序 50% / 静默过期可检出 0%）+ 第 26 个 ops 检查项 stale_health（真实库上抽查泄漏硬不变量 + 陈旧 fact 清单 >45 天零唤起，只报不裁）；.54=第三轮 R4·D4 MCP 2026-07-28 对齐：**部分采纳**（刻意不切协议版本——六个现有接入都报 2024-11-05，切版本号会让它们全部重协商）。采纳双向兼容的增量：① tools/list 带 resultType/ttlMs/cacheScope（SEP-2549 缓存提示，老客户端忽略未知 result 字段、新客户端省掉每会话重取；cacheScope 取 private——可见集由 --profile 决定=per-caller，标 public 会让共享网关把 A agent 的工具目录发给 B agent，cacheScope 是标签不是锁）；② **确定性排序**：visible_tools 按 name 升序（规范「deterministic order... keep upstream prompt caches stable across reconnects」——本目录 19.3K tok/会话，顺序稳定才是 prompt cache 命中的前提；TOOLS 声明顺序随人维护漂移）；③ JSON Schema 方言**有意不声明 $schema** 并加守卫：实测 69 工具零方言特有构造=两种方言公共子集，不声明对最多客户端兼容，显式声明 2020-12 会让只认 draft-07 的校验器拒整个列表；.55=第三轮 R5·D5 确定性裁决辅助：ghost 检测从「只报不裁」升级为「报 + 附确定性建议」——LLM 做语义识别（similar_* 词法相似判定「这几条在说同一件事」）、确定性代码做选择（_adjudicate：版本信号→质量信号 tiebreak→id 兜底三层，冲突时降级为 confident=False 而非假装知道；语义上不用质量信号去覆盖版本信号）。memories/records 两表的信号定义各自独立（不可互抄）。建议不写任何数据。；.56=第三轮 R6·D6 工具使用治理：先修数据地基再谈治理——① **使用留痕扩到全部工具**（此前只有 4 个能力型只读工具进 tool_calls，加上 op_audit 写/searches 检索仍只有 21/69 有证据，「48 个从未被调用」绝大部分是留痕盲区的假象；按假象治理会把在用工具当僵尸下线。写工具仍额外走 op_audit：审计语义含 undo 句柄，与 tool_calls 不可互相替代。失败调用不计入使用；留痕 fail-open，绝不影响调用本身）；② 新增 tools/usage_report.py：零调用工具分三类（keep-escape 逃生舱/发现面、keep-governance 治理体检面、review 待审查）+ **边界诚实标注**（本表只反映 MCP 面，GUI 直接调 brain.py 不入库，零调用≠没人用）；③ 用大脑自带分词做**工具描述重叠**检测——研究点名的「从未被调用」两大原因（描述不清 / 与别家重叠）在本库双双被证伪：desc_quality 69 个达标、描述重叠仅 2 对且都是 set/list 互补配对而非真重叠新增第五项评测指标「裁决建议正确率 6/6=100%」（确定性计算，非统计数字）；ops ghost_memory detail 每行附「建议留 X、退 Y（依据：…）」+ 降级计数；.57=第三轮 R7·D7 GUI 结构快照基线：新增 tools/gui_snapshot.py + tests/gui/test_snapshot_baseline.py——**刻意不用像素黄金图**：R8 已证明 offscreen 下 Qt 把应用默认字体解析成宽拉丁回退体（Claude Code 132px）vs 生产微软雅黑 73px，同代码两环境截图天然不同，逐像素比必然误报。改比结构（控件类名计数+去重静态文案+最小高度）：对字体/DPI 敏感度低得多，区块消失/文案被改坏/控件数骤降照样抓住。固定字体（显式加载生产字体）/主题/窗口尺寸/种子数据，动态内容（日期时间路径id计数）采集时归一化；png 仍存但只作人工参考图、不参与自动比对。18 页基线；反向验证三态（删文案/控件数骤变/页面消失必报，完全一致零问题）；.58=第三轮 R8·D8 错误分类学：错误分三桶并告诉调用方该怎么反应——transient（限流/库锁/资源忙）可退避重试、permanent（参数非法/目标不存在/越权/键冲突）立即失败、ambiguous（超时/结果未知）不能盲重试且幂等键是解药。**单点实现不改 59 个失败站点**：各站点保持「错误：」开头约定，分类在返回处统一判定（关键词规则，兜底=ambiguous——误判代价不对称：把 transient 误判成 permanent 会让本可成功的调用被放弃，所以兜底取「未知」而非「别试了」）。分类走 structuredContent.error_kind（机器可读，不破坏既有文案约定）；提示文案差异化：permanent 不加任何「可重试」字样，另两类追加且对写工具指向 idem_key（R2 幂等键的配套：幂等解决「能不能安全重试」，分类解决「该不该重试」）。新增统一错误出口 _err_result 给「工具执行前就返回」的路径（速率限制等）使用，防分类口径漂移成两套；服务端异常也纳入三桶（入参类型错=permanent，其余=ambiguous），与业务失败日志口径统一；.59=第三轮 R9·D5 出口：新增 hub_memory_supersede（keep_id/drop_id）——两条**已存在**的记忆指定谁胜出、落进取代链。填补 R5 留下的执行路径缺口：ghost 检测给出「留 #3188、退 #3187」的建议后此前无处执行——既有 hub_memory_write(supersedes=X) 语义是「新建一条取代 X」（会多造第 3 条记忆），不是一回事。**刻意不判断谁对**（那是调用方的判断，系统只给确定性建议），执行权在人手里。参数守卫（非正整数/自己取代自己/不存在 id 全拒）+ 走 dry_run/confirm 闸门 + journal 留痕；数据保留可追溯（取代≠删除），反向再裁一次即可撤销。工具数 69→70（worker 切片内），被动上下文 19.6K→20.1K tok，仍在 24K 预算内。三个守护按设计拦下并要求显式确认：schema 兼容守卫要补基线、整数入参漂移守卫要登记 keep_id/drop_id、工具数守卫要从 69 改到 70；.60=第四轮 R2·D10 使用时间线统一查询面：新增 hub_usage_timeline（view=timeline 四源合并事件流 / view=stats 窗口聚合）+ brain.usage_timeline/usage_stats——四张使用表（tool_calls 全工具调用/op_audit 写审计/searches 检索/journal 运维动作）此前没有统一查询，「这工具最近谁在用什么程度」要查四张表人脑合并。外部研究（moltbook 生产实录）：「审计日志不是可观测性，对日志的定时查询才是」——但查询面先要有。stats 故意不做 burst 类指标：tool_calls 无参数列，正常高频只读与异常重试不可区分，做了就是噪声；能做且诚实的是零命中检索（有需求没满足的早信号）与重复查询（retry storm 代理）。边界标注沿用 usage_report 纪律：只反映 MCP 面，GUI 直连 brain.py 不入库
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -324,6 +324,53 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             return "错误：" + res["error"]
         return (f"语义索引已刷新：records +{res.get('records', 0)} / memories +{res.get('memories', 0)}"
                 f"（扫描 {res.get('scanned', 0)} 条；model={res.get('model')} · dim={res.get('dim')}）")
+
+    if name == "hub_usage_timeline":
+        ok, days = _as_int(arguments, "days", 7)
+        if not ok:
+            return days
+        ok, lim = _as_int(arguments, "limit", 50)
+        if not ok:
+            return lim
+        view = str(arguments.get("view") or "timeline").strip().lower()
+        ag = str(arguments.get("agent") or "").strip()
+        tl = str(arguments.get("tool") or "").strip()
+        if view == "stats":
+            st = brain.usage_stats(root, days=days, agent=ag, tool=tl)
+            t = st["totals"]
+            lines = [f"使用统计（窗口 {st['window_days'] or '∞'} 天"
+                     + (f" · agent={ag}" if ag else "") + (f" · tool={tl}" if tl else "") + "）：",
+                     f"四源总量：调用 {t['calls']} · 写审计 {t['audits']} · 检索 {t['searches']}"
+                     + (f" · 运维 {t['journal']}" if "journal" in t else " · 运维 —（tool 过滤时不计）")]
+            if st["by_tool"]:
+                lines.append("按工具：" + "，".join(f"{r['tool']}×{r['n']}" for r in st["by_tool"][:12]))
+            if st["by_agent"]:
+                lines.append("按 agent：" + "，".join(f"{r['agent'] or '?'}×{r['n']}" for r in st["by_agent"][:12]))
+            if st["last_seen"]:
+                fresh = sorted(st["last_seen"].items(), key=lambda kv: kv[1], reverse=True)[:8]
+                lines.append("最近露面：" + "，".join(f"{k}({v[5:16].replace('T', ' ')})" for k, v in fresh))
+            if st["zero_hit_searches"]:
+                lines.append("零命中检索（反复出现=索引/描述待修）：")
+                for r in st["zero_hit_searches"][:8]:
+                    lines.append(f"  ×{r['n']} 「{r['query'][:40]}」（{r['agent'] or '?'}，末次 {r['last'][5:16].replace('T', ' ')}）")
+            if st["repeated_queries"]:
+                lines.append("重复查询（≥3 次，重试风暴代理信号）：")
+                for r in st["repeated_queries"][:8]:
+                    lines.append(f"  ×{r['n']} 「{r['query'][:40]}」（{r['agent'] or '?'}）")
+            if not any([st["by_tool"], st["zero_hit_searches"], st["repeated_queries"]]):
+                lines.append("窗口内无使用记录（新库或确无流量；注意 GUI 直连 brain.py 不入库）")
+            return "\n".join(lines)
+        ev = brain.usage_timeline(root, days=days, agent=ag, tool=tl, limit=lim)
+        if not ev:
+            return (f"窗口内无使用事件（days={days}"
+                    + (f" · agent={ag}" if ag else "") + (f" · tool={tl}" if tl else "")
+                    + "）。只反映 MCP 面，GUI 直连 brain.py 不入库")
+        lines = [f"使用时间线（倒序，窗口 {days or '∞'} 天，{len(ev)} 条）："]
+        for e in ev:
+            det = f" · {e['detail']}" if e["detail"] else ""
+            lines.append(f"- {e['ts'][5:16].replace('T', ' ')} [{e['source']}] "
+                         f"{e['agent'] or '?'} → {e['subject']}{det}")
+        return "\n".join(lines)
 
     # ---- P3-2 待办状态机 + 事件流 ----
 
@@ -2366,6 +2413,15 @@ TOOLS = [
      "description": "写操作审计（P3-1）：最近的写工具调用记录（谁/何时/写了什么/undo 句柄）。怀疑误写、要找 undo 句柄时查；日常只读调用不入审计。例：hub_audit(limit=10)",
      "inputSchema": {"type": "object",
                      "properties": {"limit": {"type": "integer", "description": "条数，默认 20"}}}},
+    {"name": "hub_usage_timeline",
+     "description": "使用时间线/用量统计（D10，四源合一：全工具调用+写审计+检索+运维动作）。view=timeline 看「谁何时用了什么」的合并事件流；view=stats 看窗口内按工具/按 agent 排行、每工具最后露面时间（零调用断言的活校验）、零命中与重复查询（索引/描述问题的早信号）。例：hub_usage_timeline(days=7, view=\"stats\")；只看某个 agent：hub_usage_timeline(agent=\"workbuddy\")。只反映 MCP 面，GUI 直接调 brain.py 不入库",
+     "inputSchema": {"type": "object",
+                     "properties": {
+                         "days": {"type": "integer", "description": "统计窗口天数，默认 7；0=不限"},
+                         "agent": {"type": "string", "description": "按 agent 过滤（小写规范名）"},
+                         "tool": {"type": "string", "description": "按工具名过滤（journal 运维流无 tool 列，过滤时不计入）"},
+                         "view": {"type": "string", "description": "timeline=事件流（默认）/ stats=聚合统计"},
+                         "limit": {"type": "integer", "description": "timeline 条数，默认 50"}}}},
     {"name": "hub_flush_index",
      "description": "语义索引维护：把缺失向量补进 embeddings（force=true 全量重编码）。语义依赖缺失时如实报错（fail-open）",
      "inputSchema": {"type": "object",
@@ -2534,6 +2590,7 @@ _INT_PARAMS = {
     "hub_skill_match": ("topk",),
     "hub_tasks": ("limit",),
     "hub_todo_done": ("record_id",),
+    "hub_usage_timeline": ("days", "limit"),   # D10 使用时间线：窗口/条数
 }
 # 豁免（均已在各自位置处理得当，不再集中拦截）：
 #   · max_chars —— 协议级结果预算参数，_shape_result 刻意「非法值回落默认」的硬预算设计
@@ -2651,6 +2708,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_playbook", "hub_trigger", "hub_graph",  # Y1/Y2/Y3 编排、自动化、图谱：都是干活的日常
     "hub_skill_match",  # 技能原生化：按需召回要给所有干活的 agent（含 worker）
     "hub_asset_find",  # 技能原生化：装工具前查台账，同属干活常用
+    "hub_usage_timeline",  # D10 使用时间线：干活的人自查「我在循环吗/这工具没人用吗」
 )
 PROFILES = {"reader": PROFILE_READER, "worker": PROFILE_WORKER, "admin": None}  # None=全量
 

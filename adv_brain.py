@@ -2243,6 +2243,93 @@ def t_gap_note(tmp):
         assert got == want, f"判定不符：{note[:40]!r} want={want} got={got}"
 
 
+def t_usage_timeline(tmp):
+    """D10/R4：四源统一使用时间线 + 窗口聚合。
+    覆盖：合并倒序 / source 标记 / agent 与 tool 过滤（tool 过滤时 journal 不计——
+    该表无 tool 列，口径必须与 docstring 一致）/ days 窗口 / 零命中与重复查询检出 /
+    last_seen 活校验 / 只读不改数。"""
+    import datetime as _dt
+    root = Path(tmp) / "hub_usage"
+    root.mkdir(parents=True, exist_ok=True)
+    rs = str(root)
+    assert brain.init_db(rs) == ""
+    now = _dt.datetime.now()
+    old = (now - _dt.timedelta(days=30)).isoformat(timespec="seconds")
+    fresh = (now - _dt.timedelta(hours=2)).isoformat(timespec="seconds")
+    with brain.db_conn(rs) as conn:
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "workbuddy", "hub_search"))
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "workbuddy", "hub_search"))
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "zcode", "hub_health"))
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (old, "workbuddy", "hub_search"))
+        conn.execute("INSERT INTO op_audit(ts,agent,tool,project,summary,undo_kind,undo_ref) "
+                     "VALUES(?,?,?,?,?,?,?)", (fresh, "workbuddy", "hub_log_work", "p", "写了记录", "record", "7"))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                     (fresh, "workbuddy", "hub_search", "代理 端口", 2))
+        for _ in range(3):  # 重复查询（retry storm 代理信号）
+            conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                         (fresh, "zcode", "hub_search", "不存在的词qwerty", 0))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                     (fresh, "zcode", "hub_search", "另一个零命中", 0))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                     (fresh, "zcode", "recall_push", "", 0))  # 空 query 是内部调用噪声，必须排除
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note) VALUES(?,?,?,?,?,?)",
+                     (fresh, "workbuddy", "检查 deploy_diff", "target-x", "", "发布一致"))
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note) VALUES(?,?,?,?,?,?)",
+                     (old, "workbuddy", "检查 deploy_diff", "target-old", "", "旧的"))
+
+    # ① 时间线：四源合并、倒序、窗口过滤（30 天前的不在 7 天窗内）
+    ev = brain.usage_timeline(rs, days=7, limit=50)
+    srcs = {e["source"] for e in ev}
+    assert {"call", "audit", "search", "journal"} <= srcs, f"缺源：{srcs}"
+    assert all(e["ts"] >= (now - _dt.timedelta(days=7)).isoformat(timespec="seconds") for e in ev), \
+        "窗口外的旧事件混进来了"
+    tss = [e["ts"] for e in ev]
+    assert tss == sorted(tss, reverse=True), "时间线不是倒序"
+    assert any(e["subject"] == "hub_log_work" and "record#7" in e["detail"] for e in ev), \
+        "audit 事件缺 undo 句柄细节"
+    # agent 过滤
+    ev_z = brain.usage_timeline(rs, days=7, agent="zcode")
+    assert ev_z and all(e["agent"] == "zcode" for e in ev_z), "agent 过滤漏了别家事件"
+    # tool 过滤：journal 无 tool 列，必须不计入（口径同 docstring）
+    ev_t = brain.usage_timeline(rs, days=7, tool="hub_search")
+    assert ev_t and all(e["subject"] == "hub_search" for e in ev_t), "tool 过滤漏了别家工具"
+    assert not any(e["source"] == "journal" for e in ev_t), "tool 过滤时 journal 竟混入（口径漂移）"
+    # 窗口=0 不限：旧 journal 应该回来
+    ev_all = brain.usage_timeline(rs, days=0, limit=200)
+    assert any("target-old" in (e["detail"] or "") for e in ev_all), "days=0 不限窗口失效"
+
+    # ② stats：聚合口径
+    st = brain.usage_stats(rs, days=7)
+    assert st["totals"]["calls"] == 3, f"calls 口径错：{st['totals']}"       # 3 条 fresh
+    assert st["totals"]["audits"] == 1 and st["totals"]["searches"] == 6, st["totals"]
+    assert st["totals"]["journal"] == 1, st["totals"]                          # 旧的被窗口滤掉
+    by_tool = {r["tool"]: r["n"] for r in st["by_tool"]}
+    assert by_tool.get("hub_search") == 2 and by_tool.get("hub_health") == 1, f"by_tool 错：{by_tool}"
+    assert st["last_seen"].get("hub_health", "").startswith(fresh[:10]), "last_seen 不是最新露面"
+    zh = [r for r in st["zero_hit_searches"] if r["query"] == "不存在的词qwerty"]
+    assert zh and zh[0]["n"] == 3, f"重复零命中没聚起来：{st['zero_hit_searches']}"
+    rq = [r for r in st["repeated_queries"] if r["query"] == "不存在的词qwerty"]
+    assert rq and rq[0]["n"] == 3, f"重复查询（≥3）没检出：{st['repeated_queries']}"
+    assert not any(r["query"] == "代理 端口" for r in st["repeated_queries"]), "非重复查询被误报"
+    assert not any(not r["query"].strip() for r in st["zero_hit_searches"]), "空 query 混进零命中（内部调用噪声）"
+    assert not any(not r["query"].strip() for r in st["repeated_queries"]), "空 query 混进重复查询（内部调用噪声）"
+    # tool 过滤时 journal 总计不计（与时间线同口径）
+    st_t = brain.usage_stats(rs, days=7, tool="hub_search")
+    assert "journal" not in st_t["totals"], "tool 过滤时 journal 总计竟计入（口径漂移）"
+    assert st_t["totals"]["calls"] == 2, st_t["totals"]
+
+    # ③ 只读：跑完前后四表计数不变
+    with brain.db_conn(rs) as conn:
+        for tbl, want in (("tool_calls", 4), ("op_audit", 1), ("searches", 6), ("journal", 2)):
+            got = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+            assert got == want, f"{tbl} 被写改了：{got} != {want}"
+
+    # ④ 空窗口不崩
+    assert brain.usage_timeline(rs, days=7, agent="nobody") == []
+    st_e = brain.usage_stats(rs, days=7, agent="nobody")
+    assert st_e["totals"]["calls"] == 0 and not st_e["by_tool"], "空窗口应有零值不崩"
+
+
 def t_batchA_memory_governance(tmp):
     """批次A·可靠性地基：记忆取代链 + 双时相 + 证据链 + 置信度 + 治理统计。
     验证：被取代/过期/作废的记忆退出推送与检索但仍可追溯；latest-write-wins；
@@ -2989,6 +3076,7 @@ def main():
     case("M7+M9+M12 整合/视角/技能资产（提案apply链/关注动态速览/技能hit统计）", lambda: t_consolidate_view_skill(tmp))
     case("X3+X4 导出备份与时间机器（备份含WAL不丢数据/变更史三源合并）", lambda: t_export_history(tmp))
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
+    case("D10 使用时间线（四源合并倒序/agent·tool 过滤口径/days 窗口/零命中与重复查询/last_seen 活校验/只读不改数）", lambda: t_usage_timeline(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

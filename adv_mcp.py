@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.59"
+    assert r["serverInfo"]["version"] == "2.40.60"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -85,7 +85,7 @@ def t_protocol(root):
             "hub_skill_match", "hub_skill_sync"} <= names, names
     # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
     # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
-    assert len(names) == 70  # 68=X3+X4+Y1+Y2+Y3+playbook/trigger/graph；69=+hub_error_close（2026-10-17 错误闭环：MCP 侧关错，治僵尸堆积）；70=+hub_memory_supersede（2026-10-19 D5 出口：两条既有记忆裁决谁胜出——ghost 检测报出「多版本共存未裁决」后此前没有对应调用，write(supersedes=X) 会多造第 3 条记忆，不是一回事）
+    assert len(names) == 71  # 68=X3+X4+Y1+Y2+Y3+playbook/trigger/graph；69=+hub_error_close（2026-10-17 错误闭环：MCP 侧关错，治僵尸堆积）；70=+hub_memory_supersede（2026-10-19 D5 出口：两条既有记忆裁决谁胜出——ghost 检测报出「多版本共存未裁决」后此前没有对应调用，write(supersedes=X) 会多造第 3 条记忆，不是一回事）；71=+hub_usage_timeline（2026-10-19 D10：四张使用表首次有统一查询面——「审计日志不是可观测性，对日志的查询才是」，查询面先要有）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -2402,6 +2402,73 @@ def t_memory_supersede_exit(hub):
     assert _count() == n1, "裁决后总数必须不变（新增/删除都不是它该做的事）"
 
 
+def t_usage_timeline_surface(hub):
+    """D10/R4 回归：`hub_usage_timeline` 工具面。
+
+    覆盖：① 工具注册与 profile 切片（worker 可见 / reader 不可见——它是干活者的
+    自查面，不是最小只读集）；② 只读契约（不进 WRITE_TOOLS → 无 dry_run/confirm 注入，
+    annotations.readOnlyHint）；③ 两个视图（timeline 事件流 / stats 聚合）都有输出；
+    ④ 未知 view 回落 timeline（不炸）；⑤ 整数入参走集中守卫（days/limit 坏类型 →
+    清晰错误 + error_kind=permanent，不静默回落默认值）；⑥ 过滤参数透传；
+    ⑦ **只读**：调用不写任何表（用 tool_calls 计数不变证明——注意：本工具自己的
+    调用也会留痕，所以只能证明「除自身留痕外无其他写入」用前后差验证）。"""
+    import brain as _b
+    rs = str(hub)
+    t = next(x for x in m.TOOLS if x["name"] == "hub_usage_timeline")
+
+    # ① 注册与切片
+    assert "hub_usage_timeline" not in m.WRITE_TOOLS, "只读工具不该进写清单"
+    assert t.get("annotations", {}).get("readOnlyHint") is True, "只读提示必须显式"
+    assert "hub_usage_timeline" in m.PROFILE_WORKER, "worker 切片要能看到（干活者自查面）"
+    assert "hub_usage_timeline" not in m.PROFILE_READER, "reader 是最小集，不放自查面"
+    assert "days" in t["inputSchema"]["properties"] and "view" in t["inputSchema"]["properties"]
+
+    # 造点使用数据（直接写库，绕开 MCP——测的是查询面不是留痕面）
+    with _b.db_conn(rs) as conn:
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)",
+                     (_b._now(), "workbuddy", "hub_search"))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                     (_b._now(), "workbuddy", "hub_search", "零命中探针", 0))
+
+    def _call(args):
+        return m.handle_message(rpc("tools/call", {"name": "hub_usage_timeline",
+                                                   "arguments": args}), rs)["result"]
+
+    # ③ 两个视图
+    rt = _call({"days": 7})
+    assert not rt.get("isError") and "使用时间线" in rt["content"][0]["text"], rt["content"][0]["text"][:200]
+    assert "hub_search" in rt["content"][0]["text"], "造的调用没出现在时间线里"
+    rstats = _call({"days": 7, "view": "stats"})
+    assert not rstats.get("isError"), rstats["content"][0]["text"][:200]
+    for sec in ("四源总量", "按工具", "零命中检索"):
+        assert sec in rstats["content"][0]["text"], f"stats 缺段：{sec}"
+    assert "零命中探针" in rstats["content"][0]["text"], "零命中查询没进 stats"
+
+    # ④ 未知 view 回落 timeline 不炸
+    rv = _call({"view": "bogus"})
+    assert not rv.get("isError") and "使用时间线" in rv["content"][0]["text"], "未知 view 应回落"
+
+    # ⑤ 整数守卫（days/limit 已登记 _INT_PARAMS）
+    for bad in ({"days": "abc"}, {"limit": "xyz"}):
+        rb = _call(bad)
+        assert rb.get("isError") and "必须是整数" in rb["content"][0]["text"], f"坏参未清晰拒：{bad}"
+        assert rb["structuredContent"]["error_kind"] == "permanent", f"入参错应归 permanent：{bad}"
+
+    # ⑥ 过滤透传：不存在的 agent → 空态文案（不炸）
+    rf = _call({"agent": "nobody-here"})
+    assert not rf.get("isError") and "无使用事件" in rf["content"][0]["text"], rf["content"][0]["text"][:200]
+
+    # ⑦ 只读证明：除本工具自身留痕外无其他写入
+    with _b.db_conn(rs) as conn:
+        before = {tbl: conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                  for tbl in ("op_audit", "searches", "journal")}
+    _call({"days": 7, "view": "stats"})
+    with _b.db_conn(rs) as conn:
+        after = {tbl: conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                 for tbl in ("op_audit", "searches", "journal")}
+    assert before == after, f"只读工具写了非 tool_calls 表：{before} → {after}"
+
+
 def t_error_taxonomy(root):
     """D8/R8 回归：**错误分类学**——三桶（transient / permanent / ambiguous）。
 
@@ -2624,6 +2691,8 @@ def main():
          lambda: t_error_taxonomy(root))
     case("D5出口·hub_memory_supersede（裁决后退出检索/数据保留/j撤销/坏参拒/过闸门/留痕/总数不变）",
          lambda: t_memory_supersede_exit(fresh_hub(tmp, "hub_supersede")))
+    case("D10·hub_usage_timeline 工具面（worker切片/只读契约/两视图/未知view回落/整数守卫/过滤透传/只读不改数）",
+         lambda: t_usage_timeline_surface(fresh_hub(tmp, "hub_usage_surface")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
