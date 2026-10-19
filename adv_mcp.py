@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.57"
+    assert r["serverInfo"]["version"] == "2.40.58"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -2308,6 +2308,68 @@ def t_usage_trace_completeness(hub):
         raise AssertionError(f"留痕路径对任意工具名失败：{e}") from e
 
 
+def t_error_taxonomy(root):
+    """D8/R8 回归：**错误分类学**——三桶（transient / permanent / ambiguous）。
+
+    研究依据（technologyonthe.net / itential）：生产 MCP 服务器必须把错误分成三桶并
+    **告诉调用方该怎么反应**——transient 可退避重试、permanent 立即失败、ambiguous
+    结果未知（幂等键是解药）。反模式是「所有错误都只塞一句文案、不给类别」，模型于是
+    要么对永久性错误死循环重试、要么对暂时性错误直接放弃。这也是 R2 幂等键的配套：
+    幂等键解决「能不能安全重试」，分类学解决「该不该重试」。
+
+    验证六面：① 参数类错误 → permanent；② 限流 → transient；③ 未归类错误 → ambiguous
+    （兜底，不假装知道）；④ `structuredContent.error_kind` 带分类（机器可读，且不破坏
+    「错误：」开头的既有约定——59 个失败站点与全库断言都依赖它）；⑤ 成功调用无 error_kind；
+    ⑥ **提示文案的差异化**：permanent 不追加任何「可重试」字样（多说一句就是噪音、
+    还会诱导无意义重试），transient/ambiguous 追加且指向幂等键。
+    """
+    rs = str(root)
+
+    def _call(name, args=None):
+        return m.handle_message(rpc("tools/call", {"name": name, "arguments": args or {}}), rs)
+
+    # ① 参数类错误 → permanent（重试同一个坏参数只会再错一次）
+    r1 = _call("hub_get_record", {"id": "not-a-number"})
+    txt1 = r1["result"]["content"][0]["text"]
+    assert r1["result"]["isError"] and txt1.startswith("错误"), f"应失败：{txt1[:80]}"
+    k1 = r1["result"].get("structuredContent", {}).get("error_kind")
+    assert k1 == "permanent", f"参数错误应归 permanent，实得 {k1}：{txt1[:80]}"
+    assert "重试" not in txt1, f"permanent 不该诱导重试：{txt1[-80:]}"
+
+    # ② 限流 → transient（等窗口过去就能成）
+    os.environ["AGENTHUB_RATE_TOOL_MAX"] = "1"
+    try:
+        _call("hub_status", {})                       # 第 1 次：占用唯一配额
+        r2 = _call("hub_status", {})                  # 第 2 次：被拦
+        txt2 = r2["result"]["content"][0]["text"]
+        assert r2["result"]["isError"], f"应被限流拦下：{txt2[:80]}"
+        k2 = r2["result"].get("structuredContent", {}).get("error_kind")
+        assert k2 == "transient", f"限流应归 transient，实得 {k2}：{txt2[:80]}"
+        assert "退避重试" in txt2, f"transient 必须给出可行动提示：{txt2[-100:]}"
+    finally:
+        os.environ.pop("AGENTHUB_RATE_TOOL_MAX", None)
+        m._RATE_WINDOWS.clear()
+
+    # ③/⑥ 分类函数本身的边界（不依赖具体工具，直接测三桶判定）
+    assert m._error_kind("错误：project 必填") == "permanent"
+    assert m._error_kind("错误：项目不存在") == "permanent"
+    assert m._error_kind("错误：触发速率限制（工具 hub_status，agent=zcode）") == "transient"
+    assert m._error_kind("错误：数据库被锁定，请稍后再试") == "transient"
+    assert m._error_kind("错误：某种全新的未知故障形态") == "ambiguous", "未命中任何关键词应兜底为 ambiguous"
+    # permanent 无提示；另两类的提示对写工具会指向幂等键（R2 的配套）
+    assert m._error_hint("permanent", "hub_log_work") == "", "permanent 不追加提示"
+    assert "idem_key" in m._error_hint("transient", "hub_log_work")
+    assert "idem_key" in m._error_hint("ambiguous", "hub_log_work")
+    # 只读工具的 ambiguous 提示不提幂等键（幂等只对写有意义），改为建议先查现状
+    assert "idem_key" not in m._error_hint("ambiguous", "hub_search")
+    assert "只读查询" in m._error_hint("ambiguous", "hub_search")
+
+    # ⑤ 成功调用不带 error_kind
+    r5 = _call("hub_status", {})
+    assert not r5["result"].get("isError"), f"成功调用：{r5}"
+    assert "error_kind" not in r5["result"].get("structuredContent", {}), "成功结果不该带错误分类"
+
+
 def t_rate_limit_loop_guard(root):
     """C6 回归：速率限制/循环保护——外部检索点名的生产常见存根「无限流：agent 进循环
     可无限调用」，本大脑此前无任何节流。断言面：默认阈值放行日常频次 / 单工具超限即拦
@@ -2464,6 +2526,8 @@ def main():
          lambda: t_schema_dialect_safety(root))
     case("D6·使用留痕全覆盖（写工具/原留痕内/原留痕外三类都留/失败不留/fail-open 不反噬业务）",
          lambda: t_usage_trace_completeness(fresh_hub(tmp, "hub_trace")))
+    case("D8·错误分类学三桶（permanent不诱导重试/transient提示退避/ambiguous兜底+幂等键/error_kind机器可读）",
+         lambda: t_error_taxonomy(root))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
