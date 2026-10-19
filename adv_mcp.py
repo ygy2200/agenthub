@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.58"
+    assert r["serverInfo"]["version"] == "2.40.59"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -83,7 +83,9 @@ def t_protocol(root):
             "hub_next", "hub_crystallize",
             "hub_event_write", "hub_events",
             "hub_skill_match", "hub_skill_sync"} <= names, names
-    assert len(names) == 69  # 68=X3+X4+Y1+Y2+Y3+playbook/trigger/graph；69=+hub_error_close（2026-10-17 错误闭环：MCP 侧关错，治僵尸堆积）
+    # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
+    # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
+    assert len(names) == 70  # 68=X3+X4+Y1+Y2+Y3+playbook/trigger/graph；69=+hub_error_close（2026-10-17 错误闭环：MCP 侧关错，治僵尸堆积）；70=+hub_memory_supersede（2026-10-19 D5 出口：两条既有记忆裁决谁胜出——ghost 检测报出「多版本共存未裁决」后此前没有对应调用，write(supersedes=X) 会多造第 3 条记忆，不是一回事）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -2308,6 +2310,98 @@ def t_usage_trace_completeness(hub):
         raise AssertionError(f"留痕路径对任意工具名失败：{e}") from e
 
 
+def t_memory_supersede_exit(hub):
+    """R9 回归：D5 的**执行路径**——`hub_memory_supersede`（两条既有记忆裁决谁胜出）。
+
+    缺口由来：R5 让 ghost 检测给出确定性建议「留 #3188、退 #3187」，但**没有对应的
+    调用去执行它**——agent 拿到建议后无处下手。现有 `hub_memory_write(supersedes=X)`
+    是「新建一条取代 X」，会多造出第 3 条记忆，语义完全不是一回事（那是「我写了新结论
+    取代旧结论」，这是「这两条都在库里，指定谁胜出」）。
+
+    验证七面：① 裁决后 drop 那条退出检索（_live_sql 生效）、keep 那条仍在；
+    ② 条目本体与证据链**保留可追溯**（不删数据，是取代不是删除）；
+    ③ 撤销可行（反向再裁一次即可回到原状）；
+    ④ 参数守卫（非正整数 / 自己取代自己 / 不存在的 id 都拒）；
+    ⑤ 过 dry_run 与 confirm 闸门（它是写工具，不能绕过既有契约）；
+    ⑥ journal 留痕（治理动作要可追溯）；
+    ⑦ **语义分工正确**：本工具执行后记忆总数**不变**（与 write(supersedes=) 会 +1 区分开）。
+    """
+    import brain as _b
+    rs = str(hub)
+    body = "代理端口是 7890 这是本机长期生效的环境事实"
+
+    def _live_ids():
+        with _b.db_conn(rs) as conn:
+            return {r["id"] for r in conn.execute(
+                "SELECT id FROM memories WHERE " + _b._live_sql())}
+
+    def _count():
+        with _b.db_conn(rs) as conn:
+            return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+    a = int(_b.add_memory(rs, body + "（旧版 A）", kind="fact", agent="zcode", project="p"))
+    b = int(_b.add_memory(rs, body + "（新版 B）", kind="fact", agent="zcode", project="p"))
+    assert _live_ids() >= {a, b}, "两条都应在检索内（未裁决）"
+    n0 = _count()
+
+    # ⑤ 先过闸门：dry_run 不落任何东西
+    rd = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                             "arguments": {"keep_id": b, "drop_id": a,
+                                                           "dry_run": True}}), rs)["result"]
+    assert "dry_run" in rd["content"][0]["text"] and _live_ids() >= {a, b}, "dry_run 不该落库"
+    rc = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                             "arguments": {"keep_id": b, "drop_id": a,
+                                                           "confirm": False}}), rs)["result"]
+    assert "人工确认" in rc["content"][0]["text"] and _live_ids() >= {a, b}, "confirm=false 应被拦且不执行"
+
+    # ① 正式裁决：b 胜出，a 退出检索
+    r = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                            "arguments": {"keep_id": b, "drop_id": a}}), rs)["result"]
+    assert not r.get("isError"), f"裁决失败：{r['content'][0]['text']}"
+    live = _live_ids()
+    assert b in live and a not in live, f"裁决未生效：keep={b in live} drop仍可见={a in live}"
+
+    # ② 数据保留可追溯（取代 ≠ 删除）
+    assert _count() == n0, "裁决不该删行（条目与证据链要能追溯）"
+    with _b.db_conn(rs) as conn:
+        row = conn.execute("SELECT superseded_by FROM memories WHERE id=?", (a,)).fetchone()
+    assert row and int(row["superseded_by"] or 0) == b, f"取代链未落：{row}"
+
+    # ⑥ journal 留痕（journal 表的列名是 action 不是 kind）
+    with _b.db_conn(rs) as conn:
+        hit = conn.execute("SELECT COUNT(*) FROM journal WHERE action='memory_supersede'").fetchone()[0]
+    assert hit > 0, "治理动作必须进 journal（可追溯）"
+
+    # ③ 撤销：反向再裁一次
+    r2 = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                             "arguments": {"keep_id": a, "drop_id": b}}), rs)["result"]
+    assert not r2.get("isError"), f"反向裁决失败：{r2['content'][0]['text']}"
+    live2 = _live_ids()
+    assert a in live2 and b not in live2, "反向裁决未生效（撤销路径断了）"
+    assert _count() == n0, "来回裁决都不该改变总条数"
+
+    # ④ 参数守卫
+    for bad in ({"keep_id": 0, "drop_id": a}, {"keep_id": "abc", "drop_id": a},
+                {"keep_id": a, "drop_id": 0}):
+        rb = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                                 "arguments": bad}), rs)["result"]
+        assert rb.get("isError") and rb["content"][0]["text"].startswith("错误"), f"坏参未拒：{bad}"
+        assert rb["structuredContent"]["error_kind"] == "permanent", f"参数错应归 permanent：{bad}"
+    same = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                               "arguments": {"keep_id": a, "drop_id": a}}), rs)["result"]
+    assert same.get("isError") and "自己" in same["content"][0]["text"], "自己取代自己应拒"
+    ghost = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                                "arguments": {"keep_id": 999999,
+                                                              "drop_id": a}}), rs)["result"]
+    assert ghost.get("isError"), "不存在的 id 应拒"
+
+    # ⑦ 语义分工：与 write(supersedes=) 区分——本工具执行后总数不变
+    n1 = _count()
+    m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                        "arguments": {"keep_id": a, "drop_id": b}}), rs)
+    assert _count() == n1, "裁决后总数必须不变（新增/删除都不是它该做的事）"
+
+
 def t_error_taxonomy(root):
     """D8/R8 回归：**错误分类学**——三桶（transient / permanent / ambiguous）。
 
@@ -2528,6 +2622,8 @@ def main():
          lambda: t_usage_trace_completeness(fresh_hub(tmp, "hub_trace")))
     case("D8·错误分类学三桶（permanent不诱导重试/transient提示退避/ambiguous兜底+幂等键/error_kind机器可读）",
          lambda: t_error_taxonomy(root))
+    case("D5出口·hub_memory_supersede（裁决后退出检索/数据保留/j撤销/坏参拒/过闸门/留痕/总数不变）",
+         lambda: t_memory_supersede_exit(fresh_hub(tmp, "hub_supersede")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
