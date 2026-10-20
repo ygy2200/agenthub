@@ -41,6 +41,54 @@ AGENT_LEGACY = {"zcode", "hermes", "deepseek", "claude", "codex", "其他"}
 # 兼容旧引用（勿在新代码里直接用；它是历史集合，不含 dsh/workbuddy）
 AGENT_KNOWN = AGENT_LEGACY
 
+# 运行进程版本标记：agenthub_mcp 导入时写入。ops 据此判断「部署后没重启，仍在跑旧代码」。
+SERVER_DIR = ""
+SERVER_STARTED_AT = ""
+
+
+def files_newer_than(base_dir: str, since_iso: str, pattern: str = "*.py",
+                     tolerance: float = 2.0) -> list[dict]:
+    """列出 base_dir 顶层在 since_iso 之后被改过的文件（部署未重启 / 验证后变更检测）。
+
+    tolerance 吸收「进程启动与源码 mtime 同秒」的误差——加载动作本身不算变更。
+    只看目录顶层（服务目录是平铺的），不递归、不碰 __pycache__/数据库等非 .py 噪音。
+    base_dir / since_iso 无效返回 []（调用方据此报 unknown，不猜）。
+    """
+    if not base_dir or not since_iso:
+        return []
+    try:
+        since = datetime.datetime.fromisoformat(str(since_iso)).timestamp()
+    except (TypeError, ValueError):
+        return []
+    d = Path(base_dir)
+    if not d.is_dir():
+        return []
+    out = []
+    for p in d.glob(pattern):
+        try:
+            if not p.is_file():
+                continue
+            mt = p.stat().st_mtime
+        except OSError:
+            continue
+        if mt > since + tolerance:
+            out.append({"file": p.name,
+                        "mtime": datetime.datetime.fromtimestamp(mt).isoformat(timespec="seconds"),
+                        "mtime_ts": mt})
+    out.sort(key=lambda r: r["mtime_ts"], reverse=True)
+    return out
+
+
+def runtime_staleness(base_dir: str = "", started_at: str = "") -> dict:
+    """当前进程加载的代码是否落后于磁盘（known=False 表示不在 MCP 进程内，不能猜）。"""
+    started = started_at or SERVER_STARTED_AT
+    base = base_dir or SERVER_DIR
+    if not started:
+        return {"known": False, "count": 0, "stale": [], "started": "", "base": base}
+    stale = files_newer_than(base, started)
+    return {"known": True, "count": len(stale), "stale": stale, "started": started, "base": base}
+
+
 # 工作记录段头：## 或 ### 开头
 HEADER_RE = re.compile(r"^#{2,3}\s+(.+?)\s*$")
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")

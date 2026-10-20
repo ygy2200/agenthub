@@ -397,6 +397,30 @@ def t_agents_detect(tmp):
     assert len(names) == len(set(names))
 
 
+def t_registry_probes():
+    """R5 回归：PROBES 必须覆盖注册表里的 agent。
+
+    「能不能被看见」不该取决于谁记得往 PROBES 里加一条——Qoder 接入后已在注册表，
+    hub_list_skills 却报「未找到 agent」，技能面看起来像没装。这里逐家点名；
+    新增适配器漏补探测当场红。同时覆盖 TOML 形态的 MCP 配置（Codex config.toml）。
+    """
+    import agentscore
+    names = {a["name"] for a in agentscore.PROBES}
+    for want in ("ZCode", "Claude Code", "Codex", "hermes", "DSH", "WorkBuddy", "Qoder"):
+        assert want in names, f"PROBES 缺 {want}：{sorted(names)}"
+    with tempfile.TemporaryDirectory() as td:
+        f = Path(td) / "config.toml"
+        f.write_text('[mcp_servers.agenthub]\ncommand = "python"\n\n'
+                     '[mcp_servers.other.env]\nA = "1"\n', encoding="utf-8")
+        parsed = agentscore._parse_mcp_json(f)
+        assert "agenthub" in parsed and "other" in parsed, parsed
+        assert parsed["agenthub"]["command"] == "python", parsed
+        assert agentscore._parse_mcp_json(Path(td) / "missing.toml") == {}
+        bad = Path(td) / "bad.toml"
+        bad.write_text("[mcp_servers\n", encoding="utf-8")
+        assert agentscore._parse_mcp_json(bad) == {}
+
+
 def t_exit_guard():
     """R5·退出守卫（2026-10-17）：GUI 脚本禁止裸 os._exit，必须走 window._hard_exit。
 
@@ -449,6 +473,7 @@ def main():
     case("搜索（内容/文件名/空词/超长文件）", lambda: t_search(tmp))
     case("规则读写与收编建议", lambda: t_rules(tmp))
     case("agent能力探测（特征识别/坏json/键名变体）", lambda: t_agents_detect(tmp))
+    case("R5·探测覆盖注册表（七家点名/TOML MCP/坏 TOML 兜底）", t_registry_probes)
     case("hub初始化（幂等/不覆盖用户内容）", lambda: t_init_hub(tmp))
     case("跨进程锁（互斥/重入/陈旧强拆/新鲜不拆）", lambda: t_hub_lock(tmp))
     case("备份保留策略（超限裁剪/不误删）", lambda: t_backup_prune(tmp))

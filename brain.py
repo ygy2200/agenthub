@@ -28,6 +28,26 @@ DB_NAME = "brain.db"
 BACKUP_DIR = "brain-backups"
 BACKUP_KEEP = 30
 KINDS = ("fact", "preference", "lesson", "project", "note")
+
+# ---------------------------------------------------------------- 新鲜度策略（R4）
+# 「Facts Should Expire」模式（外部研究，2026-10）：事实行该带「我的真相多旧」——
+# 状态 fresh/stale/expired **在读时计算**（无清扫进程、无定时任务），且**过期不删除**：
+# 过期事实仍是证据，只是更弱（「供应商三月在 Austin」胜过「未知」）。
+# 分档依据（同研究）：耐久知识（决策/约束/偏好）长窗口，易变运维事实短窗口——
+# 「如果每条事实同一个 TTL，等于每隔不久把全库重审一遍」。
+# 本库口径：fact=环境事实（路径/端口/版本，随升级就变）最短；note=随手记最 ephemeral；
+# preference/lesson=人的认知，最耐久。checked 信号优先用显式确认列（R5 的
+# hub_memory_confirm 会写），没有时退回 last_hit（被检索≈最近有人看过它，弱确认）。
+FRESH_POLICY = {
+    # kind: (fresh_days, expire_days)——age ≤ fresh 为 fresh；fresh < age ≤ expire 为 stale；
+    #       age > expire 或 valid_until 过期 → expired。未知 kind 用 note 档（最保守）。
+    "fact": (14, 90),          # 环境事实：机器配置两周就该复核，三个月不信
+    "preference": (180, 730),  # 用户偏好：人的习惯以季计
+    "lesson": (365, 1825),     # 踩坑经验：教训很少变假，五年一审
+    "project": (90, 365),      # 项目进展：跟项目周期走
+    "note": (7, 30),           # 随手记：本来就该速朽
+}
+FRESH_STATES = ("fresh", "stale", "expired", "unknown")
 # M6 记忆成熟度（2026-10-12，ByteRover 模式）：记忆不是生来平等——新写入是草稿，
 # 被反复用/人工确认过的才敢依赖。与 salience（显著度权重）互补：那是「多响」，这是「多信」。
 # 晋升只上不下（core 不降级——人工 pinned 的信任不该被低频推翻）。
@@ -233,7 +253,8 @@ CREATE TABLE IF NOT EXISTS memories (
     valid_until TEXT DEFAULT "",
     confidence REAL DEFAULT 1.0,
     evidence TEXT DEFAULT "",
-    maturity TEXT DEFAULT "draft"
+    maturity TEXT DEFAULT "draft",
+    confirmed TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS memory_revisions (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -304,6 +325,16 @@ CREATE TABLE IF NOT EXISTS agents (
     last_project TEXT DEFAULT "",
     heartbeats INTEGER DEFAULT 0,
     records INTEGER DEFAULT 0
+);
+-- R6：接入验证快照（每 agent 一行，最新一次 verify 的结果）。
+-- 为什么落库：现场探测只能回答「现在配没配」，回答不了「上次验证过吗、当时哪项没过」。
+-- 重启/改配置后，没有快照就没人知道上一轮的「已接入」结论是否还成立。
+CREATE TABLE IF NOT EXISTS agent_onboarding (
+    agent TEXT PRIMARY KEY,
+    ts TEXT DEFAULT "",
+    ok INTEGER DEFAULT 0,
+    steps TEXT DEFAULT "",
+    note TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS env_items (
     category TEXT,
@@ -619,10 +650,66 @@ def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, recor
     conn.execute(f"UPDATE agents SET {','.join(sets)} WHERE name=?", args)
 
 
-SCHEMA_VERSION = 1
+def onboarding_save(root: str, agent: str, ok: bool, steps: list, note: str = "") -> str:
+    """写接入验证快照（每 agent 一行，覆盖上一次）。返回错误或 ""。"""
+    key = _norm_agent(agent)
+    if not key:
+        return "agent 必填"
+    ensure_schema(root)
+    try:
+        with db_conn(root) as conn:
+            conn.execute(
+                "INSERT INTO agent_onboarding(agent,ts,ok,steps,note) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(agent) DO UPDATE SET ts=excluded.ts, ok=excluded.ok, "
+                "steps=excluded.steps, note=excluded.note",
+                (key, _now(), 1 if ok else 0, json.dumps(steps or [], ensure_ascii=False), note or ""))
+        return ""
+    except sqlite3.Error as e:
+        return f"接入快照写入失败：{e}"
+
+
+def onboarding_get(root: str, agent: str = "") -> list:
+    """读接入验证快照。agent 为空返回全部；表不存在（旧库未跑 ensure_schema）返回 []。"""
+    sql = "SELECT agent, ts, ok, steps, note FROM agent_onboarding"
+    args: list = []
+    if agent:
+        sql += " WHERE agent=?"
+        args.append(_norm_agent(agent))
+    sql += " ORDER BY ts DESC"
+    try:
+        with db_conn(root) as conn:
+            rows = []
+            for r in conn.execute(sql, args):
+                d = dict(r)
+                try:
+                    d["steps"] = json.loads(d.get("steps") or "[]")
+                except ValueError:
+                    d["steps"] = []
+                rows.append(d)
+            return rows
+    except sqlite3.OperationalError:
+        return []
+
+
+def agent_record_stats(root: str, agent: str, days: int = 30) -> dict:
+    """近 N 天该 agent 的工作记录数 + 最近一条日期（接入是否真在用）。"""
+    key = _norm_agent(agent)
+    since = (datetime.date.today() - datetime.timedelta(days=days)).isoformat()
+    try:
+        with db_conn(root) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) AS n, MAX(date) AS last FROM records "
+                "WHERE lower(agent)=? AND status='active' AND date>=?", (key, since)).fetchone()
+            return {"days": days, "count": row["n"] or 0, "last": row["last"] or ""}
+    except sqlite3.Error:
+        return {"days": days, "count": 0, "last": ""}
+
+
+SCHEMA_VERSION = 2
 # B11 schema 版本号。约定：新增表/列/迁移时 **+1**，并在本注释里记一笔：
 #   v1 = 基线（本登记落地的时刻；此前所有迁移都靠幂等的 _migrate_columns 逐列 PRAGMA 试探，
 #        能补列但没有版本号——无法回答「这个库现在是哪个版本」「是不是降级运行了」）。
+#   v2 = R6 新增 agent_onboarding（接入验证快照）。
 # 故意**不**替换 _migrate_columns：它已幂等且被大量回归覆盖，推翻重来风险远大于收益。
 # 这里只补缺口的一环——版本登记 + 降级检测。
 
@@ -951,6 +1038,10 @@ def _migrate_columns(root: str) -> None:
                 "UPDATE memories SET maturity=CASE WHEN pinned=1 AND use_count>=? THEN 'core' "
                 "WHEN use_count>=? THEN 'validated' ELSE 'draft' END",
                 (CORE_AT, VALIDATE_AT))
+        # 第五轮 R2（2026-10-20）复核列：新鲜度状态机自 R4 起就在读 confirmed，
+        # 但列和写入路径一直缺失（只能靠 last_hit 弱确认）。补列纯增量，旧行默认空。
+        if "confirmed" not in cols:
+            conn.execute("ALTER TABLE memories ADD COLUMN confirmed TEXT DEFAULT ''")
         # P1-1（2026-10-11）records 双时相版本列：valid_from/valid_until/superseded_by
         # 「失效 ≠ 删除」——旧版本行保留可追溯，检索只认现行有效（_rec_live_sql）。
         rcols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
@@ -2674,7 +2765,8 @@ def memory_trace(root: str, mid: int) -> list:
         m = dict(row)
     out = [{"role": "self", "id": m["id"], "kind": m["kind"], "content": m["content"],
             "agent": m["agent"], "created": m["created"], "valid_until": m["valid_until"],
-            "confidence": m["confidence"], "superseded_by": m["superseded_by"]}]
+            "confidence": m["confidence"], "superseded_by": m["superseded_by"],
+            "confirmed": m.get("confirmed", "")}]
     # ① 向后：谁取代了它（含链式）
     cur = int(m["superseded_by"] or 0)
     guard = 0
@@ -3741,6 +3833,11 @@ def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
         rows = _fold_near_dupes(rows)   # 折叠在计唤起之前：被折掉的没进上下文，不该算唤起
         rows = _mark_conflicts(rows)    # 矛盾标记（业界：取回后、进上下文前检测，别让 LLM 自己发现）
         rows = _demote_older_versions(rows)  # R3：同事实多版本对内降序（旧版沉底+标注，只动对内顺序）
+        now0 = datetime.datetime.now()  # R4：新鲜度读时标注（一次 now，行间一致）
+        for r in rows:
+            fr = memory_freshness(r, now0)
+            r["_freshness"] = fr["state"]
+            r["_age_days"] = fr["age_days"]
     if rows and words and count_hits:
         now = _now()
         _bump_access(root, [r["id"] for r in rows], now)
@@ -3759,6 +3856,125 @@ def count_memories(root: str, kind: str = "") -> int:
         args.append(kind)
     with db_conn(root) as conn:
         return conn.execute(q, args).fetchone()[0]
+
+
+def memory_freshness(row: dict, now: "datetime.datetime | None" = None) -> dict:
+    """R4：单条记忆的新鲜度状态——**读时计算，无清扫进程，过期不删除**。
+
+    外部模式（「Facts Should Expire」）：事实带 observed_at/checked_at，状态
+    fresh/stale/expired 在读时算出；过期事实仍是证据只是更弱。本库的字段映射：
+      observed = max(created, updated)   —— 值最后被（重）写的时点
+      checked  = max(confirmed, last_hit)—— 最后被「确认还有效」的时点；
+                 显式确认列（R5 hub_memory_confirm 写入）优先，没有时退回
+                 last_hit（被检索≈最近有人看过——弱确认，口径在 basis 里写明）
+      reference = max(observed, checked)—— 以两者较新者计龄（写过或用得近都算新）
+    硬过期（valid_until 已过）优先于年龄判定——那是写入者显式划的线。
+
+    返回 {state, age_days, basis, fresh_days, expire_days}。时间戳缺失/畸形 →
+    state="unknown"（不猜：把没时间戳的当成 stale 会误报一片）。
+    """
+    now = now or datetime.datetime.now()
+    kind = (row.get("kind") or "note")
+    fresh_d, expire_d = FRESH_POLICY.get(kind, FRESH_POLICY["note"])
+    base = {"state": "unknown", "age_days": None, "basis": "", "kind": kind,
+            "fresh_days": fresh_d, "expire_days": expire_d}
+    observed = max(str(row.get("created") or ""), str(row.get("updated") or ""))
+    checked = max(str(row.get("confirmed") or ""), str(row.get("last_hit") or ""))
+    reference = max(observed, checked)
+    try:
+        ref_dt = datetime.datetime.fromisoformat(reference)
+    except (ValueError, TypeError):
+        return base                      # 无可用时间戳：不猜
+    age = (now - ref_dt).total_seconds() / 86400
+    base["age_days"] = round(age, 1)
+    base["basis"] = ("confirmed" if checked > observed else "written") \
+        if checked else "written"
+    vu = str(row.get("valid_until") or "").strip()
+    if vu and vu < now.date().isoformat():
+        base["state"] = "expired"
+        base["basis"] = "valid_until"
+        return base
+    base["state"] = "expired" if age > expire_d else ("stale" if age > fresh_d else "fresh")
+    return base
+
+
+def confirm_memories(root: str, ids=None, kind: str = "", all_stale: bool = False,
+                     limit: int = 50, now: str = "") -> dict:
+    """复核记忆（第五轮 R2）：把「现在还成立」写进 confirmed，新鲜度读时立即重置。
+
+    两种入口：ids=[...] 显式指定；all_stale=True 批量复核当前 stale/expired（可按
+    kind 过滤，limit 截断并如实上报 remaining）。**只写 confirmed**——不碰
+    content/updated/use_count：updated 表示「值最后被修改」，confirmed 表示「最后被
+    确认仍成立」，混用会污染版本裁决与「谁更新」的判断。
+    valid_until 已过的硬过期不确认解除（写入者显式划的线，要改就改 valid_until）。
+    返回 {confirmed:[id], skipped:[{id,reason}], remaining, before:{id:state}, stamp}。
+    """
+    stamp = str(now or _now()).strip()
+    try:
+        now_dt = datetime.datetime.fromisoformat(stamp)
+    except (TypeError, ValueError):
+        stamp, now_dt = _now(), datetime.datetime.now()
+    try:
+        limit = max(1, min(int(limit or 50), 200))
+    except (TypeError, ValueError):
+        limit = 50
+    out = {"confirmed": [], "skipped": [], "remaining": 0, "before": {}, "stamp": stamp}
+
+    def _skip(mid, reason):
+        out["skipped"].append({"id": mid, "reason": reason})
+
+    with db_conn(root) as conn:
+        if ids:
+            seen = []
+            for raw in ids:
+                try:
+                    mid = int(raw)
+                except (TypeError, ValueError):
+                    _skip(raw, "不是整数 id")
+                    continue
+                if mid not in seen:
+                    seen.append(mid)
+            for mid in seen:
+                row = conn.execute("SELECT * FROM memories WHERE id=?", (mid,)).fetchone()
+                if not row:
+                    _skip(mid, "不存在")
+                    continue
+                row = dict(row)
+                if (row.get("status") or "active") != "active":
+                    _skip(mid, f"非现行（status={row.get('status')}）")
+                    continue
+                sup = int(row.get("superseded_by") or 0)
+                if sup > 0:
+                    _skip(mid, f"已被 #{sup} 取代")
+                    continue
+                if sup < 0:
+                    _skip(mid, "已作废（无继任）")
+                    continue
+                fr = memory_freshness(row, now_dt)
+                if fr["basis"] == "valid_until":
+                    _skip(mid, "valid_until 已过（硬过期；确认不能解除，请更新有效期）")
+                    continue
+                out["before"][mid] = fr["state"]
+                conn.execute("UPDATE memories SET confirmed=? WHERE id=?", (stamp, mid))
+                out["confirmed"].append(mid)
+        elif all_stale:
+            q = ("SELECT * FROM memories WHERE status='active' AND superseded_by=0"
+                 + (" AND kind=?" if kind in KINDS else "") + " ORDER BY id")
+            rows = [dict(r) for r in conn.execute(q, (kind,) if kind in KINDS else ())]
+            for row in rows:
+                fr = memory_freshness(row, now_dt)
+                if fr["basis"] == "valid_until":
+                    _skip(row["id"], "valid_until 已过（硬过期；确认不能解除，请更新有效期）")
+                    continue
+                if fr["state"] not in ("stale", "expired"):
+                    continue
+                if len(out["confirmed"]) >= limit:
+                    out["remaining"] += 1
+                    continue
+                out["before"][row["id"]] = fr["state"]
+                conn.execute("UPDATE memories SET confirmed=? WHERE id=?", (stamp, row["id"]))
+                out["confirmed"].append(row["id"])
+    return out
 
 
 def memory_governance_stats(root: str) -> dict:
@@ -4070,6 +4286,25 @@ def skill_sync(root: str, rows: list) -> dict:
             else:
                 stat["unchanged"] += 1
     return stat
+
+
+def skills_by_agent(root: str, agent: str = "") -> list:
+    """从技能索引按 agent 取行（hub_list_skills 的兜底数据源）。
+
+    本地目录探测不到（agent 装在别处/目录改名）时，索引里仍有上次同步的记录。
+    索引只增不删，路径可能已失效——调用方必须标注「来自索引」而不是当作现场探测。
+    """
+    sql = "SELECT name, agent, path, desc, hits, last_hit FROM skills"
+    args: list = []
+    if agent:
+        sql += " WHERE lower(agent) LIKE ?"
+        args.append(f"%{agent.lower()}%")
+    sql += " ORDER BY agent, name"
+    try:
+        with db_conn(root) as conn:
+            return [dict(r) for r in conn.execute(sql, args).fetchall()]
+    except sqlite3.OperationalError:
+        return []
 
 
 def skill_match(root: str, query: str, topk: int = 3, agent: str = "") -> list:

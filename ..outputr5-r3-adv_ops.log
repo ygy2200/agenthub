@@ -1,0 +1,152 @@
+  PASS  release ���嵥ʱ���� mtime ����ʾ������
+  PASS  build_manifest ��������ʱ����+ͼ��
+  PASS  build_manifest �ų� adv_ �ع�ű�
+  PASS  build_manifest ��¼�汾
+  PASS  release �ܾ�δ��ɵĹ����嵥
+  PASS  release �嵥�����Դ/exe/����һ��
+  PASS  release ץ�������Դ����������
+  PASS  release ץ�����渱��ͬ�ߴ粻ͬ��ϣ
+  PASS  release ץ�� exe ���嵥�����ϣ����
+  PASS  release �嵥��ʱ���� mtime ����
+  PASS  py_compile ץ���﷨����
+  PASS  py_compile �ų� __pycache__
+  PASS  ghost_memory �������ע���Ҹɾ���ͨ��
+Loading weights:   0%|          | 0/71 [00:00<?, ?it/s]Loading weights: 100%|��������������������| 71/71 [00:00<00:00, 1506.62it/s]
+  PASS  ghost_memory ע�����鼴ץ����汾����δ�þ���
+  PASS  ghost_memory ÿ�Ը�ȷ���Բþ����飨���ݿɽ��ͣ�
+  PASS  �������ڶ��ڵ��������� keep/drop ����
+  PASS  ghost_memory ��ȡ����ת�̣����������ٱ���
+  PASS  ghost_memory ��¼����ߣ�ע������Ƽ�¼��ץ����������ѡ�ֿ�������
+  PASS  ghost_memory ��¼��ȡ�����ٱ�����������
+  PASS  profile_surface 已注册且真实源在预算内
+  PASS  profile_surface detail ≤ 8 行
+  PASS  profile_surface 描述膨胀超预算即 warn（被动面失控可见）
+  PASS  profile_surface 恢复后不误报
+  PASS  stale_health 已注册且干净库通过
+  PASS  stale_health 陈旧 fact 可见（只报不裁，ok 仍为 True）
+  PASS  stale_health 泄漏必抓（已取代旧事实被检索返回即红）
+  PASS  stale_health 恢复检索后转绿（真实管线无泄漏）
+  PASS  rules_health 动态点名漏登记闸门的新 agent
+  PASS  rules_health 漏登记原因可读（指向 targets.json）
+  PASS  agent_onboard_status 八项核对齐全
+  PASS  未注册 agent 也返回清单（诊断不被准入挡住）
+  PASS  每个非 ok 项都带可直接执行的下一步
+  PASS  ops agent_onboard 可单独核对未注册 agent（硬缺口点名）
+  PASS  ops agent_onboard detail ≤ 8
+  PASS  验证快照落库后 verify 项转 ok（不再「从未 verify」）
+  PASS  技能索引覆盖缺口被点名（本地有、索引无，且给出同步命令）
+  PASS  补齐索引后技能项转 ok（本地已覆盖）
+  PASS  runtime_health 已注册且非 MCP 场景不误报
+  PASS  runtime_health 注入旧启动时刻即点名落后文件并要求重启
+  PASS  runtime_health detail ≤ 8
+  PASS  回归套件登记完整（ops.REGRESSION_SUITES == 目录里实际 adv_*.py）
+  PASS  py_compile 输出精简（detail≤8）
+  PASS  py_compile 全绿
+  PASS  py_compile 拒绝非法 target ''
+  PASS  py_compile 拒绝非法 target '   '
+  PASS  py_compile 拒绝非法 target 'C:\\Users\\y\\AppData\\Local\\Temp\\agenthub_adv_ops_zd2dl2zx\\测试项目-检查工具箱\\good.py'
+  PASS  py_compile 拒绝非法 target 'C:\\Users\\y\\AppData\\Local\\Temp\\agenthub_adv_ops_zd2dl2zx\\不存在目录xyz'
+  PASS  py_compile 拒绝非法 target 'con:'
+  PASS  py_compile 拒绝非法 target 'NUL'
+  PASS  未知检查项拒绝
+  PASS  regression 拒绝非 AgentHub 目录
+  PASS  deploy_diff 拒绝非 AgentHub 目录
+  PASS  git_status 拒绝非仓库
+  PASS  env 出环境清单
+  PASS  env detail ≤ 8 行
+  PASS  brain 空库不崩
+  PASS  brain 无效 root 拒绝
+  PASS  inbox 空态
+  PASS  inbox 列出积压
+  PASS  stalled 列出停滞项目
+  PASS  dup_mem 列出疑似重复
+  PASS  dup_mem 无效 root 拒绝
+  PASS  deploy_diff 自检输出可读
+  PASS  deploy_diff detail ≤ 8
+  PASS  py_compile 预算 300 停止遍历
+  PASS  deploy_diff 源码缺失分支
+  PASS  wakeups 首次提醒
+  PASS  wakeups 当天跑过不再提醒
+  PASS  wakeups 无码项目静默
+  PASS  wakeups 未知项目静默
+  PASS  wakeups git项目提醒
+  PASS  wakeups 蒸馏候选提醒
+  PASS  wakeups 蒸馏提醒当天去重
+  PASS  wakeups 全办完静默
+  PASS  wakeups 欠账提醒
+  PASS  wakeups 欠账水位线不再提
+  PASS  wakeups 新欠账再提
+  PASS  compress 抽出路径事实
+  PASS  compress 抽出错误事实
+  PASS  compress 不抽 note 类
+  PASS  compress 对抗内容不崩
+  PASS  compress 伪路径 UNC 原样可识别（人取舍）
+  PASS  compress 代码块内容不炸正则
+  PASS  注册表 py_compile 描述非空
+  PASS  注册表 git_status 描述非空
+  PASS  注册表 regression 描述非空
+  PASS  注册表 deploy_diff 描述非空
+  PASS  注册表 release 描述非空
+  PASS  注册表 env 描述非空
+  PASS  注册表 brain 描述非空
+  PASS  注册表 inbox 描述非空
+  PASS  注册表 stalled 描述非空
+  PASS  注册表 dup_mem 描述非空
+  PASS  注册表 compress 描述非空
+  PASS  注册表 agents 描述非空
+  PASS  注册表 rules_health 描述非空
+  PASS  注册表 agent_onboard 描述非空
+  PASS  注册表 runtime_health 描述非空
+  PASS  注册表 hygiene 描述非空
+  PASS  注册表 ponytail_gate 描述非空
+  PASS  注册表 coverage_gate 描述非空
+  PASS  注册表 db_health 描述非空
+  PASS  注册表 graph_health 描述非空
+  PASS  注册表 ghost_memory 描述非空
+  PASS  注册表 date_health 描述非空
+  PASS  注册表 stdout_guard 描述非空
+  PASS  注册表 schema_drift 描述非空
+  PASS  注册表 desc_quality 描述非空
+  PASS  注册表 record_quality 描述非空
+  PASS  注册表 profile_surface 描述非空
+  PASS  注册表 stale_health 描述非空
+  PASS  检查项数量未倒退（当前 28，历史最高 23）
+  PASS  检查项 py_compile 描述非空
+  PASS  检查项 git_status 描述非空
+  PASS  检查项 regression 描述非空
+  PASS  检查项 deploy_diff 描述非空
+  PASS  检查项 release 描述非空
+  PASS  检查项 env 描述非空
+  PASS  检查项 brain 描述非空
+  PASS  检查项 inbox 描述非空
+  PASS  检查项 stalled 描述非空
+  PASS  检查项 dup_mem 描述非空
+  PASS  检查项 compress 描述非空
+  PASS  检查项 agents 描述非空
+  PASS  检查项 rules_health 描述非空
+  PASS  检查项 agent_onboard 描述非空
+  PASS  检查项 runtime_health 描述非空
+  PASS  检查项 hygiene 描述非空
+  PASS  检查项 ponytail_gate 描述非空
+  PASS  检查项 coverage_gate 描述非空
+  PASS  检查项 db_health 描述非空
+  PASS  检查项 graph_health 描述非空
+  PASS  检查项 ghost_memory 描述非空
+  PASS  检查项 date_health 描述非空
+  PASS  检查项 stdout_guard 描述非空
+  PASS  检查项 schema_drift 描述非空
+  PASS  检查项 desc_quality 描述非空
+  PASS  检查项 record_quality 描述非空
+  PASS  检查项 profile_surface 描述非空
+  PASS  检查项 stale_health 描述非空
+  PASS  desc_quality 真实源码通过
+  PASS  desc_quality 合格样本通过
+  PASS  desc_quality 拦截过短描述
+  PASS  desc_quality 拦截核心工具缺示例
+  PASS  desc_quality 拦截必填参数无说明
+  PASS  desc_quality 非核心工具只查长度
+  PASS  desc_quality 拦截 CORE_TOOLS 腐烂
+  PASS  record_quality 合成库度量
+  PASS  record_quality 缺段分布
+
+OPS ALL PASS

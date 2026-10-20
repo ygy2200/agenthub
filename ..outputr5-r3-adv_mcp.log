@@ -1,0 +1,139 @@
+[agenthub][tool-error] hub_get_progress agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_task_add agent=- :: 错误：必填参数 title 缺失（hub_task_add 需要：title）
+[agenthub][tool-error] hub_call_tool agent=- :: 错误：未知工具 hub_no_such_tool_xyz。你是不是要找：hub_search_tools、hub_call_tool？
+下一步：按上面的准确名重调；都不对就用 hub_search_tools(keyword="…") 搜全部工具。
+[agenthub][tool-error] hub_no_such_tool_direct agent=- :: 错误：未知工具 hub_no_such_tool_direct。你是不是要找：hub_search_tools？
+下一步：按上面的准确名重调；都不对就用 hub_search_tools(keyword="…") 搜全部工具。
+[agenthub][tool-error] hub_claim agent=- :: 错误：agent 必填（认领必须署名）
+[agenthub][tool-error] hub_get_project agent=- :: 错误：必填参数 project 缺失（hub_get_project 需要：project） 正确示例：hub_get_project(project="AgentHub-多agent文件统一管理")
+[agenthub][tool-error] hub_search agent=- :: 错误：必填参数 keyword 缺失（hub_search 需要：keyword） 正确示例：hub_search(keyword="ops_run 执行异常")
+[agenthub][tool-error] hub_heartbeat agent=- :: 错误：agent 必填
+[agenthub][tool-error] hub_checkpoint agent=- :: 错误：查看检查点时间线需要 task_id（检查点按任务维度组织：hub_checkpoint(action=list, task_id=<id>)）
+[agenthub][tool-error] hub_call_tool agent=- :: 错误：必填参数 project 缺失（hub_get_project 需要：project） 正确示例：hub_get_project(project="AgentHub-多agent文件统一管理")
+[agenthub][tool-error] hub_get_project agent=- :: 错误：项目不存在：不存在的项目XYZ。相近项目：无。项目目录名须与磁盘目录名一致（「对象-问题」结构），先用 hub_list_projects 核对准确名；例：hub_get_project(project="AgentHub-多agent文件统一管理")
+[agenthub][tool-error] hub_history agent=- :: 错误：record #999999 不存在
+[agenthub][tool-error] hub_playbook agent=- :: 错误：流程「不存在的流程XYZ」不存在。hub_playbook action=list 看清单
+临时目录：C:\Users\y\AppData\Local\Temp\agenthub_mcp_q0etp2f6
+
+  PASS  交接协议工具（create/list/claim/重复认领拒绝/空态）
+  PASS  MCP协议（握手/50工具/未知方法/异常自动登记/ping）
+  PASS  isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）
+  PASS  响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）
+  PASS  协议健壮性（畸形请求-32600 / 异常不外泄路径SQL）
+  PASS  集中式必填校验（缺参拦截/agent豁免/checkpoint豁免/透传覆盖）
+  PASS  Round7·业务失败缺前缀静默成功（项目/条目/流程不存在→isError=True）
+Loading weights:   0%|          | 0/71 [00:00<?, ?it/s]Loading weights: 100%|██████████| 71/71 [00:00<00:00, 2491.30it/s]
+[agenthub][tool-error] hub_checkpoint agent=- :: 错误：查看检查点时间线需要 task_id（检查点按任务维度组织：hub_checkpoint(action=list, task_id=<id>)）
+[agenthub][tool-error] hub_checkpoint agent=- :: 错误：查看最新检查点需要 task_id（hub_checkpoint(action=latest, task_id=<id>)）
+[agenthub][tool-error] hub_graph agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_graph agent=- :: 错误：参数 limit 必须是整数（收到 'x'）
+[agenthub][tool-error] hub_graph agent=- :: 错误：参数 limit 必须是整数（收到 'bad'）
+[agenthub][tool-error] hub_graph agent=- :: 错误：参数 limit 必须是整数（收到 '2.5'）
+[agenthub][tool-error] hub_graph agent=- :: 错误：参数 max_depth 必须是整数（收到 'nan'）
+[agenthub][tool-error] hub_playbook agent=- :: 错误：参数 limit 必须是整数（收到 'oops'）
+[agenthub][tool-error] hub_log_work agent=zcode :: 错误：review_date 需为 YYYY-MM-DD（如 2026-10-20），收到 'tomorrow'——格式不对会让「到期提醒」静默不触发
+[agenthub][tool-error] hub_task_add agent=zcode :: 错误：due 需为 YYYY-MM-DD（如 2026-10-20），收到 '下周五'——格式不对会让「到期提醒」静默不触发
+[agenthub][tool-error] hub_memory_write agent=zcode :: 错误：valid_until 不是合法日期（收到 '2026-02-30'）
+[agenthub][tool-error] hub_tasks agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_next agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_list_todos agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_get_record agent=- :: 错误：参数 record_id 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_memory_read agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_events agent=- :: 错误：参数 since_id 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_audit agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_export agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_memory_write agent=- :: 错误：参数 supersedes 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_get_record agent=- :: 错误：参数 record_id 必须是整数（收到 'not-an-int'）
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 3次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单工具上限 2次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_health agent=- :: 错误：触发速率限制（工具 hub_health，agent=-）：60 秒内已达单 agent 全工具上限 2次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off
+[agenthub][tool-error] hub_get_record agent=- :: 错误：必填参数 record_id 缺失（hub_get_record 需要：record_id） 正确示例：hub_get_record(record_id=3262, level="outline")
+[agenthub][tool-error] hub_get_record agent=- :: 错误：必填参数 record_id 缺失（hub_get_record 需要：record_id） 正确示例：hub_get_record(record_id=3262, level="outline")
+[agenthub][rate-limit] hub_status agent=- :: 错误：触发速率限制（工具 hub_status，agent=-）：60 秒内已达单工具上限 1次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][rate-limit] hub_status agent=- :: 错误：触发速率限制（工具 hub_status，agent=-）：60 秒内已达单工具上限 1次，疑似调用方陷入循环。请停止重试并检查循环逻辑；确需调整设 AGENTHUB_RATE_TOOL_MAX / AGENTHUB_RATE_AGENT_MAX，或 AGENTHUB_RATE_LIMIT=off 整体关闭。
+[agenthub][tool-error] hub_memory_supersede agent=- :: 错误：keep_id / drop_id 必须是正整数记忆 id
+[agenthub][tool-error] hub_memory_supersede agent=- :: 错误：参数 keep_id 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_memory_supersede agent=- :: 错误：keep_id / drop_id 必须是正整数记忆 id
+[agenthub][tool-error] hub_memory_supersede agent=- :: 错误：keep_id 与 drop_id 相同（一条记忆不能自己取代自己）
+[agenthub][tool-error] hub_memory_supersede agent=- :: 错误：记忆 #1 或 #999999 不存在
+[agenthub][tool-error] hub_usage_timeline agent=- :: 错误：参数 days 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_usage_timeline agent=- :: 错误：参数 limit 必须是整数（收到 'xyz'）
+[agenthub][tool-error] hub_memory_confirm agent=- :: 错误：参数不足，必须给出 ids=[...] 指定条目，或 all_stale=true 批量复核陈旧条目
+[agenthub][tool-error] hub_memory_confirm agent=- :: 错误：ids 必须是整数数组（收到 ['abc']）
+[agenthub][tool-error] hub_memory_confirm agent=- :: 错误：kind 非法（只能是 fact/preference/lesson/project/note，收到 'nope'）
+[agenthub][tool-error] hub_memory_confirm agent=- :: 错误：参数 limit 必须是整数（收到 'abc'）
+[agenthub][tool-error] hub_log_work agent=nosuchagent :: 错误：agent 名「nosuchagent」不在注册表内，已拒收（避免时间线归属/统计出错）。可用：claude、codex、deepseek、dsh、hermes、qoder、workbuddy、zcode、其他；确实无法归属时传 unknown。
+[agenthub][tool-error] hub_agent agent=QoderProbe :: 错误：action 只能是 status/plan/verify（收到「bogus」）。例：hub_agent(action="status", agent="Qoder")
+  PASS  批次B·问大脑D2+元认知D10工具（结构化回答/出处/弃权/自省面板/空参不崩）
+  PASS  MCP工具集（读写记录/搜索/公用记忆/进度/注入拦截）
+  PASS  记忆overwrite语义（真清空+备份+非法mode）
+  PASS  record_type枚举校验（非法拒收不落库/合法入库）
+  PASS  P1-3 双链自动成 relation（MCP 写入路径）
+  PASS  8线程并发log_work（不丢行/journal完整）
+  PASS  心跳撞车预警/陈旧清理/坏json自愈
+  PASS  M10 心跳开工推送今日任务（空库不刷/项目过滤/回退全局/P排序）
+  PASS  错误登记（上报/查询/流转/坏行）
+  PASS  撤销（只切自己最新段/误伤检查/栈式撤销）
+  PASS  新工具（get_rules/create_project+注入拒绝）
+  PASS  单条全文读取+Everything列表回归（畸形id/死代码bug）
+  PASS  蒸馏展示即登记（同一记录不重复推送）
+  PASS  hub_status五问快照（正常/空库/脏数据/限条数/只读性/畸形参数）
+  PASS  决策记录AgDR（带参写入/旧行为/outline抽段/畸形类型/超长拦截/表格原样）
+  PASS  检索顺手度（#id精读闭环/片段/零命中建议/通配符转义/计数）
+  PASS  memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）
+  PASS  写入时踩坑拦截（相似lesson提醒/无关不附）
+  PASS  体检验收达成度输出（协议级）
+  PASS  项目归档工具（状态+目录/未找到/重复归档）
+  PASS  引导注入（幂等/移除还原/自动创建/四家目标）
+  PASS  端到端子进程握手
+  PASS  root动态跟随（迁移后旧进程写新库/不误写旧库）
+  PASS  一键接入（两种布局/备份/移除/坏json/幂等）
+  PASS  用户画像工具（空库/preference警告/正常库关键行/脏参）
+  PASS  随记工具（写入/空content拒绝/检索互通随记段）
+  PASS  B1/B2身份锁定（覆盖自报/兼容旧接入/筛选不下发/不一致留痕/节流）
+  PASS  身份校验（注册表放行/显示名归一/非法拒收/锁定值不校验）
+  PASS  B1启动参数解析（--agent与root位置参数不冲突）
+  PASS  P3-1契约（profile切片/discover协商/max_chars截断/dry_run/confirm闸门/审计undo）
+  PASS  P3-2待办状态机（并发认领只胜一家/持有者约束/超时接管/阻塞/事件流增量）
+  PASS  Y1 编排层（模板清单/计划不落库/自建拒收/真跑停人工/断点续跑/失败即停/中止/坏参）
+  PASS  Y2 自动化（默认停用/条件匹配/冷却/强制试跑/心跳可见/playbook动作/停用删除/坏参）
+  PASS  Y3 知识图谱（结构边物化/体检/邻居/相关条目/最短路径/知识簇/孤岛清单/坏参）
+  PASS  Y1 内置模板可升级（回归步骤补种/历史执行不受影响）
+  PASS  Round8·协议帧编码加固（ensure_ascii=True纯ASCII帧/中文无损/工具描述无损）
+  PASS  Round10·hub_checkpoint 无task_id 不再#None（清晰必填提示/有tid不退化）
+  PASS  Round11·整数入参坏类型不再伪装服务端故障（hub_graph/hub_playbook 清晰整数提示/合法值零回归/登记归类）
+  PASS  Round12·日期入参规范化（斜杠/非法日期/到期提醒静默失效修复+缺省零回归）
+  PASS  Round13·18工具整数入参不再静默回落（集中校验+漂移守卫+supersedes语义）
+  PASS  R3·错误信息三件套（必填/项目不存在/枚举/未知工具/坏根/缺content 均带示例或核对路径）
+  PASS  R9·未知工具可执行诊断（拼错最近名/MCP全名前缀/无匹配留发现入口/零命中检索建议）
+  PASS  R7·四段式模板软提示（缺段回显/不污染存储/todo 不提示）
+  PASS  B3·确认闸门破坏半径分级（默认不打断/严格模式高危需显式confirm/低危不受影响）
+  PASS  B8·结构化可观测日志（默认关闭零副作用/字段齐全/异常落痕/写失败不影响主链路）
+  PASS  文档纪律·README 版本历史表必须含当前 SERVER_INFO 版本（防第三次 changelog 断档）
+  PASS  C1·MCP 工具 annotations（只读放行/高危 destructiveHint/幂等/端到端输出带注解）
+  PASS  C2·工具 schema 兼容（只允许加法式变更；删参数/改类型/新增必填一律拦）
+  PASS  C6·速率限制/循环保护（默认放行/单工具超限即拦/被拦不计额/窗口恢复/off开关/agent级配额/反向验证）
+  PASS  D1·写工具幂等键（重试原样重放不重复记/同键异内容拒收/agent 命名空间/过期不重放/memory+note 同效）
+  PASS  D4·tools/list 缓存提示+确定性排序（2026-07-28 SEP-2549：resultType/ttlMs≥0/private/逐字节一致/切片保序/env 可调）
+  PASS  D4·JSON Schema 方言安全守卫（不锁 $schema / 无 2020-12 特有关键字 + 反向验证）
+  PASS  D6·使用留痕全覆盖（写工具/原留痕内/原留痕外三类都留/失败不留/fail-open 不反噬业务）
+  PASS  D8·错误分类学三桶（permanent不诱导重试/transient提示退避/ambiguous兜底+幂等键/error_kind机器可读）
+  PASS  D5出口·hub_memory_supersede（裁决后退出检索/数据保留/j撤销/坏参拒/过闸门/留痕/总数不变）
+  PASS  D10·hub_usage_timeline 工具面（worker切片/只读契约/两视图/未知view回落/整数守卫/过滤透传/只读不改数）
+  PASS  R3·多版本处置可见性（ghost对旧版行标注现行版/近重复折叠留新版+回溯/行格式不破）
+  PASS  R4·新鲜度标注可见性（stale行提示复核/age过期行标历史证据/fresh不误标/valid_until契约/行格式不破）
+  PASS  R5·hub_memory_confirm 工具面（参数闸门/ids路径/批量kind+limit+remaining/硬过期跳过/journal/总数不变）
+  PASS  R5·agent 注册表准入（写工具无死枚举/登记即可写/未在册仍拒+名单/permanent）
+  PASS  R6/R7·接入状态机（未注册也出清单/plan只列缺口/verify落快照/快照过期/运行版本告警/坏action拒）
+
+MCP ALL PASS

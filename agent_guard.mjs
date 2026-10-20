@@ -12,6 +12,13 @@
  *   PreToolUse(其他工具) → 记 worked=true（说明本会话"干了活"，Stop 时才需要闸门）
  *   Stop / SessionEnd   → 闸门：worked 且未记大脑 → 阻断（最多 2 次，防死循环）
  *
+ * 工具名归一（R8，2026-10-20）：守卫原生剥壳，不再需要每家维护适配器。
+ *   直接调用：mcp__agenthub__hub_log_work / hub_log_work
+ *   多路复用：mcp_call / hub_call_tool / mcp__agenthub__hub_call_tool
+ *             （内层 toolName + arguments，允许套娃；最多剥 3 层）
+ *   Qoder 曾是唯一例外（客户端 agent 枚举不含 qoder，写大脑只能走 hub_call_tool），
+ *   其专属 agenthub_guard_adapter.mjs 因此存在；现已不需要。
+ *
  * 输出契约：
  *   PreToolUse 拒绝 → {"hookSpecificOutput":{"hookEventName":"PreToolUse","permissionDecision":"deny","permissionDecisionReason":"..."}}
  *   Stop 阻断      → {"decision":"block","reason":"..."}   ← Claude 系 Stop 钩子标准；不认识的家会忽略（fail-safe）
@@ -80,7 +87,35 @@ const isReset = en === 'sessionstart' || en === 'sessionbegin';
 const isPre = en === 'pretooluse' || en === 'pretoolcall';
 const isStop = en === 'stop' || en === 'sessionend' || en === 'subagentstop' || en === 'turnstop';
 const isPreLlm = en === 'prellmcall';
-const tool = (ev.tool_name || ev.toolName || '').toString();
+
+// 工具名归一：剥掉 MCP 前缀，并解开 mcp_call / hub_call_tool 的嵌套参数。
+function leafTool(name) {
+  const s = String(name || '');
+  const m = s.match(/^mcp__.+?__(.+)$/);
+  return m ? m[1] : s;
+}
+function isMultiplexer(name) {
+  return /^(?:mcp__.+?__)?(?:hub_call_tool|mcp_call)$/i.test(String(name || ''));
+}
+function resolveTool(ev) {
+  let name = String(ev.tool_name || ev.toolName || '');
+  let input = (ev.tool_input && typeof ev.tool_input === 'object') ? ev.tool_input
+            : (ev.toolInput && typeof ev.toolInput === 'object') ? ev.toolInput : {};
+  const raw = name;
+  for (let depth = 0; depth < 3 && isMultiplexer(name); depth++) {
+    const inner = input.toolName || input.tool_name || input.name || input.tool;
+    if (typeof inner !== 'string' || !inner.trim()) break;
+    const args = input.arguments || input.params || input.input;
+    name = inner.trim();
+    input = (args && typeof args === 'object') ? args : {};
+  }
+  return { raw, name, leaf: leafTool(name), input };
+}
+const _call = resolveTool(ev);
+const tool = _call.leaf;
+const toolInput = _call.input;
+// 日志里保留原始形态，嵌套调用一眼可见（tool=mcp_call→hub_memory_write）
+const toolLabel = (_call.raw && _call.raw !== tool) ? `${_call.raw}→${tool}` : tool;
 const sid = (ev.session_id || ev.sessionId || '').toString();
 const key = sid || NOSID;
 
@@ -95,11 +130,11 @@ if (isReset) {
 
 // 逃生门 + 审计
 if (process.env.ASU_SKIP_BRAINLOG === '1') {
-  logLine(`SKIP(ASU_SKIP_BRAINLOG) event=${event} tool=${tool} sid=${key}`);
+  logLine(`SKIP(ASU_SKIP_BRAINLOG) event=${event} tool=${toolLabel} sid=${key}`);
   process.exit(0);
 }
 
-const isHub = /hub_log_work|hub_memory_write/.test(tool);
+const isHub = /\bhub_log_work\b|\bhub_memory_write\b/.test(tool);
 
 // 2) PreToolUse / pre_tool_call
 if (isPre) {
@@ -108,16 +143,16 @@ if (isPre) {
 
   if (isHub) {
     // 最小校验：content 非空 且 非 dry_run 才计数（防空调用翻牌）
-    const ti = (ev.tool_input && typeof ev.tool_input === 'object') ? ev.tool_input : {};
+    const ti = toolInput;
     const dry = ti.dry_run === true;
     const content = typeof ti.content === 'string' ? ti.content.trim() : '';
     if (!dry && content.length > 0) {
       cur.logged = true;
       cur.lastHubTs = Date.now();
       cur.lastHubTool = tool;
-      logLine(`marked logged via ${tool} sid=${key}`);
+      logLine(`marked logged via ${toolLabel} sid=${key}`);
     } else {
-      logLine(`NOT counted (${dry ? 'dry_run' : 'empty content'}) via ${tool} sid=${key}`);
+      logLine(`NOT counted (${dry ? 'dry_run' : 'empty content'}) via ${toolLabel} sid=${key}`);
     }
     s.sessions[key] = cur;
     writeState(s);

@@ -66,7 +66,7 @@ def fresh_hub(tmp, name) -> Path:
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.61"
+    assert r["serverInfo"]["version"] == "2.40.69"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -85,7 +85,7 @@ def t_protocol(root):
             "hub_skill_match", "hub_skill_sync"} <= names, names
     # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
     # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
-    assert len(names) == 71  # 68=X3+X4+Y1+Y2+Y3+playbook/trigger/graph；69=+hub_error_close（2026-10-17 错误闭环：MCP 侧关错，治僵尸堆积）；70=+hub_memory_supersede（2026-10-19 D5 出口：两条既有记忆裁决谁胜出——ghost 检测报出「多版本共存未裁决」后此前没有对应调用，write(supersedes=X) 会多造第 3 条记忆，不是一回事）；71=+hub_usage_timeline（2026-10-19 D10：四张使用表首次有统一查询面——「审计日志不是可观测性，对日志的查询才是」，查询面先要有）
+    assert len(names) == 73  # ...；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -1198,9 +1198,23 @@ def t_server_agent_override(tmp):
         m.apply_server_agent("hub_log_work", orig, rs)
         assert orig == {"agent": "zcode"}, "调用方 dict 被就地修改"
 
-        # ③ 只读筛选工具不下发（agent 参数是"查别人"，语义不同）
-        got = m.apply_server_agent("hub_list_skills", {"agent": "zcode"}, rs)
-        assert got["agent"] == "zcode", got
+        # ③ 筛选工具不下发（agent 参数是"查别人/全机"，语义不同）。
+        # 2026-10-20：新增工具漏登记曾导致 hub_usage_timeline 永远只统计自己——
+        # 逐个断言「显式 agent 原样保留 + 不传时不注入」，防再次漏网。
+        for tname in ("hub_list_skills", "hub_bootstrap_status", "hub_skill_match", "hub_agent",
+                      "hub_usage_timeline", "hub_events", "hub_skill_sync"):
+            got = m.apply_server_agent(tname, {"agent": "zcode"}, rs)
+            assert got["agent"] == "zcode", f"{tname} 的筛选参数被身份覆盖：{got}"
+            got = m.apply_server_agent(tname, {}, rs)
+            assert "agent" not in got, f"{tname} 未传 agent 却被注入身份：{got}"
+
+        # ③b 端到端：锁定身份下 stats 默认仍是全机视角（不是只统计自己）
+        with brain.db_conn(rs) as conn:
+            for ag in ("zcode", "workbuddy"):
+                conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)",
+                             (brain._now(), ag, "probe_filter_tool"))
+        out = m.call_tool("hub_usage_timeline", {"view": "stats", "days": 7}, rs)
+        assert "zcode" in out and "workbuddy" in out, f"全机统计被身份过滤：{out[:300]}"
 
         # ④ 不一致留痕
         n0 = len([e for e in brain.journal_list(rs, 500) if e.get("action") == "agent_mismatch"])
@@ -1895,6 +1909,25 @@ def t_error_msg_three_part(root):
     assert "content" in out and "缺失" in out and "例：" in out, out
 
 
+def t_unknown_tool_diagnostics(root):
+    """R9：未知工具错误必须能自我纠正——三类真实原因各给不同动作，而非统一「去搜索」。"""
+    root = str(root)
+    # ① 拼错 → difflib 最近名（含经 hub_call_tool 转发的同一路径）
+    out = m.call_tool("hub_memroy_write", {}, root)
+    assert "你是不是要找" in out and "hub_memory_write" in out, out
+    out = m.call_tool("hub_call_tool", {"name": "hub_memroy_write"}, root)
+    assert "你是不是要找" in out and "hub_memory_write" in out, out
+    # ② 带 MCP 全名 → 直接给本服务器内的准确名（不必再猜前缀）
+    out = m.call_tool("mcp__agenthub__hub_health", {}, root)
+    assert "MCP 全名" in out and "直接传 hub_health" in out, out
+    # ③ 无法匹配 → 保留搜索与清单入口（不能只说「未知」）
+    out = m.call_tool("zzz_no_such_tool_zzz", {}, root)
+    assert "没有相近名" in out and "hub_search_tools" in out and "hub_help" in out, out
+    # ④ 零命中检索 → 相近名 + 换更短名词的可行动提示
+    out = m.call_tool("hub_search_tools", {"keyword": "hub_skill_matx"}, root)
+    assert "0 命中不一定是没能力" in out and "hub_skill_match" in out, out
+
+
 def t_template_nudge(root):
     """R7·四段式模板软提示（2026-10-17）：缺段只在回显点一句，不阻断、不污染存储。
 
@@ -2508,6 +2541,284 @@ def t_ghost_demotion_surface(hub):
     assert f"#{n1} " not in text2.replace(kept_line, ""), "被折掉的旧版不该单独成行"
 
 
+def t_agent_registry_surface(hub):
+    """R5 回归：agent 准入只看注册表，不看客户端死枚举。
+
+    ① 三个写工具的 agent 参数不再有 enum——新增 agent 只登记 config.agents.json
+       （Qoder 接入时被死枚举挡在客户端，才逼出 hub_call_tool+每家风适配器）；
+    ② 临时根登记 Qoder → 以 qoder 写入成功（服务端按注册表放行）；
+    ③ 未登记名字仍被拒收，且文案列出可用名单（服务端校验没被一起拆掉）；
+    ④ 拒绝是 permanent（模型可立即纠正，不是催它重试）。"""
+    rs = str(hub)
+    tools = resp_ok(m.handle_message(rpc("tools/list"), rs))["tools"]
+    schemas = {t["name"]: t.get("inputSchema") or {} for t in tools}
+    for name in ("hub_log_work", "hub_memory_write", "hub_memory_supersede"):
+        prop = schemas[name]["properties"]["agent"]
+        assert "enum" not in prop, f"{name}.agent 客户端死枚举未移除：{prop}"
+        assert "注册表" in prop.get("description", ""), f"{name}.agent 未说明准入来源：{prop}"
+    (Path(rs) / core.AGENTS_CONFIG_NAME).write_text(
+        json.dumps({"agents": [{"agent": "Qoder"}]}, ensure_ascii=False), encoding="utf-8")
+    out = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "qoder",
+                                       "content": "R5 注册表准入验证（无死枚举）"}, rs)
+    assert "已记入大脑" in out, out
+    res = m.handle_message(rpc("tools/call", {"name": "hub_log_work",
+                                              "arguments": {"project": "测试-项目", "agent": "nosuchagent",
+                                                            "content": "应被拒"}}, 2), rs)["result"]
+    body = res["content"][0]["text"]
+    assert res["isError"] is True and "不在注册表内" in body and "qoder" in body, body
+    assert (res.get("structuredContent") or {}).get("error_kind") == "permanent", res
+
+
+def t_agent_onboard_surface(hub):
+    """R6 回归：接入状态机的 MCP 面。
+
+    ① 未注册 agent 也照常出七项清单（诊断不能被准入校验挡住——新 agent 正是最需要它的人）；
+    ② plan 只留非 ok 项，status 全量；
+    ③ verify 落快照（agent_onboarding 一行、七步、备注），复查时说「上次验证」不再说「从未 verify」；
+    ④ 未知 action 是清晰错误（列出合法值+示例），不是静默回落。"""
+    rs = str(hub)
+    ag = "QoderProbe"
+    r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                            "arguments": {"action": "status", "agent": ag}}), rs)["result"]
+    text = r["content"][0]["text"]
+    assert not r.get("isError"), text[:300]
+    for label in ("注册表", "引导注入", "MCP", "规则闸门", "技能索引", "工作记录", "运行版本", "验证快照"):
+        assert label in text, f"清单缺 {label}：{text}"
+    assert "接入清单" in text and "从未 verify" in text and 'hub_agent(action="verify"' in text, text
+
+    r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                            "arguments": {"action": "plan", "agent": ag}}), rs)["result"]
+    plan = r["content"][0]["text"]
+    assert not r.get("isError"), plan[:300]
+    assert "✓ 注册表" not in plan, f"plan 不该列已通过项：{plan}"
+    assert "注册表" in plan and "下一步：" in plan, plan
+
+    r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                            "arguments": {"action": "verify", "agent": ag,
+                                                          "note": "R6 测试快照"}}), rs)["result"]
+    vtext = r["content"][0]["text"]
+    assert not r.get("isError") and "已写验证快照" in vtext, vtext[:300]
+    import brain as _b
+    snap = _b.onboarding_get(rs, ag)
+    assert len(snap) == 1 and len(snap[0]["steps"]) == 8, snap
+    assert snap[0]["note"] == "R6 测试快照", snap
+
+    r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                            "arguments": {"action": "status", "agent": ag}}), rs)["result"]
+    again = r["content"][0]["text"]
+    assert "从未 verify" not in again and "上次验证" in again, again
+
+    # R7：快照过期——验证之后代码又变了，快照不能继续冒充「已验证」
+    _b.onboarding_save(rs, ag, True, snap[0]["steps"], "旧快照")
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE agent_onboarding SET ts='2020-01-01T00:00:00' WHERE agent=?",
+                     (ag.lower(),))
+    r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                            "arguments": {"action": "status", "agent": ag}}), rs)["result"]
+    expired = r["content"][0]["text"]
+    assert "快照已过期" in expired and 'hub_agent(action="verify"' in expired, expired
+
+    # R7：运行版本落后（把启动时刻拨到 2020）——清单与进度页都必须当场告警
+    import core as _core
+    old_start = _core.SERVER_STARTED_AT
+    try:
+        _core.SERVER_STARTED_AT = "2020-01-01T00:00:00"
+        r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                                "arguments": {"action": "status", "agent": ag}}), rs)["result"]
+        rt = r["content"][0]["text"]
+        assert "正在跑旧代码" in rt and "重启" in rt, rt
+        r = m.handle_message(rpc("tools/call", {"name": "hub_get_progress",
+                                                "arguments": {"limit": 3}}), rs)["result"]
+        gp = r["content"][0]["text"]
+        assert gp.lstrip().startswith("⚠") and "旧代码" in gp, gp[:200]
+    finally:
+        _core.SERVER_STARTED_AT = old_start
+
+    r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                            "arguments": {"action": "bogus", "agent": ag}}), rs)["result"]
+    body = r["content"][0]["text"]
+    assert r.get("isError") is True and "status/plan/verify" in body, body[:300]
+
+
+def t_freshness_surface(hub):
+    """R4 回归：新鲜度标注在 MCP 面的**可见性**——brain 层算出状态还不够，
+    hub_memory_read 的读的人（LLM）必须看到「这条多久没人复核/已过期」，
+    否则读时状态机只是隐形重排、采信前毫无提示。
+
+    覆盖五面：
+    ① 30 天前的 fact（过 14 天新鲜窗）→ 行带「N 天未复核，采信前请确认仍现行」；
+    ② 100 天前的 fact（过 90 天入仓期限）→ 行带「已过期…仅作历史证据」；
+    ③ 昨天的 fact → 无任何新鲜度标注（不误报，噪音比漏报更贵）；
+    ④ valid_until 已过的记忆 → 按 P1-1 契约**根本不进检索结果**（到期自动退出），
+        MCP 的「已过期」文案实际覆盖年龄过期路径——契约边界写进测试防回归；
+    ⑤ 标注不破坏既有行格式（#id/[kind]/内容仍在，isError=False）。"""
+    import brain as _b
+    import datetime as _dt
+    rs = str(hub)
+    now = _dt.datetime.now()
+    d = lambda n: (now - _dt.timedelta(days=n)).isoformat(timespec="seconds")
+
+    def _mk(content, days_ago, **cols):
+        mid = int(_b.add_memory(rs, content, kind="fact", agent="zcode", project="p"))
+        ts = d(days_ago)
+        sets = {"created": ts, "updated": ts}
+        sets.update(cols)
+        with _b.db_conn(rs) as conn:
+            conn.execute("UPDATE memories SET " + ", ".join(f"{k}=?" for k in sets)
+                         + " WHERE id=?", list(sets.values()) + [mid])
+        return mid
+
+    def _line(text, mid):
+        return next(l for l in text.splitlines() if f"#{mid} " in l)
+
+    # ① 30 天前的 fact → stale 提示
+    stale_id = _mk("环境事实：代理端口 7890 是三十天前记下的旧配置", 30)
+    # ② 100 天前的 fact → age 过期（expire_days=90）
+    expired_id = _mk("环境事实：代理端口 7892 于百日前记下且从未复核已深过期", 100)
+    # ③ 昨天的 fact → fresh，不该有任何标注
+    fresh_id = _mk("环境事实：代理端口 7891 是昨天刚确认的现行配置", 1)
+
+    r = m.handle_message(rpc("tools/call", {"name": "hub_memory_read",
+                                            "arguments": {"query": "代理端口"}}), rs)["result"]
+    assert not r.get("isError"), r["content"][0]["text"][:200]
+    text = r["content"][0]["text"]
+    line_stale = _line(text, stale_id)
+    assert "天未复核，采信前请确认仍现行" in line_stale, f"stale 行缺复核提示：{line_stale}"
+    assert "旧版" not in line_stale, "stale 行不该混入版本标注（与 R3 职责分离）"
+    line_expired = _line(text, expired_id)
+    assert "已过期" in line_expired and "仅作历史证据" in line_expired, f"过期行缺标注：{line_expired}"
+    line_fresh = _line(text, fresh_id)
+    assert "未复核" not in line_fresh and "已过期" not in line_fresh, f"fresh 行被误标：{line_fresh}"
+    # 行格式不破：编号/种类/内容三要素仍在
+    for lid in (stale_id, expired_id, fresh_id):
+        ln = _line(text, lid)
+        assert f"#{lid} " in ln and "[环境事实]" in ln, f"行格式破损：{ln}"
+
+    # ④ valid_until 过期 → 不进检索（P1-1 契约：到期自动退出；文案覆盖年龄路径）
+    vu_id = _mk("环境事实：临时端口 9999 只在本周内有效", 1, valid_until="2020-01-01")
+    r2 = m.handle_message(rpc("tools/call", {"name": "hub_memory_read",
+                                             "arguments": {"query": "临时端口 9999"}}), rs)["result"]
+    assert not r2.get("isError"), r2["content"][0]["text"][:200]
+    assert f"#{vu_id} " not in r2["content"][0]["text"], "valid_until 过期仍被检索（契约 regression）"
+
+
+def t_memory_confirm_tool(hub):
+    """R5（第五轮 R2）回归：`hub_memory_confirm` MCP 面——把「复核」变成可执行动作。
+
+    R4 的读时状态机已能标注 stale，但读的人**没有出口**：只能继续采信或自己重写一条
+    记忆（后者会篡改 updated、制造重复）。本工具把「我还确认它成立」落成 confirmed
+    时间戳，不碰内容、不碰 updated。
+
+    验证面：
+    ① 参数守卫（无选择器 / 坏 ids / 坏 kind / 坏 limit）→ permanent，且不落库；
+    ② dry_run 与 confirm=false 两道闸门都拦得住；
+    ③ ids 路径：确认后 confirmed 落库、检索标注转 fresh、内容与 updated 不变；
+    ④ all_stale 路径：按 kind 过滤、limit 截断、remaining 如实上报；
+    ⑤ valid_until 硬过期只跳过并说明原因（确认不能解除写入者划的线）；
+    ⑥ journal 留痕 `memory_confirm`；记忆总数不变（复核不是新增/删除）。
+    """
+    import brain as _b
+    import datetime as _dt
+    rs = str(hub)
+    now = _dt.datetime.now()
+    old = (now - _dt.timedelta(days=30)).isoformat(timespec="seconds")
+
+    def _mk(content, kind="fact", **cols):
+        mid = int(_b.add_memory(rs, content, kind=kind, agent="zcode", project="p"))
+        sets = {"created": old, "updated": old}
+        sets.update(cols)
+        with _b.db_conn(rs) as conn:
+            conn.execute("UPDATE memories SET " + ", ".join(f"{k}=?" for k in sets)
+                         + " WHERE id=?", list(sets.values()) + [mid])
+        return mid
+
+    def _call(args):
+        return m.handle_message(rpc("tools/call", {"name": "hub_memory_confirm",
+                                                    "arguments": args}), rs)["result"]
+
+    def _conf(mid):
+        with _b.db_conn(rs) as conn:
+            return conn.execute("SELECT confirmed FROM memories WHERE id=?", (mid,)).fetchone()[0]
+
+    def _reset_hit(*mids):
+        """清掉 last_hit：读 s1 的检索可能经过语义路把 s2/s3 也「顺带唤起」，
+        那会让它们以弱确认口径变 fresh，批量复核用例就测不到 stale 分支。"""
+        with _b.db_conn(rs) as conn:
+            conn.execute("UPDATE memories SET last_hit='' WHERE id IN ("
+                         + ",".join("?" * len(mids)) + ")", mids)
+
+    def _count():
+        with _b.db_conn(rs) as conn:
+            return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+    s1 = _mk("环境事实：单条复核端口 7001（工具面）")
+    s2 = _mk("环境事实：批量复核端口 7002（工具面）")
+    s3 = _mk("环境事实：批量复核端口 7003（工具面）")
+    lesson = _mk("踩坑经验：批量复核不得碰耐久知识（工具面）", kind="lesson")
+    hard = _mk("环境事实：临时令牌只到昨天（工具面）", valid_until="2026-10-19")
+    n0 = _count()
+
+    # ① 参数守卫
+    for bad, hint in (({}, "ids"), ({"ids": "abc"}, "整数"),
+                      ({"ids": [s1], "kind": "nope"}, "kind"),
+                      ({"all_stale": True, "limit": "abc"}, "整数")):
+        rb = _call(bad)
+        assert rb.get("isError"), f"坏参未拒：{bad}"
+        assert hint in rb["content"][0]["text"], f"错误提示不可行动：{rb['content'][0]['text']}"
+        assert rb["structuredContent"]["error_kind"] == "permanent", f"参数错应 permanent：{bad}"
+    assert _conf(s1) == "" and _conf(s2) == "", "坏参路径写了库"
+
+    # ② 闸门
+    rd = _call({"ids": [s1], "dry_run": True})
+    assert "dry_run" in rd["content"][0]["text"] and _conf(s1) == "", "dry_run 不该落库"
+    rc = _call({"ids": [s1], "confirm": False})
+    assert "人工确认" in rc["content"][0]["text"] and _conf(s1) == "", "confirm=false 应被拦"
+
+    # ③ ids 路径
+    r = _call({"ids": [s1]})
+    assert not r.get("isError"), r["content"][0]["text"]
+    assert "已确认" in r["content"][0]["text"], f"缺确认回执：{r['content'][0]['text']}"
+    assert _conf(s1), "confirmed 未落库"
+    with _b.db_conn(rs) as conn:
+        row = dict(conn.execute("SELECT * FROM memories WHERE id=?", (s1,)).fetchone())
+    assert row["content"].startswith("环境事实：单条复核端口 7001"), "确认改写了内容"
+    assert row["updated"] == old, "确认改写了 updated（复核≠重写）"
+    hit = next(x for x in _b.search_memories(rs, "单条复核端口 7001", "", 5, count_hits=False)
+               if x["id"] == s1)
+    assert hit["_freshness"] == "fresh", f"确认后检索仍标 {hit['_freshness']}"
+    line = next(l for l in m.handle_message(
+        rpc("tools/call", {"name": "hub_memory_read",
+                           "arguments": {"query": "单条复核端口 7001"}}), rs
+    )["result"]["content"][0]["text"].splitlines() if f"#{s1} " in l)
+    assert "未复核" not in line, f"确认后仍提示复核：{line}"
+
+    # ④ all_stale：kind 过滤 + limit + remaining
+    _reset_hit(s2, s3, lesson)
+    ra = _call({"all_stale": True, "kind": "fact", "limit": 1})
+    assert not ra.get("isError"), ra["content"][0]["text"]
+    assert _conf(s2) != "" and _conf(s3) == "", f"limit/排序未按预期：{ra['content'][0]['text']}"
+    assert "剩余" in ra["content"][0]["text"], f"截断未上报 remaining：{ra['content'][0]['text']}"
+    assert _conf(lesson) == "", "kind=fact 碰到了 lesson"
+    ra2 = _call({"all_stale": True, "kind": "fact", "limit": 10})
+    assert not ra2.get("isError"), ra2["content"][0]["text"]
+    assert _conf(s3) != "", "第二轮未收敛剩余条目"
+    assert _conf(lesson) == "", "lesson 仍不该被确认"
+
+    # ⑤ valid_until 硬过期：跳过且说明原因
+    rh = _call({"ids": [hard]})
+    assert not rh.get("isError"), rh["content"][0]["text"]
+    assert _conf(hard) == "", "valid_until 硬过期不该被确认"
+    assert "valid_until" in rh["content"][0]["text"], f"未解释跳过原因：{rh['content'][0]['text']}"
+    ra3 = _call({"all_stale": True, "kind": "fact", "limit": 10})
+    assert "valid_until" in ra3["content"][0]["text"], "批量路径未报告硬过期跳过项"
+
+    # ⑥ 留痕与条数
+    with _b.db_conn(rs) as conn:
+        hit_n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='memory_confirm'").fetchone()[0]
+    assert hit_n > 0, "复核动作必须进 journal"
+    assert _count() == n0, "复核不该改变记忆总数"
+
+
 def t_error_taxonomy(root):
     """D8/R8 回归：**错误分类学**——三桶（transient / permanent / ambiguous）。
 
@@ -2705,6 +3016,8 @@ def main():
          lambda: t_round13_int_params_central(root))
     case("R3·错误信息三件套（必填/项目不存在/枚举/未知工具/坏根/缺content 均带示例或核对路径）",
          lambda: t_error_msg_three_part(root))
+    case("R9·未知工具可执行诊断（拼错最近名/MCP全名前缀/无匹配留发现入口/零命中检索建议）",
+         lambda: t_unknown_tool_diagnostics(root))
     case("R7·四段式模板软提示（缺段回显/不污染存储/todo 不提示）", lambda: t_template_nudge(root))
     case("B3·确认闸门破坏半径分级（默认不打断/严格模式高危需显式confirm/低危不受影响）",
          lambda: t_confirm_blast_radius(fresh_hub(tmp, "hub_b3")))
@@ -2734,6 +3047,14 @@ def main():
          lambda: t_usage_timeline_surface(fresh_hub(tmp, "hub_usage_surface")))
     case("R3·多版本处置可见性（ghost对旧版行标注现行版/近重复折叠留新版+回溯/行格式不破）",
          lambda: t_ghost_demotion_surface(fresh_hub(tmp, "hub_demote_surface")))
+    case("R4·新鲜度标注可见性（stale行提示复核/age过期行标历史证据/fresh不误标/valid_until契约/行格式不破）",
+         lambda: t_freshness_surface(fresh_hub(tmp, "hub_fresh_surface")))
+    case("R5·hub_memory_confirm 工具面（参数闸门/ids路径/批量kind+limit+remaining/硬过期跳过/journal/总数不变）",
+         lambda: t_memory_confirm_tool(fresh_hub(tmp, "hub_confirm_surface")))
+    case("R5·agent 注册表准入（写工具无死枚举/登记即可写/未在册仍拒+名单/permanent）",
+         lambda: t_agent_registry_surface(fresh_hub(tmp, "hub_registry_surface")))
+    case("R6/R7·接入状态机（未注册也出清单/plan只列缺口/verify落快照/快照过期/运行版本告警/坏action拒）",
+         lambda: t_agent_onboard_surface(fresh_hub(tmp, "hub_onboard_surface")))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

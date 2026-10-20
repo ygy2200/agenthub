@@ -2091,6 +2091,7 @@ def t_consolidate_view_skill(tmp):
     """M7 整合 + M9 视角 + M12 技能资产（2026-10-12）：
     提案只读 / apply 写 validated+supersede 原条目+证据链 / 拒不足 2 条 /
     关注幂等 / recent 排除当前项目 / unfollow 幂等 / skill_stats top 与 zero。"""
+    import datetime as _dt
     root = str(Path(tmp) / "hub_cvs")
     Path(root).mkdir(parents=True, exist_ok=True)
     brain.init_db(root)
@@ -2122,7 +2123,8 @@ def t_consolidate_view_skill(tmp):
     assert "已关注" in brain.view_follow(root, "zcode", "project", "乙-问题")  # 幂等
     assert "scope_type" in brain.view_follow(root, "zcode", "xxx", "乙")  # 坏类型拒
     assert len(brain.view_list(root, "zcode")) == 1
-    brain.add_record(root, "乙-问题", "hermes", "2026-10-12", "乙项目新进展", "X")
+    # 用 today 而不是写死日期：view_recent 是 7 天滚动窗，写死日期到期必红（本轮实锤）
+    brain.add_record(root, "乙-问题", "hermes", _dt.date.today().isoformat(), "乙项目新进展", "X")
     recent = brain.view_recent(root, "zcode", exclude_project="甲-问题")
     assert len(recent) == 1 and recent[0]["project"] == "乙-问题", recent
     assert brain.view_recent(root, "zcode", exclude_project="乙-问题") == []  # 排除当前
@@ -2136,6 +2138,10 @@ def t_consolidate_view_skill(tmp):
     assert st["total"] == 2 and st["by_agent"]["workbuddy"] == 1, st
     assert [s["name"] for s in st["top_used"]] == ["used-skill"], st["top_used"]
     assert [s["name"] for s in st["zero_used"]] == ["unused-skill"], st["zero_used"]
+    # R5 索引兜底：按 agent 取行（大小写不敏感），没有索引的 agent 返回空而不是编造
+    assert [r["name"] for r in brain.skills_by_agent(root, "WORKBUDDY")] == ["used-skill"]
+    assert {r["name"] for r in brain.skills_by_agent(root)} == {"used-skill", "unused-skill"}
+    assert brain.skills_by_agent(root, "qoder") == []
 
 
 def t_export_history(tmp):
@@ -2362,6 +2368,208 @@ def t_ghost_pair_demotion(tmp):
     assert kept.get("_dup_n") == 1, f"_dup_n 计数错：{kept.get('_dup_n')}"
     assert not any(r.get("_older_version_of") for r in rows_n if r["id"] in got), \
         "折叠场景不该再出降序标注（两个刻度串了）"
+
+
+def t_memory_freshness(tmp):
+    """R4 回归：新鲜度状态机——读时计算 fresh/stale/expired，**过期不删除、只标注**。
+
+    外部模式（「Facts Should Expire」）：事实带 observed_at/checked_at，状态在读时算；
+    过期事实仍是证据只是更弱。本库映射：observed=max(created,updated)、
+    checked=max(confirmed,last_hit)（显式确认列优先，R5 的 confirm 工具会写；
+    没有时 last_hit 是弱确认）、reference 取两者较新者。
+
+    验证面：
+    ① kind 分档策略真的分档（同 30 天年龄：fact=stale、lesson=fresh——耐久知识长窗口）；
+    ② reference 取 max：老写入但最近被检索（last_hit 新）→ 仍 fresh（弱确认口径）；
+    ③ valid_until 硬过期优先于年龄（写入者显式划的线）；
+    ④ 时间戳缺失/畸形 → unknown（不猜：当成 stale 会误报一片）；
+    ⑤ confirmed 列前向兼容（列还不存在，.get 取空；将来 R5 加了自动生效）；
+    ⑥ 检索结果带 _freshness/_age_days 标注（读时计算接进 search_memories）；
+    ⑦ 纯计算不写库（前后行数不变）。"""
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_fresh")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    # 用真实钟面而不是写死日期：检索标注路径用的是真实 now，写死会让 age 随日历漂移
+    # （2026-10-20 实测：固定 10-19 的 now 在次日把 30 天漂成 31.1，测试无谓变红）。
+    now = _dt.datetime.now()
+
+    def _mk(content, kind="fact", **cols):
+        mid = int(brain.add_memory(root, content, kind=kind, agent="zcode", project="p"))
+        if cols:
+            with brain.db_conn(root) as conn:
+                conn.execute("UPDATE memories SET " + ", ".join(f"{k}=?" for k in cols)
+                             + " WHERE id=?", list(cols.values()) + [mid])
+        with brain.db_conn(root) as conn:
+            return dict(conn.execute("SELECT * FROM memories WHERE id=?", (mid,)).fetchone())
+
+    # ① 分档：同 30 天前写入，fact 过 14 天窗 = stale；lesson 365 天窗 = fresh
+    old30 = (now - _dt.timedelta(days=30)).isoformat(timespec="seconds")
+    r_fact = _mk("环境事实：代理端口是 7890（分档测试）", created=old30, updated=old30)
+    r_lesson = _mk("踩坑经验：排序后截断会把边界落在字母序上（分档测试）", kind="lesson",
+                   created=old30, updated=old30)
+    assert brain.memory_freshness(r_fact, now)["state"] == "stale", "fact 30 天应过 14 天新鲜窗"
+    assert brain.memory_freshness(r_lesson, now)["state"] == "fresh", "lesson 30 天远未到 365 天窗"
+
+    # ② reference 取 max：90 天前写、昨天被检索（last_hit）→ fresh（弱确认）
+    old90 = (now - _dt.timedelta(days=90)).isoformat(timespec="seconds")
+    hit = (now - _dt.timedelta(days=1)).isoformat(timespec="seconds")
+    r_hit = _mk("环境事实：数据根在 D 盘（弱确认测试）", created=old90, updated=old90, last_hit=hit)
+    fr = brain.memory_freshness(r_hit, now)
+    assert fr["state"] == "fresh" and fr["basis"] == "confirmed", f"last_hit 未当弱确认：{fr}"
+
+    # ③ valid_until 硬过期优先（哪怕 last_hit 是昨天）
+    r_vu = _mk("环境事实：临时令牌今晚失效（硬过期测试）", created=old90, updated=old90,
+               last_hit=hit, valid_until=(now - _dt.timedelta(days=1)).date().isoformat())
+    fr_vu = brain.memory_freshness(r_vu, now)
+    assert fr_vu["state"] == "expired" and fr_vu["basis"] == "valid_until", f"硬过期未优先：{fr_vu}"
+
+    # ④ 时间戳缺失 → unknown（不猜）
+    r_blank = _mk("环境事实：没有时间戳的条目（unknown 测试）", created="", updated="")
+    assert brain.memory_freshness(r_blank, now)["state"] == "unknown", "缺时间戳应 unknown"
+
+    # ⑤ confirmed 列前向兼容：手工塞进行字典（模拟 R5 加列后的 SELECT * 行）
+    r_fwd = dict(r_fact)
+    r_fwd["confirmed"] = hit
+    assert brain.memory_freshness(r_fwd, now)["state"] == "fresh", "confirmed 应压过 last_hit/created"
+
+    # ⑥ 检索结果带标注（读时计算接进 search_memories）
+    rows = brain.search_memories(root, "代理端口", "", 10, count_hits=False)
+    hit_row = next(r for r in rows if r["id"] == r_fact["id"])
+    assert hit_row.get("_freshness") == "stale", f"检索结果缺新鲜度标注：{hit_row.get('_freshness')}"
+    # age 容差 ±1.1 天：函数单测用固定 now，检索路径用真实 now（本测试跑时刻的钟面偏移）
+    assert abs((hit_row.get("_age_days") or 0) - 30) <= 1.1, f"age_days 错：{hit_row.get('_age_days')}"
+
+    # ⑦ 不写库
+    with brain.db_conn(root) as conn:
+        n0 = conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+    brain.search_memories(root, "环境事实", "", 10, count_hits=False)
+    with brain.db_conn(root) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0] == n0, "标注路径写了库"
+
+    # ⑧ 深过期：fact 超过 90 天 expire 窗 → expired（比 stale 更强的信号）
+    old200 = (now - _dt.timedelta(days=200)).isoformat(timespec="seconds")
+    r_deep = _mk("环境事实：两百天前的端口（深过期测试）", created=old200, updated=old200)
+    assert brain.memory_freshness(r_deep, now)["state"] == "expired", "200 天的 fact 应 expired"
+
+
+def t_memory_confirm(tmp):
+    """R5（第五轮 R2）回归：记忆复核闭环——`confirmed` 列 + `confirm_memories`。
+
+    R4 的新鲜度状态机已经**读** `confirmed` 并在 basis 里标注 confirmed，但那一列和
+    写入路径都不存在：状态机只能靠 last_hit 的弱确认，读到的「已复核」永远无法由
+    人和 agent 主动产生。本测试补上闭环，并守住三条边界：
+
+    ① **迁移兼容**：老库没有 confirmed 列 → ensure_schema 幂等补列，旧数据不丢；
+    ② **确认只动 confirmed**：content/updated/use_count 一律不变——复核不是重写，
+       篡改 updated 会把「值最后被修改的时间」和「上次复核的时间」混成一团；
+    ③ **批量复核有边界**：all_stale 只碰 stale/expired（含深过期），不碰 fresh；
+       valid_until 硬过期不确认解除（写入者显式划的线，要改就得改 valid_until）；
+       被取代/作废/不存在的条目跳过并给出原因；limit 截断时 remaining 如实上报。
+
+    验证面：迁移补列 / 单条确认转 fresh / basis=confirmed / 不重写内容与 updated /
+    检索标注同步 / 跳过取代·不存在·硬过期 / 批量按 kind 过滤 + limit + remaining /
+    重复确认幂等（只更新时间戳、条数不变）。
+    """
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_confirm")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    now = _dt.datetime(2026, 10, 20, 12, 0, 0)
+    old30 = (now - _dt.timedelta(days=30)).isoformat(timespec="seconds")
+    stamp = now.isoformat(timespec="seconds")
+
+    # ① 老库迁移：先建一条，再模拟 R4 时代的表（无 confirmed），ensure_schema 补回
+    legacy_id = int(brain.add_memory(root, "环境事实：老库迁移前的端口 7890", kind="fact",
+                                     agent="zcode", project="p"))
+    with brain.db_conn(root) as conn:
+        conn.execute("ALTER TABLE memories DROP COLUMN confirmed")
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+        assert "confirmed" not in cols, "测试前提失败：confirmed 列未被移除"
+    brain.ensure_schema(root)
+    with brain.db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+        assert "confirmed" in cols, "ensure_schema 未补 confirmed 列（老库无法升级）"
+        row = dict(conn.execute("SELECT * FROM memories WHERE id=?", (legacy_id,)).fetchone())
+        assert row["confirmed"] == "", f"旧行 confirmed 默认值应为空：{row['confirmed']!r}"
+
+    def _mk(content, kind="fact", **cols):
+        mid = int(brain.add_memory(root, content, kind=kind, agent="zcode", project="p"))
+        sets = dict(cols)
+        if sets:
+            with brain.db_conn(root) as conn:
+                conn.execute("UPDATE memories SET " + ", ".join(f"{k}=?" for k in sets)
+                             + " WHERE id=?", list(sets.values()) + [mid])
+        with brain.db_conn(root) as conn:
+            return dict(conn.execute("SELECT * FROM memories WHERE id=?", (mid,)).fetchone())
+
+    # ② 单条确认：30 天前的 fact（stale）→ 确认后 fresh，且内容/updated/use_count 不变
+    r = _mk("环境事实：代理端口 7890（单条确认测试）", created=old30, updated=old30)
+    assert brain.memory_freshness(r, now)["state"] == "stale", "测试前提失败：应先 stale"
+    res = brain.confirm_memories(root, ids=[r["id"]], now=stamp)
+    assert res["confirmed"] == [r["id"]], f"确认未生效：{res}"
+    assert not res["skipped"], f"合法条目不该被跳过：{res['skipped']}"
+    with brain.db_conn(root) as conn:
+        after = dict(conn.execute("SELECT * FROM memories WHERE id=?", (r["id"],)).fetchone())
+    assert after["confirmed"] == stamp, f"confirmed 时间戳不对：{after['confirmed']!r}"
+    assert after["content"] == r["content"] and after["updated"] == r["updated"], \
+        "确认不得重写内容或 updated（复核 ≠ 重写）"
+    assert after["use_count"] == r["use_count"], "确认不是检索，不该 +use_count"
+    fr = brain.memory_freshness(after, now)
+    assert fr["state"] == "fresh" and fr["basis"] == "confirmed", f"确认后状态不对：{fr}"
+
+    # ③ 检索标注同步：search_memories 返回 fresh（读时计算接进检索）
+    hit = next(x for x in brain.search_memories(root, "单条确认", "", 10, count_hits=False)
+               if x["id"] == r["id"])
+    assert hit["_freshness"] == "fresh", f"检索标注未同步：{hit['_freshness']}"
+
+    # ④ 跳过：不存在 / 被取代 / 作废 / valid_until 硬过期
+    gone = _mk("环境事实：已被取代的端口（跳过测试）", created=old30, updated=old30,
+               superseded_by=1)
+    retired = _mk("环境事实：已作废的端口（跳过测试）", created=old30, updated=old30,
+                  superseded_by=-1)
+    hard = _mk("环境事实：令牌今晚失效（硬过期跳过测试）", created=old30, updated=old30,
+               valid_until="2026-10-19")
+    res2 = brain.confirm_memories(root, ids=[999999, gone["id"], retired["id"], hard["id"]],
+                                  now=stamp)
+    assert res2["confirmed"] == [], f"不该确认任何一条：{res2['confirmed']}"
+    reasons = {s["id"]: s["reason"] for s in res2["skipped"]}
+    assert "不存在" in reasons.get(999999, ""), reasons
+    assert "取代" in reasons.get(gone["id"], ""), reasons
+    assert "作废" in reasons.get(retired["id"], ""), reasons
+    assert "valid_until" in reasons.get(hard["id"], ""), reasons
+    with brain.db_conn(root) as conn:
+        for mid in (gone["id"], retired["id"], hard["id"]):
+            got = conn.execute("SELECT confirmed FROM memories WHERE id=?", (mid,)).fetchone()[0]
+            assert got == "", f"#{mid} 被错误确认：{got!r}"
+
+    # ⑤ 批量复核：只碰 stale/expired，按 kind 过滤，limit 截断时 remaining 如实上报
+    facts = [_mk(f"环境事实：批量复核端口 79{i}（{i}）", created=old30, updated=old30)
+             for i in range(3)]
+    lesson = _mk("踩坑经验：批量复核不该碰耐久知识", kind="lesson",
+                 created=old30, updated=old30)
+    fresh_row = _mk("环境事实：刚复核过的端口（批量测试）",
+                    created=stamp, updated=stamp)
+    res3 = brain.confirm_memories(root, kind="fact", all_stale=True, limit=2, now=stamp)
+    assert len(res3["confirmed"]) == 2, f"limit 未生效：{res3}"
+    assert res3["remaining"] == 1, f"remaining 应为 1：{res3}"
+    with brain.db_conn(root) as conn:
+        conf = {r["id"]: r["confirmed"] for r in conn.execute(
+            "SELECT id,confirmed FROM memories")}
+    assert all(conf[mid] == stamp for mid in res3["confirmed"]), "批量确认未落库"
+    assert conf[lesson["id"]] == "", "lesson 不该被 kind=fact 的批量复核碰到"
+    assert conf[fresh_row["id"]] == "", "fresh 条目不该被 all_stale 碰（只复核陈旧知识）"
+    assert conf[hard["id"]] == "", "valid_until 硬过期不该被批量确认"
+    left = [mid for mid in (f["id"] for f in facts) if conf[mid] == ""]
+    assert len(left) == 1, f"应剩 1 条未确认（不含 lesson/fresh）：{conf}"
+
+    # ⑥ 再跑一次收敛剩余，重复确认幂等（只更新时间戳、总数不变、不新增行）
+    n0 = brain.count_memories(root)
+    res4 = brain.confirm_memories(root, kind="fact", all_stale=True, limit=10, now=stamp)
+    assert res4["confirmed"] == left, f"第二轮应确认剩余那条：{res4}"
+    res5 = brain.confirm_memories(root, ids=[r["id"]], now=stamp)
+    assert res5["confirmed"] == [r["id"]], "重复确认应幂等成功"
+    assert brain.count_memories(root) == n0, "确认不该改变记忆条数"
 
 
 def t_usage_timeline(tmp):
@@ -3115,6 +3323,83 @@ def t_intercept_hot_path_cached(tmp):
     assert brain.similar_lessons_for(root, "短") == []
 
 
+def t_agent_onboarding_store(tmp):
+    """R6 接入状态机持久层：快照 upsert / 七步 JSON 往返 / 记录活跃度口径。
+
+    「验证过」必须留下证据，否则下次只能重新现场算——快照按 agent 覆盖（一行），
+    不是流水；记录统计按日期窗口，老记录不计入近 30 天。"""
+    import datetime as _dt
+    root = str(tmp)
+    ag = "r6probeagent"
+    assert brain.onboarding_get(root, ag) == []
+
+    step = lambda k, st: {"key": k, "label": k, "state": st, "detail": "x", "fix": "y"}
+    err = brain.onboarding_save(root, ag, False, [step("registry", "fail")], "首验")
+    assert err == "", err
+    got = brain.onboarding_get(root, ag)
+    assert len(got) == 1 and got[0]["agent"] == ag, got
+    assert got[0]["ok"] == 0 and got[0]["steps"][0]["key"] == "registry", got
+    assert got[0]["note"] == "首验", got
+
+    assert brain.onboarding_save(root, ag.upper(), True,
+                                 [step("registry", "ok"), step("verify", "ok")], "复查") == ""
+    got2 = brain.onboarding_get(root, ag)
+    assert len(got2) == 1, f"快照应为覆盖而非流水：{got2}"
+    assert got2[0]["ok"] == 1 and len(got2[0]["steps"]) == 2 and got2[0]["note"] == "复查", got2
+    assert any(r["agent"] == ag for r in brain.onboarding_get(root)), "全量查询应含该 agent"
+    assert brain.onboarding_save(root, "", True, []) == "agent 必填"
+
+    today = _dt.date.today()
+    old = (today - _dt.timedelta(days=60)).isoformat()
+    brain.add_record(root, "R6-接入活跃度", ag, today.isoformat(), "今天",
+                     "【目的】验证近30天口径\n【做了什么】写记录")
+    brain.add_record(root, "R6-接入活跃度", ag, old, "六十天前",
+                     "【目的】验证窗口外不计\n【做了什么】写旧记录")
+    st30 = brain.agent_record_stats(root, ag.upper(), days=30)
+    assert st30["count"] == 1 and st30["last"] == today.isoformat(), st30
+    st90 = brain.agent_record_stats(root, ag, days=90)
+    assert st90["count"] == 2 and st90["last"] == today.isoformat(), st90
+
+
+def t_runtime_staleness(tmp):
+    """R7 运行版本：重启检测只看服务目录顶层 .py，非 .py/子目录/容差内不算变更。
+
+    部署后没重启时进程仍在跑旧代码——判定必须保守（同秒误差不算、数据库/缓存不算），
+    否则每次写库都会误报「需重启」。"""
+    import datetime as _dt
+    d = Path(tmp) / "rt_probe"
+    d.mkdir()
+    a, b = d / "a.py", d / "b.txt"
+    a.write_text("x = 1\n", encoding="utf-8")
+    b.write_text("x", encoding="utf-8")
+    sub = d / "sub"
+    sub.mkdir()
+    (sub / "c.py").write_text("x = 1\n", encoding="utf-8")
+
+    now = _dt.datetime.now().timestamp()
+    os.utime(a, (now - 3600, now - 3600))
+    os.utime(b, (now - 10, now - 10))
+    os.utime(sub / "c.py", (now - 10, now - 10))
+    start_old = _dt.datetime.fromtimestamp(now - 5400).isoformat(timespec="seconds")
+    start_new = _dt.datetime.fromtimestamp(now - 1800).isoformat(timespec="seconds")
+
+    info = core.runtime_staleness(str(d), start_old)
+    assert info["known"] is True and info["count"] == 1, info
+    assert info["stale"][0]["file"] == "a.py", info
+    info2 = core.runtime_staleness(str(d), start_new)
+    assert info2["count"] == 0, info2
+    assert [r["file"] for r in core.files_newer_than(str(d), start_old)] == ["a.py"]
+    assert core.files_newer_than(str(d), "not-a-time") == []
+    assert core.files_newer_than(str(d / "不存在"), start_old) == []
+
+    saved = core.SERVER_STARTED_AT
+    try:
+        core.SERVER_STARTED_AT = ""
+        assert core.runtime_staleness(str(d), "")["known"] is False
+    finally:
+        core.SERVER_STARTED_AT = saved
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -3199,6 +3484,10 @@ def main():
     case("异常摘要报缺判定（[gap]/[ok] 标记 + 否定陷阱边界，防误报）", lambda: t_gap_note(tmp))
     case("D10 使用时间线（四源合并倒序/agent·tool 过滤口径/days 窗口/零命中与重复查询/last_seen 活校验/只读不改数）", lambda: t_usage_timeline(tmp))
     case("R3 ghost 对内降序（旧版沉底+标注/只动对内顺序/不置信不动/三版链/不写库/折叠优先刻度不串）", lambda: t_ghost_pair_demotion(tmp))
+    case("R4 新鲜度状态机（kind分档/max参考/valid_until优先/缺戳unknown/confirmed前向兼容/检索标注/不写库/深过期）", lambda: t_memory_freshness(tmp))
+    case("R5 记忆复核闭环（老库补列/确认转fresh/不重写updated/跳过取代·作废·硬过期/批量kind+limit+remaining/幂等）", lambda: t_memory_confirm(tmp))
+    case("R6 接入快照（upsert一行/七步JSON往返/大小写归一/空agent拒/记录活跃度窗口）", lambda: t_agent_onboarding_store(tmp))
+    case("R7 运行版本检测（顶层py/非py与子目录不算/容差/缺启动标记不猜/坏时间不崩）", lambda: t_runtime_staleness(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

@@ -61,6 +61,11 @@ _DYNAMIC = (
     (re.compile(r"\d+\s*条"), "<N> 条"),
     (re.compile(r"\d+\s*个"), "<N> 个"),
     (re.compile(r"\d+\s*次"), "<N> 次"),
+    # agent 概览行的技能/MCP/记忆数是本机安装状态的投影，不是 UI 结构；
+    # 装一个技能就变一次会让结构基线天天误报（R9 实测 165→186 即触发）。
+    (re.compile(r"技能\s*\d+"), "技能 <N>"),
+    (re.compile(r"MCP\s*\d+"), "MCP <N>"),
+    (re.compile(r"记忆\s*\d+"), "记忆 <N>"),
 )
 
 
@@ -127,12 +132,25 @@ def capture(update_shots: bool = False) -> dict:
     core.get_root = lambda: root
     tokens.apply_theme(THEME)
 
+    # agent 探测扫的是本机真实目录，结果随安装状态漂移（技能/MCP 数量变化就会改文案）。
+    # 结构基线必须只反映 UI，故探测固定为两个种子 agent；异步线程仍照常走完。
+    import agentscore
+    _orig_detect = agentscore.detect_agents
+    _seed_agents = [
+        agentscore.AgentInfo(name="Seed Agent A", home="~/.seed-a", detected=True),
+        agentscore.AgentInfo(name="Seed Agent B", home="~/.seed-b", detected=True),
+    ]
+    agentscore.detect_agents = lambda extra=None: _seed_agents
+
     out = {"_meta": {"theme": THEME, "size": [WIN_W, WIN_H], "font": font_src}, "pages": {}}
     w = ui.AgentHubWindow()
     try:
         w.resize(WIN_W, WIN_H)
         w.show()
         pump(app, lambda: getattr(w.project_page, "snap", None) is not None, 30)
+        # 总览的 agent 行来自 300ms 定时器 + 后台探测：不等它就会采到半空页面，
+        # 表现为时有时无的「文案消失」（R10 实测：新增 3 个 agent 后探测变慢即触发）。
+        pump(app, lambda: bool(getattr(w.hub_page, "agents", None)), 8.0)
 
         for attr, title, *_rest in actions.PAGES:
             page = getattr(w, attr, None)
@@ -173,6 +191,7 @@ def capture(update_shots: bool = False) -> dict:
                     pm.save(str(SHOTS / f"{attr}.png"))
     finally:
         core.get_root = _orig_get_root
+        agentscore.detect_agents = _orig_detect
         w.close()
     return out
 

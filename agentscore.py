@@ -69,6 +69,42 @@ PROBES = [
         "mcp_globs": [],
         "mcp_globs_rel": ["profiles/desktop/cordis.patch.yml"],
     },
+    {
+        # Codex CLI（2026-10-20 注册表收口时补探测）：技能在 ~/.codex/skills，
+        # MCP 配置是 TOML 的 [mcp_servers.*]（_parse_mcp_json 已支持 .toml）。
+        "name": "Codex",
+        "home": "~/.codex",
+        "skills": ["~/.codex/skills"],
+        "memories": ["~/.codex/memories"],
+        "configs": ["~/.codex/AGENTS.md"],
+        "mcp": ["~/.codex/config.toml"],
+        "mcp_globs": [],
+    },
+    {
+        # WorkBuddy（2026-10-20 补探测）：用户级技能根 + 共享 ~/.agents/skills
+        # （其 settings.json 明确引用该共享根），MCP 走标准 mcp.json。
+        "name": "WorkBuddy",
+        "home": "~/.workbuddy",
+        "skills": ["~/.workbuddy/skills", "~/.agents/skills"],
+        "skill_depth": {0: 1, 1: 1},
+        "memories": ["~/.workbuddy/memory"],
+        "configs": ["~/.workbuddy/AGENTS.md"],
+        "mcp": ["~/.workbuddy/mcp.json"],
+        "mcp_globs": [],
+    },
+    {
+        # Qoder 桌面版（2026-10-20 接入大脑时补探测）。技能两级：~/.qoder-cn/skills 是
+        # 用户级根，plugins/cache 是市场插件里的技能包（层级深，限 5 层）。
+        # MCP 与 hooks 同住 settings.json / hooks 目录，指令文件是 ~/.qoder-cn/AGENTS.md。
+        "name": "Qoder",
+        "home": "~/.qoder-cn",
+        "skills": ["~/.qoder-cn/skills", "~/.qoder-cn/plugins/cache"],
+        "skill_depth": {0: 1, 1: 5},
+        "memories": ["~/.qoder-cn/memory"],
+        "configs": ["~/.qoder-cn/AGENTS.md"],
+        "mcp": ["~/.qoder-cn/settings.json"],
+        "mcp_globs": [],
+    },
 ]
 
 
@@ -166,9 +202,18 @@ def _collect_skills(agent: str, roots: list, depths: dict) -> list:
 
 
 def _parse_mcp_json(path: Path) -> dict:
-    """解析 MCP 配置 json，返回 {server_name: config}。兼容多种键名/嵌套：
-    mcpServers / mcp.servers / mcp（直接为 server 字典）。解析失败返回 {}。
+    """解析 MCP 配置（json 或 toml），返回 {server_name: config}。兼容多种键名/嵌套：
+    json：mcpServers / mcp.servers / mcp（直接为 server 字典）；toml：mcp_servers。
+    解析失败返回 {}。
     """
+    if path.suffix.lower() == ".toml":
+        try:
+            import tomllib
+            data = tomllib.loads(path.read_text(encoding="utf-8", errors="replace"))
+        except Exception:  # noqa: BLE001  toml 坏值/老版本 python，全兜住
+            return {}
+        m = data.get("mcp_servers") if isinstance(data, dict) else None
+        return m if isinstance(m, dict) else {}
     try:
         data = json.loads(path.read_text(encoding="utf-8", errors="replace"))
     except Exception:  # noqa: BLE001  配置文件可能带注释/坏值，全兜住

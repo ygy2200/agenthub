@@ -8,6 +8,15 @@ rem   误排会导致启动崩（且 windowed 模式进程仍存活，需用 Mai
 cd /d "%~dp0"
 rem ⚠ 禁用 UPX（--noupx）：UPX 压缩 Qt 官方 DLL 会破坏图形管线——实测表现为
 rem   窗口首次启动不渲染内容（全透明）、文字模糊发虚（2026-10-09 用户报「接入页字看不清」）。
+rem 构建清单（R3）：start 必须在 PyInstaller 之前——mtime 判不出「构建中段改的源码」，
+rem 只有构建前快照的源码哈希才能证明 exe 冻结的是哪一版。
+echo [1/4] 构建清单 start（快照源码哈希）...
+D:\python311\python.exe cli.py build-manifest start
+if errorlevel 1 (
+  echo 构建清单 start 失败
+  pause
+  exit /b 1
+)
 D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx --name AgentHub ^
   --icon assets\agenthub.ico --add-data "assets\agenthub.ico;." ^
   --exclude-module aiohttp --exclude-module aiohappyeyeballs --exclude-module aiosignal --exclude-module yarl --exclude-module multidict --exclude-module frozenlist --exclude-module propcache ^
@@ -19,12 +28,27 @@ D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx 
   --exclude-module ujson --exclude-module tzdata --exclude-module mypyc ^
   --exclude-module pythonwin --exclude-module win32trace --exclude-module win32pdh --exclude-module win32evtlog ^
   --exclude-module torch --exclude-module tensorflow --exclude-module jupyter --exclude-module IPython --exclude-module notebook ^
+  --exclude-module torchvision --exclude-module torchaudio --exclude-module cv2 --exclude-module hf_xet ^
   main.py
 if errorlevel 1 (
   echo 打包失败
   pause
   exit /b 1
 )
+echo [2/4] 构建清单 finish（记录 exe sha256）...
+D:\python311\python.exe cli.py build-manifest finish
+if errorlevel 1 (
+  echo 构建清单 finish 失败
+  pause
+  exit /b 1
+)
 copy /y dist\AgentHub.exe "%USERPROFILE%\Desktop\AgentHub.exe"
-echo 完成：桌面 AgentHub.exe
+echo [3/4] 发布一致性检查（清单/源码/桌面副本哈希）...
+D:\python311\python.exe cli.py release
+if errorlevel 1 (
+  echo 发布检查未通过：exe 与源码或桌面副本不一致
+  pause
+  exit /b 1
+)
+echo [4/4] 完成：桌面 AgentHub.exe
 pause

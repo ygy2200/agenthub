@@ -30,13 +30,22 @@ import core  # noqa: E402  ops 与 core 互有依赖，此处仅取常量（core
 DEPLOY_FILES = list(core.SERVER_FILES)
 PY = sys.executable  # 与 MCP server 同解释器，保证跑测试时依赖一致
 
+# R3（第五轮）：构建清单。exe 是打包时冻结的，mtime 判断有致命盲区——
+# PyInstaller 的 PYZ 在构建中段就固化，构建后半段改的源码仍可能早于最终 exe 的生成时间，
+# 于是「源码比 exe 新」判不出来（2026-10-20 R2 后实测：exe 缺 R2 代码却被判一致）。
+# 改为构建开始时快照源码哈希、结束时记录 exe sha256，发布检查比对清单而不是时间。
+BUILD_MANIFEST = "AgentHub.build.json"
+RELEASE_SKIP_PREFIXES = ("adv_", "fix_", "test_")
+RELEASE_SKIP_FILES = {"diag_launch.py", "drag_probe.py", "layout_stress.py",
+                      "smoke_ui.py", "ui_audit.py", "make_icon.py", "publish.py"}
+
 # name -> (一句话说明, 是否需要 target 目录)
 CHECKS = {
     "py_compile": ("编译检查 target 目录全部 .py（ast 语法解析，抓低级语法错），通用任意项目", True),
     "git_status": ("git 工作区是否干净（未提交/未跟踪清单），通用任意仓库", True),
-    "regression": ("跑 AgentHub 十一套对抗回归 adv_brain/adv_mcp/adv_cli/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log/adv_mywork/adv_concurrency/adv_ops/adv_api（约3分钟）", True),
+    "regression": ("跑 AgentHub 十二套对抗回归 adv_brain/adv_mcp/adv_cli/adv_agenthub/adv_e2e_schema/adv_report/adv_auto_log/adv_mywork/adv_concurrency/adv_ops/adv_api/adv_guard（约3分钟）", True),
     "deploy_diff": ("AgentHub 源码 vs 部署目录逐文件 md5 一致性（部署≠源码盲区检测）", True),
-    "release": ("发布一致性：GUI exe 是否比关键源码（main/ui/core/brain/agentscore）旧 + 桌面副本是否同步——防止「改了源码没重打包」", True),
+    "release": ("发布一致性（哈希化）：exe 与构建清单的产物 sha256 匹配 + 构建后源码未变 + 桌面副本同哈希——mtime 判不出「构建中段改的源码」，清单才靠得住；无清单时回退 mtime 并标注", True),
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
     "brain": ("大脑健康一行摘要（记录/记忆/结晶率/待办/检索累计）", False),
     "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
@@ -45,6 +54,8 @@ CHECKS = {
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计）——检测规则有没有被真正执行，而非只写在纸面", False),
+    "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
+    "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
     "hygiene": ("整洁体检：备份文件（.bak*）堆积量与最旧年龄 + agents 表零记录冗余行——只报不动手，供你决定清哪些", False),
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
@@ -93,6 +104,10 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _agents(root)
     elif name == "rules_health":
         r = _rules_health(root)
+    elif name == "agent_onboard":
+        r = _agent_onboard(root, target)
+    elif name == "runtime_health":
+        r = _runtime_health(root)
     elif name == "hygiene":
         r = _hygiene(root)
     elif name == "ponytail_gate":
@@ -349,7 +364,8 @@ def _git_status(target: Path) -> dict:
 # 守一条规矩：新增 adv_*.py 套件时必须同时改这里；adv_ops 有守卫盯着目录里的实际文件。
 REGRESSION_SUITES = ["adv_brain.py", "adv_mcp.py", "adv_cli.py", "adv_agenthub.py",
                      "adv_e2e_schema.py", "adv_report.py", "adv_auto_log.py",
-                     "adv_mywork.py", "adv_concurrency.py", "adv_ops.py", "adv_api.py"]
+                     "adv_mywork.py", "adv_concurrency.py", "adv_ops.py", "adv_api.py",
+                     "adv_guard.py"]
 
 
 def _regression(target: Path) -> dict:
@@ -817,15 +833,19 @@ def _suggest_line(s: dict) -> str:
 
 
 def _stale_health(root: str) -> dict:
-    """陈旧健康（D3/R3，2026-10-18）：① supersede 泄漏硬不变量；② 陈旧 fact 清单。
+    """陈旧健康（D3/R3，2026-10-18；R4 2026-10-19 升级为新鲜度状态机）：① supersede
+    泄漏硬不变量；② 全库新鲜度分布 + 最陈的几条。
 
     由来：外部研究一致把 **staleness rate** 列为记忆系统第一指标（「persistence ≠ truth」
     ——旧事实安静变假是生产最常见失效）。本检查**不发明「真相预言机」**（系统无法知道
     外部世界何时变了），只做两件可验证的事：
       ① 已标 superseded_by 的旧事实**不得被检索返回**（_live_sql 的结构保证；任何泄漏 =
          检索管线回归，硬不变量）；
-      ② 写入 >45 天且零唤起的 fact → 「该复核」候选清单（只报不裁）。
-    """
+      ② 按 brain.FRESH_POLICY 的 kind 分档策略，读时算每条现行记忆的 fresh/stale/expired
+         分布（R4 前这里是一张「45 天零唤起 fact」手工清单——口径只有一种事实、只认
+         「从没被检索过」，被反复检索印证过的老 fact 反而漏掉；状态机以「距上次
+         写入/确认多久」计，与 maturity（多信）/use_count（多响）三个刻度互补）。
+    过期不删除、只报告——「供应商三月在 Austin」仍是证据。"""
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
     if not root:
         return {"ok": False, "summary": "大脑库根目录未配置", "detail": []}
@@ -844,29 +864,42 @@ def _stale_health(root: str) -> dict:
                 leaks.append(mcode["id"])
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"泄漏检测失败（{type(e).__name__}）：{e}", "detail": []}
-    # ② 陈旧 fact 清单（>45 天零唤起）
+    # ② 新鲜度分布（读时计算，全量现行记忆——过期不删除的精神下，被 superseded/
+    #    作废的仍排除，但 valid_until 过期的要数到：它还是证据，只是标出来）
     try:
         with brain.db_conn(root) as conn:
-            stale = [dict(r) for r in conn.execute(
-                "SELECT id, substr(content,1,60) c FROM memories WHERE kind='fact' AND status='active' "
-                "AND (superseded_by IS NULL OR superseded_by=0) AND updated < datetime('now','-45 days') "
-                "AND (use_count IS NULL OR use_count=0) ORDER BY updated LIMIT 8")]
-            total_fact = conn.execute(
-                "SELECT COUNT(*) FROM memories WHERE kind='fact' AND status='active'").fetchone()[0]
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, kind, content, created, updated, last_hit, valid_until "
+                "FROM memories WHERE status='active' "
+                "AND (superseded_by IS NULL OR superseded_by=0)")]
+        dist = {"fresh": 0, "stale": 0, "expired": 0, "unknown": 0}
+        worst: list = []
+        for r in rows:
+            fr = brain.memory_freshness(r)
+            dist[fr["state"]] = dist.get(fr["state"], 0) + 1
+            if fr["state"] in ("stale", "expired") and fr["age_days"] is not None:
+                worst.append((fr["age_days"], r, fr["state"]))
+        worst.sort(key=lambda t: -t[0])
     except Exception as e:  # noqa: BLE001
-        return {"ok": False, "summary": f"陈旧清单读取失败：{e}", "detail": []}
+        return {"ok": False, "summary": f"新鲜度计算失败（{type(e).__name__}）：{e}", "detail": []}
     if leaks:
         return {"ok": False,
                 "summary": f"⚠ supersede 泄漏 {len(leaks)} 条（已取代的旧事实仍被检索返回——硬不变量破坏）",
                 "detail": [f"泄漏记忆 #{i}（检索管线回归，查 _live_sql/语义路过滤）" for i in leaks][:8]}
-    detail = [f"陈旧 fact #{r['id']}（45+ 天零唤起，该复核）：{r['c']}" for r in stale[:8]]
-    if stale:
-        pct = len(stale) * 100 // max(1, total_fact)
+    total = len(rows)
+    stale_n = dist["stale"] + dist["expired"]
+    detail = [f"{st.upper()} #{r['id']}（{brain.KIND_CN.get(r['kind'], r['kind'])}，"
+              f"{age:.0f} 天未复核）：{(r['content'] or '')[:50]}" for age, r, st in worst[:8]]
+    if stale_n:
         return {"ok": True,
-                "summary": f"无 supersede 泄漏；{len(stale)} 条陈旧 fact 待复核"
-                           f"（占 active fact {total_fact} 条的 {pct}%）",
+                "summary": f"无 supersede 泄漏；新鲜度分布 fresh {dist['fresh']} / "
+                           f"stale {dist['stale']} / expired {dist['expired']}"
+                           + (f" / unknown {dist['unknown']}" if dist["unknown"] else "")
+                           + f"（共 {total} 条现行；复核看 hub_memory_read 的新鲜度标注）",
                 "detail": detail}
-    return {"ok": True, "summary": "无 supersede 泄漏、无陈旧 fact 待复核", "detail": []}
+    return {"ok": True,
+            "summary": f"无 supersede 泄漏；{total} 条现行记忆全部在新鲜窗口内",
+            "detail": detail}
 
 
 def _date_health(root: str) -> dict:
@@ -982,36 +1015,155 @@ def _deploy_diff(target: Path) -> dict:
             "detail": diffs[:8]}
 
 
-def _release(target: Path) -> dict:
-    """发布一致性：GUI exe 是否比「GUI 关键源码」旧；桌面副本是否与 dist 同步。
-    防的是「改了源码却没重打包」——exe 是打包时冻结的，源码改了不重打就发的是旧 GUI。"""
+def _file_hash(path: Path, algo: str = "md5") -> str:
+    h = hashlib.new(algo)
+    with open(path, "rb") as f:
+        for chunk in iter(lambda: f.read(1 << 20), b""):
+            h.update(chunk)
+    return h.hexdigest()
+
+
+def _release_sources(root: Path) -> dict:
+    """本次构建的输入快照：根目录运行时代码 + 图标。
+    排除回归/一次性修复脚本——它们不参与 exe，改了不该触发「需重打包」。"""
+    out = {}
+    for p in sorted(root.glob("*.py")):
+        if p.name.startswith(RELEASE_SKIP_PREFIXES) or p.name in RELEASE_SKIP_FILES:
+            continue
+        out[p.name] = _file_hash(p, "md5")
+    ico = root / "assets" / "agenthub.ico"
+    if ico.is_file():
+        out["assets/agenthub.ico"] = _file_hash(ico, "md5")
+    return out
+
+
+def _app_version(root: Path) -> str:
+    try:
+        txt = (root / "agenthub_mcp.py").read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return ""
+    m = re.search(r'SERVER_INFO\s*=\s*\{[^}]*"version"\s*:\s*"([^"]+)"', txt)
+    return m.group(1) if m else ""
+
+
+def build_manifest(root: str | Path, phase: str = "start") -> dict:
+    """构建清单两阶段。start 必须在 PyInstaller 之前跑（快照输入哈希），
+    finish 在打包后跑（记录产物 sha256）。build.bat 自动调用，也可手工补跑。"""
+    root = Path(root)
+    dist = root / "dist"
+    dist.mkdir(parents=True, exist_ok=True)
+    path = dist / BUILD_MANIFEST
+    if phase == "start":
+        data = {
+            "schema": 1,
+            "version": _app_version(root),
+            "started": datetime.datetime.now().isoformat(timespec="seconds"),
+            "finished": "",
+            "python": sys.version.split()[0],
+            "source": _release_sources(root),
+            "exe": None,
+        }
+        try:
+            git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                                 capture_output=True, text=True, timeout=3)
+            data["git_head"] = git.stdout.strip() if git.returncode == 0 else ""
+        except (OSError, subprocess.SubprocessError):
+            data["git_head"] = ""
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "manifest": str(path),
+                "summary": f"构建清单已快照 {len(data['source'])} 个输入（v{data['version']}）"}
+    if phase == "finish":
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return {"ok": False, "summary": "构建清单不存在或损坏——构建前必须先跑 build-manifest start"}
+        exe = dist / "AgentHub.exe"
+        if not exe.is_file():
+            return {"ok": False, "summary": "打包产物 dist/AgentHub.exe 不存在，无法完成清单"}
+        data["exe"] = {"sha256": _file_hash(exe, "sha256"), "size": exe.stat().st_size,
+                       "mtime": exe.stat().st_mtime}
+        data["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
+        path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
+        return {"ok": True, "manifest": str(path),
+                "summary": f"构建清单已完成：exe {exe.stat().st_size // 1024 // 1024}MB，"
+                           f"sha256 {data['exe']['sha256'][:12]}…"}
+    return {"ok": False, "summary": f"未知阶段 {phase!r}（只能是 start / finish）"}
+
+
+def _release(target: Path, home: Path | None = None) -> dict:
+    """发布一致性（R3 哈希化）：exe 必须与构建清单的产物哈希一致、源码未变、桌面副本同哈希。
+    无清单时回退旧的 mtime 判断（会明示「可能误报」）。"""
     if not (target / "ui.py").is_file():
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 ui.py）", "detail": []}
     exe = target / "dist" / "AgentHub.exe"
     if not exe.is_file():
         return {"ok": False, "summary": "未找到 dist/AgentHub.exe（还没打过包？跑 build.bat）", "detail": []}
-    key = ["main.py", "ui.py", "core.py", "brain.py", "agentscore.py"]  # 改了这些就必须重打包
+    fmt = lambda t: datetime.datetime.fromtimestamp(t).strftime("%m-%d %H:%M")  # noqa: E731
+    exe_sz = exe.stat().st_size
+    desktop = (Path(home) if home else Path.home()) / "Desktop" / "AgentHub.exe"
+    detail = [f"exe       {fmt(exe.stat().st_mtime)}  {exe_sz // 1024 // 1024}MB"]
+    mpath = target / "dist" / BUILD_MANIFEST
+    manifest = None
+    if mpath.is_file():
+        try:
+            manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = None
+    if manifest and manifest.get("source"):
+        detail.insert(0, f"构建清单  v{manifest.get('version') or '?'}  "
+                          f"{manifest.get('started', '?')} → {manifest.get('finished') or '未完成'}")
+        ex = manifest.get("exe") or {}
+        if not ex.get("sha256"):
+            return {"ok": False, "summary": "上次构建未完成（清单没有 exe 记录）—— 重跑 build.bat", "detail": detail}
+        exe_hash = _file_hash(exe, "sha256")
+        if exe_hash != ex["sha256"]:
+            detail.append("产物哈希  与清单不一致")
+            return {"ok": False, "summary": "exe 与构建清单不一致（构建后 exe 被替换/清单过期）—— 重跑 build.bat",
+                    "detail": detail}
+        changed = []
+        for name, want in manifest["source"].items():
+            p = target / name
+            if not p.is_file():
+                changed.append(f"{name}(缺失)")
+            elif _file_hash(p, "md5") != want:
+                changed.append(name)
+        if changed:
+            detail.append("变更源码  " + "、".join(changed[:5])
+                          + (f" 等 {len(changed)} 个" if len(changed) > 5 else ""))
+            return {"ok": False, "summary": f"源码在打包后已变（{len(changed)} 个）—— 需重打包（build.bat）",
+                    "detail": detail}
+        detail.append(f"清单版本  v{manifest.get('version') or '?'}（当前 v{_app_version(target)}）")
+        if not desktop.is_file():
+            detail.append("桌面副本  不存在")
+            return {"ok": False, "summary": "桌面副本不存在 —— 重跑 build.bat（含拷贝）", "detail": detail}
+        if _file_hash(desktop, "sha256") != ex["sha256"]:
+            detail.append("桌面副本  **哈希不一致**")
+            return {"ok": False, "summary": "桌面副本与 dist 不一致（同尺寸也可能内容不同）—— 重跑 build.bat 的拷贝步骤",
+                    "detail": detail}
+        detail.append("桌面副本  同步（sha256 一致）")
+        return {"ok": True, "summary": "发布一致：exe 与构建清单匹配、源码未变、桌面副本哈希同步", "detail": detail}
+    # 旧产物无清单：回退 mtime，明确标注不可靠
+    key = ["main.py", "ui.py", "core.py", "brain.py", "agentscore.py"]
     newest, newest_name = 0.0, ""
     for f in key:
         p = target / f
         if p.is_file() and p.stat().st_mtime > newest:
             newest, newest_name = p.stat().st_mtime, f
-    fmt = lambda t: datetime.datetime.fromtimestamp(t).strftime("%m-%d %H:%M")  # noqa: E731
-    exe_mt, exe_sz = exe.stat().st_mtime, exe.stat().st_size
-    desktop = Path.home() / "Desktop" / "AgentHub.exe"
-    detail = [f"exe       {fmt(exe_mt)}  {exe_sz // 1024 // 1024}MB",
-              f"最新源码  {newest_name} {fmt(newest)}"]
+    detail.append(f"最新源码  {newest_name} {fmt(newest)}")
+    detail.append("构建清单  缺失（回退 mtime，可能误报——重跑 build.bat 生成）")
     if desktop.is_file():
         same = desktop.stat().st_size == exe_sz
         detail.append(("桌面副本  同步" if same else "桌面副本  **不一致**") + f"  {fmt(desktop.stat().st_mtime)}")
     else:
         detail.append("桌面副本  不存在")
-    if newest > exe_mt:
+    if newest > exe.stat().st_mtime:
         return {"ok": False,
                 "summary": f"exe 旧了：{newest_name} 比 exe 新 —— 需重打包（build.bat）", "detail": detail}
     if desktop.is_file() and desktop.stat().st_size != exe_sz:
         return {"ok": False, "summary": "桌面副本与 dist 不一致 —— 重跑 build.bat（含拷贝）", "detail": detail}
-    return {"ok": True, "summary": "发布一致：exe 不旧于关键源码，桌面副本同步", "detail": detail}
+    if not desktop.is_file():
+        return {"ok": False, "summary": "桌面副本不存在 —— 重跑 build.bat（含拷贝）", "detail": detail}
+    return {"ok": True, "summary": "发布一致（无构建清单，mtime 判断，可能误报）", "detail": detail}
 
 
 def _env(root: str = "") -> dict:
@@ -1097,14 +1249,11 @@ def _agents(root: str) -> dict:
     return {"ok": not (miss_boot or stale or miss_mcp), "summary": summary, "detail": detail[:8]}
 
 
-def _rules_health(root: str) -> dict:
-    """规则执行体检（2026-10-12 新增）：逐家核对「干完活记大脑」闸门是否真在位、真在跑。
+def rules_components(root: str) -> dict:
+    """逐家闸门状态的结构化版本（rules_health 与 hub_agent 共用，避免两套口径）。
 
-    三类核对（全只读）：
-      1) 闸门配置在位：各家配置文件里必须出现守卫脚本名（缺=被删/被覆盖）
-      2) 守卫脚本存在：agent_guard.mjs / guard-brainlog.mjs 在盘
-      3) 近期真触发：读守卫日志，按 agent= 归因统计最近触发与拦截/拒绝次数
-         （配置在但日志零触发 = 最危险的一类——「装了但没跑」，此前完全不可见）
+    返回 {"agents": [{agent,state,last,block,deny,mark}], "scripts_missing": [...],
+          "untracked": [...]}；state ∈ inplace/missing/unwired。
     """
     guard_script = Path.home() / ".agenthub" / "hooks" / "agent_guard.mjs"
     brainlog_script = Path.home() / ".workbuddy" / "bin" / "guard-brainlog.mjs"
@@ -1137,20 +1286,19 @@ def _rules_health(root: str) -> dict:
             ("hermes-cn", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"), "agent_guard.mjs"),
             ("zcode", Path.home() / ".zcode" / "cli" / "config.json", "auto_log.py"),
             ("dsh", Path.home() / ".dsh" / "hooks.json", "agent_guard.mjs"),
+            ("qoder", Path.home() / ".qoder-cn" / "settings.json", "agent_guard.mjs"),
         ]
 
-    missing, unwired, inplace = [], [], []
-    for agent, cfg, keyword in targets:
-        try:
-            txt = cfg.read_text(encoding="utf-8", errors="replace") if cfg.is_file() else ""
-        except OSError:
-            txt = ""
-        if not txt:
-            missing.append(agent)
-        elif keyword not in txt:
-            unwired.append(agent)
-        else:
-            inplace.append(agent)
+    # 动态核对注册表：新增 agent 只登记 config.agents.json 而忘了补 targets.json 时，
+    # 过去是静默漏掉（Qoder 接入即如此）。这里按注册表逐家点名，而不是等人去发现。
+    try:
+        _core = _import_core()
+        covered = {_core.agent_key(a) for a, _c, _k in targets}
+        untracked = [str(a.get("agent") or "?")
+                     for a in _core.AGENT_ADAPTERS + _core.load_agent_adapters(root)
+                     if _core.agent_key(str(a.get("agent") or "")) not in covered]
+    except Exception:  # noqa: BLE001  注册表读不到时不阻塞其余核对
+        untracked = []
 
     # 近期触发统计（各取日志尾 400 行）
     stat = {}
@@ -1175,29 +1323,60 @@ def _rules_health(root: str) -> dict:
             elif "marked logged" in ln:
                 d["mark"] += 1
 
-    scripts_ok = []
-    for p in scripts:
-        if not p.is_file():
-            scripts_ok.append(p.name)
+    agents = []
+    for agent, cfg, keyword in targets:
+        try:
+            txt = cfg.read_text(encoding="utf-8", errors="replace") if cfg.is_file() else ""
+        except OSError:
+            txt = ""
+        state = "missing" if not txt else ("unwired" if keyword not in txt else "inplace")
+        s = stat.get(agent) or {}
+        agents.append({"agent": agent, "state": state,
+                       "last": s.get("last", ""), "block": s.get("block", 0),
+                       "deny": s.get("deny", 0), "mark": s.get("mark", 0)})
+    return {"agents": agents,
+            "scripts_missing": [p.name for p in scripts if not p.is_file()],
+            "untracked": untracked}
 
-    silent = [a for a in inplace if a not in stat]
+
+def _rules_health(root: str) -> dict:
+    """规则执行体检（2026-10-12 新增）：逐家核对「干完活记大脑」闸门是否真在位、真在跑。
+
+    三类核对（全只读）：
+      1) 闸门配置在位：各家配置文件里必须出现守卫脚本名（缺=被删/被覆盖）
+      2) 守卫脚本存在：agent_guard.mjs / guard-brainlog.mjs 在盘
+      3) 近期真触发：读守卫日志，按 agent= 归因统计最近触发与拦截/拒绝次数
+         （配置在但日志零触发 = 最危险的一类——「装了但没跑」，此前完全不可见）
+    """
+    comp = rules_components(root)
+    rows = comp["agents"]
+    missing = [r["agent"] for r in rows if r["state"] == "missing"]
+    unwired = [r["agent"] for r in rows if r["state"] == "unwired"]
+    inplace = [r["agent"] for r in rows if r["state"] == "inplace"]
+    scripts_ok = comp["scripts_missing"]
+    untracked = comp["untracked"]
+
+    silent = [r["agent"] for r in rows
+              if r["state"] == "inplace" and not r["last"]]
     detail = []
     if scripts_ok:
         detail.append("守卫脚本缺失：" + "、".join(scripts_ok))
-    for agent, _cfg, _kw in targets:
-        s = stat.get(agent)
-        if agent in missing:
+    for r in rows:
+        agent = r["agent"]
+        if r["state"] == "missing":
             detail.append(f"{agent}: ✗ 闸门配置缺失（被删/被覆盖？）")
-        elif agent in unwired:
+        elif r["state"] == "unwired":
             detail.append(f"{agent}: ✗ 配置在但未含守卫（被改动？）")
-        elif s:
-            detail.append(f"{agent}: ✓ 最近触发 {s['last'][5:16]} 拦截{s['block']}/拒绝{s['deny']}/记账{s['mark']}")
+        elif r["last"]:
+            detail.append(f"{agent}: ✓ 最近触发 {r['last'][5:16]} 拦截{r['block']}/拒绝{r['deny']}/记账{r['mark']}")
         else:
             detail.append(f"{agent}: ⚠ 配置在位但日志零触发（未用过，或钩子没生效）")
 
-    gaps = len(missing) + len(unwired) + len(scripts_ok)
+    gaps = len(missing) + len(unwired) + len(scripts_ok) + len(untracked)
+    if untracked:
+        detail.append("注册表有但闸门清单未覆盖：" + "、".join(untracked) + "（补 ~/.agenthub/hooks/targets.json）")
     if gaps == 0:
-        summary = (f"规则执行体检：{len(inplace)} 家闸门在位、脚本齐；"
+        summary = (f"规则执行体检：{len(inplace)} 家闸门在位、脚本齐、注册表全覆盖；"
                    + (f"其中 {len(silent)} 家尚无触发记录（{ '/'.join(silent) }）" if silent else "且均有触发记录"))
     else:
         bits = []
@@ -1205,10 +1384,242 @@ def _rules_health(root: str) -> dict:
             bits.append(f"缺配置 {'/'.join(missing)}")
         if unwired:
             bits.append(f"未含守卫 {'/'.join(unwired)}")
+        if untracked:
+            bits.append(f"清单漏登记 {'/'.join(untracked)}")
         if scripts_ok:
             bits.append("脚本缺失")
         summary = "规则执行缺口：⚠ " + "；".join(bits)
-    return {"ok": gaps == 0, "summary": summary, "detail": detail[:8]}
+    return {"ok": gaps == 0, "summary": summary, "detail": detail[:10]}
+
+
+def agent_onboard_status(root: str, agent: str) -> dict:
+    """接入清单逐项体检（R6）。hub_agent 与 ops.agent_onboard 共用这一份实现。
+
+    七项：注册表 / 引导注入 / MCP / 规则闸门 / 技能索引 / 工作记录 / 验证快照。
+    state ∈ ok / warn / fail / unknown；ok 只要求无 fail（warn 是「能接上但还不完整」）。
+    未注册的 agent 也照样返回清单——接入前先看差哪步，正是本函数的用途。
+    """
+    import brain as _brain  # noqa: PLC0415  ops 顶层不 import brain（保持检查工具独立性）
+
+    try:
+        _core = _import_core()
+    except Exception as e:  # noqa: BLE001
+        return {"agent": agent, "key": "", "ok": False,
+                "steps": [{"key": "registry", "label": "注册表", "state": "fail",
+                           "detail": f"注册表读取失败：{type(e).__name__}", "fix": "检查 config.agents.json"}],
+                "counts": {"ok": 0, "warn": 0, "fail": 1, "unknown": 0}, "next": []}
+
+    key = _core.agent_key(agent)
+    reg = _core.agent_known_names(root)
+    steps = []
+
+    def add(k, label, state, detail, fix=""):
+        steps.append({"key": k, "label": label, "state": state, "detail": detail, "fix": fix})
+
+    if key in reg:
+        add("registry", "注册表", "ok", f"已注册（{reg[key]}）")
+    else:
+        add("registry", "注册表", "fail", f"未注册：{agent or '未指定'}",
+            "在 config.agents.json 的 agents 追加适配器（agent/channel/instr_path/mcp）")
+
+    row = next((r for r in _core.agent_bootstrap_status(root)
+                if _core.agent_key(str(r.get("agent") or "")) == key), None)
+    if row is None:
+        add("instruction", "引导注入", "fail", "注册表无对应适配器，无法定位指令文件",
+            "先登记 instr_path，再跑接入注入（onboard）")
+        add("mcp", "MCP", "unknown", "无适配器，无法判定", "先登记适配器")
+    else:
+        if row.get("boot_stale"):
+            add("instruction", "引导注入", "warn",
+                f"引导块旧版 v{row.get('boot_version') or '?'}（当前 v{_core.BOOTSTRAP_VERSION}）：{row.get('instr_path', '')}",
+                "重跑接入注入（onboard）刷新引导块")
+        elif row.get("boot"):
+            add("instruction", "引导注入", "ok",
+                f"v{row.get('boot_version') or '?'} 已注入 {row.get('instr_path', '')}")
+        else:
+            add("instruction", "引导注入", "fail", f"未检测到引导块：{row.get('instr_path', '')}",
+                "重跑接入注入（onboard）或检查指令文件路径")
+        mcp_state = row.get("mcp")
+        if mcp_state is True:
+            add("mcp", "MCP", "ok", "已配置 agenthub")
+        elif mcp_state is False:
+            add("mcp", "MCP", "fail", f"配置里没有 agenthub（{row.get('mcp_path', '')}）",
+                "在 agent 的 MCP 配置里加 agenthub（onboard 可自动写入）")
+        else:
+            add("mcp", "MCP", "unknown", "布局无法自动解析（bundle/YAML 等），需人工确认",
+                "hub_list_mcps 核对实际加载")
+
+    guard = next((r for r in rules_components(root)["agents"]
+                  if _core.agent_key(r["agent"]) == key), None)
+    if guard is None:
+        add("hooks", "规则闸门", "warn", "闸门清单（targets.json）未登记",
+            "在 ~/.agenthub/hooks/targets.json 补一条 target")
+    elif guard["state"] == "missing":
+        add("hooks", "规则闸门", "fail", "闸门配置文件缺失（被删/被覆盖？）",
+            "恢复该 agent settings 里的守卫钩子")
+    elif guard["state"] == "unwired":
+        add("hooks", "规则闸门", "fail", "配置在但未含守卫脚本（被改动？）",
+            "重装守卫钩子（onboard / 手动加 hooks）")
+    elif guard["last"]:
+        add("hooks", "规则闸门", "ok",
+            f"最近触发 {guard['last'][5:16]}（拦{guard['block']}/拒{guard['deny']}/记{guard['mark']}）")
+    else:
+        add("hooks", "规则闸门", "warn", "配置在位但日志零触发（未用过，或钩子没生效）",
+            "让该 agent 跑一次真实会话，确认钩子加载")
+
+    idx_rows = _brain.skills_by_agent(root, key)
+    n_skills = len(idx_rows)
+    # 覆盖缺口是召回盲区的根因（R2 零命中检索暴露）：索引只增不删但没人定期同步，
+    # 新增技能后 hub_skill_match 搜不到。接入清单每次现场探测并点名缺口。
+    local_names: set = set()
+    local_n = None
+    try:
+        import agentscore as _asc  # noqa: PLC0415  与 hub_skill_sync 同一探测源
+        _probe = next((a for a in _asc.detect_agents(_core.load_config().get("extra_agents"))
+                       if _core.agent_key(a.name) == key), None)
+        if _probe is not None:
+            local_n = len(_probe.skills)
+            local_names = {s.name.lower() for s in _probe.skills}
+    except Exception:  # noqa: BLE001  探测失败按「未知」处理，不阻断接入结论
+        local_n = None
+    missing = local_names - {str(r.get("name") or "").lower() for r in idx_rows}
+    if n_skills == 0:
+        add("skills", "技能索引", "warn", "索引无记录（技能面对召回不可见）",
+            f'hub_skill_sync(agent="{agent}")')
+    elif missing:
+        sample = "、".join(sorted(missing)[:2])
+        add("skills", "技能索引", "warn",
+            f"索引 {n_skills} 条，但本地 {local_n} 个技能中有 {len(missing)} 个未入索引"
+            f"（如 {sample}）——这些技能 hub_skill_match 搜不到",
+            f'hub_skill_sync(agent="{agent}")')
+    else:
+        add("skills", "技能索引", "ok",
+            f"索引 {n_skills} 条" + (f"（本地 {local_n} 个已覆盖）" if local_n else ""))
+
+    rec = _brain.agent_record_stats(root, key, days=30)
+    if rec["count"]:
+        add("records", "工作记录", "ok", f"近{rec['days']}天 {rec['count']} 条（最近 {rec['last']}）")
+    else:
+        add("records", "工作记录", "warn", f"近{rec['days']}天无记录（接入后还没落过账）",
+            "hub_log_work(project=\"…\", agent=\"…\", content=\"目的/做了什么/验证/回滚\")")
+
+    _rt = _core.runtime_staleness()
+    if not _rt.get("known"):
+        add("runtime", "运行版本", "unknown", "非 MCP 进程调用，无法判断加载的代码是否最新",
+            "在 agent 会话里调 hub_agent 复查")
+    elif _rt["count"]:
+        _top = _rt["stale"][0]
+        add("runtime", "运行版本", "warn",
+            f"正在跑旧代码：进程启动 {_rt['started'][5:16]} 后有 {_rt['count']} 个文件更新"
+            f"（最近 {_top['file']} {_top['mtime'][5:16]}）",
+            "重启该 agent 的会话/客户端，让 MCP 进程加载新代码")
+    else:
+        add("runtime", "运行版本", "ok", f"与磁盘一致（进程启动 {_rt['started'][5:16]}）")
+
+    snap = _brain.onboarding_get(root, key)
+    if not snap:
+        add("verify", "验证快照", "warn", "从未 verify（结论只在现场算过、没留下）",
+            f'hub_agent(action="verify", agent="{agent}")')
+    elif snap[0].get("ok"):
+        _ts = str(snap[0].get("ts") or "")
+        _changed = _core.files_newer_than(getattr(_core, "SERVER_DIR", ""), _ts)
+        if _changed:
+            add("verify", "验证快照", "warn",
+                f"上次验证通过 {_ts[5:16]}，但之后 {len(_changed)} 个文件更新"
+                f"（最近 {_changed[0]['file']}）——快照已过期",
+                f'hub_agent(action="verify", agent="{agent}")')
+        else:
+            add("verify", "验证快照", "ok", f"上次验证通过 {_ts[5:16]}")
+    else:
+        add("verify", "验证快照", "warn", f"上次验证未通过 {str(snap[0].get('ts') or '')[5:16]}",
+            'hub_agent(action="plan") 看缺口')
+
+    counts = {k: sum(1 for s in steps if s["state"] == k) for k in ("ok", "warn", "fail", "unknown")}
+    nxt, seen = [], set()
+    for s in steps:
+        if s["fix"] and s["state"] in ("fail", "warn", "unknown") and s["fix"] not in seen:
+            seen.add(s["fix"])
+            nxt.append(s["fix"])
+    return {"agent": agent, "key": key, "ok": counts["fail"] == 0,
+            "steps": steps, "counts": counts, "next": nxt}
+
+
+def _agent_onboard(root: str, target: str = "") -> dict:
+    """ops 检查项：接入清单（target=agent 名；缺省全部注册表 agent）。"""
+    if err := _need_root(root):
+        return err
+    try:
+        _core = _import_core()
+        if (target or "").strip():
+            agents = [target.strip()]
+        else:
+            agents = [str(a.get("agent") or "?")
+                      for a in _core.AGENT_ADAPTERS + _core.load_agent_adapters(root)]
+        reports = [agent_onboard_status(root, a) for a in agents]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"接入清单计算失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+
+    bad = [r for r in reports if not r["ok"]]
+    detail = []
+    for r in reports:
+        c = r["counts"]
+        tail = f'；下一步：{r["next"][0]}' if r["next"] else ""
+        detail.append(f'{r["agent"]}: {"✓" if r["ok"] else "✗"} '
+                      f'{c["ok"]}✓/{c["warn"]}⚠/{c["fail"]}✗{tail}')
+    if len(reports) == 1:
+        r0 = reports[0]
+        summary = (f'接入清单 {r0["agent"]}：{"通过（无硬缺口）" if r0["ok"] else "有硬缺口"}'
+                   f'（{r0["counts"]["ok"]}/{len(r0["steps"])} 项通过，{r0["counts"]["warn"]} 项待完善）')
+    else:
+        summary = (f'接入清单：{len(reports)} 家，{len(bad)} 家有硬缺口'
+                   + (f'（{"/".join(r["agent"] for r in bad)}）' if bad else ""))
+    return {"ok": not bad, "summary": summary, "detail": detail[:8]}
+
+
+def _runtime_health(root: str = "") -> dict:
+    """R7：运行版本体检——进程加载的代码是否落后于磁盘。
+
+    部署≠生效：MCP 是长驻子进程，部署目录文件更新后，没重启的会话仍在跑旧代码。
+    这类问题最难查——「明明改了却没生效」会被误判成代码 bug。此检查当场点名需重启的文件。
+    非 MCP 进程（没有启动标记）无法判断，诚实返回 ok（不能凭空报红）。
+    """
+    import brain as _brain  # noqa: PLC0415
+    core = _import_core()
+    fmt = lambda s: s[5:16] if isinstance(s, str) and len(s) >= 16 else (s or "?")  # noqa: E731
+    info = core.runtime_staleness()
+    if not info["known"]:
+        return {"ok": True,
+                "summary": "运行版本：非 MCP 进程，无法判断（在 agent 会话里跑 hub_ops_run 才有意义）",
+                "detail": [f"服务目录：{info['base'] or '未知'}（导入 agenthub_mcp 时记录启动时刻）"]}
+    if info["count"]:
+        top = info["stale"][0]
+        summary = (f"运行版本：落后 {info['count']} 个文件"
+                   f"（最近 {top['file']} {fmt(top['mtime'])}）——需重启 MCP 进程"
+                   f"（当前加载的是 {fmt(info['started'])} 之前的代码）")
+        detail = [f"{r['file']}  {fmt(r['mtime'])}" for r in info["stale"][:5]]
+        if len(info["stale"]) > 5:
+            detail.append(f"…另有 {len(info['stale']) - 5} 个文件")
+    else:
+        summary = f"运行版本：一致（进程启动 {fmt(info['started'])}，磁盘无更新）"
+        detail = [f"服务目录：{info['base']}",
+                  f"进程启动：{fmt(info['started'])}，磁盘 .py 无更新"]
+
+    if root and os.path.isdir(root):
+        try:
+            snaps = _brain.onboarding_get(root)
+        except Exception:  # noqa: BLE001
+            snaps = []
+        if snaps and len(detail) < 8:
+            s0 = snaps[0]
+            changed = core.files_newer_than(getattr(core, "SERVER_DIR", ""),
+                                            str(s0.get("ts") or ""))
+            if changed:
+                detail.append(f"验证快照 {s0.get('agent')} {fmt(str(s0.get('ts') or ''))}："
+                              f"之后 {len(changed)} 个文件更新 → 建议重新 hub_agent verify")
+            else:
+                detail.append(f"验证快照 {s0.get('agent')} {fmt(str(s0.get('ts') or ''))}："
+                              "与当前代码同步")
+    return {"ok": info["count"] == 0, "summary": summary, "detail": detail[:8]}
 
 
 def _hygiene(root: str) -> dict:

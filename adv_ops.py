@@ -42,9 +42,79 @@ def t_regression_suite_coverage():
     assert not ghost, f"清单登记了不存在的套件：{sorted(ghost)}"
 
 
+def t_release_manifest(tmp):
+    """R3 回归：发布检查哈希化——构建清单存在时，mtime 判不出的「构建中段改源码」必须被抓到。
+
+    背景：2026-10-20 实测 PyInstaller 的 PYZ 在构建中段固化，构建后半段改的源码
+    mtime 仍早于最终 exe，旧 release 检查据此报「一致」，实际 exe 缺新代码。
+    覆盖：无清单回退并标注 / start 快照排除回归脚本 / 未完成清单拒判 /
+    正常一致 / 源码变更点名 / 桌面副本同尺寸不同内容 / exe 被替换 / 清单损坏回退。
+    """
+    import json
+    import os
+    root = Path(tmp) / "release_src"
+    (root / "assets").mkdir(parents=True)
+    (root / "dist").mkdir()
+    (root / "ui.py").write_text("x = 1\n", encoding="utf-8")
+    (root / "agenthub_mcp.py").write_text('SERVER_INFO = {"name": "agenthub", "version": "9.9.9"}\n',
+                                         encoding="utf-8")
+    (root / "main.py").write_text("print(1)\n", encoding="utf-8")
+    (root / "brain.py").write_text("b = 1\n", encoding="utf-8")
+    (root / "adv_test.py").write_text("assert True\n", encoding="utf-8")
+    (root / "assets" / "agenthub.ico").write_bytes(b"ico")
+    old = 1_600_000_000
+    for p in list(root.glob("*.py")) + [root / "assets" / "agenthub.ico"]:
+        os.utime(p, (old, old))
+    exe = root / "dist" / "AgentHub.exe"
+    exe.write_bytes(b"EXE-A")
+    home = Path(tmp) / "fake_home"
+    desktop = home / "Desktop" / "AgentHub.exe"
+    desktop.parent.mkdir(parents=True)
+    desktop.write_bytes(b"EXE-A")
+
+    r = ops._release(root, home=home)
+    check("release 无清单时回退 mtime 并明示可能误报",
+          r["ok"] and "无构建清单" in r["summary"], str(r)[:200])
+
+    ops.build_manifest(root, "start")
+    man = json.loads((root / "dist" / ops.BUILD_MANIFEST).read_text(encoding="utf-8"))
+    check("build_manifest 快照运行时代码+图标", "brain.py" in man["source"] and "assets/agenthub.ico" in man["source"],
+          str(sorted(man["source"])))
+    check("build_manifest 排除 adv_ 回归脚本", "adv_test.py" not in man["source"], str(sorted(man["source"])))
+    check("build_manifest 记录版本", man["version"] == "9.9.9", str(man.get("version")))
+    r = ops._release(root, home=home)
+    check("release 拒绝未完成的构建清单", (not r["ok"]) and "未完成" in r["summary"], str(r)[:200])
+
+    ops.build_manifest(root, "finish")
+    r = ops._release(root, home=home)
+    check("release 清单完成且源/exe/桌面一致", r["ok"], str(r)[:200])
+
+    (root / "brain.py").write_text("b = 2\n", encoding="utf-8")
+    r = ops._release(root, home=home)
+    check("release 抓到打包后源码变更并点名", (not r["ok"]) and "brain.py" in str(r["detail"]), str(r)[:200])
+    (root / "brain.py").write_text("b = 1\n", encoding="utf-8")
+
+    desktop.write_bytes(b"EXE-B")  # 与 dist 同尺寸、不同内容
+    r = ops._release(root, home=home)
+    check("release 抓到桌面副本同尺寸不同哈希",
+          (not r["ok"]) and "不一致" in r["summary"] and any("哈希" in d for d in r["detail"]), str(r)[:200])
+    desktop.write_bytes(b"EXE-A")
+
+    exe.write_bytes(b"EXE-C")  # 构建后 exe 被替换（同尺寸）
+    r = ops._release(root, home=home)
+    check("release 抓到 exe 与清单产物哈希不符", (not r["ok"]) and "清单不一致" in r["summary"], str(r)[:200])
+
+    (root / "dist" / ops.BUILD_MANIFEST).write_text("{broken", encoding="utf-8")
+    os.utime(exe, None)
+    r = ops._release(root, home=home)
+    check("release 清单损坏时回退 mtime 不崩", r["ok"] and "无构建清单" in r["summary"],
+          str(r)[:200])
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="agenthub_adv_ops_"))
     build_fake_hub(tmp)
+    t_release_manifest(tmp)
 
     # ---- 正常路径
     proj = tmp / "测试项目-检查工具箱"
@@ -131,12 +201,14 @@ def main():
     check("stale_health 已注册且干净库通过", r["ok"] and "无 supersede 泄漏" in r["summary"],
           str(r["summary"]))
     # 陈旧可见：一条 60 天前写入且零唤起的 fact
+    # 注意：created/updated 都要回拨——R4 的 reference=max(created,updated,confirmed,last_hit)，
+    # 只拨 updated 会被「今天写的 created」压住，测不出陈旧（R4 语义：取最新信号）
     _old = _b3.add_memory(stale_root, "环境事实：旧端口是 7000（历史配置）", kind="fact", agent="zcode")
     with _b3.db_conn(stale_root) as _c3:
-        _c3.execute("UPDATE memories SET updated='2026-08-01T00:00:00' WHERE id=?", (_old,))
+        _c3.execute("UPDATE memories SET created='2026-08-01T00:00:00', updated='2026-08-01T00:00:00' WHERE id=?", (_old,))
     r = ops.run_check("stale_health", root=stale_root)
     check("stale_health 陈旧 fact 可见（只报不裁，ok 仍为 True）",
-          r["ok"] and "1 条陈旧 fact" in r["summary"] and f"#{_old}" in "".join(r["detail"]),
+          r["ok"] and "stale 1" in r["summary"] and f"#{_old}" in "".join(r["detail"]),
           str(r["summary"]))
     # 泄漏必抓：把检索返回里塞进一条"已取代"记忆 → 必须 ok=False（模拟检索管线回归）
     _new = _b3.add_memory(stale_root, "环境事实：新端口是 7001（现行配置）", kind="fact", agent="zcode")
@@ -152,6 +224,88 @@ def main():
         _b3.search_memories = _orig
     r = ops.run_check("stale_health", root=stale_root)
     check("stale_health 恢复检索后转绿（真实管线无泄漏）", r["ok"], str(r["summary"]))
+
+    # ---- R5·规则闸门清单动态核对（注册表有、targets.json 没登记 → 必须点名）
+    # 过去只按 targets.json 正向核对，新增 agent 漏登记时**静默通过**（Qoder 接入即如此）。
+    _reg_root = tmp / "hub_registry"
+    _reg_root.mkdir()
+    (_reg_root / "config.agents.json").write_text(
+        json.dumps({"agents": [{"agent": "新Agent-未登记闸门"}]}, ensure_ascii=False), encoding="utf-8")
+    _rh = ops.run_check("rules_health", root=str(_reg_root))
+    check("rules_health 动态点名漏登记闸门的新 agent",
+          (not _rh["ok"]) and "新Agent-未登记闸门" in str(_rh.get("detail")) , str(_rh["summary"]))
+    check("rules_health 漏登记原因可读（指向 targets.json）",
+          "targets.json" in "".join(_rh.get("detail") or []), str(_rh.get("detail"))[:200])
+
+    # ---- R6·接入状态机（七项齐全 / 未注册也出清单 / 缺口带下一步 / 快照可复查）
+    _ob = ops.agent_onboard_status(str(tmp), "Qoder-未接入样例")
+    _keys = [s["key"] for s in _ob["steps"]]
+    check("agent_onboard_status 八项核对齐全",
+          _keys == ["registry", "instruction", "mcp", "hooks", "skills", "records",
+                    "runtime", "verify"], str(_keys))
+    check("未注册 agent 也返回清单（诊断不被准入挡住）",
+          (not _ob["ok"]) and "未注册" in _ob["steps"][0]["detail"], str(_ob["steps"][0]))
+    check("每个非 ok 项都带可直接执行的下一步",
+          all(s["fix"] for s in _ob["steps"] if s["state"] != "ok"),
+          str([s["key"] for s in _ob["steps"] if s["state"] != "ok" and not s["fix"]]))
+    _ra = ops.run_check("agent_onboard", "Qoder-未接入样例", str(tmp))
+    check("ops agent_onboard 可单独核对未注册 agent（硬缺口点名）",
+          (not _ra["ok"]) and "Qoder-未接入样例" in _ra["summary"] and "硬缺口" in _ra["summary"],
+          str(_ra["summary"]))
+    check("ops agent_onboard detail ≤ 8", len(_ra["detail"]) <= 8)
+    import brain as _b6
+    _save_err = _b6.onboarding_save(str(tmp), _ob["key"], True, _ob["steps"], "R6 测试")
+    _ob2 = ops.agent_onboard_status(str(tmp), _ob["key"])
+    _vs = next(s for s in _ob2["steps"] if s["key"] == "verify")
+    check("验证快照落库后 verify 项转 ok（不再「从未 verify」）",
+          _save_err == "" and _vs["state"] == "ok" and "上次验证" in _vs["detail"], str(_vs))
+
+    # ---- R9·技能索引覆盖诊断（本地探测有、索引无 → 点名；同步后转 ok）
+    import types as _types
+    import agentscore as _asc9
+    _sk_root = tmp / "hub_skills"
+    _sk_root.mkdir()
+    (_sk_root / "config.agents.json").write_text(json.dumps({"agents": [{
+        "agent": "Qoder", "channel": "instr_file",
+        "instr_path": str(_sk_root / "QODER.md"),
+        "mcp": {"path": str(_sk_root / "qoder.json"), "layout": "standard"},
+    }]}, ensure_ascii=False), encoding="utf-8")
+    _orig_detect = _asc9.detect_agents
+    try:
+        _asc9.detect_agents = lambda extra=None: [_types.SimpleNamespace(
+            name="Qoder", skills=[_types.SimpleNamespace(name="alpha"),
+                                  _types.SimpleNamespace(name="beta")])]
+        _brain.skill_sync(str(_sk_root), [{"name": "alpha", "agent": "Qoder",
+                                           "path": "C:/skills/alpha/SKILL.md", "desc": "a"}])
+        _sk = next(s for s in ops.agent_onboard_status(str(_sk_root), "Qoder")["steps"]
+                   if s["key"] == "skills")
+        check("技能索引覆盖缺口被点名（本地有、索引无，且给出同步命令）",
+              _sk["state"] == "warn" and "1 个未入索引" in _sk["detail"]
+              and "beta" in _sk["detail"] and "hub_skill_sync" in _sk["fix"], str(_sk))
+        _brain.skill_sync(str(_sk_root), [{"name": "beta", "agent": "Qoder",
+                                           "path": "C:/skills/beta/SKILL.md", "desc": "b"}])
+        _sk = next(s for s in ops.agent_onboard_status(str(_sk_root), "Qoder")["steps"]
+                   if s["key"] == "skills")
+        check("补齐索引后技能项转 ok（本地已覆盖）",
+              _sk["state"] == "ok" and "已覆盖" in _sk["detail"], str(_sk))
+    finally:
+        _asc9.detect_agents = _orig_detect
+
+    # ---- R7·运行版本体检（非 MCP 不妄判 / 旧启动时刻即点名需重启 / 快照过期可见）
+    _rh = ops.run_check("runtime_health", "", str(tmp))
+    check("runtime_health 已注册且非 MCP 场景不误报",
+          isinstance(_rh, dict) and _rh["ok"] and "运行版本" in _rh["summary"], str(_rh["summary"]))
+    import core as _core7
+    _old_start = _core7.SERVER_STARTED_AT
+    try:
+        _core7.SERVER_STARTED_AT = "2020-01-01T00:00:00"
+        _rh = ops.run_check("runtime_health", "", str(tmp))
+        check("runtime_health 注入旧启动时刻即点名落后文件并要求重启",
+              (not _rh["ok"]) and "需重启" in _rh["summary"]
+              and any(".py" in d for d in _rh["detail"]), str(_rh["summary"]))
+        check("runtime_health detail ≤ 8", len(_rh["detail"]) <= 8)
+    finally:
+        _core7.SERVER_STARTED_AT = _old_start
 
     # ---- 守卫：回归套件必须全部登记进巡检（漏登记 = 静默少跑）
     try:

@@ -8,8 +8,10 @@
 文案被改坏、控件数骤降照样抓得住。
 
 两条用例：
-  ① 有基线 → 采集当前快照并比对，零差异才算过；无基线则 skip（不静默放行：
-     skip 原因写明如何生成基线）。
+  ① 有基线 → **子进程**采集当前快照并比对，零差异才算过；无基线则 skip（不静默
+     放行：skip 原因写明如何生成基线）。必须子进程：与基线生成同处一个全新解释器，
+     否则会读到前序 GUI 用例留下的全局状态，全序列跑报假差异（R10 实测「WorkBuddy
+     文案消失」，单跑却通过）。
   ② **反向验证 diff 逻辑**：往基线副本里注入三种回归（删文案 / 控件数骤变 /
      页面消失），守卫必须全部报出；完全一致时必须零问题。守卫自己失灵 = 静默失效，
      这条是本套件的惯例。
@@ -36,16 +38,23 @@ def test_gui_structural_snapshot_matches_baseline():
                     "`python tools/gui_snapshot.py --update` 生成后再回来守卫")
 
     baseline = json.loads(g.SNAP.read_text(encoding="utf-8"))
-    current = g.capture(update_shots=False)
-    if baseline.get("_meta", {}).get("size") != current["_meta"]["size"]:
-        pytest.fail(f"基线窗口尺寸 {baseline['_meta']['size']} 与当前 "
-                    f"{current['_meta']['size']} 不同，几何不可比——"
-                    "跑 python tools/gui_snapshot.py --update 重建基线")
-    problems = g.diff(baseline, current)
-    assert not problems, ("GUI 结构回归（如为有意改动，"
-                          "跑 python tools/gui_snapshot.py --update 重建基线）：\n  "
-                          + "\n  ".join(problems))
-    assert len(current["pages"]) >= 10, f"采集到的页面过少：{len(current['pages'])}"
+    assert len(baseline.get("pages", {})) >= 10, (
+        f"基线本身页面过少：{len(baseline.get('pages', {}))}——疑似基线损坏，"
+        "跑 python tools/gui_snapshot.py --update 重建")
+
+    # 子进程采集：环境与 --update 生成基线时完全一致，且不受本进程前面用例的
+    # 全局状态（core.get_root / 主题 / 已实例化窗口）污染。
+    import os
+    import subprocess
+    env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONIOENCODING": "utf-8"}
+    proc = subprocess.run(
+        [sys.executable, str(ROOT / "tools" / "gui_snapshot.py"), "--json"],
+        cwd=ROOT, env=env, capture_output=True, text=True,
+        encoding="utf-8", errors="replace", timeout=300)
+    detail = (proc.stdout or "") + (proc.stderr or "")
+    assert proc.returncode == 0, (
+        "GUI 结构回归（如为有意改动，跑 python tools/gui_snapshot.py --update 重建基线）：\n"
+        + detail)
 
 
 def test_snapshot_diff_catches_regressions():

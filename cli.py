@@ -148,12 +148,20 @@ def cmd_deploy(root: str) -> int:
 
 
 def cmd_release(root: str) -> int:
-    """发布一致性检查：GUI exe 是否比关键源码旧 / 桌面副本是否同步。"""
+    """发布一致性检查：exe 是否与构建清单匹配 / 源码是否变 / 桌面副本是否同哈希。"""
     import ops  # 同目录
     r = ops.run_check("release", str(Path(__file__).resolve().parent), "")
     print(r["summary"])
     for line in r["detail"]:
         print("  ", line)
+    return 0 if r["ok"] else 1
+
+
+def cmd_build_manifest(src: Path, phase: str) -> int:
+    """构建清单两阶段（build.bat 调用）：start 快照源码哈希，finish 记录 exe sha256。"""
+    import ops  # 同目录
+    r = ops.build_manifest(src, phase)
+    print(r["summary"])
     return 0 if r["ok"] else 1
 
 
@@ -226,7 +234,9 @@ def main(argv=None) -> int:
     sub.add_parser("refresh", help="刷新所有 agent 引导到当前版本")
     sub.add_parser("discover", help="扫描常见位置，找未登记 agent")
     sub.add_parser("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
-    sub.add_parser("release", help="发布一致性检查（exe 是否旧 / 桌面副本是否同步）")
+    sub.add_parser("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
+    p_bm = sub.add_parser("build-manifest", help="构建清单：start 快照源码哈希 / finish 记录 exe sha256（build.bat 自动调用）")
+    p_bm.add_argument("phase", choices=["start", "finish"])
     sub.add_parser("tools", help="X5：列出所有可调用的 MCP 工具")
     p_call = sub.add_parser("call", help="X5：命令行直调 MCP 工具（call hub_health / call hub_search query=词 limit=5）")
     p_call.add_argument("tool")
@@ -240,6 +250,8 @@ def main(argv=None) -> int:
 
     if args.cmd == "release":
         return cmd_release(_root(args.root))
+    if args.cmd == "build-manifest":
+        return cmd_build_manifest(Path(__file__).resolve().parent, args.phase)
     root = _root(args.root)
     if not root or not Path(root).is_dir():
         print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")

@@ -1,4 +1,12 @@
 {
+  "hub_agent": {
+    "props": {
+      "action": "string",
+      "agent": "string",
+      "note": "string"
+    },
+    "required": []
+  },
   "hub_archive_project": {
     "props": {
       "agent": "string",
@@ -389,6 +397,19 @@
       "content",
       "project"
     ]
+  },
+  "hub_memory_confirm": {
+    "props": {
+      "agent": "string",
+      "all_stale": "boolean",
+      "confirm": "boolean",
+      "dry_run": "boolean",
+      "ids": "array",
+      "kind": "string",
+      "limit": "integer",
+      "max_chars": "integer"
+    },
+    "required": []
   },
   "hub_memory_read": {
     "props": {

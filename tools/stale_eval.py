@@ -127,12 +127,14 @@ def measure(root: str, ann: dict) -> dict:
             rn = ids.index(p["new"]) if p["new"] in ids else 99
             if rn < ro:
                 res["recency_ok"] += 1
-    # ④ 静默过期：有没有任何陈旧信号（valid_until 已过期）
+    # ④ 静默过期：无后继旧事实是否被**新鲜度状态机**标出（R4 起有信号——读时按
+    #    kind 策略算 fresh/stale/expired；此前只有 valid_until 一条路，而静默过期
+    #    事实恰恰没有 valid_until，所以恒 0%：那不是系统做不到，是信号从来没接）
     with brain.db_conn(root) as conn:
         for p in ann["silent"]:
             res["silent_total"] += 1
-            row = conn.execute("SELECT valid_until FROM memories WHERE id=?", (p["old"],)).fetchone()
-            if row and (row["valid_until"] or "") and row["valid_until"] <= brain._now()[:10]:
+            row = conn.execute("SELECT * FROM memories WHERE id=?", (p["old"],)).fetchone()
+            if row and brain.memory_freshness(dict(row))["state"] in ("stale", "expired"):
                 res["silent_flagged"] += 1
     # ⑤ 裁决建议正确率（D5）：ghost 对必须被检出，且建议留「较新的那条」。
     #    这一步是确定性计算的，所以基线应当是 **100%**（不是统计数字）——任何非 100%
@@ -167,7 +169,8 @@ def main() -> int:
     print(f"③ recency 排序正确率：{res['recency_ok']}/{res['recency_total']} = {rec_rate:.0%}"
           "（ghost 对里较新版排前——D5 确定性裁决的基线）")
     print(f"④ 静默过期可检出率：{res['silent_flagged']}/{res['silent_total']} = {flag_rate:.0%}"
-          "（无后继旧事实被陈旧信号标出的比例——期望被标，现状预计 0%：这正是待补的能力）")
+          "（无后继旧事实被新鲜度状态机标出的比例——R4 前只有 valid_until 一条路，"
+          "静默过期事实没有它所以恒 0%；现状应 100%：30 天前的 fact 已过 14 天新鲜窗）")
     print(f"⑤ 裁决建议正确率（D5）：{res['sugg_ok']}/{res['sugg_total']} = {sugg_rate:.0%}"
           "（ghost 对的建议是否选中较新版——确定性计算，应当恒等于 100%，非统计数字）")
     if not keep:
