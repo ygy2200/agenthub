@@ -7,6 +7,7 @@ dist_*/
 *.spec
 *.exe
 _adv_tmp/
+_pytest_tmp/
 publish.py
 drag_probe.py
 *.bak-*

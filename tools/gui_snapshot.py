@@ -67,6 +67,10 @@ _DYNAMIC = (
     (re.compile(r"技能\s*\d+"), "技能 <N>"),
     (re.compile(r"MCP\s*\d+"), "MCP <N>"),
     (re.compile(r"记忆\s*\d+"), "记忆 <N>"),
+    # 接入页状态行（R33 去部署化后）：真实反映 ready/stale/missing/no-python 四态，
+    # 陈旧态还会列出当时漂移的文件名——整句都是运行态投影而非 UI 结构，整句打码。
+    (re.compile(r"^(?:⚠\s*)?(?:未找到可用的 python\.exe|MCP server|服务端就绪).*"),
+     "<DEPLOY_STATUS>"),
 )
 
 

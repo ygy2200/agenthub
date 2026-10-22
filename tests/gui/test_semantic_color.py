@@ -17,7 +17,12 @@ from helpers import boot_window, pump
 
 
 def test_connect_status_uses_distinct_semantic_colors(qapp, hub_root):
-    """接入页状态行三态必须三色（缺前提 / 失败 / 就绪）。"""
+    """接入页状态行四态必须语义着色（R33：缺 python=警告 / 未部署=危险 / 陈旧=警告 / 就绪=成功）。
+
+    颜色语义阶梯不变（缺前提与陈旧同为 WARNING、真失败 DANGER、就绪 SUCCESS），
+    但契约从「(py, server, rows) 三值」改为 deploy_status 字典四态——测试跟着改，
+    否则守住的是旧实现。另钉死文案可行动：失败/陈旧态必须点名下一步（「部署服务端」）。
+    """
     import brain
     import tokens
     brain.init_db(hub_root)
@@ -25,22 +30,38 @@ def test_connect_status_uses_distinct_semantic_colors(qapp, hub_root):
     w = boot_window(qapp, hub_root)
     cp = w.connect_page
     orig = cp._rows_data
-    seen = {}
+    warn_c, danger_c, ok_c = (tokens.C(tokens.WARNING), tokens.C(tokens.DANGER),
+                              tokens.C(tokens.SUCCESS))
     try:
-        cp._rows_data = lambda: (None, None, [])
+        cp._rows_data = lambda: ({"python": "", "server": "", "state": "no-python",
+                                  "diff": [], "absent": [], "same": 0}, [])
         cp.refresh_status()
-        seen["缺 python"] = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
-        cp._rows_data = lambda: ("C:/fake/python.exe", None, [])
+        no_py = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
+        cp._rows_data = lambda: ({"python": "C:/fake/python.exe", "server": "",
+                                  "state": "missing", "diff": [], "absent": [], "same": 0}, [])
         cp.refresh_status()
-        seen["部署失败"] = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
-        cp._rows_data = lambda: ("C:/fake/python.exe", "C:/fake/agenthub_mcp.py", [])
+        missing = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
+        cp._rows_data = lambda: ({"python": "C:/fake/python.exe", "server": "C:/fake/s.py",
+                                  "state": "stale", "diff": ["brain.py"], "absent": [],
+                                  "same": 10}, [])
         cp.refresh_status()
-        seen["就绪"] = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
+        stale = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
+        cp._rows_data = lambda: ({"python": "C:/fake/python.exe", "server": "C:/fake/s.py",
+                                  "state": "ready", "diff": [], "absent": [], "same": 11}, [])
+        cp.refresh_status()
+        ready = (cp.pyLabel.text(), cp.pyLabel.styleSheet())
     finally:
         cp._rows_data = orig
-    styles = {k: v[1] for k, v in seen.items()}
-    assert len(set(styles.values())) == 3, f"三态颜色未区分开：{styles}"
-    assert all(s.strip() for s in styles.values()), f"存在未着色的状态：{styles}"
+    assert warn_c in no_py[1], f"缺 python 应用 WARNING：{no_py}"
+    assert danger_c in missing[1], f"未部署应用 DANGER：{missing}"
+    assert warn_c in stale[1], f"陈旧应用 WARNING：{stale}"
+    assert ok_c in ready[1], f"就绪应用 SUCCESS：{ready}"
+    for name, st in (("缺python", no_py), ("陈旧", stale), ("就绪", ready)):
+        assert danger_c not in st[1], f"{name} 不是失败态，不得用 DANGER：{st}"
+    # 文案可行动：失败/陈旧必须给出下一步，陈旧还要点名不一致的文件
+    assert "未部署" in missing[0] and "部署服务端" in missing[0], f"未部署文案无可行动提示：{missing[0]}"
+    assert "brain.py" in stale[0] and "部署服务端" in stale[0], f"陈旧文案未点名文件/下一步：{stale[0]}"
+    assert "服务端就绪" in ready[0], ready[0]
 
 
 def test_project_issue_label_uses_warning_not_danger(qapp, hub_root):

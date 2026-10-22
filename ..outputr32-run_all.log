@@ -1,0 +1,97 @@
+
+===== 层：unit（tests/unit，1 个目标）=====
+...........                                                              [100%]
+11 passed in 11.03s
+----- unit: PASS（11 tests）-----
+
+===== 层：gui（tests/gui，15 个目标）=====
+.....                                                                    [100%]
+5 passed in 0.43s
+  [1/15] test_contrast.py: PASS（5 tests）
+.                                                                        [100%]
+1 passed in 14.27s
+  [2/15] test_empty_state.py: PASS（1 tests）
+.                                                                        [100%]
+1 passed in 14.27s
+  [3/15] test_journal_undo.py: PASS（1 tests）
+.                                                                        [100%][safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":52,"threshold":50,"scope":"turn","targets":["\\\\?\\C:\\Users\\y\\AppData\\Local\\Temp\\pytest-of-y\\garbage-54d330e6-2e05-4e6c-8bfa-d6f7af0c840e"],"targetCount":1}
+  [4/15] test_memory_governance.py: FAIL（rc=1）
+.....                                                                    [100%]
+5 passed in 10.54s
+  [5/15] test_message_copy.py: PASS（5 tests）
+  [6/15] test_page_bg.py: 无 junit 结果
+  [7/15] test_page_head.py: 无 junit 结果
+[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":60,"threshold":50,"scope":"turn","targets":["C:\\Users\\y\\.agenthub\\.mcp_server.old-15364-1792667011396"],"targetCount":1}
+[safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":51,"threshold":50,"scope":"turn","targets":["\\\\?\\C:\\Users\\y\\AppData\\Local\\Temp\\pytest-of-y\\garbage-dc3a8237-a5ce-493b-8f4f-b189a8e0f758"],"targetCount":1}
+  [8/15] test_semantic_color.py: 无 junit 结果
+F.                                                                       [100%]
+================================== FAILURES ===================================
+________________ test_gui_structural_snapshot_matches_baseline ________________
+
+    def test_gui_structural_snapshot_matches_baseline():
+        import pytest
+        try:
+            import tools.gui_snapshot as g
+        except ImportError as e:
+            pytest.skip(f"GUI 快照工具不可用（{e}）——GUI 侧检查，可跳过")
+    
+        if not g.SNAP.exists():
+            pytest.skip("尚无 GUI 结构基线——先跑一次 "
+                        "`python tools/gui_snapshot.py --update` 生成后再回来守卫")
+    
+        baseline = json.loads(g.SNAP.read_text(encoding="utf-8"))
+        assert len(baseline.get("pages", {})) >= 10, (
+            f"基线本身页面过少：{len(baseline.get('pages', {}))}——疑似基线损坏，"
+            "跑 python tools/gui_snapshot.py --update 重建")
+    
+        # 子进程采集：环境与 --update 生成基线时完全一致，且不受本进程前面用例的
+        # 全局状态（core.get_root / 主题 / 已实例化窗口）污染。
+        import os
+        import subprocess
+        env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONIOENCODING": "utf-8"}
+        proc = subprocess.run(
+            [sys.executable, str(ROOT / "tools" / "gui_snapshot.py"), "--json"],
+            cwd=ROOT, env=env, capture_output=True, text=True,
+            encoding="utf-8", errors="replace", timeout=300)
+        detail = (proc.stdout or "") + (proc.stderr or "")
+>       assert proc.returncode == 0, (
+            "GUI 结构回归（如为有意改动，跑 python tools/gui_snapshot.py --update 重建基线）：\n"
+            + detail)
+E       AssertionError: GUI 结构回归（如为有意改动，跑 python tools/gui_snapshot.py --update 重建基线）：
+E         
+E         [1;33m📢 Tips:[0m QFluentWidgets Pro is now released. Click [1;96mhttps://qfluentwidgets.com/pages/pro[0m to learn more about it.
+E         
+E         
+E         Loading weights:   0%|          | 0/71 [00:00<?, ?it/s]
+E         Loading weights: 100%|██████████| 71/71 [00:00<00:00, 1393.64it/s]
+E         QFontDatabase: Cannot find font directory C:/Users/y/AppData/Roaming/Python/Python311/site-packages/PySide6/lib/fonts.
+E         Note that Qt no longer ships fonts. Deploy some (from https://dejavu-fonts.github.io/ for example) or switch to fontconfig.
+E         This plugin does not support propagateSizeHints()
+E         [safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":60,"threshold":50,"scope":"turn","targets":["C:\\Users\\y\\.agenthub\\.mcp_server.old-21456-1792667025493"],"targetCount":1}
+E         
+E       assert 1 == 0
+E        +  where 1 = CompletedProcess(args=['D:\\python311\\python.exe', 'D:\\agent资料\\zcode项目记录\\AgentHub-多agent文件统一管理\\AgentHub\\tools\\g...,"scope":"turn","targets":["C:\\\\Users\\\\y\\\\.agenthub\\\\.mcp_server.old-21456-1792667025493"],"targetCount":1}\n').returncode
+
+tests\gui\test_snapshot_baseline.py:55: AssertionError
+=========================== short test summary info ===========================
+FAILED tests/gui/test_snapshot_baseline.py::test_gui_structural_snapshot_matches_baseline
+1 failed, 1 passed in 14.66s
+  [9/15] test_snapshot_baseline.py: FAIL（1 failed, rc=1）
+.....  [10/15] test_spacing_guard.py: 无 junit 结果
+  [11/15] test_task_governance.py: 无 junit 结果
+  [12/15] test_text_visible.py: 无 junit 结果
+  [13/15] test_timeline_virtual.py: 无 junit 结果
+  [14/15] test_typography_guard.py: 无 junit 结果
+  [15/15] test_window_smoke.py: 无 junit 结果
+----- gui: FAIL（15 tests, 1 failed；11 个目标异常）-----
+
+===== 层：e2e（tests/e2e，1 个目标）=====
+..F                                                                      [100%][safe-delete][SAFE_DELETE_BULK_CONFIRM_REQUIRED] {"count":51,"threshold":50,"scope":"turn","targets":["\\\\?\\C:\\Users\\y\\AppData\\Local\\Temp\\pytest-of-y\\garbage-ce50078f-0ca7-4138-a599-0279f93578bd"],"targetCount":1}
+  [1/1] tests/e2e: FAIL（1 failed, rc=1）
+----- e2e: FAIL（3 tests, 1 failed；1 个目标异常）-----
+
+===== 三层汇总 =====
+  unit  PASS
+  gui   FAIL
+  e2e   FAIL
+结果： 存在失败层：['gui', 'e2e']

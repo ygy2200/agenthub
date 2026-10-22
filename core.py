@@ -1265,6 +1265,43 @@ def deploy_server(src_dir: str = "", dst_dir: str = "") -> tuple:
     return find_python(), str(dst / "agenthub_mcp.py")
 
 
+def deploy_status(src_dir: str = "", dst_dir: str = "") -> dict:
+    """只读探测 MCP server 部署状态（R33）。不写任何文件。
+
+    返回 {"python", "server", "state", "diff", "absent", "same"}：
+      state ∈ ready（11 个文件全部与源码一致）/ stale（有不一致或缺失）/
+              missing（未部署）/ no-python（找不到解释器）
+    为什么需要它：接入中心原来把「刷新状态」直接接到 deploy_server()——
+    打开接入页（GUI 结构快照会实例化全部页面）就往 ~/.agenthub/mcp_server
+    重写 11 个文件、留 .old-* 备份再删。**看一样东西不该改它**，且在严格
+    沙箱里那 60+ 文件删除直接被拦，整层回归血红（2026-10-22 实测）。
+    现在状态刷新只读它；部署仍是显式动作（cli.py deploy / 接入页按钮 /
+    do_connect 按需自愈）。src_dir 仅供回归注入，生产不传。
+    """
+    py = find_python()
+    if not py:
+        return {"python": "", "server": "", "state": "no-python",
+                "diff": [], "absent": [], "same": 0}
+    src = Path(src_dir) if src_dir else Path(__file__).resolve().parent
+    dst = Path(dst_dir) if dst_dir else MCP_SERVER_DIR
+    if not (dst / "agenthub_mcp.py").is_file():
+        return {"python": py, "server": "", "state": "missing",
+                "diff": [], "absent": [], "same": 0}
+    diff, absent, same = [], [], 0
+    for f in SERVER_FILES:
+        s, d = src / f, dst / f
+        if not d.is_file():
+            absent.append(f)
+        elif (not s.is_file()
+              or hashlib.md5(s.read_bytes()).digest() != hashlib.md5(d.read_bytes()).digest()):
+            diff.append(f)
+        else:
+            same += 1
+    return {"python": py, "server": str(dst / "agenthub_mcp.py"),
+            "state": "ready" if not diff and not absent else "stale",
+            "diff": diff, "absent": absent, "same": same}
+
+
 def _mcp_entry(python_exe: str, server_py: str, root: str = "", agent: str = "",
                profile: str = "") -> dict:
     """接入条目。返回 {command, args}。

@@ -53,7 +53,7 @@ CHECKS = {
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
-    "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计）——检测规则有没有被真正执行，而非只写在纸面", False),
+    "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计 / 零触发按 agent 活性分级）——检测规则有没有被真正执行，而非只写在纸面", False),
     "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
     "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
     "hygiene": ("整洁体检：备份文件（.bak*）堆积量与最旧年龄 + agents 表零记录冗余行——只报不动手，供你决定清哪些", False),
@@ -84,7 +84,7 @@ CHECK_FIXES = {
     "runtime_health": "重启各 agent 的 agenthub MCP 进程（旧进程仍跑旧代码）；部署先 cli.py deploy",
     "db_health": "重启连接清理 -wal/-shm；journal_mode 非 WAL 时检查连接参数；必要时 sqlite VACUUM",
     "backup_health": "hub_export action=backup 生成整包；清理用 action=prune（确认后 apply=true）",
-    "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门",
+    "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门；零触发且有记录的 agent 去其会话实测一次写工具调用，确认钩子加载",
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
@@ -1405,8 +1405,10 @@ def _agents(root: str) -> dict:
 def rules_components(root: str) -> dict:
     """逐家闸门状态的结构化版本（rules_health 与 hub_agent 共用，避免两套口径）。
 
-    返回 {"agents": [{agent,state,last,block,deny,mark}], "scripts_missing": [...],
-          "untracked": [...]}；state ∈ inplace/missing/unwired。
+    返回 {"agents": [{agent,state,last,block,deny,mark,last_work,work_recent}],
+          "scripts_missing": [...], "untracked": [...]}；state ∈ inplace/missing/unwired。
+    last_work/work_recent（R32）= 该 agent 近 GATE_SILENT_ACTIVITY_DAYS 天最后一条工作记录/是否有记录，
+    供 rules_health 把零触发分级成「未验证」与「钩子失效」；只增字段。
     """
     guard_script = Path.home() / ".agenthub" / "hooks" / "agent_guard.mjs"
     brainlog_script = Path.home() / ".workbuddy" / "bin" / "guard-brainlog.mjs"
@@ -1487,19 +1489,56 @@ def rules_components(root: str) -> dict:
         agents.append({"agent": agent, "state": state,
                        "last": s.get("last", ""), "block": s.get("block", 0),
                        "deny": s.get("deny", 0), "mark": s.get("mark", 0)})
+    # R32：闸门生效性分级的数据面——零触发单看不分善恶，配上「agent 近期有没有在干活」
+    # 才能把「没活动所以没触发」（未验证）与「在干活却零触发」（钩子没生效）分开。
+    # 只增字段，不改既有口径；大脑读不到时留空，由消费侧按未验证处理（不猜）。
+    try:
+        import brain as _brain  # noqa: PLC0415
+        for _row in agents:
+            _st = _brain.agent_record_stats(root, _row["agent"], days=GATE_SILENT_ACTIVITY_DAYS)
+            _row["last_work"] = _st.get("last") or ""
+            _row["work_recent"] = bool(_st.get("count"))
+    except Exception:  # noqa: BLE001  读不到大脑时不改变既有分级
+        for _row in agents:
+            _row.setdefault("last_work", "")
+            _row.setdefault("work_recent", False)
     return {"agents": agents,
             "scripts_missing": [p.name for p in scripts if not p.is_file()],
             "untracked": untracked}
 
 
-def _rules_health(root: str) -> dict:
-    """规则执行体检（2026-10-12 新增）：逐家核对「干完活记大脑」闸门是否真在位、真在跑。
+# R32：判断「闸门零触发」是否构成失效时，agent 近期活动的回看窗口。
+# 14 天 ≈ 两周：覆盖「刚装好还没用」与「装了很久一次没触发」两类安装噪声，
+# 又短于大多数项目的正常间歇期——窗口内心跳/记录仍在 = agent 在干活。
+GATE_SILENT_ACTIVITY_DAYS = 14
 
-    三类核对（全只读）：
+
+def _classify_silent_gates(rows: list) -> tuple:
+    """把「闸门配置在位却零触发」的 agent 分成两类（R32）。纯函数，便于单测。
+
+    零触发单看不分善恶，配上「agent 近期有没有在干活」才能分开两种完全不同的情况：
+      - dead：近期有工作记录却零触发 = 钩子没生效（管控黑洞，计硬缺口）
+      - idle：近期无活动 = 闸门只是未获验证（良性，只警告）
+    返回 (dead, idle) 两个 agent 名列表。有触发记录的 agent 两类都不进。
+    """
+    dead, idle = [], []
+    for r in rows:
+        if r.get("state") != "inplace" or r.get("last"):
+            continue
+        (dead if r.get("work_recent") else idle).append(r["agent"])
+    return dead, idle
+
+
+def _rules_health(root: str) -> dict:
+    """规则执行体检（2026-10-12 新增，R32 增强）：逐家核对「干完活记大脑」闸门是否真在位、真在跑。
+
+    四类核对（全只读）：
       1) 闸门配置在位：各家配置文件里必须出现守卫脚本名（缺=被删/被覆盖）
       2) 守卫脚本存在：agent_guard.mjs / guard-brainlog.mjs 在盘
       3) 近期真触发：读守卫日志，按 agent= 归因统计最近触发与拦截/拒绝次数
-         （配置在但日志零触发 = 最危险的一类——「装了但没跑」，此前完全不可见）
+      4) 零触发分级（R32）：配置在但零触发 ≠ 一律「未用过」——该 agent 近
+         GATE_SILENT_ACTIVITY_DAYS 天有工作记录却零触发 = 钩子没生效（计硬缺口）；
+         无活动 = 只是未获验证（警告）。大脑读不到 work_recent 时不猜，按未验证处理。
     """
     comp = rules_components(root)
     rows = comp["agents"]
@@ -1509,8 +1548,8 @@ def _rules_health(root: str) -> dict:
     scripts_ok = comp["scripts_missing"]
     untracked = comp["untracked"]
 
-    silent = [r["agent"] for r in rows
-              if r["state"] == "inplace" and not r["last"]]
+    silent_dead, silent_idle = _classify_silent_gates(rows)
+    silent = silent_dead + silent_idle
     detail = []
     if scripts_ok:
         detail.append("守卫脚本缺失：" + "、".join(scripts_ok))
@@ -1522,15 +1561,30 @@ def _rules_health(root: str) -> dict:
             detail.append(f"{agent}: ✗ 配置在但未含守卫（被改动？）")
         elif r["last"]:
             detail.append(f"{agent}: ✓ 最近触发 {r['last'][5:16]} 拦截{r['block']}/拒绝{r['deny']}/记账{r['mark']}")
+        elif agent in silent_dead:
+            detail.append(f"{agent}: ✗ 闸门零触发但该 agent 近期在工作（最后记录 "
+                          f"{r.get('last_work') or '?'}）——钩子可能没生效，去其会话实测一次写工具调用")
         else:
-            detail.append(f"{agent}: ⚠ 配置在位但日志零触发（未用过，或钩子没生效）")
+            detail.append(f"{agent}: ⚠ 配置在位但零触发（agent 近期无活动"
+                          + (f"，最后记录 {r.get('last_work')}" if r.get("last_work")
+                             else f"，近 {GATE_SILENT_ACTIVITY_DAYS} 天无工作记录")
+                          + "，闸门未获验证）")
 
-    gaps = len(missing) + len(unwired) + len(scripts_ok) + len(untracked)
+    gaps = len(missing) + len(unwired) + len(scripts_ok) + len(untracked) + len(silent_dead)
     if untracked:
         detail.append("注册表有但闸门清单未覆盖：" + "、".join(untracked) + "（补 ~/.agenthub/hooks/targets.json）")
+    if silent_dead:
+        detail.append(f"闸门失效判定依据：这些 agent 近 {GATE_SILENT_ACTIVITY_DAYS} 天有工作记录、"
+                      "守卫日志却零触发——配置在位 ≠ 钩子生效")
     if gaps == 0:
-        summary = (f"规则执行体检：{len(inplace)} 家闸门在位、脚本齐、注册表全覆盖；"
-                   + (f"其中 {len(silent)} 家尚无触发记录（{ '/'.join(silent) }）" if silent else "且均有触发记录"))
+        tail = "且均有触发记录"
+        if silent:
+            tail = f"其中 {len(silent)} 家尚无触发记录"
+            if silent_dead:
+                tail += f"（{'/'.join(silent_dead)} 近期有活动但零触发=钩子疑似失效）"
+            if silent_idle:
+                tail += f"（{'/'.join(silent_idle)} 无活动，未获验证）"
+        summary = (f"规则执行体检：{len(inplace)} 家闸门在位、脚本齐、注册表全覆盖；" + tail)
     else:
         bits = []
         if missing:
@@ -1541,6 +1595,8 @@ def _rules_health(root: str) -> dict:
             bits.append(f"清单漏登记 {'/'.join(untracked)}")
         if scripts_ok:
             bits.append("脚本缺失")
+        if silent_dead:
+            bits.append(f"闸门失效 {'/'.join(silent_dead)}（有记录零触发）")
         summary = "规则执行缺口：⚠ " + "；".join(bits)
     return {"ok": gaps == 0, "summary": summary, "detail": detail[:10]}
 

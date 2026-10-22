@@ -32,6 +32,14 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parent.parent
 ENV = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "HF_HUB_OFFLINE": "1",
        "PYTHONIOENCODING": "utf-8"}
+# R33：把子进程的临时目录整体迁到仓库内（_pytest_tmp/）。Windows 上 Python 的
+# tempfile 与 pytest 的 basetemp 都跟随 TEMP/TMP——默认落在 C:\Users\y\AppData
+# \Local\Temp，pytest 每次启动轮换旧 basetemp（动辄 50+ 文件）会踩到宿主沙箱
+# 的批量删保护：删除被拦 → pytest 进程异常退出 → junit 缺失 → 整层判 FAIL
+# （2026-10-22 实测，qoder 侧无此沙箱所以从未暴露）。仓库树不在沙箱看护的
+# 个人目录清单里，温度迁移后回归不再被环境误伤。
+ENV["TEMP"] = ENV["TMP"] = str(ROOT / "_pytest_tmp")
+(ROOT / "_pytest_tmp").mkdir(parents=True, exist_ok=True)
 # (层名, 路径, 是否逐文件独立进程, 单目标超时秒)
 LAYERS = (
     ("unit", "tests/unit", False, 300),

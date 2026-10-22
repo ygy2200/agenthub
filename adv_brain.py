@@ -4650,6 +4650,52 @@ def t_deploy_atomic(tmp):
         "故障排除后重试未成功"
 
 
+def t_deploy_status(tmp):
+    """R33：deploy_status 只读探测（missing/ready/stale/no-python 四态），全程不写盘。"""
+    src = Path(tmp) / "status_src"
+    dst = Path(tmp) / "status_dst"
+    src.mkdir(parents=True)
+    for f in core.SERVER_FILES:
+        p = src / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"# {f} v1\n", encoding="utf-8")
+
+    # ① 未部署 → missing，且探测本身不创建目录
+    st = core.deploy_status(str(src), str(dst))
+    assert st["state"] == "missing" and st["server"] == "", st
+    assert not dst.exists(), "只读探测不得创建部署目录"
+    assert st["python"], "测试机应有 python"
+
+    # ② 部署后 → ready，same=全部文件
+    core.deploy_server(str(src), str(dst))
+    st = core.deploy_status(str(src), str(dst))
+    assert st["state"] == "ready" and st["same"] == len(core.SERVER_FILES), st
+    assert not st["diff"] and not st["absent"], st
+
+    # ③ 源码变 → stale 且点名文件
+    (src / "brain.py").write_text("# brain.py v2\n", encoding="utf-8")
+    st = core.deploy_status(str(src), str(dst))
+    assert st["state"] == "stale" and "brain.py" in st["diff"], st
+
+    # ④ 部署缺文件 → stale 且进 absent
+    (dst / "ops.py").unlink()
+    st = core.deploy_status(str(src), str(dst))
+    assert st["state"] == "stale" and "ops.py" in st["absent"], st
+
+    # ⑤ 找不到 python → no-python（不猜其余态）
+    _real_fp = core.find_python
+    core.find_python = lambda: ""
+    try:
+        st = core.deploy_status(str(src), str(dst))
+    finally:
+        core.find_python = _real_fp
+    assert st["state"] == "no-python" and st["server"] == "", st
+
+    # ⑥ 全程只读：无暂存/旧目录残留
+    assert not list(dst.parent.glob(f".{dst.name}.stage-*")), "探测留下暂存目录"
+    assert not list(dst.parent.glob(f".{dst.name}.old-*")), "探测留下旧目录"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -4778,6 +4824,8 @@ def main():
     case("R7 备份盘点与清理（四家族/预演不删/保留最新/年龄闸/主库不动/留痕）", lambda: t_backup_inventory_prune(tmp))
     case("R29 部署原子化（全量暂存+校验/中段失败旧部署不变/无残留/故障后重试成功）",
          lambda: t_deploy_atomic(tmp))
+    case("R33 部署状态只读探测（missing/ready/stale/no-python 四态/全程不写盘）",
+         lambda: t_deploy_status(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

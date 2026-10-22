@@ -630,9 +630,10 @@
     },
     "connect_page": {
       "title": "接入",
-      "widget_count": 88,
+      "widget_count": 89,
       "class_count": {
         "PageTitleLabel": 1,
+        "PrimaryPushButton": 1,
         "PushButton": 14,
         "CaptionLabel": 21,
         "QWidget": 9,
@@ -649,6 +650,7 @@
         "EditLayer": 1
       },
       "texts": [
+        "<DEPLOY_STATUS>",
         "AgentHub 通过标准 MCP 协议向所有 agent 提供 <N> 个工具：项目登记/新建、工作记录（可撤销）、全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、踩坑拦截、归档、技能/MCP 清单、进度对齐。「一",
         "Claude Code",
         "Codex",
@@ -669,9 +671,9 @@
         "所有写入（接入/引导）均先自动备份原文件为 *.bak-agenthub-时间戳，可随时移除还原；操作全部进「流水」页可查。",
         "手动接入（hermes 等未自动探测到 MCP 配置文件的 agent）",
         "接入中心 · 公用大脑",
-        "服务端就绪：<PATH>",
         "移除引导",
         "移除接入",
+        "部署服务端",
         "配置文件：<PATH> Agent CN Desktop/data/hermes-home/config.yaml",
         "配置文件：~/.claude.json",
         "配置文件：~/.codex/config.toml",

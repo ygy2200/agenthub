@@ -278,6 +278,31 @@ def main():
     check("rules_health 漏登记原因可读（指向 targets.json）",
           "targets.json" in "".join(_rh.get("detail") or []), str(_rh.get("detail"))[:200])
 
+    # ---- R32·闸门生效性分级：零触发单看不分善恶，配「近期有没有在干活」才分得清
+    # 「没活动所以没触发」（未验证，良性）与「在干活却零触发」（钩子没生效，管控黑洞）。
+    _rows = [
+        {"agent": "dead-one", "state": "inplace", "last": "", "block": 0, "deny": 0, "mark": 0, "last_work": "2026-10-22", "work_recent": True},
+        {"agent": "idle-one", "state": "inplace", "last": "", "block": 0, "deny": 0, "mark": 0, "last_work": "", "work_recent": False},
+        {"agent": "fired-one", "state": "inplace", "last": "2026-10-22T10:00:00", "block": 1, "deny": 0, "mark": 2, "last_work": "2026-10-22", "work_recent": True},
+        {"agent": "unwired-one", "state": "unwired", "last": "", "block": 0, "deny": 0, "mark": 0, "last_work": "2026-10-22", "work_recent": True},
+    ]
+    _dead, _idle = ops._classify_silent_gates(_rows)
+    check("R32 零触发分级：有记录零触发=dead；无记录=idle；有触发/未接线不进分类",
+          _dead == ["dead-one"] and _idle == ["idle-one"], f"dead={_dead} idle={_idle}")
+    _orig_rc = ops.rules_components
+    try:
+        ops.rules_components = lambda root: {"agents": _rows, "scripts_missing": [], "untracked": []}
+        _rh2 = ops._rules_health(str(tmp))
+        check("R32 dead 闸门计硬缺口（ok=False 且 summary 点名）",
+              (not _rh2["ok"]) and "dead-one" in _rh2["summary"], str(_rh2["summary"]))
+        _rows_idle = [r for r in _rows if r["agent"] in ("idle-one", "fired-one")]
+        ops.rules_components = lambda root: {"agents": _rows_idle, "scripts_missing": [], "untracked": []}
+        _rh3 = ops._rules_health(str(tmp))
+        check("R32 idle 闸门只警告不造假红（ok=True 且 detail 标注未获验证）",
+              _rh3["ok"] and any("未获验证" in d for d in _rh3["detail"]), str(_rh3["detail"])[:200])
+    finally:
+        ops.rules_components = _orig_rc
+
     # ---- R6·接入状态机（七项齐全 / 未注册也出清单 / 缺口带下一步 / 快照可复查）
     _ob = ops.agent_onboard_status(str(tmp), "Qoder-未接入样例")
     _keys = [s["key"] for s in _ob["steps"]]

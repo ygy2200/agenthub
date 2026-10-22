@@ -15,6 +15,9 @@ class ConnectPage(QWidget):
         top = QHBoxLayout()
         top.addWidget(PageTitleLabel("接入中心 · 公用大脑"))   # 页头统一 24（P2：与数字拉开层级）
         top.addStretch(1)
+        deployBtn = PrimaryPushButton(ic("DOWNLOAD", "INFO"), "部署服务端")
+        deployBtn.clicked.connect(self.do_deploy)
+        top.addWidget(deployBtn)
         refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新状态")
         refreshBtn.clicked.connect(self.refresh_status)
         top.addWidget(refreshBtn)
@@ -56,7 +59,9 @@ class ConnectPage(QWidget):
         QTimer.singleShot(400, self.refresh_status)
 
     def _rows_data(self):
-        py, server = core.deploy_server()
+        # R33：状态刷新只读探测（core.deploy_status），不再触发 deploy_server——
+        # 「看状态」不该「改部署」，GUI 快照实例化本页时尤其如此。
+        st = core.deploy_status()
         rows = []
         for a in core.load_agent_adapters(self.win.root):
             boot_path = a.get("instr_path") or a.get("boot") or ""
@@ -69,24 +74,39 @@ class ConnectPage(QWidget):
             rows.append({"agent": a["agent"], "path": path, "layout": layout,
                          "mcp": core.mcp_has_agenthub(path, layout),
                          "boot_path": boot_path})
-        return py, server, rows
+        return st, rows
+
+    def do_deploy(self):
+        """显式部署动作（R33 新增）：用户点了才写 ~/.agenthub/mcp_server。"""
+        _py, server = core.deploy_server()
+        if not server:
+            InfoBar.error("部署失败", "写入 ~/.agenthub/mcp_server 失败，详见「流水」页",
+                          duration=5000, parent=self.win)
+        else:
+            InfoBar.success("部署完成", server, duration=3000, parent=self.win)
+        self.refresh_status()
 
     def refresh_status(self):
         while self.rows.count():
             it = self.rows.takeAt(0)
             if it.widget():
                 it.widget().deleteLater()
-        py, server, rows = self._rows_data()
+        st, rows = self._rows_data()
         # Round 3（配色逻辑）：三态原来共用默认色——「部署失败」和「服务端就绪」长得一模一样，
         # 用户扫一眼判断不出接入是否正常。按语义阶梯着色：缺前提=警告 / 真失败=危险 / 就绪=成功。
-        if not py:
+        if not st["python"]:
             self.pyLabel.setText("⚠ 未找到可用的 python.exe，无法自动接入（MCP server 需要 python 运行）")
             self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.WARNING)};")
-        elif not server:
-            self.pyLabel.setText("⚠ MCP server 部署失败")
+        elif st["state"] == "missing":
+            self.pyLabel.setText("⚠ MCP server 未部署——点上方「部署服务端」")
             self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};")
+        elif st["state"] == "stale":
+            bad = "、".join((st["diff"] + st["absent"])[:3])
+            more = "…" if len(st["diff"] + st["absent"]) > 3 else ""
+            self.pyLabel.setText(f"⚠ MCP server 陈旧（{bad}{more} 与当前版本不一致）——点「部署服务端」同步")
+            self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.WARNING)};")
         else:
-            self.pyLabel.setText(f"服务端就绪：{server}")
+            self.pyLabel.setText(f"服务端就绪：{st['server']}")
             self.pyLabel.setStyleSheet(f"color:{tokens.C(tokens.SUCCESS)};")
         for r in rows:
             card = CardWidget()
@@ -127,14 +147,23 @@ class ConnectPage(QWidget):
             self.rows.addWidget(card)
 
     def do_connect(self, path, layout, agent="", profile=""):
-        py, server, _ = self._rows_data()
-        if not py or not server:
+        st, _ = self._rows_data()
+        if not st["python"]:
             InfoBar.error("无法接入", "python 或服务端未就绪", duration=3000, parent=self.win)
             return
+        if st["state"] != "ready":
+            # 「一键接入」是显式写动作，服务端没就绪时按需自愈部署一次（R33：
+            # 只读的刷新状态不部署；这里用户明确要求接入，部署是必要步骤）。
+            _py, server = core.deploy_server()
+            if not server:
+                InfoBar.error("无法接入", "服务端部署失败，请手动跑 cli.py deploy",
+                              duration=5000, parent=self.win)
+                return
+            st = core.deploy_status()
         # agent 名写进启动参数（B1）：server 据此锁定身份，忽略工具调用里的自报值
         # profile（P3-1）：来自 adapter 配置（config.agents.json），重装时保持工具面切片
-        err = core.install_mcp_entry(path, layout, py, server, self.win.root, agent=agent,
-                                     profile=profile)
+        err = core.install_mcp_entry(path, layout, st["python"], st["server"], self.win.root,
+                                     agent=agent, profile=profile)
         if err:
             InfoBar.error("接入失败", err, duration=5000, parent=self.win)
         else:
