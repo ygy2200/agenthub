@@ -44,9 +44,224 @@ core.JOURNAL_SINK = brain.journal_add
 # R7：运行版本标记——「部署了但没重启」时，进程里跑的是旧代码，所有体检结论都不可信
 core.SERVER_DIR = str(Path(__file__).resolve().parent)
 core.SERVER_STARTED_AT = datetime.datetime.now().isoformat(timespec="seconds")
+core.SERVER_FINGERPRINT = core.file_fingerprints(core.SERVER_DIR)
+core.SERVER_FINGERPRINT_AT = core.SERVER_STARTED_AT
 
 PROTOCOL_VERSION = "2024-11-05"
-SERVER_INFO = {"name": "agenthub", "version": "2.40.69"}  # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）；.53=第三轮 R3·D3 过期值服务率 harness：新增 tools/stale_eval.py（18 组合成标注事实，四类指标基线：supersede 泄漏 0% 硬不变量 / ghost 混合 50% / recency 排序 50% / 静默过期可检出 0%）+ 第 26 个 ops 检查项 stale_health（真实库上抽查泄漏硬不变量 + 陈旧 fact 清单 >45 天零唤起，只报不裁）；.54=第三轮 R4·D4 MCP 2026-07-28 对齐：**部分采纳**（刻意不切协议版本——六个现有接入都报 2024-11-05，切版本号会让它们全部重协商）。采纳双向兼容的增量：① tools/list 带 resultType/ttlMs/cacheScope（SEP-2549 缓存提示，老客户端忽略未知 result 字段、新客户端省掉每会话重取；cacheScope 取 private——可见集由 --profile 决定=per-caller，标 public 会让共享网关把 A agent 的工具目录发给 B agent，cacheScope 是标签不是锁）；② **确定性排序**：visible_tools 按 name 升序（规范「deterministic order... keep upstream prompt caches stable across reconnects」——本目录 19.3K tok/会话，顺序稳定才是 prompt cache 命中的前提；TOOLS 声明顺序随人维护漂移）；③ JSON Schema 方言**有意不声明 $schema** 并加守卫：实测 69 工具零方言特有构造=两种方言公共子集，不声明对最多客户端兼容，显式声明 2020-12 会让只认 draft-07 的校验器拒整个列表；.55=第三轮 R5·D5 确定性裁决辅助：ghost 检测从「只报不裁」升级为「报 + 附确定性建议」——LLM 做语义识别（similar_* 词法相似判定「这几条在说同一件事」）、确定性代码做选择（_adjudicate：版本信号→质量信号 tiebreak→id 兜底三层，冲突时降级为 confident=False 而非假装知道；语义上不用质量信号去覆盖版本信号）。memories/records 两表的信号定义各自独立（不可互抄）。建议不写任何数据。；.56=第三轮 R6·D6 工具使用治理：先修数据地基再谈治理——① **使用留痕扩到全部工具**（此前只有 4 个能力型只读工具进 tool_calls，加上 op_audit 写/searches 检索仍只有 21/69 有证据，「48 个从未被调用」绝大部分是留痕盲区的假象；按假象治理会把在用工具当僵尸下线。写工具仍额外走 op_audit：审计语义含 undo 句柄，与 tool_calls 不可互相替代。失败调用不计入使用；留痕 fail-open，绝不影响调用本身）；② 新增 tools/usage_report.py：零调用工具分三类（keep-escape 逃生舱/发现面、keep-governance 治理体检面、review 待审查）+ **边界诚实标注**（本表只反映 MCP 面，GUI 直接调 brain.py 不入库，零调用≠没人用）；③ 用大脑自带分词做**工具描述重叠**检测——研究点名的「从未被调用」两大原因（描述不清 / 与别家重叠）在本库双双被证伪：desc_quality 69 个达标、描述重叠仅 2 对且都是 set/list 互补配对而非真重叠新增第五项评测指标「裁决建议正确率 6/6=100%」（确定性计算，非统计数字）；ops ghost_memory detail 每行附「建议留 X、退 Y（依据：…）」+ 降级计数；.57=第三轮 R7·D7 GUI 结构快照基线：新增 tools/gui_snapshot.py + tests/gui/test_snapshot_baseline.py——**刻意不用像素黄金图**：R8 已证明 offscreen 下 Qt 把应用默认字体解析成宽拉丁回退体（Claude Code 132px）vs 生产微软雅黑 73px，同代码两环境截图天然不同，逐像素比必然误报。改比结构（控件类名计数+去重静态文案+最小高度）：对字体/DPI 敏感度低得多，区块消失/文案被改坏/控件数骤降照样抓住。固定字体（显式加载生产字体）/主题/窗口尺寸/种子数据，动态内容（日期时间路径id计数）采集时归一化；png 仍存但只作人工参考图、不参与自动比对。18 页基线；反向验证三态（删文案/控件数骤变/页面消失必报，完全一致零问题）；.58=第三轮 R8·D8 错误分类学：错误分三桶并告诉调用方该怎么反应——transient（限流/库锁/资源忙）可退避重试、permanent（参数非法/目标不存在/越权/键冲突）立即失败、ambiguous（超时/结果未知）不能盲重试且幂等键是解药。**单点实现不改 59 个失败站点**：各站点保持「错误：」开头约定，分类在返回处统一判定（关键词规则，兜底=ambiguous——误判代价不对称：把 transient 误判成 permanent 会让本可成功的调用被放弃，所以兜底取「未知」而非「别试了」）。分类走 structuredContent.error_kind（机器可读，不破坏既有文案约定）；提示文案差异化：permanent 不加任何「可重试」字样，另两类追加且对写工具指向 idem_key（R2 幂等键的配套：幂等解决「能不能安全重试」，分类解决「该不该重试」）。新增统一错误出口 _err_result 给「工具执行前就返回」的路径（速率限制等）使用，防分类口径漂移成两套；服务端异常也纳入三桶（入参类型错=permanent，其余=ambiguous），与业务失败日志口径统一；.59=第三轮 R9·D5 出口：新增 hub_memory_supersede（keep_id/drop_id）——两条**已存在**的记忆指定谁胜出、落进取代链。填补 R5 留下的执行路径缺口：ghost 检测给出「留 #3188、退 #3187」的建议后此前无处执行——既有 hub_memory_write(supersedes=X) 语义是「新建一条取代 X」（会多造第 3 条记忆），不是一回事。**刻意不判断谁对**（那是调用方的判断，系统只给确定性建议），执行权在人手里。参数守卫（非正整数/自己取代自己/不存在 id 全拒）+ 走 dry_run/confirm 闸门 + journal 留痕；数据保留可追溯（取代≠删除），反向再裁一次即可撤销。工具数 69→70（worker 切片内），被动上下文 19.6K→20.1K tok，仍在 24K 预算内。三个守护按设计拦下并要求显式确认：schema 兼容守卫要补基线、整数入参漂移守卫要登记 keep_id/drop_id、工具数守卫要从 69 改到 70；.60=第四轮 R2·D10 使用时间线统一查询面：新增 hub_usage_timeline（view=timeline 四源合并事件流 / view=stats 窗口聚合）+ brain.usage_timeline/usage_stats——四张使用表（tool_calls 全工具调用/op_audit 写审计/searches 检索/journal 运维动作）此前没有统一查询，「这工具最近谁在用什么程度」要查四张表人脑合并。外部研究（moltbook 生产实录）：「审计日志不是可观测性，对日志的定时查询才是」——但查询面先要有。stats 故意不做 burst 类指标：tool_calls 无参数列，正常高频只读与异常重试不可区分，做了就是噪声；能做且诚实的是零命中检索（有需求没满足的早信号）与重复查询（retry storm 代理）。边界标注沿用 usage_report 纪律：只反映 MCP 面，GUI 直连 brain.py 不入库；.61=第四轮 R3·recency 对内排序（第三轮遗留「recency 50%」）：新增 brain._demote_older_versions——检索结果内同事实多版本按「世代」沉底并标注指向现行版。关键设计：**不是全局 recency 项**——P4.4 三档实测 β>0 全局掉分（0.878→0.842），新旧不该全局影响排序，「同一事实的多版本谁在前」才该管；本函数只动版本间顺序，非对子行相对位置逐一不变（回归双 hub 对照死守）。世代数而非二值沉底：三版链 A<B<C 时 B 既旧于 C 又新于 A，二值标记会把 A、B 一起沉底保持原序（链式不传递），沿「旧于」边取最长路径才传递。**顺带修 _fold_near_dupes 的真缺陷**：原按融合分留存，近重复文本分数基本任意，实测把旧版当现行版留在上下文（stale_eval「同步间隔」对 sim=0.88 被折，留的是 30 天前旧值）——改为同事实两版留新的、保留行带 _folded_older 回溯；版本信号不可分辨时维持原行为（与 _adjudicate 不置信不动同一条纪律）。同时修 stale_eval 合成数据失真：两版同秒双写→ 版本信号恒打平 → ③ 被人为钉在 50%，旧版回拨 30 天才是对被测现象的忠实建模。验证：③ 50%→100%（6/6）、① 0% 与 ⑤ 100% 不动、eval_search 真实库 MRR 0.836/Hit@5 96% 与冻结基线逐位相同（无全局回退）；.62=第四轮 R4·新鲜度状态机（Facts Should Expire 模式）：按 kind 分档 TTL（fact 14/90 天、preference 180/730、lesson 365/1825、project 90/365、note 7/30）——读时计算 fresh/stale/expired，**过期不删除**（旧事实仍是证据，只是更弱）；reference=max(created,updated,confirmed,last_hit)，valid_until 硬过期优先；时间戳缺失→unknown 不猜；检索结果行内标注「N 天未复核/已过期」。ops stale_health 从「45 天零唤起 fact」手工清单升级为全库新鲜度分布；stale_eval ④ 静默过期可检出率 0%→100%。顺带修一个日期腐烂测试（view_recent 7 天滚动窗写死 2026-10-12，8 天后必红）——测试写相对时间。验证：adv_brain/adv_mcp/adv_ops 全绿；.63=第四轮 R5·接入注册表单一事实源：三个写工具（hub_log_work/hub_memory_write/hub_memory_supersede）的 agent 死枚举全部移除——注册表（config.agents.json）才是唯一准入源，客户端枚举只会把新 agent 挡在门外（Qoder 接入时被迫走 hub_call_tool+适配器正是这条）；服务端 check_agent 校验保持不变。agentscore.PROBES 补齐 Qoder/Codex/WorkBuddy（此前只探 ZCode/Claude/hermes/DSH，注册表里有的三家在技能/MCP 面不可见），MCP 解析支持 TOML（Codex config.toml 的 [mcp_servers.*]）；hub_list_skills 增加索引兜底（本地探测不到目录时回退 skills 表，标注「来自索引」）；targets.json 补 qoder；ops rules_health 动态核对注册表，新增 agent 漏登记闸门清单时点名告警（过去静默漏掉）。顺带修一处错误分类：agent 不在注册表被兜底成 ambiguous（提示「可能已部分生效」），实际是写入前拒收的永久错误 → 补关键词归 permanent（R5 新测试当场抓到）；.64=第四轮 R6·接入状态机：新增 hub_agent（status/plan/verify）+ brain.agent_onboarding 快照表 + brain.agent_record_stats + ops 检查项 agent_onboard。根治「接入只在现场算过、没留下」——七项核对（注册表/引导注入/MCP/规则闸门/技能索引/工作记录/验证快照）逐项给可直接执行的下一步，verify 落快照供事后复查；未注册 agent 也可自查（诊断不能被准入校验挡住）；rules_components 同一份语义同时供 rules_health 与接入清单，避免两套口径漂移；.65=第四轮 R7·运行版本检测（部署≠生效）：core.files_newer_than/runtime_staleness 判定进程加载的代码是否落后于磁盘（只认服务目录顶层 .py，2s 容差防「启动与 mtime 同秒」误报；无启动标记返回 unknown 不猜）；agenthub_mcp 导入时登记 SERVER_DIR/SERVER_STARTED_AT；hub_get_progress 顶部与 hub_agent「运行版本」项当场告警需重启；验证快照与代码变更比对——verify 后又改过代码则快照自动标过期（不能继续冒充已验证）；新增 ops 检查项 runtime_health（非 MCP 诚实跳过、旧进程点名落后文件）。接入清单七项→八项（+运行版本）；.66=第四轮 R8·守卫原生剥壳（消灭每家适配器）：agent_guard.mjs 现在自己解开 mcp_call/hub_call_tool/mcp__agenthub__hub_call_tool 的嵌套参数（允许套娃，最多 3 层），并归一 mcp__server__tool 前缀——Qoder 专属 agenthub_guard_adapter.mjs 不再是必需品（原文件保留未删，settings 已直连通用守卫）。判定语义不变：content 非空且非 dry_run 才翻牌；日志保留原始→归一形态便于追责。新增第 12 套回归 adv_guard.py（17 面：四种调用形态/套娃/dry_run/空内容/present_files/阻断上限/会话隔离/逃生门/日志归因），ops 巡检登记同步；rules_health fallback 与 targets.json 的 qoder keyword 改指 agent_guard.mjs；.67=第四轮 R9·可执行异常诊断：未知工具不再只回「去搜索」——先分清三类真实原因（带 mcp__服务器__ 前缀→给出本服务器内的准确名；拼错→difflib 最近名 top3，被 profile 藏起的标注「可用 hub_call_tool 直调」；完全无匹配→保留搜索与清单入口），hub_search_tools 零命中补「相近工具名 + 换更短名词」提示；ops 接入清单「技能索引」从「有没有记录」升级为「覆盖是否完整」——现场探测该 agent 本地技能目录，点名本地有、索引无的技能（WorkBuddy 实测 149/165 未入索引，这些技能 hub_skill_match 搜不到）并给出按 agent 的同步命令；.68=第五轮 R2·记忆复核闭环：R4 的新鲜度状态机自上线起就在读 `confirmed`，但列与写入路径都不存在（只能靠 last_hit 弱确认，人/agent 无法主动说「我复核过」）——本次补 `memories.confirmed` 增量列（老库 ensure_schema 幂等补，旧行默认空）+ `brain.confirm_memories` + `hub_memory_confirm`：ids 显式确认 / all_stale 批量复核 stale+expired（可按 kind 过滤、limit 截断并如实上报 remaining）；只写 confirmed，不碰 content/updated/use_count（复核≠重写，updated 是「值最后被修改」、confirmed 是「最后被确认仍成立」，混用会污染版本裁决）；valid_until 硬过期只跳过不解除（写入者显式划的线）；被取代/作废/不存在逐条给原因；走 dry_run/confirm 闸门 + journal 留痕；检索行的 stale 提示同步指向该工具（从「发现问题」到「可执行动作」的闭环）。工具数 72→73（worker 切片内），schema 基线同步新增；.69=第五轮 R3·发布链路哈希化：release 检查从「比 mtime」改为「比构建输入哈希清单」——PyInstaller 的 PYZ 在构建中段固化，构建后半段改的源码 mtime 仍可能早于最终 exe，旧检查据此误报一致（R2 实测 exe 缺新代码）；build.bat 现在构建前跑 `cli.py build-manifest start` 快照源码 md5、打包后 `finish` 记录 exe sha256，`cli.py release` 比对产物哈希/源码哈希/桌面副本 sha256（同尺寸不同内容也抓），构建末尾自动自检、失败即退出；无清单时回退 mtime 并明示可能误报。顺带把文本嵌入用不到的视觉栈排除出包（torchvision/cv2/torchaudio/hf_xet），缩小 onefile 体积与启动解压时间。
+SERVER_INFO = {"name": "agenthub", "version": "2.40.99"}  # .99=第十四轮 R30 待办饥饿：能开工（无阻塞/前置全完成）却 ≥ TASK_STARVE_DAYS(3) 无人认领的 pending——在办任务出问题有人可找，无人认领的活此前连「找谁」都没有；brain.task_starvation 单一口径供 tasks_health/hub_status/hub_next/GUI 共用；看板与 CLI 行尾「⌛待办饥饿 Nd」，hub_next/status 汇总点名并提供认领/关单动作；等待依赖/显式阻塞/缺失前置/在办/新任务均不计（防巡检退化为「待办多=报警」）；真实库巡检当场点名 11 天旧任务。 # .79=第七轮 R1-R10·任务管控闭环（2026-10-21，qoder）：R1 解除阻塞/清除截止不再静默失效（blocked_by/due 传 - 清空，残留标记在看板标注「可清除」）；R2 租约自愈（无主/缺租约的在办任务可被 claim 接管，同 owner 续租；心跳/进展/检查点都续租）；R3 依赖图完整性（自依赖/成环拒收并给出环路径，未完成前置不可认领，缺失前置在等待段标「不存在」）；R4 tasks_health 扩到依赖结构审计（成环/缺失前置/残留阻塞一次点名）；R5 任务审计流水与时间机器（task_update 同事务写 journal、hub_history 新增 kind=task 合并 journal+检查点+任务卡时点）；R6 验证快照绑定运行中代码指纹（md5，旧快照回落 mtime）——部署未重启/换代码后快照当场过期，不再冒充已验证；R7 控制面工作量（hub_list_agents/hub_agent status 显示持有任务与租约状态，无主在办单列）；R8 看板可读性（hub_tasks/hub_next 标注截止紧迫度/前置 n/m/缺失前置/残留阻塞/租约）；R9 CLI 任务操作（tasks/next/claim/update/checkpoint，与 MCP 同一状态机、依赖闸门、持有者围栏）；R10 帮助主题/README/运维手册同步 + 全量回归部署。外部依据：多 Worker 抢任务的租约+心跳+迟到写入围栏（CSDN/51CTO 2026-08；ninelayer agent-mutex）与 MCP 工具目录/版本漂移需客户端重启或主动刷新（Cherry Studio #20283；MCP 客户端缓存按 schema 指纹失效）。 # v2.40.40=R1 annotations；.41=R2 schema 兼容守卫；.42=R3 只读能力工具留痕；.43=R4 ghost memory 检测；.44=R5 ghost 出口+修腐烂断言；.45=R6·B10 写入热路径复用 token 缓存：similar_lessons_for（log_work 每次写记录都全库扫）改为复用 R3 建的 _MEM_TOK_CACHE（失效机制已就位），并加 |∪|=|A|+|B|-|∩| 免建并集；N=400 实测 2.3x 且结果逐字段等价；.46=R7·C6 速率限制/循环保护：handle_message 的 tools/call 分发层加进程内滑动窗口两级配额（单工具 per-agent 600 次/60s + 单 agent 全工具 2000 次/60s，全部环境变量可调、AGENTHUB_RATE_LIMIT=off 可关）——外部检索点名的生产常见存根「无限流：agent 进循环可无限调用」，此前本大脑无任何节流；被拦调用不计窗口、返回 isError 业务错误不断连；.47=R8·C7 工具数与默认 profile 评估（数据驱动结论：默认保持 admin）+ 新增 ops 检查项 profile_surface（被动上下文预算，三档 profile 实测 tools/list token 成本，超 24K warn）；.48=R9·C8 onboard/serve 测试覆盖：onboard 经 tmp 根 config.agents.json 假适配器全量重定向真跑（MCP 外科写入/引导注入/备份/幂等/拒写坏 JSON），serve 用真实子进程+临时端口覆盖（只读默认写 403/allow-write token 闸门）——「怕碰真实配置」从一律不测升级为可测；.49=R11 遗留项第一批：① C4 遗留——ghost 检测扩展到 records（新增 brain.similar_records/ghost_record_candidates：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚两类机器模板记录；ops 检查项 ghost_memory 记忆+记录双报；真实库首跑抓到 10-13 release playbook 5 条运行日志簇）；② config.agents.json 落地 profile 分派（注释写了从未应用的「其余四家挂 worker」本次补上：Claude Code/Codex/DSH/hermes 挂 worker，reader 被否——引导铁律的写工具全在 worker、且 hub_call_tool 逃生舱只在 worker）；.50=R11 遗留项第二批：onboard 多 layout 覆盖（toml/yaml 端到端+bundle 拒写）+ serve 优雅停止（api.serve_forever 接 SIGBREAK，Ctrl+Break 与 Ctrl+C 同走 KeyboardInterrupt 优雅路径）+ 统一 token 缓存层（_TokenCache typed 门面三命名空间结构隔离，R6 缓存串味 bug 类从靠注释防变成 API 上不可能；热路径 2.06ms 中位无回退）；.51=第三轮 R1·D2 多进程并发压测：新增 adv_concurrency.t_multiprocess_stress——6 子进程（对应 6 接入）同库各 40 轮混合操作（ensure_schema+写记录+写记忆+检索+心跳），四面断言（零失败/零丢失/完整性/WAL 有界<64MB 防 khive#580 式无界增长）；实测 240 混合操作全过、总耗时 29.9s、WAL 0KB；并代码审计确认两个 _encode 慢调用点均在 db_conn 块关闭后才执行（事务不跨慢操作，khive 形态不存在）；.52=第三轮 R2·D1 写工具幂等键：hub_log_work/hub_memory_write/hub_note 接受可选 idem_key（≤64 字符）——同 (agent,key,内容) 重试原样重放首次结果不重复执行，同键不同内容冲突拒收（digest 防键复用），键按 agent 命名空间隔离，保留期 7 天（查询侧时间窗过滤——回归抓到「只靠 store 清理会导致过期键仍重放」的自引入 bug 并修复）；默认完全兼容（不传键走原路径）；.53=第三轮 R3·D3 过期值服务率 harness：新增 tools/stale_eval.py（18 组合成标注事实，四类指标基线：supersede 泄漏 0% 硬不变量 / ghost 混合 50% / recency 排序 50% / 静默过期可检出 0%）+ 第 26 个 ops 检查项 stale_health（真实库上抽查泄漏硬不变量 + 陈旧 fact 清单 >45 天零唤起，只报不裁）；.54=第三轮 R4·D4 MCP 2026-07-28 对齐：**部分采纳**（刻意不切协议版本——六个现有接入都报 2024-11-05，切版本号会让它们全部重协商）。采纳双向兼容的增量：① tools/list 带 resultType/ttlMs/cacheScope（SEP-2549 缓存提示，老客户端忽略未知 result 字段、新客户端省掉每会话重取；cacheScope 取 private——可见集由 --profile 决定=per-caller，标 public 会让共享网关把 A agent 的工具目录发给 B agent，cacheScope 是标签不是锁）；② **确定性排序**：visible_tools 按 name 升序（规范「deterministic order... keep upstream prompt caches stable across reconnects」——本目录 19.3K tok/会话，顺序稳定才是 prompt cache 命中的前提；TOOLS 声明顺序随人维护漂移）；③ JSON Schema 方言**有意不声明 $schema** 并加守卫：实测 69 工具零方言特有构造=两种方言公共子集，不声明对最多客户端兼容，显式声明 2020-12 会让只认 draft-07 的校验器拒整个列表；.55=第三轮 R5·D5 确定性裁决辅助：ghost 检测从「只报不裁」升级为「报 + 附确定性建议」——LLM 做语义识别（similar_* 词法相似判定「这几条在说同一件事」）、确定性代码做选择（_adjudicate：版本信号→质量信号 tiebreak→id 兜底三层，冲突时降级为 confident=False 而非假装知道；语义上不用质量信号去覆盖版本信号）。memories/records 两表的信号定义各自独立（不可互抄）。建议不写任何数据。；.56=第三轮 R6·D6 工具使用治理：先修数据地基再谈治理——① **使用留痕扩到全部工具**（此前只有 4 个能力型只读工具进 tool_calls，加上 op_audit 写/searches 检索仍只有 21/69 有证据，「48 个从未被调用」绝大部分是留痕盲区的假象；按假象治理会把在用工具当僵尸下线。写工具仍额外走 op_audit：审计语义含 undo 句柄，与 tool_calls 不可互相替代。失败调用不计入使用；留痕 fail-open，绝不影响调用本身）；② 新增 tools/usage_report.py：零调用工具分三类（keep-escape 逃生舱/发现面、keep-governance 治理体检面、review 待审查）+ **边界诚实标注**（本表只反映 MCP 面，GUI 直接调 brain.py 不入库，零调用≠没人用）；③ 用大脑自带分词做**工具描述重叠**检测——研究点名的「从未被调用」两大原因（描述不清 / 与别家重叠）在本库双双被证伪：desc_quality 69 个达标、描述重叠仅 2 对且都是 set/list 互补配对而非真重叠新增第五项评测指标「裁决建议正确率 6/6=100%」（确定性计算，非统计数字）；ops ghost_memory detail 每行附「建议留 X、退 Y（依据：…）」+ 降级计数；.57=第三轮 R7·D7 GUI 结构快照基线：新增 tools/gui_snapshot.py + tests/gui/test_snapshot_baseline.py——**刻意不用像素黄金图**：R8 已证明 offscreen 下 Qt 把应用默认字体解析成宽拉丁回退体（Claude Code 132px）vs 生产微软雅黑 73px，同代码两环境截图天然不同，逐像素比必然误报。改比结构（控件类名计数+去重静态文案+最小高度）：对字体/DPI 敏感度低得多，区块消失/文案被改坏/控件数骤降照样抓住。固定字体（显式加载生产字体）/主题/窗口尺寸/种子数据，动态内容（日期时间路径id计数）采集时归一化；png 仍存但只作人工参考图、不参与自动比对。18 页基线；反向验证三态（删文案/控件数骤变/页面消失必报，完全一致零问题）；.58=第三轮 R8·D8 错误分类学：错误分三桶并告诉调用方该怎么反应——transient（限流/库锁/资源忙）可退避重试、permanent（参数非法/目标不存在/越权/键冲突）立即失败、ambiguous（超时/结果未知）不能盲重试且幂等键是解药。**单点实现不改 59 个失败站点**：各站点保持「错误：」开头约定，分类在返回处统一判定（关键词规则，兜底=ambiguous——误判代价不对称：把 transient 误判成 permanent 会让本可成功的调用被放弃，所以兜底取「未知」而非「别试了」）。分类走 structuredContent.error_kind（机器可读，不破坏既有文案约定）；提示文案差异化：permanent 不加任何「可重试」字样，另两类追加且对写工具指向 idem_key（R2 幂等键的配套：幂等解决「能不能安全重试」，分类解决「该不该重试」）。新增统一错误出口 _err_result 给「工具执行前就返回」的路径（速率限制等）使用，防分类口径漂移成两套；服务端异常也纳入三桶（入参类型错=permanent，其余=ambiguous），与业务失败日志口径统一；.59=第三轮 R9·D5 出口：新增 hub_memory_supersede（keep_id/drop_id）——两条**已存在**的记忆指定谁胜出、落进取代链。填补 R5 留下的执行路径缺口：ghost 检测给出「留 #3188、退 #3187」的建议后此前无处执行——既有 hub_memory_write(supersedes=X) 语义是「新建一条取代 X」（会多造第 3 条记忆），不是一回事。**刻意不判断谁对**（那是调用方的判断，系统只给确定性建议），执行权在人手里。参数守卫（非正整数/自己取代自己/不存在 id 全拒）+ 走 dry_run/confirm 闸门 + journal 留痕；数据保留可追溯（取代≠删除），反向再裁一次即可撤销。工具数 69→70（worker 切片内），被动上下文 19.6K→20.1K tok，仍在 24K 预算内。三个守护按设计拦下并要求显式确认：schema 兼容守卫要补基线、整数入参漂移守卫要登记 keep_id/drop_id、工具数守卫要从 69 改到 70；.60=第四轮 R2·D10 使用时间线统一查询面：新增 hub_usage_timeline（view=timeline 四源合并事件流 / view=stats 窗口聚合）+ brain.usage_timeline/usage_stats——四张使用表（tool_calls 全工具调用/op_audit 写审计/searches 检索/journal 运维动作）此前没有统一查询，「这工具最近谁在用什么程度」要查四张表人脑合并。外部研究（moltbook 生产实录）：「审计日志不是可观测性，对日志的定时查询才是」——但查询面先要有。stats 故意不做 burst 类指标：tool_calls 无参数列，正常高频只读与异常重试不可区分，做了就是噪声；能做且诚实的是零命中检索（有需求没满足的早信号）与重复查询（retry storm 代理）。边界标注沿用 usage_report 纪律：只反映 MCP 面，GUI 直连 brain.py 不入库；.61=第四轮 R3·recency 对内排序（第三轮遗留「recency 50%」）：新增 brain._demote_older_versions——检索结果内同事实多版本按「世代」沉底并标注指向现行版。关键设计：**不是全局 recency 项**——P4.4 三档实测 β>0 全局掉分（0.878→0.842），新旧不该全局影响排序，「同一事实的多版本谁在前」才该管；本函数只动版本间顺序，非对子行相对位置逐一不变（回归双 hub 对照死守）。世代数而非二值沉底：三版链 A<B<C 时 B 既旧于 C 又新于 A，二值标记会把 A、B 一起沉底保持原序（链式不传递），沿「旧于」边取最长路径才传递。**顺带修 _fold_near_dupes 的真缺陷**：原按融合分留存，近重复文本分数基本任意，实测把旧版当现行版留在上下文（stale_eval「同步间隔」对 sim=0.88 被折，留的是 30 天前旧值）——改为同事实两版留新的、保留行带 _folded_older 回溯；版本信号不可分辨时维持原行为（与 _adjudicate 不置信不动同一条纪律）。同时修 stale_eval 合成数据失真：两版同秒双写→ 版本信号恒打平 → ③ 被人为钉在 50%，旧版回拨 30 天才是对被测现象的忠实建模。验证：③ 50%→100%（6/6）、① 0% 与 ⑤ 100% 不动、eval_search 真实库 MRR 0.836/Hit@5 96% 与冻结基线逐位相同（无全局回退）；.62=第四轮 R4·新鲜度状态机（Facts Should Expire 模式）：按 kind 分档 TTL（fact 14/90 天、preference 180/730、lesson 365/1825、project 90/365、note 7/30）——读时计算 fresh/stale/expired，**过期不删除**（旧事实仍是证据，只是更弱）；reference=max(created,updated,confirmed,last_hit)，valid_until 硬过期优先；时间戳缺失→unknown 不猜；检索结果行内标注「N 天未复核/已过期」。ops stale_health 从「45 天零唤起 fact」手工清单升级为全库新鲜度分布；stale_eval ④ 静默过期可检出率 0%→100%。顺带修一个日期腐烂测试（view_recent 7 天滚动窗写死 2026-10-12，8 天后必红）——测试写相对时间。验证：adv_brain/adv_mcp/adv_ops 全绿；.63=第四轮 R5·接入注册表单一事实源：三个写工具（hub_log_work/hub_memory_write/hub_memory_supersede）的 agent 死枚举全部移除——注册表（config.agents.json）才是唯一准入源，客户端枚举只会把新 agent 挡在门外（Qoder 接入时被迫走 hub_call_tool+适配器正是这条）；服务端 check_agent 校验保持不变。agentscore.PROBES 补齐 Qoder/Codex/WorkBuddy（此前只探 ZCode/Claude/hermes/DSH，注册表里有的三家在技能/MCP 面不可见），MCP 解析支持 TOML（Codex config.toml 的 [mcp_servers.*]）；hub_list_skills 增加索引兜底（本地探测不到目录时回退 skills 表，标注「来自索引」）；targets.json 补 qoder；ops rules_health 动态核对注册表，新增 agent 漏登记闸门清单时点名告警（过去静默漏掉）。顺带修一处错误分类：agent 不在注册表被兜底成 ambiguous（提示「可能已部分生效」），实际是写入前拒收的永久错误 → 补关键词归 permanent（R5 新测试当场抓到）；.64=第四轮 R6·接入状态机：新增 hub_agent（status/plan/verify）+ brain.agent_onboarding 快照表 + brain.agent_record_stats + ops 检查项 agent_onboard。根治「接入只在现场算过、没留下」——七项核对（注册表/引导注入/MCP/规则闸门/技能索引/工作记录/验证快照）逐项给可直接执行的下一步，verify 落快照供事后复查；未注册 agent 也可自查（诊断不能被准入校验挡住）；rules_components 同一份语义同时供 rules_health 与接入清单，避免两套口径漂移；.65=第四轮 R7·运行版本检测（部署≠生效）：core.files_newer_than/runtime_staleness 判定进程加载的代码是否落后于磁盘（只认服务目录顶层 .py，2s 容差防「启动与 mtime 同秒」误报；无启动标记返回 unknown 不猜）；agenthub_mcp 导入时登记 SERVER_DIR/SERVER_STARTED_AT；hub_get_progress 顶部与 hub_agent「运行版本」项当场告警需重启；验证快照与代码变更比对——verify 后又改过代码则快照自动标过期（不能继续冒充已验证）；新增 ops 检查项 runtime_health（非 MCP 诚实跳过、旧进程点名落后文件）。接入清单七项→八项（+运行版本）；.66=第四轮 R8·守卫原生剥壳（消灭每家适配器）：agent_guard.mjs 现在自己解开 mcp_call/hub_call_tool/mcp__agenthub__hub_call_tool 的嵌套参数（允许套娃，最多 3 层），并归一 mcp__server__tool 前缀——Qoder 专属 agenthub_guard_adapter.mjs 不再是必需品（原文件保留未删，settings 已直连通用守卫）。判定语义不变：content 非空且非 dry_run 才翻牌；日志保留原始→归一形态便于追责。新增第 12 套回归 adv_guard.py（17 面：四种调用形态/套娃/dry_run/空内容/present_files/阻断上限/会话隔离/逃生门/日志归因），ops 巡检登记同步；rules_health fallback 与 targets.json 的 qoder keyword 改指 agent_guard.mjs；.67=第四轮 R9·可执行异常诊断：未知工具不再只回「去搜索」——先分清三类真实原因（带 mcp__服务器__ 前缀→给出本服务器内的准确名；拼错→difflib 最近名 top3，被 profile 藏起的标注「可用 hub_call_tool 直调」；完全无匹配→保留搜索与清单入口），hub_search_tools 零命中补「相近工具名 + 换更短名词」提示；ops 接入清单「技能索引」从「有没有记录」升级为「覆盖是否完整」——现场探测该 agent 本地技能目录，点名本地有、索引无的技能（WorkBuddy 实测 149/165 未入索引，这些技能 hub_skill_match 搜不到）并给出按 agent 的同步命令；.68=第五轮 R2·记忆复核闭环：R4 的新鲜度状态机自上线起就在读 `confirmed`，但列与写入路径都不存在（只能靠 last_hit 弱确认，人/agent 无法主动说「我复核过」）——本次补 `memories.confirmed` 增量列（老库 ensure_schema 幂等补，旧行默认空）+ `brain.confirm_memories` + `hub_memory_confirm`：ids 显式确认 / all_stale 批量复核 stale+expired（可按 kind 过滤、limit 截断并如实上报 remaining）；只写 confirmed，不碰 content/updated/use_count（复核≠重写，updated 是「值最后被修改」、confirmed 是「最后被确认仍成立」，混用会污染版本裁决）；valid_until 硬过期只跳过不解除（写入者显式划的线）；被取代/作废/不存在逐条给原因；走 dry_run/confirm 闸门 + journal 留痕；检索行的 stale 提示同步指向该工具（从「发现问题」到「可执行动作」的闭环）。工具数 72→73（worker 切片内），schema 基线同步新增；.69=第五轮 R3·发布链路哈希化：release 检查从「比 mtime」改为「比构建输入哈希清单」——PyInstaller 的 PYZ 在构建中段固化，构建后半段改的源码 mtime 仍可能早于最终 exe，旧检查据此误报一致（R2 实测 exe 缺新代码）；build.bat 现在构建前跑 `cli.py build-manifest start` 快照源码 md5、打包后 `finish` 记录 exe sha256，`cli.py release` 比对产物哈希/源码哈希/桌面副本 sha256（同尺寸不同内容也抓），构建末尾自动自检、失败即退出；无清单时回退 mtime 并明示可能误报。顺带把文本嵌入用不到的视觉栈排除出包（torchvision/cv2/torchaudio/hf_xet），缩小 onefile 体积与启动解压时间；.70=第五轮 R4·MCP 初始化说明（渐进披露）：initialize 现在返回 instructions——把「开工对齐→查背景→收工三件套→复核/裁决→工具路由→写闸门」压成一段约 400 字的规程，客户端握手即可拿到，不必先读 73 个工具描述；只写主干不复制参数细节（细节仍归工具描述/hub_help，防两套口径漂移），并新增回归守护「文案提到的每个 hub_* 必须是真实工具、核心工具全覆盖、长度≤900 字」，将来改名/下线工具时说明腐烂会当场红；.71=第五轮 R5·GUI 记忆治理：HubPage 记忆列表给 stale/expired 加徽标（◐陈旧/⛔过期）与 tooltip（天数/依据/最后复核），详情页展示新鲜度状态、阈值与最后复核时间；新增「复核选中」「复核陈旧」两个动作——只写 confirmed（不改 content/updated），批量复核单次 200 条封顶并如实上报 remaining，valid_until 硬过期跳过；新增 GUI 回归（400 天 fact 必须显示过期、点复核后 confirmed 落库且状态转 fresh、列表即时刷新），结构快照基线同步重建；.72=第五轮 R6·检索校准：记忆语义路权重 1.5→2.0、门槛 0.60→0.58，冻结快照（memories 248/records 1419）实测 MRR 0.839→0.842、Hit@5 26/28→28/28，两条漏召回（#5 语义 rank1 被压、#44 余弦 0.585 被 0.60 挡）清零；同快照 records A/B 发现权重 2.0 会让记录侧 MRR 0.856→0.838、Hit@1 23/29→22/29，故权重按表拆分（记忆 2.0、记录保持 1.5），阈值 0.58 对记录逐位无影响；eval_search 新增 --root 冻结语料对比并打印语料规模（防跨天语料漂移冒充回归）；新增确定性回归锁「语义 rank1 不得被 BM25 rank1 压过 / 0.58 门槛过闸 / 两表权重不混用」；.73=第五轮 R7·备份盘点与清理：真实库 _hub 下四类备份 48 份/548.7MB，此前没有统一盘点入口（backup 目录、brain-backups、手工 .bak 各找各的），且从未生成过 zip 整包（只备库不备源文件，还原会丢项目文件）。新增 brain.backup_inventory/backup_prune（四家族单一事实源；默认保留最新 N 份 + 未满 7 天不动 + 只预演，apply 才删；主库/WAL/SHM 永不碰，删除写 journal 可追溯）+ hub_export action=backups 升级为四家族盘点、action=prune 预演/执行 + cli.py backup-prune（--apply）+ ops 检查项 backup_health（无整包/总量超 1GB/最新超 7 天/可清理超 512MB 点名）；实测预演可清理 15 份/114.3MB；.74=第五轮 R8·一键自检与修复建议：hub_sentry 新增 action=report（跑 12 项巡检只出报告不发广播，每条问题附可执行修复建议）+ ops.run_patrol/PATROL_CHECKS/CHECK_FIXES（检查器自身异常记为问题不拖垮整轮，需 target/未知项如实跳过）+ cli.py doctor（有问题退出码 1，供脚本判断）。真实库首跑：12 项通过 9、问题 3、耗时 13.3s（含嵌入模型加载）——备份无整包、10 组幽灵记录、四段式俱全率 24%；哨兵广播同步附修复建议；.75=第五轮 R9·文档与可发现性：hub_help 支持 topic（start/search/backup/recover/release）——场景步骤直接在 MCP 里取，不必翻文档；默认清单末尾列可选主题；新增 docs/运维手册.md（五分钟体检、工具消失排查、部署≠生效、备份/校验/恢复手工步骤、检索评测、发布链路、数据位置、错误分类），README 顶部加「快速开始」并链接手册；回归守护覆盖五主题、未知主题可选项、手册关键命令存在。.76=补充·记录侧取代与去陈旧：records 早有 superseded_by 双时相列，但 _rec_live_sql 漏了它、也没有执行路径——ghost 检查项报「高相似记录对」只报不裁。本次 hub_memory_supersede 增加 target=record（复用既有工具名，不扩工具面），brain.supersede_record 校验双记录存在且 active、落取代链、反向即撤销；_rec_live_sql 加 COALESCE(superseded_by,0)=0（NULL 不再静默漏记录），被取代记录退出 LIKE/BM25/语义/图谱/时间线汇总，但 hub_get_record 仍按 id 可读并明确标注「已被 #N 取代」。；.77=第六轮 R1-R6·任务管控与备份可靠性（2026-10-21）：① 备份整包改「临时文件 + os.replace 原子收尾」，打包前 quick_check（失败清理并明确报错），跳过构建/缓存/依赖/备份目录与 >50MB 单文件（AGENTHUB_BACKUP_MAX_FILE_MB），zip 内 _AgentHub_备份清单.txt 记录跳过明细；verify 读清单并复跑 quick_check 报完整性；修 mtime=0 触发 zipfile「1980 前时间戳」ValueError 且异常路径清理临时文件。② 新增 ops tasks_health（过期租约/无主/持有者失联/逾期一次点名 + hub_claim/hub_task_update 修复路径）接进 PATROL_CHECKS/CHECK_FIXES。③ hub_heartbeat 增加任务级撞车预警：同项目他人持有的在办任务（认领时间 + 租约过期可接管标记）。④ 大脑页任务行显示「租约过期」「逾期 MM-DD」徽标。⑤ 检查点写入围栏：在办任务只收持有者写入（非持有者拒收不落行），写入同事务续租 claimed_at；被接管后旧持有者迟到补写因条件 UPDATE rowcount=0 被拒；修正 hub_checkpoint 误标 idempotentHint。⑥ hub_help 新增 tasks 主题，backup 主题补原子收尾/quick_check/跳过清单，运维手册新增「任务认领、租约与检查点」并更新备份章节。
+# .96（2026-10-22）：R27 任务时间口径统一。R26 让「心跳在线、任务停住」可见，但三个钟仍混着用：
+# hub_history(kind=task) 把 tasks.updated 标成「最后更新」——它会被心跳续租刷新，读起来像进展；
+# 控制面只见「停滞」二字，看不到各钟具体时刻，「多久没动」无从判断。本次把口径拆成四列并在读写
+# 两侧统一：① 推进（任务级 = progress_at + 手工检查点，真实任务动作）；② 检查点（任务级断点，
+# auto_claim 起点锚不计）；③ 心跳（agent 级存活，owner 的最近一次 sessions.ts，不是任务级进度）；
+# ④ 租约（可接管判定）。brain 新增 _sessions_index/_task_clock_fields，task_holdings 与
+# task_annotate 同源广播 _last_cp/_last_cp_age_h/_heartbeat_at/_heartbeat_age_h；history_of 返回
+# clocks，时间线把「最后更新」改名「最后改动（心跳续租也会刷新，不代表进展）」，推进与改动不一致时
+# 补一条「最后推进」。MCP：hub_history 头部加「时间口径」四钟一行 + 语义说明；控制面默认显示
+# 「推进 Nh 前」，hub_agent status（verbose）再列检查点与心跳并标注 agent 级；hub_list_agents 保持
+# 单行密度。原则：谁都不能冒充谁——agent 在线不等于任务在走，updated 不等于进展。
+# 回归：adv_brain 四钟字段/心跳不刷推进/history clocks 与时间线标签、adv_mcp history 时间口径行 +
+# status 三钟展示 + 列表推进徽标；adv_ops 口径不变（复用 _task_progress）。
+# .95（2026-10-22）：R26 任务进展停滞检测。tasks_health 此前把「心跳在线」当作在办任务健康的
+# 充分证据：`seen = max(心跳, 任务 updated)`，一个每小时打卡却三小时没动过的任务在巡检里全绿。
+# 租约只回答「人还在不在」，回答不了「任务有没有在走」。更麻烦的是心跳续租本身就会刷新
+# tasks.updated——直接拿 updated 当推进信号，等于让心跳自己作证，停滞永远不可见。本次新增
+# 专用列 tasks.progress_at（ensure_schema 幂等补列，老行以 updated 起步）：只有真实任务动作
+# 写它（认领/状态流转/改详情/写检查点），心跳明确不碰。推进信号 = max(progress_at, 最新手工
+# 检查点)，认领自动锚点（auto_claim）是系统起点标记不计入。超过 TASK_PROGRESS_STALL_HOURS
+# （6h，3×租约 TTL，覆盖一个正常长工作段）无推进即「进展停滞」；与「持有者失联」互斥
+# （先判失联：人都不在了，停滞没有意义），且**只点名不自动释放**——卡住的任务需要人/agent
+# 决定是继续还是放弃，系统无权替它收尸。口径单点：brain._task_progress/_checkpoint_index 计算，
+# task_annotate/task_holdings 一次批量查询后广播到 hub_tasks/hub_next/CLI 看板与 hub_list_agents/
+# hub_agent 持有视图，ops tasks_health 复用同一函数，阈值不出现第二份。GUI 大脑页任务行加
+# 「进展停滞 Nh」徽标，tooltip 指向 hub_checkpoint(action=save) 的可执行动作。
+# 回归：adv_brain 停滞/检查点续命/正常三态注解＋心跳不刷 progress_at、adv_ops 停滞点名＋
+# 检查点续命转绿＋失联优先不重复计数、adv_mcp 控制面与看板徽标同口径。
+# .94（2026-10-22）：R25 运行标记健壮性。标记是磁盘上的跨进程输入，直接参与「一致/需重启」
+# 判定，但 R24 只校验了 base/started 非空：`fingerprint` 若被写成字符串会在 fp.items() 崩溃；
+# `started` 写未来时间会让 files_newer_than 判全量「启动后未改」→ 伪造一致（假阴性，最危险）。
+# 校验前移到 runtime_markers：base 必须非空字符串、started 必须可解析且不晚于 now+5min
+# （容忍时钟偏差）、fingerprint 必须为字典且只保留字符串键值；坏 JSON/坏类型/未来时刻一律
+# 跳过，整条观测丢弃而不是带病判定。_marker_staleness 对单条标记的比对加异常隔离，
+# 一条畸形数据不能拖垮整个 CLI 体检视图。回归：adv_brain 注入坏指纹/未来时刻/坏时间/
+# 空目录/坏 JSON 五类标记，断言全部丢弃、只剩坏标记时 unknown、与有效标记共存时只采信有效者。
+# .93（2026-10-22）：R24 运行标记与跨进程观测。R22 让 CLI/doctor 对「运行版本」诚实返回
+# 「无法判断」，代价是这些入口从此完全失去视野——长驻 MCP 进程是否在跑旧代码又只能靠 agent
+# 会话内的工具回答。本次让 serve() 把自身身份写进磁盘：~/.agenthub/runtime/serve-<pid>.json
+# （AGENTHUB_RUNTIME_DIR 可重定向；含 pid/agent/root/base/started/fingerprint/version/ts），
+# 启动时写、30s 心跳刷新、优雅退出删除；TTL 120s 按 *标记文件 mtime* 判新鲜，不探测 PID
+# 存活（Windows 上 os.kill(pid,0) 会终止目标进程，不能用来探活）。prune 清理超 20×TTL 的
+# 遗留标记。runtime_staleness 在非 MCP 且无显式参数时先扫新鲜标记：优先部署目录上的进程，
+# 多个进程取落后文件最多者（最保守），返回 source=marker 与 procs；CLI/doctor 据此恢复
+# 「一致/需重启」结论并注明观测来源。判定仍以各进程加载时的指纹/启动时刻为基准，心跳
+# 只刷新标记文件的 mtime，不会把旧代码洗成一致。写标记失败只记日志、不拖垮服务。
+# 回归：adv_brain 标记往返/过期/清理/心跳不洗白；adv_ops CLI 经标记得结论并标来源、
+# 标记清理后回到无法判断。
+# .92（2026-10-22）：R23 验证快照绑定代码树。R22 发现：同一 agent 的快照可能由 CLI
+# 从源码树（40 个 .py）写入，又被 MCP 从部署树（11 个 .py）读取——旧逻辑只比文件名/指纹，
+# 跨树比对会把另一棵树多出的文件报成「已移除/新增」，快照被误判成过期或同步，两者都是假结论。
+# agent_onboarding 增 base 列（旧库幂等补），verify 落库时记录 core.SERVER_DIR；ops 比对前
+# 先比树（normcase+abspath），不同树返回 basis=other-tree，hub_agent/ops 显示「无法据此判断」
+# 并指向在 agent 会话重跑 verify——不冒充过期、也不冒充一致。旧快照无 base 时沿用原口径。
+# 回归：adv_ops 跨树不判过期、同树仍判过期；adv_mcp verify 快照记录 base 且文案标出代码树。
+# .91（2026-10-22）：R22 运行版本检查的进程身份。CLI 的 `call hub_ops_run runtime_health`
+# 经 cmd_call 在进程内 import 本模块，导入时写下的 SERVER_STARTED_AT/SERVER_FINGERPRINT
+# 让一次性 CLI 进程被当成在跑的长驻服务，输出「运行版本：一致」——这个假阳性会被当作
+# 「部署已生效」的证据；而真正的 MCP 进程可能仍在跑旧代码。新增 core.SERVER_IS_MCP：
+# 默认 False，只有 agenthub_mcp.serve()（真正进入 stdio 主循环）置 True；runtime_staleness
+# 在无显式 base_dir/started_at 且非 MCP 进程时诚实返回 known=False，CLI/GUI/REST 一律
+# 走「无法判断」分支，不再冒充一致。显式传参路径（测试/指定目录）不受影响。
+# 回归：adv_brain 加「有启动标记但非 MCP 进程也不得判 known」，adv_ops/adv_mcp 的
+# 模拟 MCP 场景显式置位后仍须抓到旧启动与指纹变更。
+# .90（2026-10-22）：R21 归档恢复通道。`archive_project` 一直宣称「可逆」，但恢复只能手改库+搬目录，
+# 工具面没有入口——承诺与执行路径脱节。新增 brain.restore_project（archive 的逆操作）：
+# ① 先校验后动手：根目录已有同名文件/目录时拒绝，绝不覆盖未归档内容；
+# ② 归档目录缺失不阻塞状态恢复（归档时目录移动失败的项目仍能回到活跃视图），并如实告警；
+# ③ 状态写回失败时把已移回的目录再移回归档区，避免半恢复；
+# ④ updated 记为今天——恢复是「继续推进」的决定，不该在下一次 init 的 90 天自动标记里被打回 stalled。
+# hub_archive_project 增加可选 restore=false（加法式 schema，不改既有参数），复用同一高危闸门与审计，
+# 流水区分 archive_project/restore_project。⑤ 错误分类补「未归档/无需恢复/同名」为 permanent
+# （重复恢复曾被告知「结果不确定、别盲重试」，实为写入前拒绝）。回归：adv_brain 往返/重复/未归档/
+# 碰撞/目录缺失，adv_mcp 工具层同一组分支 + 分类断言；schema 兼容守卫不改基线（新增可选参数）。
+# .89（2026-10-22）：R20 项目生命周期口径与任务联动。① 停滞巡检不再拿 status 当「90 天无活动」：
+# 真实库 8 个显式停滞项目实际闲置仅 6–47 天（项目索引工具无工作记录）。新增 brain.project_activity
+# 按最后工作记录/任务活动算闲置天数，分 labelled（显式标记=决策队列，ok=True，与 inbox 同口径）
+# 与 drift（active 却 ≥90 天无活动=状态漏标，才判失败）；ops._stalled 逐项列闲置天数与来源。
+# ② 任务写入刷新项目活跃（_touch_project_activity）：此前「继续推进用 hub_task_add 写下下一步」
+# 的修复建议照做后项目仍显示停滞（N卡项目任务更新 10-21、project.updated 停在 10-16）；
+# task_add/task_claim/task_update 均刷新，archived 项目不复活（与 add_record 同一守卫）。
+# ③ 记忆不参与项目活动：WiFi蓝牙 10-21 的记忆来自 ADB蓝牙调研的横向蒸馏，不等于该项目复工。
+# ④ 状态展示措辞同步（hub_status/report/CHECKS/CHECK_FIXES）；回归 adv_brain R20 + adv_ops
+# 停滞「显式/漏标」双向断言。doctor 14 项全过（停滞清单仍逐项可见，只是不再当故障）。
+# .88（2026-10-22）：R19 记录质量判据分代。全期四段式俱全率 27%，但 2026-10-17 标准上线后
+# 是 89%（87 条：qoder 36/36、workbuddy 40/49），差距全来自上线前 1200 条历史存量（22%）。
+# 旧口径拿历史平均判失败，机制成效反而看不见。改为：以标准上线后的记录判失败（阈值仍 60%），
+# 全期只作参考；上线后无记录时回退全期，不因没数据假装健康。新增 ops._record_quality_eval
+# 纯统计便于合成回归；adv_ops 覆盖「历史差/当前好=健康」「当前差=失败」「无当前=回退」与接线。
+# .87（2026-10-22）：R18 备份健康判定口径。旧规则「总量超 1GB」低于唯一整包自身 1259.9MB，
+# 且可清理仅 114.3MB——无论怎么清都不可能达标，属固定误报。改为：总量绝对值只作信息，
+# 失败条件=无整包/无备份/最新超 7 天/可清理超 512MB/总量达整包 4 倍（短期堆积）。
+# 单份超大整包不再报警，4 份以上全量备份约 5GB 仍会被点名。回归：adv_ops 用假盘点覆盖
+# 单份超 1GB 健康、4 倍堆积、陈旧、无整包、可清理积压五形态。
+# .86（2026-10-22）：R17 幽灵检测剔除自动事件流。真实库 10 组候选 100% 来自 10-13 的 5 次
+# release 运行（备份文件名/exe 时间各不相同）——同标题重复是事件流节奏，不是知识版本幽灵。
+# ① brain.similar_records 排除全部 source='auto'（会话锚之外，playbook 流程日志也走 auto）；
+# ② 新增 brain.auto_record_count，ops ghost_memory 在 summary 如实报「另跳过 N 条自动捕获记录」，
+# 排除不静默；③ 回归：adv_brain 注入同标题流程日志断言不进候选、计数含会话锚+流程日志；
+# adv_ops 断言跳过条数出现在 summary 且不判失败。
+# .85（2026-10-22）：R16 幂等占位与补列并发。① 写工具幂等键由「先查、后写两次事务」
+# 改为**原子占位**（brain.idem_begin，事务内 BEGIN IMMEDIATE）：并发同键只有一个请求执行，
+# 其余在首次结果落库后重放；占位未完成时返回「正在处理中」、不重复执行；占位超 120s
+# 视为持有者崩溃可被接管；完成时 idem_store 只补自己的占位（不覆盖他人结果）。
+# ② _migrate_columns 先拿写锁再 PRAGMA：两个新版本进程同时对老库首启，不再出现
+# 都读到缺列、后一个 ALTER 撞 duplicate column。回归：adv_concurrency 新增 4 进程同键
+# 幂等写与老库并发补列；adv_mcp 幂等键覆盖占位/超时接管。
+# .84（2026-10-21）：R15 文件租约并发防线。① 多进程同时 acquire 同一路径**暴露真实竞态**：
+# 四个子进程出现两个赢家——延迟事务里双方都先读到「无冲突」，再先后 INSERT，同一路径双持有。
+# 修复：租约四类「先查后写」操作（acquire/renew/release/prune）进事务即 `BEGIN IMMEDIATE`，
+# 检查与写入跨进程串行；写锁等待超时返回可读错误，不把 sqlite 栈抛给调用方。
+# ② 该场景固化为回归（adv_concurrency：4 子进程同一时刻抢锁，断言恰好 1 个赢家 /
+# 台账恰好 1 把活跃锁 / fence=1 / journal 只有一条「获取文件租约」）——文件租约是咨询式的，
+# 但「同路径同时只该有一个持有者」是核心承诺，双持有会让两个 agent 都以为可以改同一文件。
+# ③ file_lease_prune 收紧并发假账：只统计 UPDATE rowcount>0 的行——两条 prune 同时
+# 选中同一过期行时，后一条实际影响 0 行，不得计入回报与 journal。
+# .83（2026-10-21）：R14 GUI 任务看板与 MCP/CLI 同口径——控制面在桌面断了一截。
+# ① brain_page 改用 brain.task_annotate：租约过期/无主/缺租约三种治理态直接上桌面
+# （此前只认「claimed_at 过期」，无主/缺租约看不见）；新增「文件锁 N」徽标，tooltip
+# 列出路径/持有者/剩余分钟，与 hub_tasks 行尾「锁 N」同一数据源。② 结构快照工具修两处
+# 自身缺陷：问候语（早上好/下午好/晚上好）未归一化，基线在 18:00 后必红；页面切换只等
+# 120ms，机器负载高时 playbook/signal 的 agent 下拉文案偶发缺失——改为等事件队列安静
+# （≤1.5s）并重建基线。③ GUI 回归新增文件锁徽标用例（挂锁任务显示、未挂锁不误标、
+# tooltip 含路径/持有者/剩余时间）。
+# .82（2026-10-21）：R13 过期租约安全回收——R12 的巡检能看见「过期未释放 N 条」，
+# 但清理只能靠后续 acquire 顺带标记；没人再碰同一路径，这些行就永久占台账（看得见、
+# 清不掉）。新增 brain.file_lease_prune：只回收 released_at='' 且 expires_at<=now 的行，
+# 标记 released_by='expiry'（不删除，fence 仍是迟到写入的对照凭据）；活跃租约永不触碰；
+# 单次上限 500、默认 200，重复调用幂等；回收动作写 journal。出口两处：
+# hub_lock action="prune"（MCP，走 dry_run/confirm 闸门）与 cli.py locks --prune --agent X
+# （headless）。回归：adv_brain 覆盖只清过期/不碰活跃/limit/幂等/审计；adv_mcp 覆盖
+# dry_run 不落库 + 无过期时的空操作文案；adv_cli 覆盖 --prune 接线与活跃租约保留。
+# .81（2026-10-21）：R12 文件租约可观测与 headless 闭环——租约有了，还要看得见、清得掉。
+# ① 新增 ops 检查项 lease_health：活跃租约互相冲突 / 任务绑定漂移（任务已完成或
+# 换主却没自动释放）/ 持有者未登记 一次点名；过期未释放只报数供清理、不判失败（它不拦人）。
+# 接进 PATROL_CHECKS + CHECK_FIXES，一键自检即覆盖。② CLI 增 locks/lock/unlock——
+# headless 场景（脚本/CI/无 MCP 客户端）不必再用 call hub_lock key=value 拼参；查占按路径、
+# 台账按项目/持有者，释放只能释放自己的。③ 回归：adv_ops 覆盖巡检四种形态（干净/过期不误报/
+# 漂移/冲突/未登记/清理转绿），adv_cli 覆盖 CLI 全链路（冲突非零退出/释放归属/任务完成自动释放）。
+# .80（2026-10-21）：R11 文件租约——任务租约防「撞任务」，文件租约防「撞文件」。
+# 多家 agent 同仓并行改同一文件是动态并行协作最高频的失败源（共享状态并发写入，第三方
+# 2026-10 统计占失败模式 33.2%）。新增 file_leases 表 + hub_lock（check/acquire/renew/
+# release/list）：路径规范化（Windows 大小写/分隔符统一）+ 祖先/子孙冲突（锁目录罩住其下
+# 全部文件）+ TTL 过期可接管 + fence 按路径单调递增（识别迟到写入）+ 任务绑定（须在办且
+# 本人持有）+ 生命周期联动（任务完成/释放/换人/被接管时自动释放）+ 心跳续租（只续挂在
+# 本人进行中任务上的锁，未挂任务的不续防死锁）+ 心跳「[文件租约]」他人持锁预警 +
+# 看板「锁 N」计数 + journal 全链路审计。咨询式：不拦写盘，只让后来者看见冲突先协调。
+# 外部依据：mcp_agent_mail Advisory File Lease（holder/intent/expires）、租约+fencing
+# token 的迟到写入防护、多 agent 同仓以 worktree/锁串行化写入的实践。
+# .78（2026-10-21）：hub_help 主题枚举改由 HELP_TOPICS 动态生成——.77 的 tasks 主题只进了
+# handler 未进 schema enum，客户端在调用前就按枚举拒掉；adv_mcp 加 enum==HELP_TOPICS 守卫。
+# 另：运行版本检测补内容指纹——部署 copy2 保留旧 mtime，只比时间会把「已换代码」误判成一致。
+# MCP 2024-11-05 initialize 的 instructions 字段：客户端握手即可拿到「开工/收工」最小作业规程，
+# 不必先读 74 个工具描述。只写主干与路由，细节仍由各工具描述/hub_help 承担（防两套口径漂移）。
+SERVER_INSTRUCTIONS = (
+    "AgentHub 是多个 agent 共享的大脑（记录/记忆/项目/体检）。开工先 hub_get_progress(limit=15) "
+    "对齐团队进度；查背景用 hub_memory_read(query=具体关键词) 或 hub_search，重要结论用 hub_get_record 精读。"
+    "收工必做三步：① hub_log_work(project, agent, content)，content 含目的/做了什么/验证结果/如何回滚；"
+    "② 有跨会话价值的知识 hub_memory_write(content, kind, tags)；③ hub_ops_run 自检。"
+    "旧记忆先 hub_memory_confirm(ids=[...]) 复核；两条记忆/记录裁决用 hub_memory_supersede(keep_id, drop_id, target=memory|record)。"
+    "工具不够用时 hub_search_tools(keyword=...) 搜全部（含 profile 藏起的），hub_call_tool(name, arguments) 直调。"
+    "改共享文件前 hub_lock(action=\"acquire\", path=..., agent=...) 占位，干完 release；冲突先协调。"
+    "写工具可先 dry_run=true 预演；需人工确认传 confirm=false。出错用 hub_report_error(title, detail, undo)。"
+)
+HELP_TOPICS = {
+    "start": (
+        "开工：hub_get_progress(limit=15) 看团队进度；hub_memory_read(query=\"项目名 具体词\") 查背景。",
+        "干活：hub_log_work(project, agent, content)——content 四段式：目的/做了什么/验证结果/如何回滚。",
+        "收工：hub_memory_write 沉淀跨会话知识（kind=fact/lesson/project/preference）；hub_ops_run 自检。",
+        "复核：旧记忆 hub_memory_confirm(ids=[...])；两条冲突 hub_memory_supersede(keep_id, drop_id)。",
+        "接任务：hub_tasks 看板 → hub_claim 认领 → hub_checkpoint 存进展（写入即续租）；详见 hub_help(topic=\"tasks\")。",
+        "CLI 等价：python cli.py --root <根目录> call hub_get_progress limit=15",
+    ),
+    "search": (
+        "检索带具体词：hub_search(keyword=\"备份 恢复\")；记忆用 hub_memory_read(query=\"项目名 组件名\")。",
+        "精读 top 结果：hub_get_record(kind=\"record\"|\"memory\", id=N)；0 命中换更短名词（中文长串自动 2-gram 放宽）。",
+        "检索质量回归：python tools/eval_search.py --root <冻结语料根>（MRR/Hit@1/3/5/耗时；--records 测记录侧）。",
+        "语义路只做 paraphrase 桥（字面词不存在时）；字面查找仍走 LIKE/BM25 精确契约。",
+    ),
+    "backup": (
+        "整包备份：hub_export(action=\"backup\")——一致性库快照（打包前先 quick_check）+ 项目文件树，单个 zip；先写临时文件再原子改名，失败不留半成品。",
+        "跳过项：构建/缓存/依赖/备份目录，单文件超 50MB（AGENTHUB_BACKUP_MAX_FILE_MB 可调）；zip 内 _AgentHub_备份清单.txt 列明跳过明细。",
+        "盘点：hub_export(action=\"backups\")；校验：hub_export(action=\"verify\", path=\"…\")——读清单 + 快照 quick_check，报告文件数与完整性。",
+        "清理：hub_export(action=\"prune\") 先预演；确认后 apply=true（保留最新 N 份 + 7 天内不动 + 主库不碰）。",
+        "等价 CLI：python cli.py backup-prune [--apply]。恢复步骤见 docs/运维手册.md「备份与恢复」。",
+    ),
+    "tasks": (
+        "认领：hub_claim(task_id, agent)——单条 UPDATE 原子抢单，前置依赖未完成会拒；同 owner 再认领=续租不重复写开工资锚点。",
+        "长任务：hub_checkpoint(action=\"save\", task_id, content) 存进展快照——在办任务只收持有者写入，写入即续租；被接管后旧持有者的迟到补写会被拒。",
+        "流转：hub_task_update(task_id, status=..., blocked_by=\"-\"/due=\"-\" 清除、priority、deps、detail)；完成会自动结晶；在办任务只有 owner（或空 agent 管理面）能改。",
+        "依赖：deps 用逗号分隔任务编号；前置未全部完成不进前沿、不可认领；自依赖/成环直接拒收并给出环路径，结构问题随 tasks_health 一起点名。",
+        "看板：hub_tasks / hub_next 行尾自动标注 截止/前置进度/不存在的前置/残留阻塞/租约状态；hub_agent(action=\"status\") 与 hub_list_agents 列出每人持有的在办任务。",
+        "追溯：hub_history(kind=\"task\", id=任务编号)——合并 journal 流转/检查点/任务卡关键时点，回答「这单一路上怎么变成现在这样」。",
+        "文件：改共享文件前 hub_lock(action=\"acquire\", path=..., task_id=...) 占位，干完 release；check 查占、list 台账。冲突含祖先/子孙目录（锁目录=罩住其下全部文件），TTL 到点可被接管；任务完成/释放/换人/被接管时，挂在其上的锁自动释放；过期未释放用 action=prune 一键回收（只标记释放，活跃不受影响）。",
+        "heartbeat 会续「挂在本人进行中任务上」的文件租约（未挂任务的不续，防忘释放死锁），并列出本项目他人持锁的文件。",
+        "headless：python cli.py tasks|next|claim|update|checkpoint|locks|lock|unlock（--root 指定根；与 MCP 共用同一状态机与渲染）。",
+        "治理：hub_ops_run(name=\"tasks_health\") 点名过期租约/无主/持有者失联/逾期/依赖异常；hub_ops_run(name=\"lease_health\") 点名文件租约冲突/任务绑定漂移/未登记持有者（过期未释放只报数）；确需接手再 hub_claim。",
+        "排查撞车：hub_heartbeat 会列出同项目他人持有的在办任务；先 hub_tasks 看详情，确需接手再 claim。",
+    ),
+    "recover": (
+        "工具全部消失/连不上：先 python cli.py status；再查 MCP 进程 stdout 污染（任何 print 都会毁掉 JSON-RPC），重启客户端。",
+        "部署了但没生效：hub_ops_run(name=\"runtime_health\") 点名落后文件；python cli.py deploy 后重启各 agent。",
+        "一键体检：python cli.py doctor 或 hub_sentry(action=\"report\")——每条问题附修复建议。",
+        "桌面 exe 是旧版：python cli.py release 比对构建清单/源码/桌面副本哈希；build.bat 重建。",
+    ),
+    "release": (
+        "1) 回归：python adv_brain.py && python adv_mcp.py && python adv_ops.py（全套用 hub_ops_run(name=\"regression\")）。",
+        "2) 部署：python cli.py deploy（稳定路径 ~/.agenthub/mcp_server）。",
+        "3) 打 exe：build.bat（自动 build-manifest start/finish + 复制 + release 自检）。",
+        "4) 发布校验：python cli.py release（产物 sha256/源码哈希/桌面副本三者一致才通过）。",
+        "5) 让其他 agent 生效：重启它们的 MCP 进程（旧进程跑旧代码）。",
+    ),
+}
 SUPPORTED_PROTOCOL_VERSIONS = ("2024-11-05",)  # P3-1 协商集合（dual-era：initialize 握手保留，任意版本回显）
 SERVER_PROFILE = "admin"     # P3-1 profile 切片：admin=全量 / worker=日常读写 / reader=最小只读
 DEFAULT_MAX_CHARS = 4000     # hub_* 结果默认字符预算；0=不截断；超出截断并在文末标注 + structuredContent
@@ -89,6 +304,98 @@ def _render_onboard(rep: dict, only_actionable: bool = False) -> str:
     return "\n".join(lines)
 
 
+def _lease_badge(task: dict) -> str:
+    state = task.get("_lease_state")
+    if state == "expired":
+        return "⚠租约过期"
+    if state == "unleased":
+        return "⚠租约缺失"
+    if state == "ownerless":
+        return "⚠无主"
+    left = task.get("_lease_left_h")
+    return f"租约剩 {left:g}h" if isinstance(left, (int, float)) else "租约有效"
+
+
+def _progress_badge(task: dict) -> str:
+    """R26：心跳在线但任务长时间无推进的徽章（与 tasks_health 同口径）。"""
+    if not task.get("_progress_stall"):
+        return ""
+    age = task.get("_progress_age_h")
+    return f"⚠进展停滞 {age:g}h" if isinstance(age, (int, float)) else "⚠进展停滞（无推进记录）"
+
+
+def _age_text(age, fallback: str = "—") -> str:
+    """小时数 → 「3.2h 前」；None/坏值返回 fallback，不把未知渲染成 0。"""
+    return f"{age:g}h 前" if isinstance(age, (int, float)) else fallback
+
+
+def _render_holdings(tasks: list, limit: int = 3, verbose: bool = False) -> str:
+    """在办任务一行摘要（hub_list_agents / hub_agent 共用）；无任务返回空串。
+
+    R27：默认带「最后推进」；verbose 再加检查点与心跳两个钟。心跳是 agent 级，
+    与任务推进不是一回事，标签里显式标注，避免读者把「有人在线」当成「活在走」。
+    """
+    if not tasks:
+        return ""
+    bits = []
+    for t in tasks[:limit]:
+        due = f"，截止 {t['due']}" if (t.get("due") or "").strip() else ""
+        badges = [_lease_badge(t)]
+        if t.get("_progress_stall"):
+            badges.append(_progress_badge(t))
+        else:
+            badges.append(f"推进 {_age_text(t.get('_progress_age_h'), '无记录')}")
+        if verbose:
+            badges.append(f"检查点 {_age_text(t.get('_last_cp_age_h'), '无记录')}")
+            badges.append(f"心跳 {_age_text(t.get('_heartbeat_age_h'), '无记录')}（agent）")
+        extra = "".join(f"，{b}" for b in badges if b)
+        bits.append(f"#{t['id']} {str(t.get('title') or '')[:18]}（{extra.lstrip('，')}{due}）")
+    more = f" 等共 {len(tasks)} 项" if len(tasks) > limit else ""
+    return f"在办 {len(tasks)} 项：" + "、".join(bits) + more
+
+
+def _due_badge(task: dict) -> str:
+    state = task.get("_due_state")
+    due = str(task.get("due") or "")[:10]
+    if state == "overdue":
+        return f"⚠逾期 {-task['_due_days']} 天（{due}）"
+    if state == "today":
+        return f"⚠今天到期（{due}）"
+    if state == "upcoming":
+        return f"截止 {due}（剩 {task['_due_days']} 天）"
+    if state == "invalid":
+        return f"截止 {due}（日期无法解析）"
+    return ""
+
+
+def _task_flags(task: dict, with_due: bool = True, with_lease: bool = True) -> str:
+    """任务行尾注解：租约 / 进展停滞 / 待办饥饿 / 截止 / 前置 / 阻塞。无内容返回空串。"""
+    bits = []
+    if with_lease and task.get("_lease_state"):
+        bits.append(_lease_badge(task))
+    if _progress_badge(task):
+        bits.append(_progress_badge(task))
+    if task.get("_starve_days") is not None:
+        bits.append(f"⌛待办饥饿 {task['_starve_days']:g} 天")
+    if with_due and _due_badge(task):
+        bits.append(_due_badge(task))
+    deps = task.get("_deps_info") or []
+    if deps:
+        missing = [d for d in deps if d["status"] == "missing"]
+        if missing:
+            bits.append("⚠前置不存在 " + "、".join(f"#{d['id']}" for d in missing))
+        else:
+            done_n = sum(1 for d in deps if d["status"] == "done")
+            if done_n < len(deps):
+                bits.append(f"前置 {done_n}/{len(deps)} 完成")
+    if task.get("_block_note"):
+        bits.append("阻塞：" + str(task["_block_note"])[:30])
+    locks = int(task.get("_locks") or 0)
+    if locks:
+        bits.append(f"锁 {locks}")
+    return "（" + "；".join(bits) + "）" if bits else ""
+
+
 def _runtime_warn() -> str:
     """当前进程落后于磁盘文件时的一句话告警（正常时为空串）。
     部署后不重启 MCP，调用方看到的仍是旧工具/旧行为——比「没部署」更难排查。"""
@@ -96,8 +403,10 @@ def _runtime_warn() -> str:
     if not (info["known"] and info["count"]):
         return ""
     top = info["stale"][0]
-    return (f"⚠ 当前 MCP 进程运行的是旧代码：启动 {info['started'][5:16]} 后磁盘有 "
-            f"{info['count']} 个文件更新（最近 {top['file']} {top['mtime'][5:16]}）——"
+    when = f" {top['mtime'][5:16]}" if top.get("mtime") else ""
+    what = "内容已变化" if info.get("basis") == "content" else "文件已更新"
+    return (f"⚠ 当前 MCP 进程运行的是旧代码：启动 {info['started'][5:16]} 后磁盘代码{what}"
+            f"（{info['count']} 个文件，最近 {top['file']}{when}）——"
             "重启该 agent 的会话/客户端后新代码才生效")
 
 
@@ -106,6 +415,61 @@ def _conflict_warn(active: list) -> str:
         return ""
     others = "、".join(f"{s.get('agent')}（{s.get('note') or '工作中'}，{s.get('ts', '')}）" for s in active)
     return f"\n⚠ 撞车预警：同项目还有其他活跃会话：{others}，注意分工避让"
+
+
+def _edit_distance(a: str, b: str) -> int:
+    """字符级 Levenshtein（项目名短，DP 足够；中文按字比较）。"""
+    if len(a) < len(b):
+        a, b = b, a
+    prev = list(range(len(b) + 1))
+    for i, ca in enumerate(a, 1):
+        cur = [i]
+        for j, cb in enumerate(b, 1):
+            cur.append(min(prev[j] + 1, cur[j - 1] + 1,
+                           prev[j - 1] + (ca != cb)))
+        prev = cur
+    return prev[-1]
+
+
+def _similar_project_names(pname: str, names: list, n: int = 3) -> list:
+    """找高度相像的项目名：短名容 2 字差、长名容 3 字差，或相似度 ≥0.8。
+
+    空列表必须显式短路：`min(len(pname), *())` 会退化成 `min(int)` 抛 TypeError，
+    而这是「空库首次写入」的常态路径（R28 自测漏网，GUI 回归当场抓到）。
+    """
+    if not names:
+        return []
+    limit = 2 if min(len(pname), *(len(x) for x in names)) <= 10 else 3
+    scored = []
+    for name in names:
+        d = _edit_distance(pname, name)
+        r = difflib.SequenceMatcher(None, pname, name).ratio()
+        if d <= limit or r >= 0.8:
+            scored.append((r, -d, name))
+    scored.sort(reverse=True)
+    return [x[2] for x in scored[:n]]
+
+
+def _new_project_hint(root: str, pname: str) -> str:
+    """首次写入某项目名时提示「新建 + 相近项目」，防手滑拼错把记录劈成两个项目。
+
+    fail-open：只提示不阻断——新项目是合法操作，阻断会伤正常开工；拼错时
+    hub_undo 一步可撤。相似度按字符编辑距离判（短名 2 字差），中文错字抓得住。
+    """
+    try:
+        if brain.project_exists(root, pname):
+            return ""
+        names = brain.project_names(root)
+        close = _similar_project_names(pname, names)
+    except Exception:  # noqa: BLE001  提示失败绝不阻断写入（比对也要在闸内）
+        return ""
+    hint = f"\n⚠ 项目「{pname}」在大脑中首次出现（已自动登记）"
+    if close:
+        hint += (f"；相近项目：{'、'.join(close)}——若是拼写偏差，"
+                 "hub_undo 撤销本条后改用准确项目名重写")
+    else:
+        hint += "；若是新建项目属正常，拼错则 hub_undo 可撤销本条"
+    return hint
 
 
 def _check_content(content: str, what: str) -> str:
@@ -125,6 +489,9 @@ def _check_content(content: str, what: str) -> str:
 # 现在身份在**启动那一刻**由接入配置写死（--agent zcode），此后所有工具调用
 # 一律以它为准，调用参数里的 agent 只作交叉校验、不再参与判定。
 SERVER_AGENT = ""
+# initialize 握手自报的客户端名（低信任兜底，见 _caller_identity）。
+# 每次客户端启动 server 都会握手，因此是进程级常量；没有它时旧调用只能记空归属。
+CLIENT_NAME = ""
 # 交叉校验留痕节流：同类不一致每进程只记一次（避免刷爆 journal）
 _MISMATCH_SEEN: set = set()
 # 只读筛选参数白名单：这些工具的 agent 参数是"查别人"用，**不下发**（保持原语义）。
@@ -146,23 +513,35 @@ def apply_server_agent(tname: str, arguments: dict, root: str) -> dict:
     """把进程锁定的身份下发到本次调用（B2 单点派生）。
 
     一处覆盖全部 agent 消费点——不必逐个工具改，新工具自动受益。
-    无 SERVER_AGENT（旧接入条目/手工调用）时原样返回，退回调用参数语义（兼容）。
+    无 SERVER_AGENT（旧接入条目/手工调用）时退回客户端自报身份（已注册才用），
+    再退回调用参数语义（兼容）。
     自报值与锁定值不符时留一条 journal（B3b 运行期交叉校验）。
     """
-    if not SERVER_AGENT or tname in _AGENT_FILTER_TOOLS:
+    if tname in _AGENT_FILTER_TOOLS:
         return arguments
-    called = str(arguments.get("agent", "") or "").strip()
-    if called and brain._norm_agent(called) != SERVER_AGENT and root:
-        key = (called.lower(), SERVER_AGENT)
-        if key not in _MISMATCH_SEEN:
-            _MISMATCH_SEEN.add(key)
-            try:
-                core.journal(root, SERVER_AGENT, "agent_mismatch", f"mcp:{tname}",
-                             note=f"调用参数自称 {called}，以启动参数 {SERVER_AGENT} 为准")
-            except Exception:  # noqa: BLE001 留痕失败不影响主流程
-                pass
     out = dict(arguments)  # 不改调用方原对象
-    out["agent"] = SERVER_AGENT
+    if SERVER_AGENT:
+        called = str(out.get("agent", "") or "").strip()
+        if called and brain._norm_agent(called) != SERVER_AGENT and root:
+            key = (called.lower(), SERVER_AGENT)
+            if key not in _MISMATCH_SEEN:
+                _MISMATCH_SEEN.add(key)
+                try:
+                    core.journal(root, SERVER_AGENT, "agent_mismatch", f"mcp:{tname}",
+                                 note=f"调用参数自称 {called}，以启动参数 {SERVER_AGENT} 为准")
+                except Exception:  # noqa: BLE001 留痕失败不影响主流程
+                    pass
+        out["agent"] = SERVER_AGENT
+        return out
+    # 无 --agent 锁定时用 initialize 的 clientInfo 补写归属，否则记录/记忆/任务
+    # 会写成一堆 unknown（R28 实测 417 条调用日志空归属同源）。只补**已注册**名：
+    # 陌生客户端（如 Cursor）不能因为这里注入而被 check_agent 拒收，保持 unknown 放行。
+    if not str(out.get("agent") or "").strip() and CLIENT_NAME:
+        try:
+            if CLIENT_NAME in core.agent_known_names(root):
+                out["agent"] = CLIENT_NAME
+        except Exception:  # noqa: BLE001 身份推断失败按原路径走，绝不拦截写入
+            pass
     return out
 
 
@@ -194,6 +573,24 @@ def _guess_agent(root: str) -> str:
     except Exception:  # noqa: BLE001
         pass
     return ""
+
+
+def _caller_identity(args: dict, tool: str = "") -> str:
+    """调用者是谁：进程锁定身份 > 写工具显式自报 > initialize 客户端名。
+
+    为什么不能直接用 args.agent：hub_agent/hub_tasks/hub_usage_timeline 等筛选类
+    工具的 agent 参数语义是「查谁」，不是「我是谁」——拿它记调用者会把 qoder 查
+    workbuddy 记成 workbuddy 调用（控制面归因错位）。
+    信任层级：--agent 是操作者设定（高）；写工具的 agent 是模型自报（中）；
+    clientInfo 是客户端自报（低，但比 417 条空归属强：至少知道哪个客户端在用）。
+    """
+    if SERVER_AGENT:
+        return SERVER_AGENT
+    if tool not in _AGENT_FILTER_TOOLS:
+        explicit = str(args.get("agent") or "").strip()
+        if explicit:
+            return brain._norm_agent(explicit)
+    return CLIENT_NAME
 
 
 def _auto_title(content: str, date: str, agent: str) -> str:
@@ -256,19 +653,27 @@ def _idem_fields(tool: str, arguments: dict) -> dict:
 
 
 def _idem_precheck(root: str, tool: str, arguments: dict, agent: str):
-    """写前查幂等键。返回 None=放行；返回 str=直接回给调用方（重放结果或冲突错误）。"""
+    """写前原子占位。返回 None=抢到占位可执行；返回 str=直接回给调用方（重放/冲突/处理中）。
+
+    占位（brain.idem_begin）与写结果（brain.idem_store）分开：检查与占位必须原子，
+    否则两个并发重试都能读到「未见」再各写一次——与文件租约 R15 修的是同型竞态。"""
     key = str(arguments.get("idem_key") or "").strip()
     if not key:
         return None
     if len(key) > 64:
         return "错误：idem_key 过长（≤64 字符）——它是去重标识不是载荷"
     digest = brain.idem_digest(_idem_fields(tool, arguments))
-    hit = brain.idem_lookup(root, agent, key, digest)
-    if hit == "conflict":
+    state, payload = brain.idem_begin(root, agent, key, digest, tool)
+    if state == "conflict":
         return (f"错误：幂等键 {key!r} 已被本 agent 用于**不同内容**的写入（防键复用）——"
                 "重试请携原内容，新写入请换新键")
-    if hit:
-        return hit + "\n（幂等重放：首次结果原样返回，未重复执行）"
+    if state == "replay":
+        return payload + "\n（幂等重放：首次结果原样返回，未重复执行）"
+    if state == "pending":
+        return (f"同一幂等键 {key!r} 的写入正在处理中，本次未重复执行——"
+                "稍后用同一键重试可拿到首次结果（不要换键）")
+    if state == "busy":
+        return "错误：" + payload
     return None
 
 
@@ -330,6 +735,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     # ---- P3-1 协议 / 发现 / 审计 / 索引维护（不受 profile 藏起影响，可直接调用）----
 
     if name == "hub_help":
+        topic = str(arguments.get("topic", "")).strip().lower()
+        if topic:
+            body = HELP_TOPICS.get(topic)
+            if not body:
+                return (f"错误：未知主题 {topic!r}；可选：{'、'.join(HELP_TOPICS)}"
+                        "（不带 topic 看完整工具清单）")
+            return f"hub_help · {topic}（详细步骤：docs/运维手册.md）\n" + "\n".join(body)
         vis = visible_tools()
         lines = [f"AgentHub MCP v{SERVER_INFO['version']} —— profile={SERVER_PROFILE}",
                  f"可见工具 {len(vis)}/{len(TOOLS)}（profile 只影响 tools/list 可见面；"
@@ -340,7 +752,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                   "① 发现：hub_search_tools(关键词) 搜全部工具（含藏起）；hub_call_tool(name, arguments) 调任意工具",
                   "② 预演：写工具加 dry_run=true——先看将要写什么，不落库",
                   "③ 确认：写工具传 confirm=false → 返回 input_required（return-and-resume，服务端不阻塞）",
-                  f"④ 预算：结果超 max_chars（默认 {DEFAULT_MAX_CHARS}）截断并标注，完整内容在 structuredContent"]
+                  f"④ 预算：结果超 max_chars（默认 {DEFAULT_MAX_CHARS}）截断并标注，完整内容在 structuredContent",
+                  "", f"场景帮助：hub_help(topic=…)——可选 {'、'.join(HELP_TOPICS)}"]
         return "\n".join(lines)
 
     if name == "hub_search_tools":
@@ -423,6 +836,13 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 lines.append("按工具：" + "，".join(f"{r['tool']}×{r['n']}" for r in st["by_tool"][:12]))
             if st["by_agent"]:
                 lines.append("按 agent：" + "，".join(f"{r['agent'] or '?'}×{r['n']}" for r in st["by_agent"][:12]))
+            att = st.get("attribution") or {}
+            if att.get("total"):
+                line = f"归属覆盖：有主 {att['named']} · 空 {att['empty']}"
+                if att["empty"]:
+                    line += (f"（{att['empty_pct']}%；空归属先查客户端是否锁定 --agent、"
+                             "旧进程是否已重启，历史空行不回溯）")
+                lines.append(line)
             if st["last_seen"]:
                 fresh = sorted(st["last_seen"].items(), key=lambda kv: kv[1], reverse=True)[:8]
                 lines.append("最近露面：" + "，".join(f"{k}({v[5:16].replace('T', ' ')})" for k, v in fresh))
@@ -473,14 +893,26 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                     str(arguments.get("agent", "")))
         if err:
             return "错误：" + err
-        return (f"认领成功：任务 #{row['id']} [{brain.TASK_CN.get(row['status'], row['status'])}] "
+        if row.get("_renewed"):
+            renew = f"续期成功：租约重置为 {brain.CLAIM_TTL_HOURS}h"
+        elif row.get("_takeover"):
+            renew = f"{row['_takeover']}成功"
+        else:
+            renew = "认领成功"
+        return (f"{renew}：任务 #{row['id']} [{brain.TASK_CN.get(row['status'], row['status'])}] "
                 f"{row['title'][:60]} —— owner={row['owner']}"
-                f"（超 {brain.CLAIM_TTL_HOURS}h 未更新自动可被接管）")
+                f"（超 {brain.CLAIM_TTL_HOURS}h 无心跳/更新才可被接管）")
 
     if name == "hub_task_update":
-        ok, due_s = _norm_date(arguments.get("due"), "due")
-        if not ok:
-            return due_s
+        # due="-" 是「清除截止日」的哨兵，必须先于日期校验放行；否则文档承诺的清除路径
+        # 会被 _norm_date 当成非法日期拒掉（2026-10-21 审计发现）。
+        due_raw = str(arguments.get("due", "") or "").strip()
+        if due_raw == "-":
+            due_s = "-"
+        else:
+            ok, due_s = _norm_date(arguments.get("due"), "due")
+            if not ok:
+                return due_s
         err, row = brain.task_update(root, arguments.get("task_id"),
                                      status=str(arguments.get("status", "")),
                                      agent=str(arguments.get("agent", "")),
@@ -508,16 +940,15 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                                limit=lim)
         if not rows:
             return "暂无任务（hub_task_add 新建；状态 pending/in_progress/blocked/done）"
+        brain.task_annotate(root, rows)
         lines = [f"任务 {len(rows)} 条（进行中→阻塞→待办→完成 排序）："]
         for t in rows:
             who = f" @{t['owner']}" if t["owner"] else ""
-            blk = (f" 等待:{t['blocked_by'][:30]}"
-                   if t["status"] == "blocked" and t["blocked_by"] else "")
             proj = f"{t['project']}｜" if t["project"] else ""
             pri = t.get("priority")
             pri = brain.DEFAULT_PRIORITY if pri is None else int(pri)
             lines.append(f"- #{t['id']} [{brain.TASK_CN.get(t['status'], t['status'])}][P{pri}]"
-                         f"{who}{blk} {proj}{t['title'][:60]}")
+                         f"{who} {proj}{t['title'][:60]}{_task_flags(t)}")
         lines.append("（下一步推荐：hub_next；认领：hub_claim）")
         return "\n".join(lines)
 
@@ -528,35 +959,51 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lim = 5
         res = brain.task_next(root, project=str(arguments.get("project", "")),
                               owner=str(arguments.get("agent", "")), limit=lim)
+        brain.task_annotate(root, res["ready"] + res["doing"] + res["takeover"] + res["waiting"])
         c = res["counts"]
         if not any(c.values()):
             return ("前沿队列为空（没有待办/在办任务）。\n"
                     "不知道从哪下手时：hub_list_todos 看待办线索，hub_list_projects 看停滞项目。")
         lines = [f"下一步推荐（前沿队列：依赖已满足、可直接认领）共 {c['ready']} 条："]
+        try:
+            starve = brain.task_starvation(root, limit=3)
+        except Exception:  # noqa: BLE001  饥饿统计失败不拖垮前沿队列
+            starve = {"counts": {"starving": 0}, "starving": [], "window_days": brain.TASK_STARVE_DAYS}
+        if starve["counts"]["starving"]:
+            sample = "；".join(f"#{t['id']} {t['title'][:20]}（{t['_age_days']:g} 天）"
+                               for t in starve["starving"])
+            lines.append(f"⌛ 待办饥饿 {starve['counts']['starving']} 条（能开工却 ≥"
+                         f"{starve['window_days']:g} 天无人认领）：{sample}。"
+                         "先判断还该不该做：认领 hub_claim，或改优先级/关单 hub_task_update。")
         for i, t in enumerate(res["ready"], 1):
             proj = f"{t['project']}｜" if t["project"] else ""
-            due = f"（截止 {(t.get('due') or '')[:10]}）" if (t.get("due") or "").strip() else ""
-            lines.append(f"{i}. #{t['id']} [P{t['_priority']}] {proj}{t['title'][:60]}{due}")
+            lines.append(f"{i}. #{t['id']} [P{t['_priority']}] {proj}{t['title'][:60]}"
+                         f"{_task_flags(t)}")
         if res["doing"]:
             items = "；".join(
                 f"#{t['id']}[P{t['_priority']}]@{t['owner'] or '-'} {t['title'][:28]}"
+                f"{_task_flags(t)}"
                 for t in res["doing"][:4])
             lines.append(f"进行中 {c['doing']} 条：{items}")
         if res["takeover"]:
             items = "；".join(
-                f"#{t['id']}@{t['owner'] or '-'} {t['title'][:28]}" for t in res["takeover"][:3])
-            lines.append(f"可接管（超 {brain.CLAIM_TTL_HOURS}h 未更新）：{items}")
+                f"#{t['id']}@{t['owner'] or '-'} {t['title'][:28]}"
+                f"（{t.get('_takeover') or '租约过期'}）{_task_flags(t, with_lease=False)}"
+                for t in res["takeover"][:3])
+            lines.append(f"可接管（无主/租约缺失/超 {brain.CLAIM_TTL_HOURS}h 未更新）：{items}")
         if res["waiting"]:
             lines.append(f"等待中 {c['waiting']} 条：")
             for t in res["waiting"][:4]:
                 w = t.get("_wait") or []
                 if w:
                     why = "前置未完成：等 " + "、".join(
-                        f"#{x['id']}（{brain.TASK_CN.get(x['status'], x['status'])}）"
+                        f"#{x['id']}（{'不存在' if x['status'] == 'missing' else brain.TASK_CN.get(x['status'], x['status'])}）"
                         for x in w[:3])
                 else:
                     why = f"阻塞：{(t.get('blocked_by') or '见详情')[:30]}"
-                lines.append(f"  - #{t['id']} [P{t['_priority']}] {t['title'][:40]} —— {why}")
+                due = _due_badge(t)
+                lines.append(f"  - #{t['id']} [P{t['_priority']}] {t['title'][:40]} —— {why}"
+                             + (f"；{due}" if due else ""))
         lines.append("（认领开干：hub_claim；全部任务：hub_tasks；任务完成会自动结晶）")
         return "\n".join(lines)
 
@@ -674,6 +1121,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         pre = _idem_precheck(root, "hub_log_work", arguments, agent)
         if pre:
             return pre
+        new_hint = _new_project_hint(root, pname)
         rec_id = brain.add_record(root, pname, agent, date, _auto_title(content, date, agent), content,
                                   context=ctx, options=opts, decision=dec, tradeoffs=tro,
                                   record_type=rt,
@@ -681,7 +1129,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         core.journal(root, agent, "log_work", f"brain:records#{rec_id}", note=f"{date}（{agent}）")
         herr, active = brain.heartbeat_touch(root, agent, pname)
         warn = _conflict_warn(active)
-        out = f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}{_template_nudge(content, rt)}"
+        out = (f"已记入大脑（records#{rec_id}，项目 {pname}）{warn}"
+               f"{_template_nudge(content, rt)}{new_hint}")
         # 写入时踩坑拦截：新记录与库内 lesson/fact 相似 → 当场弹出核对
         # （"大脑拦住重复踩坑"的落地时机——比开工推送更贴近踩坑瞬间）
         try:
@@ -999,18 +1448,33 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         # D5 出口（R9）：ghost 检测说「这两条多版本共存、没人裁决」，本工具负责把裁决
         # 落进取代链。**刻意不判断谁对**——那是调用方（agent/用户）的判断；系统只提供
         # 确定性建议（ops ghost_memory 的「建议留 X、退 Y」），执行权在人手里。
+        # v2.40.76：target=record 把同一条出口接到工作记录上（ghost_memory 检查项
+        # 同样会报「高相似记录对」，此前只报不裁、没有执行路径）。
         def _pos_int(v):
             try:
                 return int(v)
             except (TypeError, ValueError):
                 return 0
 
+        target = str(arguments.get("target", "memory") or "memory").strip().lower()
+        if target not in ("memory", "record"):
+            return f"错误：target 只能是 memory / record（收到 {target!r}）"
         keep_id = _pos_int(arguments.get("keep_id"))
         drop_id = _pos_int(arguments.get("drop_id"))
         if keep_id <= 0 or drop_id <= 0:
-            return "错误：keep_id / drop_id 必须是正整数记忆 id"
+            noun = "记录" if target == "record" else "记忆"
+            return f"错误：keep_id / drop_id 必须是正整数{noun} id"
         if keep_id == drop_id:
-            return "错误：keep_id 与 drop_id 相同（一条记忆不能自己取代自己）"
+            return "错误：keep_id 与 drop_id 相同（一条不能自己取代自己）"
+        if target == "record":
+            err = brain.supersede_record(root, drop_id, keep_id)
+            if err:
+                return f"错误：{err}"
+            core.journal(root, _guess_agent(root), "record_supersede",
+                         f"brain:records#{keep_id}", note=f"取代 #{drop_id}")
+            return (f"已裁决：记录 #{keep_id} 为现行，#{drop_id} 退出检索与时间线"
+                    f"（正文与双链保留，可经 hub_get_record 按 id 追溯）。"
+                    f"撤销用 target=\"record\" 把 keep_id/drop_id 互换再裁一次。")
         err = brain.supersede_memory(root, drop_id, keep_id)
         if err:
             return f"错误：{err}"
@@ -1073,12 +1537,63 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         agent = str(arguments.get("agent", "")).strip()
         project = str(arguments.get("project", "")).strip()
         note = str(arguments.get("note", "")).strip()
-        # 免推判定须在心跳写入前读旧会话（heartbeat_touch 会重建 sessions）
+        # 免推判定须在心跳写入前读旧会话（heartbeat_touch 会更新 sessions）
         push = brain.should_push(root, agent, project)
         err, active = brain.heartbeat_touch(root, agent, project, note)
         if err:
             return f"错误：{err}"
+        # R11：心跳顺手续「挂在本人进行中任务上」的文件租约（未挂任务的不续，防死锁）
+        try:
+            renewed_locks = brain.file_lease_renew_for_agent(root, agent)
+        except Exception:  # noqa: BLE001
+            renewed_locks = 0
         out = ("心跳已更新" + _conflict_warn(active)) if active else "心跳已更新（同项目无其他活跃会话）"
+        if renewed_locks:
+            out += f"（自动续文件租约 {renewed_locks} 把）"
+        # 任务级撞车预警（R6）：会话活跃只看 5 分钟，任务租约看 2 小时——
+        # 别人认领了任务但短暂离线时，新开工的 agent 仍要知道「这件事有人在办」。
+        if project:
+            try:
+                cutoff = (datetime.datetime.now() - datetime.timedelta(
+                    hours=brain.CLAIM_TTL_HOURS)).isoformat(timespec="seconds")
+                others = [t for t in brain.task_list(
+                    root, status="in_progress", project=project)
+                    if (t["owner"] or "").strip().lower() != agent.lower()]
+            except Exception:  # noqa: BLE001
+                others = []
+            if others:
+                warn = [out, "", f"[任务预警] 项目「{project}」有 {len(others)} 项在办（他人持有）："]
+                for t in others[:5]:
+                    owner_s = (t["owner"] or "").strip()
+                    lease_s = (t["claimed_at"] or "").strip()
+                    if not owner_s:
+                        flag = " ⚠无主可接管"
+                    elif not lease_s:
+                        flag = " ⚠租约缺失可接管"
+                    elif lease_s < cutoff:
+                        flag = " ⚠租约过期可接管"
+                    else:
+                        flag = ""
+                    warn.append(f" · #{t['id']} {t['owner'] or '无主'}：{t['title'][:40]}"
+                                f"（{(t['claimed_at'] or '未记录认领时间')[:16]}）{flag}")
+                warn.append("先 hub_tasks 看详情；同一件事别重复做，确需接手用 hub_claim。")
+                out = "\n".join(warn)
+        # R11 文件级撞车预警：任务租约防「撞任务」，文件租约防「撞文件」——
+        # 多家同仓并行时，共享文件被并发改写是最高频的隐性失败源。只在他人持锁时提示。
+        if project:
+            try:
+                fl = brain.file_lease_project_active(root, project, exclude_agent=agent, limit=5)
+            except Exception:  # noqa: BLE001
+                fl = []
+            if fl:
+                wl = ["", f"[文件租约] 项目「{project}」有 {len(fl)} 个文件正被其他 agent 持有："]
+                for l in fl:
+                    task_s = f"｜任务 #{l['task_id']}" if l["task_id"] else ""
+                    reason_s = f"｜{l['reason'][:40]}" if l["reason"] else ""
+                    wl.append(f" · {l['display_path']} @{l['owner']}"
+                              f"（剩 {l['_left_min']} 分钟{task_s}{reason_s}）")
+                wl.append("改共享文件前先 hub_lock action=check/acquire；冲突先协调，别并发编辑。")
+                out = out + "\n".join(wl)
         # 大脑推送（反射弧）：开工即唤起该项目相关+置顶记忆，不靠 agent 自觉查询；
         # 免推窗口内的重复心跳不重推（内容还在会话上下文里），推送异常降级登记错误不打断心跳
         if push:
@@ -1223,6 +1738,10 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                 al.append(f"  {mark} #{f['id']} {f['name']}：{(f.get('text') or '')[:90]}")
             al.append("  管理：hub_trigger action=list/fire/enable/disable")
             out = out + "\n".join(al)
+        # R11：运行版本告警放最顶——「部署了但进程还是旧代码」比旧行为本身更难排查。
+        rw = _runtime_warn()
+        if rw:
+            out = rw + "\n" + out
         return out
 
     if name == "hub_trigger":
@@ -1330,12 +1849,22 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
     if name == "hub_archive_project":
         agent = str(arguments.get("agent", "unknown")).strip() or "unknown"
         pname = str(arguments.get("project", "")).strip()
+        restore = str(arguments.get("restore", "")).strip().lower() in ("1", "true", "yes", "on")
+        if restore:
+            err = brain.restore_project(root, pname, agent)
+            if err.startswith(("未找到", "project", "项目未归档", "未恢复")):
+                return f"错误：{err}"
+            core.journal(root, agent, "restore_project", pname, note=err)
+            if err:
+                return f"警告：{err}"
+            return (f"项目已恢复：{pname}（状态=active，目录已移回根目录；"
+                    f"下一步可用 hub_task_add 写下继续做的事）")
         err = brain.archive_project(root, pname, agent)
         if err:
             return f"错误：{err}" if err.startswith(("未找到", "project")) else f"警告：{err}"
         core.journal(root, agent, "archive_project", pname)
         return (f"项目已归档：{pname}（状态=archived，目录已移入 99_Archive\\；"
-                f"回滚=目录移回 + 状态改回 active）")
+                f"回滚=hub_archive_project project=\"{pname}\" restore=true）")
 
     if name == "hub_list_skills":
         want = str(arguments.get("agent", "")).strip().lower()
@@ -1447,14 +1976,26 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
                     '例：hub_agent(action="status", agent="Qoder")')
         rep = ops.agent_onboard_status(root, want)
         out = _render_onboard(rep, only_actionable=(action == "plan"))
+        if action == "status":
+            _hold = brain.task_holdings(root)
+            _held = (_hold.get((want or "").strip().lower())
+                     or _hold.get(rep["key"] or "") or [])
+            if _held:
+                out += "\n" + _render_holdings(_held, verbose=True)
         if action == "verify":
             note = str(arguments.get("note", "") or "").strip()[:500]
-            err = brain.onboarding_save(root, rep["key"] or want, rep["ok"], rep["steps"], note)
+            # 绑「此刻在跑的代码」而非磁盘现状：部署后没重启时磁盘已新、进程仍旧，
+            # 快照必须记旧指纹，ops 才能对「拿旧代码验出的接入结论」报过期。
+            fp = core.SERVER_FINGERPRINT or core.file_fingerprints(core.SERVER_DIR)
+            err = brain.onboarding_save(root, rep["key"] or want, rep["ok"], rep["steps"], note,
+                                        fingerprint=fp, base=core.SERVER_DIR)
             if err:
                 return f"错误：{err}\n{out}"
             core.journal(root, SERVER_AGENT or rep["key"] or want, "agent_onboard_verify",
-                         rep["agent"], note=f"ok={rep['ok']} fail={rep['counts']['fail']}")
-            out += (f"\n已写验证快照：{rep['agent']}（{'通过' if rep['ok'] else '未通过'}）"
+                         rep["agent"],
+                         note=f"ok={rep['ok']} fail={rep['counts']['fail']} files={len(fp)}")
+            out += (f"\n已写验证快照：{rep['agent']}（{'通过' if rep['ok'] else '未通过'}"
+                    f"{f'，绑定 {len(fp)} 个源码文件指纹（代码树 {core.SERVER_DIR}）' if fp else '，未取得代码指纹'}）"
                     f"；复查：hub_agent(action=\"status\", agent=\"{rep['agent']}\")")
         return out
 
@@ -1481,11 +2022,18 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         rows = brain.list_agents(root)
         if not rows:
             return "注册表为空（agent 首次心跳/写记录时自动登记）"
+        hold = brain.task_holdings(root)
         lines = ["注册 agent（在线 = 心跳存活）："]
         for r in rows:
             mark = "[在线]" if r["online"] else "[离线]"
+            held = hold.get((r["name"] or "").strip().lower(), [])
+            extra = f" · {_render_holdings(held)}" if held else ""
             lines.append(f"- {r['name']}  {mark}  记录{r['records']} · 心跳{r['heartbeats']} · "
-                         f"最近项目:{r['last_project'] or '无'} · 最近活跃:{r['last_seen'] or '无'}")
+                         f"最近项目:{r['last_project'] or '无'} · 最近活跃:{r['last_seen'] or '无'}{extra}")
+        orphan = hold.get("", [])
+        if orphan:
+            lines.append("⚠ 无主在办（可接管）：" + "、".join(
+                f"#{t['id']} {str(t['title'] or '')[:18]}" for t in orphan[:5]))
         return "\n".join(lines)
 
     if name == "hub_list_todos":
@@ -1583,6 +2131,11 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         if not rec:
             return f"未找到记录 #{rid}"
         tag = "" if rec["status"] == "active" else f"（status={rec['status']}，已软删/撤销）"
+        sup = int(rec.get("superseded_by") or 0)
+        if sup > 0:
+            tag += f"（已被 #{sup} 取代，仅存档可读；检索/时间线不再返回）"
+        elif sup < 0:
+            tag += "（已作废，无继任版本；仅存档可读）"
         lv = f" · level={level}" if level != "full" else ""
         return (f"records#{rec['id']} [{rec['date']} {rec['agent']}·{rec['project']}]{tag}{lv}\n"
                 f"标题：{rec['title']}\n\n{rec['content']}")
@@ -1770,7 +2323,8 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             if not cid:
                 return f"错误：{tip}"
             return (f"检查点已存 #{cid}\n"
-                    "长任务建议每完成一小步就存一条——断点续跑/换人接手不用从零翻记录")
+                    "长任务建议每完成一小步就存一条——断点续跑/换人接手不用从零翻记录"
+                    "（在办任务写入即续租，2h 租约不会被误判失联）")
         if action == "list":
             if not tid:
                 return ("错误：查看检查点时间线需要 task_id"
@@ -1792,7 +2346,108 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             return f"任务 #{tid} 最新检查点（{cp['ts'][5:16]} {cp['agent']}）：{cp['content']}"
         return f"错误：action 只支持 save/list/latest（收到 {action!r}）"
 
+    if name == "hub_lock":
+        action = str(arguments.get("action", "check") or "check").strip()
+        agent = str(arguments.get("agent", "") or "").strip()
+        path = str(arguments.get("path", "") or "").strip()
+        if action == "check":
+            if not path:
+                return "错误：check 需要 path（文件或目录，可写根内相对路径或绝对路径）"
+            res = brain.file_lease_check(root, path)
+            if res.get("error"):
+                return "错误：" + res["error"]
+            if res["free"]:
+                return (f"空闲：{res['display_path']} 当前无人持有"
+                        "（改共享文件前建议先 hub_lock action=acquire）")
+            lines = [f"被占用：{res['display_path']}（{len(res['holders'])} 条相关租约）："]
+            for h in res["holders"]:
+                task = f"｜任务 #{h['task_id']}" if h["task_id"] else ""
+                reason = f"｜{h['reason'][:60]}" if h["reason"] else ""
+                lines.append(f"- 租约 #{h['id']} @{h['owner']} 持有，剩 {h['_left_min']} 分钟"
+                             f"（fence {h['fence']}{task}{reason}）")
+            lines.append("不要并发编辑：先 hub_signal_send 协调、改走别的文件，或等租约过期。")
+            return "\n".join(lines)
+        if action == "acquire":
+            if not path:
+                return "错误：acquire 需要 path（文件或目录）"
+            err, row = brain.file_lease_acquire(
+                root, path, agent, task_id=arguments.get("task_id"),
+                ttl_min=arguments.get("ttl_min", brain.FILE_LEASE_TTL_MIN),
+                reason=str(arguments.get("reason", "") or ""),
+                project=str(arguments.get("project", "") or ""))
+            if err:
+                return "错误：" + err
+            verb = "续租" if row.get("_renewed") else "已获取"
+            task = f"｜任务 #{row['task_id']}" if row["task_id"] else ""
+            return (f"文件租约{verb}：#{row['id']} {row['display_path']}"
+                    f"（@{row['owner']}，剩 {row['_left_min']} 分钟，fence {row['fence']}{task}）\n"
+                    "改完 hub_lock action=release；挂任务的锁在任务完成/被接管时自动释放。")
+        if action == "renew":
+            err, row = brain.file_lease_renew(root, arguments.get("lease_id"), agent,
+                                              ttl_min=arguments.get("ttl_min"))
+            if err:
+                return "错误：" + err
+            return (f"文件租约已续：#{row['id']} {row['display_path']}"
+                    f"（剩 {row['_left_min']} 分钟，fence {row['fence']}）")
+        if action == "release":
+            err, n = brain.file_lease_release(
+                root, lease_id=arguments.get("lease_id"), path=path, agent=agent,
+                reason=str(arguments.get("reason", "") or ""))
+            if err:
+                return "错误：" + err
+            target = path or f"lease #{arguments.get('lease_id')}"
+            return f"已释放 {n} 条文件租约（{target}）"
+        if action == "prune":
+            err, rows = brain.file_lease_prune(
+                root, agent=agent, limit=arguments.get("limit", 200))
+            if err:
+                return "错误：" + err
+            if not rows:
+                return ("没有过期未释放的租约（活跃租约永不回收；"
+                        "过期退让是正常状态，无需处理）")
+            ids = "、".join(f"#{r['id']}" for r in rows[:10])
+            more = f" 等 {len(rows)} 条" if len(rows) > 10 else ""
+            return (f"已回收 {len(rows)} 条过期租约：{ids}{more}\n"
+                    "只标记释放、记录保留（fence 仍是迟到写入的对照凭据）；活跃租约未受影响。")
+        if action == "list":
+            try:
+                lim = int(arguments.get("limit") or 50)
+            except (TypeError, ValueError):
+                lim = 50
+            rows = brain.file_lease_list(
+                root, path=path, project=str(arguments.get("project", "") or ""),
+                include_released=bool(arguments.get("include_released")), limit=lim)
+            if not rows:
+                return "暂无文件租约（acquire 获取；check 查某路径是否被占）"
+            lines = [f"文件租约 {len(rows)} 条（新在前）："]
+            for r in rows:
+                state = ("已释放" if r["released_at"]
+                         else ("已过期" if r["_expired"] else f"剩 {r['_left_min']} 分钟"))
+                task = f"｜任务 #{r['task_id']}" if r["task_id"] else ""
+                reason = f"｜{r['reason'][:40]}" if r["reason"] else ""
+                rel = f"｜释放者 {r['released_by']}" if r["released_at"] else ""
+                lines.append(f"- #{r['id']} [{state}] {r['display_path']} @{r['owner']}"
+                             f"（fence {r['fence']}{task}{reason}{rel}）")
+            return "\n".join(lines)
+        return "错误：action 只支持 check/acquire/renew/release/prune/list"
+
     if name == "hub_sentry":
+        action = str(arguments.get("action", "run")).strip()
+        if action == "report":
+            rep = ops.run_patrol(root)
+            lines = [f"一键自检：{rep['checked']} 项，通过 {len(rep['passed'])}，"
+                     f"问题 {len(rep['issues'])}，耗时 {rep['elapsed_ms']}ms"]
+            for i in rep["issues"]:
+                lines.append(f"✗ {i['name']}：{(i.get('summary') or '')[:120]}")
+                lines.append(f"  修复：{i['fix']}")
+                for d in i["detail"][:3]:
+                    lines.append(f"    · {str(d)[:120]}")
+            if not rep["issues"]:
+                lines.append("全部通过。")
+            if rep["skipped"]:
+                lines.append("跳过：" + "、".join(
+                    f"{s['name']}({s['why']})" for s in rep["skipped"]))
+            return "\n".join(lines)
         summary, sid = brain.sentry_sweep(root)
         return summary + ("\n（已广播给所有 agent——下次开工即在心跳里可见）" if sid else "")
 
@@ -1924,26 +2579,85 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             err, path = brain.backup_db(root, str(arguments.get("dest", "")))
             return f"错误：{err}" if err else f"已备份：{path}（单一 .zip：一致性库快照+磁盘项目文件树，可整盘还原）"
         if action == "backups":
-            rows = brain.backup_list(root)
-            if not rows:
+            inv = brain.backup_inventory(root)
+            if not inv["total_count"]:
                 return "（还没有备份。hub_export action=backup 立即备份一次）"
-            lines = [f"备份 {len(rows)} 份（新在前）："]
-            for b in rows:
-                lines.append(f"- {b['mtime']}  {b['size'] // 1024}KB  {b['path']}")
+            lines = [f"备份 {inv['total_count']} 份 / {inv['total_bytes'] / 1048576:.1f}MB"
+                     f"（最近 {(inv['newest'] or {}).get('mtime', '—')}）："]
+            for key, fam in inv["families"].items():
+                if fam["count"]:
+                    lines.append(f"- {key} {fam['count']} 份 {fam['bytes'] / 1048576:.1f}MB"
+                                 f"（{fam['label']}，默认留 {fam['keep_default']}）")
+            lines.append("清理预演：hub_export action=prune（加 apply=true 才真删）")
             lines.append("校验：hub_export action=verify path=…（只读校验，不恢复）")
+            return "\n".join(lines)
+        if action == "prune":
+            def _keep(name, default):
+                try:
+                    return max(0, int(arguments.get(name, default)))
+                except (TypeError, ValueError):
+                    return default
+            r = brain.backup_prune(root, keep_zip=_keep("keep_zip", 3),
+                                   keep_snapshot=_keep("keep_snapshot", 10),
+                                   keep_legacy=_keep("keep_legacy", 1),
+                                   keep_bak=_keep("keep_bak", 2),
+                                   min_age_days=_keep("min_age_days", 7),
+                                   apply=bool(arguments.get("apply")))
+            inv = r["inventory"]
+            rows = r["deleted"] if r["apply"] else r["candidates"]
+            freed = r["reclaimed_bytes"] if r["apply"] else r["candidate_bytes"]
+            verb = "已清理" if r["apply"] else "可清理"
+            lines = [f"{'错误：' if not r['ok'] else ''}备份 {inv['total_count']} 份 / "
+                     f"{inv['total_bytes'] / 1048576:.1f}MB；{verb} {len(rows)} 份 / "
+                     f"{freed / 1048576:.1f}MB"]
+            for c in rows[:12]:
+                lines.append(f"- [{c['family']}] {c['mtime']} {c['size'] // 1024}KB {c['path']}")
+            if r["apply"]:
+                lines.append(f"释放 {r['reclaimed_bytes'] / 1048576:.1f}MB；清理已写 journal。")
+            else:
+                lines.append("预演未删除任何文件；确认后传 apply=true 执行。")
+            for e in r["errors"][:5]:
+                lines.append(f"错误：{e}")
             return "\n".join(lines)
         if action == "verify":
             err, summary = brain.backup_verify(root, str(arguments.get("path", "")))
             return f"错误：{err}" if err else summary
-        return f"错误：action 只支持 export/backup/backups/verify（收到 {action!r}）"
+        return f"错误：action 只支持 export/backup/backups/prune/verify（收到 {action!r}）"
 
     if name == "hub_history":
         h = brain.history_of(root, str(arguments.get("kind", "record")),
                              arguments.get("id"))
         if not h["item"]:
             return f"错误：{h['kind']} #{arguments.get('id')} 不存在"
+        srcs = ("journal 流水 / 检查点时间线 / 任务卡关键时点" if h["kind"] == "task"
+                else "journal 流水 / supersede 取代链 / 条目自身时点")
         lines = [f"{h['kind']} #{h['id']} 变更史 {len(h['timeline'])} 条（时间升序；"
-                 "来源 journal 流水 / supersede 取代链 / 条目自身时点）："]
+                 f"来源 {srcs}）："]
+        if h["kind"] == "task":
+            c = h.get("clocks") or {}
+
+            def _at(stamp, age, empty):
+                if not stamp:
+                    return empty
+                return f"{stamp[:16]}（{age:g}h 前）" if isinstance(age, (int, float)) \
+                    else stamp[:16]
+
+            lease = {"ok": (f"租约剩 {c['lease_left_h']:g}h"
+                            if isinstance(c.get("lease_left_h"), (int, float)) else "租约有效"),
+                     "expired": "租约已过期（可接管）",
+                     "unleased": "租约缺失（可接管）",
+                     "ownerless": "无主（可接管）"}.get(c.get("lease_state") or "", "非在办/无租约")
+            lines.append(
+                "时间口径：最后推进 "
+                + _at(c.get("progress_at"), c.get("progress_age_h"), "无记录")
+                + "｜最后检查点 "
+                + _at(c.get("last_checkpoint"), c.get("last_checkpoint_age_h"), "无手工检查点")
+                + "｜最近心跳 "
+                + _at(c.get("heartbeat_at"), c.get("heartbeat_age_h"), "无记录")
+                + f"（{h['item'].get('owner') or '无主'}，agent 级）｜" + lease)
+            lines.append("说明：推进只由真实任务动作写入（认领/流转/改详情/写检查点）；"
+                         "心跳只证明 agent 在线，续租时也会刷新 updated——"
+                         "updated 仅作「最后改动」列于下方，不充作进展。")
         for t in h["timeline"]:
             stamp = (t["ts"] or "")[:16] or "—"
             detail = f"：{t['detail']}" if t["detail"] else ""
@@ -2169,6 +2883,30 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
             lines.append(f"   活跃项目（近7天）：{ps}")
         else:
             lines.append("   活跃项目（近7天）：无")
+        # 过程可见性：谁在办什么 + 哪条租约过期/缺失/无主可接管（不是只有“在线”一个状态）
+        if s.get("tasks_in_progress"):
+            stale_reasons = {t["id"]: (t.get("reason") or "租约过期")
+                             for t in s.get("stale_claims", [])}
+            lines.append(f"   在办任务 {s.get('tasks_open_total', 0)} 条（进行中 "
+                         f"{len(s['tasks_in_progress'])}；租约 {s.get('claim_ttl_hours', '?')}h）：")
+            for t in s["tasks_in_progress"][:5]:
+                flag = (f" ⚠{stale_reasons[t['id']]}可接管（hub_claim）"
+                        if t["id"] in stale_reasons else "")
+                owner = f"@{t['owner']}" if t.get("owner") else "@未署名"
+                proj = f"{t['project']}｜" if t.get("project") else ""
+                lines.append(f"   - #{t['id']} {owner} {proj}{t['title'][:50]}{flag}")
+        else:
+            lines.append("   在办任务：无（hub_next 看可认领队列）")
+        try:
+            starve = brain.task_starvation(root, limit=3)
+        except Exception:  # noqa: BLE001  状态页不因饥饿统计失败整体报错
+            starve = {"counts": {"starving": 0}, "starving": [],
+                      "window_days": brain.TASK_STARVE_DAYS}
+        if starve["counts"]["starving"]:
+            sample = "；".join(f"#{t['id']} {t['title'][:20]}（{t['_age_days']:g} 天）"
+                               for t in starve["starving"])
+            lines.append(f"   待办饥饿 {starve['counts']['starving']} 条（能开工却 ≥"
+                         f"{starve['window_days']:g} 天无人认领）：{sample}（hub_next 认领）")
         # ② 什么变了
         lines.append(f"② 今日新增：记录 {s['records_today']} 条 · 记忆 {s['memories_today']} 条；最近操作：")
         for j in s["journal"]:
@@ -2194,7 +2932,7 @@ def call_tool(name: str, arguments: dict, root: str) -> str:
         else:
             lines.append("④ 置顶记忆：无")
         if s["stalled"]:
-            lines.append(f"   停滞项目 {s['stalled_total']} 个：{'、'.join(s['stalled'])}（超90天无动静，确认结局或归档）")
+            lines.append(f"   停滞项目 {s['stalled_total']} 个：{'、'.join(s['stalled'])}（显式标记，真实闲置天数见 hub_ops_run stalled；归档需拍板）")
         # ⑤ 下一步该做什么
         if s["todos"]:
             lines.append("⑤ 待办线索（勾销用 hub_todo_done）：")
@@ -2298,10 +3036,12 @@ TOOLS = [
                                     "maturity": {"type": "string", "enum": list(brain.MATURITY_LEVELS),
                                                  "description": "M6 成熟度（信任分层）：draft 草稿（缺省）/ validated 已验证（写入者已确认过的结论，慎标）/ core 核心（留给人工 pinned+高频自动晋升，勿手填）"}},
                      "required": ["content"]}},
-    {"name": "hub_memory_supersede", "description": "裁决两条已存在的记忆：让 keep_id 那条宣布为现行、drop_id 那条退出检索与推送（不删除、可追溯）。**与 hub_memory_write 的分工**：write(supersedes=X) 是「新建一条取代 X」（会多出第 3 条记忆），本工具是「两条都已在库、指定谁胜出」——ghost 检测（ops 检查项 ghost_memory / 体检页）报出「多版本共存未裁决」后的正确收口动作就是它。它**不判断谁对**（那是你的判断），只负责把裁决落进取代链。例：hub_memory_supersede(keep_id=3188, drop_id=3187)",
+    {"name": "hub_memory_supersede", "description": "裁决两条已存在的记忆/记录：让 keep_id 那条宣布为现行、drop_id 那条退出检索与推送（不删除、可追溯）。**与 hub_memory_write 的分工**：write(supersedes=X) 是「新建一条取代 X」（会多出第 3 条记忆），本工具是「两条都已在库、指定谁胜出」——ghost 检测（ops 检查项 ghost_memory / 体检页）报出「多版本共存未裁决」后的正确收口动作就是它。target=memory（默认）裁决记忆取代链；target=record 裁决工作记录（ghost 检查项里的「记录 #a ↔ #b」就用它，drop 的记录退出检索/时间线但正文保留，hub_get_record 仍可追溯）。它**不判断谁对**（那是你的判断），只负责把裁决落进取代链。例：hub_memory_supersede(keep_id=3188, drop_id=3187)；hub_memory_supersede(target=\"record\", keep_id=3262, drop_id=3259)",
      "inputSchema": {"type": "object",
-                     "properties": {"keep_id": {"type": "integer", "description": "胜出的记忆 id（继续现行、可被检索）"},
-                                    "drop_id": {"type": "integer", "description": "退出的记忆 id（立即退出检索与推送，条目与证据链保留可追溯）"},
+                     "properties": {"keep_id": {"type": "integer", "description": "胜出的记忆/记录 id（继续现行、可被检索）"},
+                                    "drop_id": {"type": "integer", "description": "退出的记忆/记录 id（立即退出检索与推送，条目与证据链保留可追溯）"},
+                                    "target": {"type": "string", "enum": ["memory", "record"],
+                                               "description": "裁决对象：memory=记忆（默认）；record=工作记录（退出检索与时间线，正文保留）"},
                                     "agent": {"type": "string",
                                               "description": "你的 agent 名（注册表内取值，服务端校验）"}},
                      "required": ["keep_id", "drop_id"]}},
@@ -2317,7 +3057,7 @@ TOOLS = [
                                               "description": "批量复核本次最多确认多少条（默认 50，上限 200；剩余数会如实返回）"},
                                     "agent": {"type": "string",
                                               "description": "你的 agent 名（注册表内取值，服务端校验）"}}}},
-    {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃时会收到撞车预警，长任务开工前先调用（开工三连之一）；短任务可不调。例：hub_heartbeat(agent=\"workbuddy\", project=\"AgentHub-多agent文件统一管理\", note=\"在改 MCP 描述\")",
+    {"name": "hub_heartbeat", "description": "会话心跳：登记自己正在哪个项目干活。同项目有其他 agent 活跃、或别人持有在办任务时会收到撞车预警（任务租约 2h 内有效，短暂离线也能看见），长任务开工前先调用（开工三连之一）；短任务可不调。例：hub_heartbeat(agent=\"workbuddy\", project=\"AgentHub-多agent文件统一管理\", note=\"在改 MCP 描述\")",
      "inputSchema": {"type": "object",
                      "properties": {"agent": {"type": "string", "description": "你的 agent 名"},
                                     "project": {"type": "string", "description": "正在工作的项目名"},
@@ -2343,9 +3083,10 @@ TOOLS = [
      "inputSchema": {"type": "object",
                      "properties": {"agent": {"type": "string", "description": "你的 agent 名（只能撤自己的）"}},
                      "required": ["agent"]}},
-    {"name": "hub_archive_project", "description": "归档已完结项目（状态改 archived + 目录移入 99_Archive，可逆）。仅限用户明确拍板的项目清理",
+    {"name": "hub_archive_project", "description": "归档已完结项目（状态改 archived + 目录移入 99_Archive），或 restore=true 恢复归档（状态回 active + 目录移回，一步可逆）。仅限用户明确拍板的项目清理/恢复",
      "inputSchema": {"type": "object",
                      "properties": {"project": {"type": "string", "description": "项目目录名"},
+                                    "restore": {"type": "boolean", "description": "true=恢复归档项目（默认 false=归档）；根目录有同名目录时拒绝，不覆盖"},
                                     "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["project"]}},
     {"name": "hub_list_skills", "description": "列出本机各 agent 的技能库（能力对齐：看别的 agent 会什么）",
@@ -2423,7 +3164,7 @@ TOOLS = [
                                     "agent": {"type": "string", "description": "你的 agent 名"}},
                      "required": ["signal_id", "agent"]}},
     {"name": "hub_checkpoint",
-     "description": "M4 检查点：长任务执行中存进展快照（断点续跑/换人接手/隔天续跑不用从零翻记录）。认领时自动存开工资锚点；action=list 看时间线、latest 只看最新一条",
+     "description": "M4 检查点：长任务执行中存进展快照（断点续跑/换人接手/隔天续跑不用从零翻记录）。认领时自动存开工资锚点；在办任务只收持有者的写入，写入即续租（接管后旧持有者补写会被拒）；action=list 看时间线、latest 只看最新一条",
      "inputSchema": {"type": "object",
                      "properties": {"action": {"type": "string", "enum": ["save", "list", "latest"],
                                                "description": "save 存（缺省）/ list 时间线 / latest 最新一条"},
@@ -2433,9 +3174,30 @@ TOOLS = [
                                              "description": "manual 手写（缺省）/ auto_claim 认领自动"},
                                     "agent": {"type": "string", "description": "你的 agent 名（save 必填）"}},
                      "required": ["task_id"]}},
+    {"name": "hub_lock",
+     "description": "R11 文件租约（咨询式）：多家 agent 同仓并发改同一文件是最高频失败源——改共享文件前先锁。action=check 查占（缺省）/ acquire 获取或续租 / renew 续租 / release 释放 / prune 回收过期未释放（只标记释放，活跃永不触碰）/ list 台账。冲突含祖先/子孙（锁目录=罩住其下全部文件）；同一 agent 同路径再次 acquire=续租；TTL 到期即可被接管，fence 按路径单调递增（识别迟到写入）；挂任务时任务必须在办且本人持有，任务完成/被接管时锁自动释放。它不拦写盘，只让后来者看见冲突并先协调。例：hub_lock(action=\"acquire\", path=\"AgentHub-多agent文件统一管理/AgentHub/brain.py\", task_id=19, reason=\"改任务状态机\", agent=\"qoder\")",
+     "inputSchema": {"type": "object",
+                     "properties": {
+                         "action": {"type": "string",
+                                    "enum": ["check", "acquire", "renew", "release", "prune", "list"],
+                                    "description": "check 查占（缺省）/ acquire 获取或续租 / renew 续租 / release 释放 / prune 回收过期未释放 / list 台账"},
+                         "path": {"type": "string",
+                                  "description": "文件或目录路径：可写数据根内相对路径，也可写绝对路径（部署目录/工作区）"},
+                         "lease_id": {"type": "integer", "description": "renew/release：租约 id"},
+                         "task_id": {"type": "integer",
+                                     "description": "acquire：挂到任务上（任务须在办且本人持有；完成/接管自动释放）"},
+                         "ttl_min": {"type": "integer",
+                                     "description": f"租约分钟数，默认 {brain.FILE_LEASE_TTL_MIN}，上限 {brain.FILE_LEASE_TTL_CAP}"},
+                         "reason": {"type": "string", "description": "在改什么/为什么锁（冲突时给对方看）"},
+                         "project": {"type": "string", "description": "acquire：项目名（缺省按路径首段推断）"},
+                         "include_released": {"type": "boolean", "description": "list：true=连历史/已释放一起看"},
+                         "limit": {"type": "integer", "description": "list 条数（默认 50）/ prune 单次回收上限（默认 200，封顶 500）"},
+                         "agent": {"type": "string", "description": "你的 agent 名（acquire/renew/release 必填）"}}}},
     {"name": "hub_sentry",
-     "description": "M5 哨兵：跑大脑自身健康巡检（闸门/规模/备份/重复记忆/inbox/停滞），把需关注项聚合成广播 alert——所有 agent 下次开工即在心跳里可见，不用各自跑体检。同内容 24h 冷却防刷屏",
-     "inputSchema": {"type": "object", "properties": {}}},
+     "description": "M5 哨兵 + R8 一键自检：action=run 跑关键巡检（运行版本/库/备份/规则闸门/重复记忆/任务治理/inbox/停滞）并把需关注项聚合广播——所有 agent 下次开工即见，同内容 24h 冷却；action=report 跑全部常规巡检项只回报告、不广播，每条问题附可执行修复建议。例：hub_sentry() / hub_sentry(action=\"report\")",
+     "inputSchema": {"type": "object",
+                     "properties": {"action": {"type": "string", "enum": ["run", "report"],
+                                               "description": "run 巡检+广播（缺省）/ report 只出报告+修复建议"}}}},
     {"name": "hub_quarantine",
      "description": "M8 隔离区：把可疑的记录/记忆移出检索与推送（status→quarantine，不删除、可解除）。与软删的分工：deleted=撤销不可见，quarantine=观察区可批量处理",
      "inputSchema": {"type": "object",
@@ -2479,18 +3241,24 @@ TOOLS = [
      "description": "M12 技能资产统计：哪些技能真被用（命中次数）、哪些零使用（清理或补说明候选）——技能索引进化了，用不用数据说话",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_export",
-     "description": "X3 导出与备份：action=export 全库导出（fmt=markdown 人读 / json 机读，落到 _hub/export）；action=backup 备份数据库（走 sqlite backup API，含 WAL——文件复制会丢数据）；backups 列备份；verify 只读校验备份可读（不恢复）",
+     "description": "X3 导出与备份：action=export 全库导出（fmt=markdown 人读 / json 机读，落到 _hub/export）；action=backup 备份数据库（走 sqlite backup API，含 WAL——文件复制会丢数据）；backups 盘点四类备份（整包/旧库/快照/手工）；prune 按保留份数清理（默认只预演，apply=true 才删，主库与 WAL 永不碰）；verify 只读校验备份可读（不恢复）。例：hub_export(action=\"backups\") / hub_export(action=\"prune\", keep_snapshot=10)",
      "inputSchema": {"type": "object",
-                     "properties": {"action": {"type": "string", "enum": ["export", "backup", "backups", "verify"],
-                                               "description": "export 导出（缺省）/ backup 备份 / backups 清单 / verify 校验"},
+                     "properties": {"action": {"type": "string", "enum": ["export", "backup", "backups", "prune", "verify"],
+                                               "description": "export 导出（缺省）/ backup 备份 / backups 盘点 / prune 清理预演或执行 / verify 校验"},
                                     "fmt": {"type": "string", "enum": ["markdown", "json"], "description": "export：格式，缺省 markdown"},
                                     "limit": {"type": "integer", "description": "export：导出行上限，默认 5000"},
                                     "dest": {"type": "string", "description": "backup：目标目录（可空=默认 _hub/backup）"},
-                                    "path": {"type": "string", "description": "verify：备份文件路径"}}}},
+                                    "path": {"type": "string", "description": "verify：备份文件路径"},
+                                    "keep_zip": {"type": "integer", "description": "prune：整包备份保留份数，默认 3"},
+                                    "keep_snapshot": {"type": "integer", "description": "prune：在线快照保留份数，默认 10"},
+                                    "keep_legacy": {"type": "integer", "description": "prune：旧版仅库备份保留份数，默认 1"},
+                                    "keep_bak": {"type": "integer", "description": "prune：手工 .bak 保留份数，默认 2"},
+                                    "min_age_days": {"type": "integer", "description": "prune：未满 N 天一律不动，默认 7"},
+                                    "apply": {"type": "boolean", "description": "prune：默认 false=只预演；true=真删除（写 journal）"}}}},
     {"name": "hub_history",
-     "description": "X4 时间机器：某条记录/记忆的完整变更史（journal 流水 + supersede 取代链 + 条目自身时点，三源合并按时间升序）——复盘「这条怎么变成现在这样」",
+     "description": "X4 时间机器：记录/记忆/任务的完整变更史（记录·记忆=journal 流水 + supersede 取代链 + 自身时点；任务=journal 流水 + 检查点时间线 + 任务卡时点，多源合并按时间升序）——复盘「这条怎么变成现在这样」",
      "inputSchema": {"type": "object",
-                     "properties": {"kind": {"type": "string", "enum": ["record", "memory"], "description": "条目类型，缺省 record"},
+                     "properties": {"kind": {"type": "string", "enum": ["record", "memory", "task"], "description": "条目类型，缺省 record；任务传 task"},
                                     "id": {"type": "integer", "description": "条目 id"}},
                      "required": ["id"]}},
     {"name": "hub_trigger",
@@ -2601,8 +3369,10 @@ TOOLS = [
     {"name": "hub_status", "description": "大脑此刻状态（连续性层）：谁在线/活跃项目/今日变更/未关闭错误与待认领交接/置顶记忆与停滞项目/待办线索。每次开工看它对齐「现在」；历史沿革用 hub_search。例：hub_status()",
      "inputSchema": {"type": "object", "properties": {}}},
     {"name": "hub_help",
-     "description": "起步指北（任何 profile 常驻可见）：当前 profile 与可见工具清单 + 发现/调用/预演/截断四件事的用法",
-     "inputSchema": {"type": "object", "properties": {}}},
+     "description": "起步指北（任何 profile 常驻可见）：不带参数列当前 profile 与可见工具清单 + 发现/调用/预演/截断；带 topic 直接给场景步骤——start 开工收工 / search 检索调优 / backup 备份恢复 / tasks 任务认领与检查点 / recover 故障排查 / release 发布部署。例：hub_help() / hub_help(topic=\"recover\")",
+     "inputSchema": {"type": "object",
+                     "properties": {"topic": {"type": "string", "enum": list(HELP_TOPICS),
+                                              "description": "场景帮助主题；缺省=工具清单"}}}},
     {"name": "hub_search_tools",
      "description": "按关键词搜索全部工具（含当前 profile 藏起的；藏起≠禁用）。找不到某个能力/忘了工具名时先来这里；已知工具名直接调，不必搜。例：hub_search_tools(keyword=\"错误\")",
      "inputSchema": {"type": "object",
@@ -2650,11 +3420,11 @@ TOOLS = [
                                     "agent": {"type": "string", "description": "你的 agent 名（必填）"}},
                      "required": ["task_id", "agent"]}},
     {"name": "hub_task_update",
-     "description": "任务状态流转：pending(释放)/in_progress/blocked(写 blocked_by)/done。done 会自动结晶成 crystal 记录（M2）。in_progress 任务只有持有者可流转（空 agent=管理面）。deps/due 传 '-' 可清除",
+     "description": "任务状态流转：pending(释放并清 owner/claimed_at/blocked_by)/in_progress(必须署名且校验前置依赖)/blocked(写 blocked_by)/done。done 会自动结晶成 crystal 记录（M2）。blocked 不能直接跳 in_progress，先回 pending；在办任务只有持有者可流转（空 agent=管理面）。blocked_by/deps/due 传 '-' 可清除",
      "inputSchema": {"type": "object",
                      "properties": {"task_id": {"type": "integer", "description": "任务 id"},
                                     "status": {"type": "string", "enum": list(brain.TASK_STATUSES)},
-                                    "blocked_by": {"type": "string", "description": "阻塞原因（status=blocked 时用）"},
+                                    "blocked_by": {"type": "string", "description": "阻塞原因（status=blocked 时用）；传 '-' 清除残留阻塞标记"},
                                     "detail": {"type": "string", "description": "补充细节/进展，可空"},
                                     "priority": {"type": "integer", "description": "优先级 0~3（可改）"},
                                     "deps": {"type": "string", "description": "前置任务 id（逗号分隔；'-' 清除）"},
@@ -2791,6 +3561,7 @@ _INT_PARAMS = {
     "hub_memory_write": ("supersedes",),
     "hub_memory_supersede": ("keep_id", "drop_id"),   # D5 出口：两条既有记忆裁决谁胜出
     "hub_memory_confirm": ("limit",),                 # 第五轮 R2：批量复核的条数上限
+    "hub_lock": ("lease_id", "task_id", "ttl_min", "limit"),   # R11 文件租约
     "hub_next": ("limit",),
     "hub_search_files": ("limit",),
     "hub_skill_match": ("topk",),
@@ -2906,6 +3677,7 @@ PROFILE_WORKER = PROFILE_READER + (
     "hub_event_write", "hub_events",
     "hub_signal_send", "hub_signals", "hub_signal_read",  # M3 信号：协作总线要给干活的 agent
     "hub_checkpoint",  # M4 检查点：长任务断点续跑
+    "hub_lock",  # R11 文件租约：并发编辑前的占位与协调
     "hub_sentry",  # M5 哨兵：巡检广播
     "hub_quarantine",  # M8 隔离区：治理工具要给干活的 agent
     "hub_decision_review",  # M11 决策回路：到期验证
@@ -2933,6 +3705,7 @@ WRITE_TOOLS = {
     "hub_skill_sync",  # 技能原生化：写索引（走 dry_run/confirm 闸门）
     "hub_signal_send", "hub_signal_read",  # M3 信号：发消息/标已读
     "hub_checkpoint",  # M4 检查点：写进展快照
+    "hub_lock",  # R11 文件租约：获取/续租/释放（咨询式，不拦写盘）
     "hub_sentry",  # M5 哨兵：跑巡检并发广播
     "hub_quarantine",  # M8 隔离区：可疑内容移出检索（不删）
     "hub_decision_review",  # M11 决策回路：到期验证决策对错
@@ -3066,7 +3839,7 @@ def _log_call(root, tname: str, args: dict, t0: float, ok: bool = True, err_kind
         rec = {"ts": datetime.datetime.now().isoformat(timespec="milliseconds"),
                "tool": tname, "ms": round((time.perf_counter() - t0) * 1000, 2),
                "ok": bool(ok), "err_kind": err_kind,
-               "agent": str(args.get("agent") or ""), "root": str(root)}
+               "agent": _caller_identity(args, tname), "root": str(root)}
         with open(path, "a", encoding="utf-8") as f:
             f.write(json.dumps(rec, ensure_ascii=False) + "\n")
     except Exception:  # noqa: BLE001
@@ -3144,7 +3917,6 @@ IDEMPOTENT_TOOLS = {
     "hub_skill_sync",       # UPSERT 技能索引，重跑覆盖不新增
     "hub_graph",            # build 重写结构边（幂等派生数据）
     "hub_flush_index",      # 重建语义索引
-    "hub_checkpoint",       # 同 task_id 覆盖保存
     "hub_env_set",          # 同键覆盖
     "hub_view",             # 关注/取关重复设置结果一致
     "hub_skill_stats",      # 重算统计量
@@ -3273,6 +4045,9 @@ _PERMANENT_KEYS = ("必填", "不存在", "未找到", "非法", "格式", "越�
                    "不能", "不可", "无权", "已存在", "冲突", "无效", "必须", "不支持",
                    # R5 实测：agent 不在注册表是纯入参错误（写入前就被拒），
                    # 归 ambiguous 会诱导模型认为「可能已部分生效」而去做无意义的重试确认
+                   # R21：归档恢复的状态冲突（重复恢复/未归档/目录同名）是永久性拒绝，
+                   # 归 ambiguous 会让模型以为「可能已部分恢复」而重复搬目录
+                   "未归档", "无需恢复", "同名",
                    "不在注册表")
 
 
@@ -3334,10 +4109,17 @@ def handle_message(msg: dict, root: str) -> dict | None:
     brain.ensure_schema(root)
 
     if method == "initialize":
+        global CLIENT_NAME
+        ci = params.get("clientInfo") or {}
+        raw_client = str(ci.get("name") or "").strip()
+        if raw_client:
+            # 只留规范首词（"Qoder CLI"→qoder）：与 agent 注册表同口径，
+            # 避免 "Qoder"/"qoder-cli" 在不同客户端里裂成多个身份。
+            CLIENT_NAME = core.agent_key(raw_client)[:64]
         req_ver = params.get("protocolVersion", PROTOCOL_VERSION)
         return {"jsonrpc": "2.0", "id": mid,
                 "result": {"protocolVersion": req_ver, "capabilities": {"tools": {}},
-                           "serverInfo": SERVER_INFO}}
+                           "serverInfo": SERVER_INFO, "instructions": SERVER_INSTRUCTIONS}}
     if method == "server/discover":
         # P3-1 版本协商：未知版本 → -32022；已知/未传 → 返回能力面（dual-era：initialize 握手保留）
         pv = params.get("protocolVersion")
@@ -3393,7 +4175,7 @@ def handle_message(msg: dict, root: str) -> dict | None:
                         f"dry_run（未执行）：{tname} 预演通过，将写入 → {preview or '(无参数)'}\n"
                         "未落任何库；去掉 dry_run 后正式执行。")}], "isError": False}}
         # C6 速率限制 / 循环保护（失控调用方止损）：放行才计数，被拦即返回业务错误
-        _rate_agent = str(args.get("agent") or SERVER_AGENT or "-")
+        _rate_agent = _caller_identity(args, tname) or "-"
         _rl = _rate_check(_rate_agent, tname)
         if _rl:
             sys.stderr.write(f"[agenthub][rate-limit] {tname} agent={_rate_agent} :: {_rl[:160]}\n")
@@ -3412,12 +4194,12 @@ def handle_message(msg: dict, root: str) -> dict | None:
                 # 造成的假象（写工具走 op_audit、检索走 searches、其余零留痕）。拿假象
                 # 做治理会把在用工具当僵尸下线。一次 INSERT 换使用数据可信，划算。
                 # 写工具额外走 op_audit（审计语义不同：含 undo 句柄），不算重复计数。
-                brain.log_tool_call(root, tname, str(args.get("agent") or ""))
+                brain.log_tool_call(root, tname, _caller_identity(args, tname))
             if is_err:
                 # 服务端留痕（MCP 官方/ mcpcat 建议：内部记录完整错误，模型侧只给可行动文案，
                 # 不把堆栈/SQL 直接塞回模型）。写 stderr，不污染 stdout 协议流。
                 sys.stderr.write(f"[agenthub][tool-error] {tname} "
-                                 f"agent={args.get('agent') or '-'} :: {text[:200]}\n")
+                                 f"agent={_caller_identity(args, tname) or '-'} :: {text[:200]}\n")
                 sys.stderr.flush()
             # D8：错误分桶 + 可行动提示（单点实现，不去改 59 个失败站点）
             err_kind = _error_kind(text) if is_err else ""
@@ -3486,6 +4268,9 @@ def serve(root: str, fixed: bool = False, agent: str = "", profile: str = "") ->
     """
     global SERVER_AGENT, SERVER_PROFILE
     log = lambda s: print(f"[agenthub-mcp] {s}", file=sys.stderr)  # noqa: E731
+    # 只有进入 stdio 主循环才算 MCP 进程：CLI 的 call 会在进程内导入本模块，
+    # 若按「导入过」判定，一次性进程会被当成在跑的服务，运行版本检查失去意义
+    core.SERVER_IS_MCP = True
     if profile:
         if profile in PROFILES:
             SERVER_PROFILE = profile
@@ -3507,39 +4292,60 @@ def serve(root: str, fixed: bool = False, agent: str = "", profile: str = "") ->
     else:
         log("未指定 --agent：身份退回工具调用参数自报（建议在接入配置里补 --agent <名>）")
     log(f"启动，根目录：{root}" + ("（固定）" if fixed else "（动态跟随 config）"))
+    # R24：登记运行标记并起心跳——CLI/doctor 等非 MCP 进程据此观测本进程是否在跑旧代码
+    _pruned = core.prune_runtime_markers()
+    if _pruned:
+        log(f"清理遗留运行标记：{_pruned} 个")
+    _marker_err = core.write_runtime_marker(root, SERVER_AGENT or agent,
+                                            version=SERVER_INFO["version"])
+    if _marker_err:
+        log(_marker_err)
+    _hb_stop = threading.Event()
+
+    def _marker_heartbeat():
+        while not _hb_stop.wait(30):
+            core.write_runtime_marker(root, SERVER_AGENT or agent,
+                                      version=SERVER_INFO["version"])
+
+    threading.Thread(target=_marker_heartbeat, daemon=True,
+                     name="agenthub-runtime-marker").start()
     err = brain.ensure_schema(root)  # 建表责任前移到 server：代码部署后旧库缺新表也能自愈
     if err:
         log(f"schema 初始化失败：{err}")
-    for raw in sys.stdin:
-        raw = raw.strip()
-        if not raw:
-            continue
-        if not fixed:
-            live = core.get_root()
-            if live and live != root:
-                root = live
-                log(f"根目录已切换：{root}")
-        try:
-            msg = json.loads(raw)
-        except json.JSONDecodeError as e:
-            log(f"坏消息（{e}）：{raw[:100]}")
-            continue
-        try:
-            resp = handle_message(msg, root)
-        except Exception as e:  # noqa: BLE001
-            log(f"处理异常：{type(e).__name__}: {e}")
-            resp = ({"jsonrpc": "2.0", "id": msg.get("id"),
-                     "error": {"code": -32603, "message": "internal error"}} if msg.get("id") is not None else None)
-        if resp:
+    try:
+        for raw in sys.stdin:
+            raw = raw.strip()
+            if not raw:
+                continue
+            if not fixed:
+                live = core.get_root()
+                if live and live != root:
+                    root = live
+                    log(f"根目录已切换：{root}")
             try:
-                # ensure_ascii=True：协议帧恒为纯 ASCII，不依赖 stdout 编码为 UTF-8，
-                # 即使启动期 reconfigure 在异常环境下失败（被吞异常）也不会因中文抛 UnicodeEncodeError 炸进程。
-                # 客户端 json.loads 会自动把 \uXXXX 还原为中文，行为无感。
-                sys.stdout.write(json.dumps(resp, ensure_ascii=True) + "\n")
-                sys.stdout.flush()
-            except (OSError, UnicodeError) as e:
-                log(f"写出失败（{type(e).__name__}）：{e}")
-    return 0
+                msg = json.loads(raw)
+            except json.JSONDecodeError as e:
+                log(f"坏消息（{e}）：{raw[:100]}")
+                continue
+            try:
+                resp = handle_message(msg, root)
+            except Exception as e:  # noqa: BLE001
+                log(f"处理异常：{type(e).__name__}: {e}")
+                resp = ({"jsonrpc": "2.0", "id": msg.get("id"),
+                         "error": {"code": -32603, "message": "internal error"}} if msg.get("id") is not None else None)
+            if resp:
+                try:
+                    # ensure_ascii=True：协议帧恒为纯 ASCII，不依赖 stdout 编码为 UTF-8，
+                    # 即使启动期 reconfigure 在异常环境下失败（被吞异常）也不会因中文抛 UnicodeEncodeError 炸进程。
+                    # 客户端 json.loads 会自动把 \uXXXX 还原为中文，行为无感。
+                    sys.stdout.write(json.dumps(resp, ensure_ascii=True) + "\n")
+                    sys.stdout.flush()
+                except (OSError, UnicodeError) as e:
+                    log(f"写出失败（{type(e).__name__}）：{e}")
+        return 0
+    finally:
+        _hb_stop.set()
+        core.remove_runtime_marker()
 
 
 def parse_argv(argv: list) -> tuple[str, bool, str, str]:

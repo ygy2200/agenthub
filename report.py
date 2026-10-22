@@ -191,9 +191,9 @@ def _frictions(d) -> list:
                     "evidence": "零唤起记忆在推送排序里已优先轮换曝光（v2.8.4），但仍大面积沉默说明内容本身低价值",
                     "fix": "hub_health 看保鲜清单：环境已漂移的更新，无效的归档——用进废退"})
     if h["projects_stalled"]:
-        out.append({"title": f"{h['projects_stalled']} 个项目停滞（90 天无活动）",
-                    "evidence": "停滞项目挤占列表与注意力，真正活跃的事被淹没",
-                    "fix": "hub_archive_project 归档（可逆：状态改回 active 即恢复），需要用户拍板"})
+        out.append({"title": f"{h['projects_stalled']} 个项目显式标记停滞（待归档决策）",
+                    "evidence": "停滞项目挤占列表与注意力；显式标记是决策队列，不等于 90 天无活动（真实闲置天数用 hub_ops_run stalled 看）",
+                    "fix": "hub_archive_project 归档（需拍板，可逆：restore=true 一步恢复）；继续推进用 hub_task_add 写下下一步（任务写入自动恢复 active）"})
     return out
 
 
@@ -275,7 +275,7 @@ def _sec_horizon(d) -> str:
     if stale:
         lis = "".join(f"<li>#{m['id']} {_esc(m['content'][:56])}</li>" for m in stale[:5])
         line += f"<ul>{lis}</ul>"
-    return line + ("<p class='muted'>归档不是删除：hub_archive_project 可逆，"
+    return line + ("<p class='muted'>归档不是删除：hub_archive_project 可逆（restore=true 恢复归档），"
                    "记忆保鲜清单里的条目确认仍有效或更新后即可移出。</p>")
 
 

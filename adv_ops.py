@@ -5,6 +5,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import sys
 import tempfile
@@ -61,9 +62,14 @@ def t_release_manifest(tmp):
     (root / "main.py").write_text("print(1)\n", encoding="utf-8")
     (root / "brain.py").write_text("b = 1\n", encoding="utf-8")
     (root / "adv_test.py").write_text("assert True\n", encoding="utf-8")
+    (root / "pages").mkdir()
+    (root / "pages" / "__init__.py").write_text("", encoding="utf-8")
+    (root / "pages" / "home_page.py").write_text("page = 1\n", encoding="utf-8")
+    (root / "pages" / "helper.py").write_text("h = 1\n", encoding="utf-8")
     (root / "assets" / "agenthub.ico").write_bytes(b"ico")
     old = 1_600_000_000
-    for p in list(root.glob("*.py")) + [root / "assets" / "agenthub.ico"]:
+    for p in (list(root.glob("*.py")) + list((root / "pages").glob("*.py"))
+              + [root / "assets" / "agenthub.ico"]):
         os.utime(p, (old, old))
     exe = root / "dist" / "AgentHub.exe"
     exe.write_bytes(b"EXE-A")
@@ -81,6 +87,9 @@ def t_release_manifest(tmp):
     check("build_manifest 快照运行时代码+图标", "brain.py" in man["source"] and "assets/agenthub.ico" in man["source"],
           str(sorted(man["source"])))
     check("build_manifest 排除 adv_ 回归脚本", "adv_test.py" not in man["source"], str(sorted(man["source"])))
+    check("build_manifest 快照 pages 页面（相对路径键）",
+          "pages/home_page.py" in man["source"] and "pages/__init__.py" in man["source"],
+          str(sorted(man["source"])))
     check("build_manifest 记录版本", man["version"] == "9.9.9", str(man.get("version")))
     r = ops._release(root, home=home)
     check("release 拒绝未完成的构建清单", (not r["ok"]) and "未完成" in r["summary"], str(r)[:200])
@@ -93,6 +102,27 @@ def t_release_manifest(tmp):
     r = ops._release(root, home=home)
     check("release 抓到打包后源码变更并点名", (not r["ok"]) and "brain.py" in str(r["detail"]), str(r)[:200])
     (root / "brain.py").write_text("b = 1\n", encoding="utf-8")
+
+    (root / "pages" / "home_page.py").write_text("page = 2\n", encoding="utf-8")
+    r = ops._release(root, home=home)
+    check("release 抓到打包后页面源码变更（任务 #4）",
+          (not r["ok"]) and "pages/home_page.py" in str(r["detail"]), str(r)[:200])
+    (root / "pages" / "home_page.py").write_text("page = 1\n", encoding="utf-8")
+
+    # finish 阶段按 TOC 收窄：子目录源码必须按相对路径保留（basename 匹配会把
+    # pages/ 整批裁掉，发布检查又变回盲的）；相对 TOC 源路径也要能按源码根解析。
+    toc_dir = root / "build" / "AgentHub"
+    toc_dir.mkdir(parents=True)
+    (toc_dir / "Analysis-00.toc").write_text(repr([[
+        ("brain", str(root / "brain.py"), "PYMODULE"),
+        ("pages.home_page", "pages/home_page.py", "PYMODULE"),
+    ]]), encoding="utf-8")
+    ops.build_manifest(root, "finish")
+    narrowed = json.loads((root / "dist" / ops.BUILD_MANIFEST).read_text(encoding="utf-8"))["source"]
+    check("finish 按 TOC 收窄后仍保留 pages 页面（相对路径/相对 TOC 源）",
+          "pages/home_page.py" in narrowed and "brain.py" in narrowed
+          and "main.py" not in narrowed and "pages/helper.py" not in narrowed,
+          str(sorted(narrowed)))
 
     desktop.write_bytes(b"EXE-B")  # 与 dist 同尺寸、不同内容
     r = ops._release(root, home=home)
@@ -173,6 +203,17 @@ def main():
         _c2.execute("UPDATE records SET superseded_by=? WHERE id=?", (_rb, _ra))
     _r2 = ops.run_check("ghost_memory", root=ghost_root)
     check("ghost_memory 记录标取代后不再报（已治理）", _r2["ok"], str(_r2["summary"]))
+    # 2026-10-22 R17：playbook 流程运行日志是事件流——同标题多次运行不报幽灵，
+    # 但跳过条数必须在 summary 如实出现（排除不能静默）。
+    with _brain2.db_conn(ghost_root) as _c3:
+        for _bak in ("brain-20261013-1018.db", "brain-20261013-1023.db"):
+            _c3.execute("INSERT INTO records(project,agent,date,title,content,source,status) "
+                        "VALUES(?,?,?,?,?,'auto','active')",
+                        (_proj, "workbuddy", "2026-10-13", "发布流程自动执行",
+                         f"playbook release 执行结果：语法=全部通过｜部署=11/11｜备份={_bak}"))
+    _r3 = ops.run_check("ghost_memory", root=ghost_root)
+    check("ghost_memory 自动流程日志按事件流跳过且如实报条数",
+          _r3["ok"] and "2 条自动捕获记录" in _r3["summary"], str(_r3["summary"]))
 
     # ---- R8·C7 被动上下文预算（真实源在预算内 / 描述膨胀即 warn / 恢复后不误报）
     r = ops.run_check("profile_surface")
@@ -260,6 +301,69 @@ def main():
     check("验证快照落库后 verify 项转 ok（不再「从未 verify」）",
           _save_err == "" and _vs["state"] == "ok" and "上次验证" in _vs["detail"], str(_vs))
 
+    # ---- R6·快照绑定代码指纹：部署 copy2 保留旧 mtime 时，mtime 判不出的「代码已换」必须抓到
+    import os as _os
+    import core as _core_fp
+    _srv = tmp / "srv_fp"
+    _srv.mkdir()
+    (_srv / "a.py").write_text("A = 1\n", encoding="utf-8")
+    (_srv / "b.py").write_text("B = 1\n", encoding="utf-8")
+    _orig_server_dir = _core_fp.SERVER_DIR
+    try:
+        _core_fp.SERVER_DIR = str(_srv)
+        _b6.onboarding_save(str(tmp), _ob["key"], True, _ob["steps"], "指纹快照",
+                            fingerprint=_core_fp.file_fingerprints(str(_srv)))
+        _vs = next(s for s in ops.agent_onboard_status(str(tmp), _ob["key"])["steps"]
+                   if s["key"] == "verify")
+        check("指纹一致时 verify 报「代码指纹一致」",
+              _vs["state"] == "ok" and "代码指纹一致" in _vs["detail"], str(_vs))
+
+        _st = (_srv / "a.py").stat()
+        (_srv / "a.py").write_text("A = 2  # changed\n", encoding="utf-8")
+        _os.utime(_srv / "a.py", (_st.st_atime, _st.st_mtime))  # 模拟 copy2 保留旧时间
+        (_srv / "c.py").write_text("C = 1\n", encoding="utf-8")
+        _vs = next(s for s in ops.agent_onboard_status(str(tmp), _ob["key"])["steps"]
+                   if s["key"] == "verify")
+        check("指纹变了但 mtime 未变仍报快照过期（copy2 场景）",
+              _vs["state"] == "warn" and "快照已过期" in _vs["detail"]
+              and "a.py" in _vs["detail"] and "已修改" in _vs["detail"], str(_vs))
+        _delta = ops._fingerprint_delta({"a.py": "1", "b.py": "2"}, {"a.py": "9", "c.py": "3"})
+        check("指纹差异区分已修改/已移除/新增",
+              _delta == ["a.py（已修改）", "b.py（已移除）", "c.py（新增）"], str(_delta))
+
+        _b6.onboarding_save(str(tmp), _ob["key"], True, _ob["steps"], "旧格式")
+        _vs = next(s for s in ops.agent_onboard_status(str(tmp), _ob["key"])["steps"]
+                   if s["key"] == "verify")
+        check("无指纹的旧快照回落 mtime 判定且不误报",
+              _vs["state"] == "ok" and "mtime" in _vs["detail"], str(_vs))
+    finally:
+        _core_fp.SERVER_DIR = _orig_server_dir
+
+    # ---- R23·快照绑定代码树：跨树比对不得冒充过期或一致
+    _other = tmp / "srv_other_tree"
+    _other.mkdir()
+    (_other / "a.py").write_text("A = 1\n", encoding="utf-8")
+    (_other / "b.py").write_text("B = 1\n", encoding="utf-8")
+    _orig_dir2 = _core_fp.SERVER_DIR
+    try:
+        _core_fp.SERVER_DIR = str(_srv)
+        _b6.onboarding_save(str(tmp), _ob["key"], True, _ob["steps"], "源码树验证",
+                            fingerprint=_core_fp.file_fingerprints(str(_srv)),
+                            base=str(_srv))
+        _core_fp.SERVER_DIR = str(_other)
+        _vs = next(s for s in ops.agent_onboard_status(str(tmp), _ob["key"])["steps"]
+                   if s["key"] == "verify")
+        check("快照来自另一代码树：报无法判断，不冒充过期/一致",
+              _vs["state"] == "unknown" and "另一代码树" in _vs["detail"]
+              and "过期" not in _vs["detail"], str(_vs))
+        _core_fp.SERVER_DIR = str(_srv)
+        _vs = next(s for s in ops.agent_onboard_status(str(tmp), _ob["key"])["steps"]
+                   if s["key"] == "verify")
+        check("回到原代码树仍正常比对（指纹一致）",
+              _vs["state"] == "ok" and "代码指纹一致" in _vs["detail"], str(_vs))
+    finally:
+        _core_fp.SERVER_DIR = _orig_dir2
+
     # ---- R9·技能索引覆盖诊断（本地探测有、索引无 → 点名；同步后转 ok）
     import types as _types
     import agentscore as _asc9
@@ -292,20 +396,92 @@ def main():
         _asc9.detect_agents = _orig_detect
 
     # ---- R7·运行版本体检（非 MCP 不妄判 / 旧启动时刻即点名需重启 / 快照过期可见）
-    _rh = ops.run_check("runtime_health", "", str(tmp))
-    check("runtime_health 已注册且非 MCP 场景不误报",
-          isinstance(_rh, dict) and _rh["ok"] and "运行版本" in _rh["summary"], str(_rh["summary"]))
+    # R22：CLI 的 call 也走进程内 import，非 MCP 身份必须诚实返回「无法判断」
+    # R24：非 MCP 进程可凭运行标记观测长驻服务；标记目录必须隔离，不能读本机真实标记
     import core as _core7
+    _flag0 = _core7.SERVER_IS_MCP
     _old_start = _core7.SERVER_STARTED_AT
+    _marker_dir0 = _core7.RUNTIME_MARKER_DIR
     try:
-        _core7.SERVER_STARTED_AT = "2020-01-01T00:00:00"
+        _core7.RUNTIME_MARKER_DIR = Path(tmp) / "rt_markers_ops"
+        _core7.SERVER_IS_MCP = False
+        _core7.SERVER_STARTED_AT = "2020-01-01T00:00:00"  # 导入残留标记也不得让 CLI 冒充服务进程
+        _rh = ops.run_check("runtime_health", "", str(tmp))
+        check("runtime_health 非 MCP 进程（含 CLI 导入场景）不妄判一致/落后",
+              isinstance(_rh, dict) and _rh["ok"] and "无法判断" in _rh["summary"],
+              str(_rh["summary"]))
+        _core7.SERVER_IS_MCP = True
         _rh = ops.run_check("runtime_health", "", str(tmp))
         check("runtime_health 注入旧启动时刻即点名落后文件并要求重启",
               (not _rh["ok"]) and "需重启" in _rh["summary"]
               and any(".py" in d for d in _rh["detail"]), str(_rh["summary"]))
         check("runtime_health detail ≤ 8", len(_rh["detail"]) <= 8)
     finally:
+        _core7.SERVER_IS_MCP = _flag0
         _core7.SERVER_STARTED_AT = _old_start
+
+    # R24：进程内没有启动标记，但磁盘上有心跳中的运行标记 → 必须给出结论并标注观测来源
+    _rt_probe = Path(tmp) / "rt_marker_probe"
+    _rt_probe.mkdir()
+    (_rt_probe / "m.py").write_text("m = 1\n", encoding="utf-8")
+    _rt_start = "2020-01-01T00:00:00"
+    _rt_saved = (_core7.SERVER_IS_MCP, _core7.SERVER_STARTED_AT, _core7.SERVER_DIR,
+                 _core7.RUNTIME_MARKER_DIR)
+    try:
+        _core7.SERVER_IS_MCP = False
+        _core7.SERVER_STARTED_AT = ""
+        _core7.SERVER_DIR = ""
+        _core7.RUNTIME_MARKER_DIR = Path(tmp) / "rt_markers_ops2"
+        _fp_loaded = _core7.file_fingerprints(str(_rt_probe))
+        _err = _core7.write_runtime_marker(root=str(tmp), agent="opsprobe", version="probe",
+                                           base=str(_rt_probe), started=_rt_start,
+                                           fingerprint=_fp_loaded)
+        check("运行标记可写入", _err == "", _err)
+        _rh = ops.run_check("runtime_health", "", str(tmp))
+        check("有运行标记时 CLI 也有一致结论，并标注观测来源",
+              _rh["ok"] and "一致" in _rh["summary"] and "运行中 MCP 进程" in _rh["summary"]
+              and any("观测来源" in d and "opsprobe" in d for d in _rh["detail"]), str(_rh))
+        (_rt_probe / "m.py").write_text("m = 2\n", encoding="utf-8")
+        _err = _core7.write_runtime_marker(root=str(tmp), agent="opsprobe", version="probe",
+                                           base=str(_rt_probe), started=_rt_start,
+                                           fingerprint=_fp_loaded)
+        _rh = ops.run_check("runtime_health", "", str(tmp))
+        check("标记心跳刷新后仍以加载时的指纹判落后（不因刷新而洗白）",
+              (not _rh["ok"]) and "需重启" in _rh["summary"]
+              and "内容变更" in " ".join(_rh["detail"]), str(_rh))
+        _core7.remove_runtime_marker()
+        _rh = ops.run_check("runtime_health", "", str(tmp))
+        check("标记被清理后回到无法判断，不凭旧结论冒充",
+              _rh["ok"] and "无法判断" in _rh["summary"], str(_rh["summary"]))
+    finally:
+        (_core7.SERVER_IS_MCP, _core7.SERVER_STARTED_AT, _core7.SERVER_DIR,
+         _core7.RUNTIME_MARKER_DIR) = _rt_saved
+
+    # 内容指纹：部署 copy2 保留旧 mtime 时，runtime_health 仍须点名落后
+    import datetime as _dt
+    import os as _os
+    _td = Path(tmp) / "rt_fp_probe"
+    _td.mkdir()
+    (_td / "x.py").write_text("x = 1\n", encoding="utf-8")
+    _stamp = _dt.datetime.now().timestamp()
+    _os.utime(_td / "x.py", (_stamp - 3600, _stamp - 3600))
+    _saved = (_core7.SERVER_IS_MCP, _core7.SERVER_DIR, _core7.SERVER_STARTED_AT,
+              _core7.SERVER_FINGERPRINT, _core7.SERVER_FINGERPRINT_AT)
+    try:
+        _core7.SERVER_IS_MCP = True
+        _core7.SERVER_DIR = str(_td)
+        _core7.SERVER_STARTED_AT = _dt.datetime.fromtimestamp(_stamp).isoformat(timespec="seconds")
+        _core7.SERVER_FINGERPRINT = _core7.file_fingerprints(str(_td))
+        _core7.SERVER_FINGERPRINT_AT = _core7.SERVER_STARTED_AT
+        (_td / "x.py").write_text("x = 2\n", encoding="utf-8")
+        _os.utime(_td / "x.py", (_stamp - 3600, _stamp - 3600))
+        _rh = ops.run_check("runtime_health", "", str(tmp))
+        check("runtime_health 内容指纹：mtime 未变也点名落后",
+              (not _rh["ok"]) and "内容变更" in " ".join(_rh["detail"])
+              and "内容指纹" in " ".join(_rh["detail"]), str(_rh))
+    finally:
+        (_core7.SERVER_IS_MCP, _core7.SERVER_DIR, _core7.SERVER_STARTED_AT,
+         _core7.SERVER_FINGERPRINT, _core7.SERVER_FINGERPRINT_AT) = _saved
 
     # ---- 守卫：回归套件必须全部登记进巡检（漏登记 = 静默少跑）
     try:
@@ -360,10 +536,23 @@ def main():
     check("inbox 列出积压", r["ok"] and "2 个" in r["summary"] and "待分拣甲" in "".join(r["detail"]))
     with brain.db_conn(str(tmp)) as conn:
         conn.execute("INSERT INTO projects(name,status,updated) VALUES('停滞项目-旧工具','stalled','2026-06-01T10:00:00')")
+        conn.execute("INSERT INTO records(project,agent,date,title,content,status) "
+                     "VALUES('停滞项目-旧工具','X','2026-06-01','t','c','active')")
         mid = conn.execute("SELECT MAX(id) FROM memories").fetchone()[0]
+    # R20：显式标记属决策队列，不再当故障——但必须按真实最后活动算闲置天数
     r = ops.run_check("stalled", root=str(tmp))
-    check("stalled 列出停滞项目", not r["ok"] and "停滞项目-旧工具" in "".join(r["detail"])
-          and "hub_archive_project" in r["summary"], str(r["summary"]))
+    check("stalled 显式标记不报故障且算真实闲置",
+          r["ok"] and "显式标记" in r["summary"] and "闲置" in r["summary"]
+          and "停滞项目-旧工具" in "".join(r["detail"]), str(r)[:200])
+    # 反向：active 项目真实超 90 天无活动 = 状态漏标，必须失败并点名
+    with brain.db_conn(str(tmp)) as conn:
+        conn.execute("INSERT INTO projects(name,status,updated) VALUES('漏标项目','active','2026-06-02')")
+        conn.execute("INSERT INTO records(project,agent,date,title,content,status) "
+                     "VALUES('漏标项目','X','2026-06-02','t','c','active')")
+    r = ops.run_check("stalled", root=str(tmp))
+    check("stalled 活跃漏标必报",
+          (not r["ok"]) and "漏标" in r["summary"] and "漏标项目" in "".join(r["detail"]),
+          str(r)[:200])
     brain.add_memory(str(tmp), "部署目录代码同步不等于真实库 schema 已升级，必须等新进程跑 init_db 才生效", "lesson")
     brain.add_memory(str(tmp), "部署目录代码同步不等于真实库 schema 已升级，必须等新进程跑 init_db 才生效!", "lesson")
     r = ops.run_check("dup_mem", root=str(tmp))
@@ -457,6 +646,38 @@ def main():
     check("compress 伪路径 UNC 原样可识别（人取舍）", "srv" in str(cr3["detail"]), str(cr3)[:200])
     check("compress 代码块内容不炸正则", isinstance(cr3["detail"], list), "")
 
+    # ---- R8 一键自检聚合：问题带修复建议、检查器自身异常不拖垮、需 target/未知项跳过
+    check("PATROL_CHECKS 每项都有修复建议",
+          all(n in ops.CHECK_FIXES for n in ops.PATROL_CHECKS),
+          str([n for n in ops.PATROL_CHECKS if n not in ops.CHECK_FIXES]))
+    _orig_run_check = ops.run_check
+
+    def fake_run_check(name, target="", root=""):
+        if name == "db_health":
+            return {"ok": False, "summary": "模拟库问题", "detail": ["wal 残留"]}
+        if name == "env":
+            raise RuntimeError("检查器炸了")
+        return {"ok": True, "summary": "ok", "detail": []}
+    try:
+        ops.run_check = fake_run_check
+        rep = ops.run_patrol(str(tmp), ("env", "db_health", "not_a_check", "regression"))
+        rep_ok = ops.run_patrol(str(tmp), ("stalled",))
+    finally:
+        ops.run_check = _orig_run_check
+    check("run_patrol 聚合两项问题", len(rep["issues"]) == 2, str(rep)[:300])
+    check("run_patrol 问题都带可执行修复",
+          all(i["fix"] and "看 hub_ops_run" not in i["fix"] for i in rep["issues"]),
+          str(rep["issues"])[:300])
+    check("run_patrol 检查器异常记为问题不崩",
+          any(i["name"] == "env" and "自身异常" in i["summary"] for i in rep["issues"]),
+          str(rep["issues"])[:300])
+    check("run_patrol 跳过未知项与需 target 项",
+          {s["name"] for s in rep["skipped"]} == {"not_a_check", "regression"},
+          str(rep["skipped"]))
+    check("run_patrol 有问题时 ok=False", rep["ok"] is False)
+    check("run_patrol 全通过时 ok=True", rep_ok["ok"] is True and not rep_ok["issues"])
+    check("run_patrol 报告耗时", isinstance(rep["elapsed_ms"], int) and rep["elapsed_ms"] >= 0)
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
@@ -503,6 +724,269 @@ def main():
     rq = ops.run_check("record_quality", "", rq_root)
     check("record_quality 合成库度量", rq["summary"].find("50%") >= 0, str(rq)[:160])
     check("record_quality 缺段分布", any("验证结果" in d for d in rq["detail"]), str(rq["detail"])[:160])
+
+    # ---- R5 任务治理巡检：正常在办不误报；过期租约/失联持有者/无主/逾期逐项点名
+    th_root = str(Path(tmp) / "hub_th")
+    Path(th_root).mkdir(parents=True, exist_ok=True)
+    _b.init_db(th_root)
+    ok0 = ops.run_check("tasks_health", "", th_root)
+    check("tasks_health 空库通过", ok0["ok"] is True, str(ok0)[:160])
+    _, t_ok = _b.task_add(th_root, "正常在办", project="甲")
+    _b.task_claim(th_root, t_ok, "qoder")
+    _b.heartbeat_touch(th_root, "qoder", "甲")
+    ok1 = ops.run_check("tasks_health", "", th_root)
+    check("tasks_health 正常在办不误报", ok1["ok"] is True, str(ok1)[:200])
+    _, t_bad = _b.task_add(th_root, "失联任务", project="乙", due="2020-01-01")
+    _b.task_claim(th_root, t_bad, "ghost")
+    with _b.db_conn(th_root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00', "
+                     "updated='2020-01-01T00:00:00' WHERE id=?", (t_bad,))
+    bad = ops.run_check("tasks_health", "", th_root)
+    check("tasks_health 报过期租约", bad["ok"] is False and "过期租约 1" in bad["summary"], str(bad)[:300])
+    check("tasks_health 报持有者失联", "持有者失联 1" in bad["summary"], str(bad)[:300])
+    check("tasks_health 报逾期", "逾期 1" in bad["summary"], str(bad)[:300])
+    check("tasks_health 明细点名任务", any("失联任务" in d for d in bad["detail"]), str(bad["detail"])[:200])
+    _, t_own = _b.task_add(th_root, "无主任务", project="丙")
+    with _b.db_conn(th_root) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='' WHERE id=?", (t_own,))
+    own = ops.run_check("tasks_health", "", th_root)
+    check("tasks_health 报无主在办", "无主 1" in own["summary"], str(own)[:300])
+    # R2：有主但租约缺失（claimed_at 空）的隐身死单也要点名，不能只等它过期
+    _, t_nolease = _b.task_add(th_root, "无租约任务", project="丁")
+    with _b.db_conn(th_root) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='qoder' WHERE id=?",
+                     (t_nolease,))
+    nl = ops.run_check("tasks_health", "", th_root)
+    check("tasks_health 报租约缺失", "租约缺失 2" in nl["summary"], str(nl)[:300])
+    check("tasks_health 租约缺失明细",
+          any("无租约任务" in d and "租约缺失" in d for d in nl["detail"]),
+          str(nl["detail"])[:300])
+    # R4：结构缺陷（缺失前置/成环/残留阻塞）与未登记持有者逐项点名
+    _, t_dangle = _b.task_add(th_root, "缺前置任务", project="戊", deps="999")
+    _, t_cyc1 = _b.task_add(th_root, "环一", project="己")
+    _, t_cyc2 = _b.task_add(th_root, "环二", project="己")
+    with _b.db_conn(th_root) as conn:
+        conn.execute("UPDATE tasks SET deps=? WHERE id=?", (str(t_cyc2), t_cyc1))
+        conn.execute("UPDATE tasks SET deps=? WHERE id=?", (str(t_cyc1), t_cyc2))
+    _, t_res = _b.task_add(th_root, "残留阻塞任务", project="庚", blocked_by="旧原因")
+    with _b.db_conn(th_root) as conn:
+        conn.execute("UPDATE tasks SET status='pending' WHERE id=?", (t_res,))
+    st = ops.run_check("tasks_health", "", th_root)
+    check("tasks_health 报未登记持有者", "未登记 1" in st["summary"], str(st)[:400])
+    check("tasks_health 报前置缺失", "前置缺失 1" in st["summary"], str(st)[:400])
+    check("tasks_health 报依赖成环", "依赖成环 1" in st["summary"], str(st)[:400])
+    check("tasks_health 报残留阻塞", "残留阻塞 1" in st["summary"], str(st)[:400])
+    check("tasks_health 结构缺陷明细",
+          any("缺前置任务" in d and "前置不存在" in d for d in st["detail"]),
+          str(st["detail"])[:400])
+    check("tasks_health 修复建议可执行",
+          "tasks_health" in ops.CHECK_FIXES and "hub_claim" in ops.CHECK_FIXES["tasks_health"],
+          str(ops.CHECK_FIXES.get("tasks_health")))
+
+    # ---- R26 进展停滞：心跳/租约只证明人还在，不能证明任务在走；与失联互斥计数
+    st_root = str(Path(tmp) / "hub_stall")
+    Path(st_root).mkdir(parents=True, exist_ok=True)
+    _b.init_db(st_root)
+    _, t_live = _b.task_add(st_root, "心跳在线活停", project="辛")
+    _b.task_claim(st_root, t_live, "qoder")
+    _b.heartbeat_touch(st_root, "qoder", "辛")
+    old = (datetime.datetime.now()
+           - datetime.timedelta(hours=_b.TASK_PROGRESS_STALL_HOURS + 1)) \
+        .isoformat(timespec="seconds")
+    with _b.db_conn(st_root) as conn:
+        conn.execute("UPDATE tasks SET updated=?, progress_at=? WHERE id=?",
+                     (old, old, t_live))
+    stall = ops.run_check("tasks_health", "", st_root)
+    check("tasks_health 报进展停滞",
+          "进展停滞 1" in stall["summary"] and "持有者失联 0" in stall["summary"],
+          str(stall)[:400])
+    check("tasks_health 停滞明细点名",
+          any("心跳在线活停" in d and "进展停滞" in d for d in stall["detail"]),
+          str(stall["detail"])[:300])
+    assert _b.checkpoint_save(st_root, t_live, "qoder", "写了进展")[0] == ""
+    resumed = ops.run_check("tasks_health", "", st_root)
+    check("tasks_health 检查点续命后通过", resumed["ok"] is True, str(resumed)[:300])
+    with _b.db_conn(st_root) as conn:
+        conn.execute("UPDATE sessions SET ts='2020-01-01T00:00:00' WHERE agent='qoder'")
+        conn.execute("UPDATE tasks SET updated=?, progress_at=? WHERE id=?",
+                     (old, old, t_live))
+        # 手工检查点是刚写的「进展」，只把会话拨老会自相矛盾（有进展怎么会失联）；
+        # 连检查点一起拨老，才是「写了进展后消失」的真实失联场景。
+        conn.execute("UPDATE checkpoints SET ts=? WHERE task_id=?", (old, t_live))
+    gone = ops.run_check("tasks_health", "", st_root)
+    check("tasks_health 失联与停滞不重复计数",
+          "持有者失联 1" in gone["summary"] and "进展停滞 0" in gone["summary"],
+          str(gone)[:400])
+
+    # ---- R30 待办饥饿：能开工却长期没人认领的 pending 要点名；等待/阻塞不误报
+    sv_root = str(Path(tmp) / "hub_starve_ops")
+    Path(sv_root).mkdir(parents=True, exist_ok=True)
+    _b.init_db(sv_root)
+    _, t_fresh = _b.task_add(sv_root, "刚建的可开工", project="壬")
+    sv0 = ops.run_check("tasks_health", "", sv_root)
+    check("tasks_health 新待办不误报饥饿", sv0["ok"] is True, str(sv0)[:300])
+    _, t_hungry = _b.task_add(sv_root, "久置可开工", project="壬")
+    _, t_pre = _b.task_add(sv_root, "未完成前置", project="壬")
+    _, t_wait = _b.task_add(sv_root, "等前置", project="壬", deps=str(t_pre))
+    _, t_blk = _b.task_add(sv_root, "等外部", project="壬", blocked_by="等审批")
+    old_day = (datetime.datetime.now()
+               - datetime.timedelta(days=_b.TASK_STARVE_DAYS + 2)).isoformat(timespec="seconds")
+    with _b.db_conn(sv_root) as conn:
+        conn.execute("UPDATE tasks SET created=? WHERE id IN (?,?,?)",
+                     (old_day, t_hungry, t_wait, t_blk))
+    sv = ops.run_check("tasks_health", "", sv_root)
+    check("tasks_health 报待办饥饿",
+          sv["ok"] is False and "待办饥饿 1" in sv["summary"], str(sv)[:400])
+    check("tasks_health 饥饿明细点名",
+          any("久置可开工" in d and "待办饥饿" in d for d in sv["detail"]),
+          str(sv["detail"])[:300])
+    check("tasks_health 等待/阻塞不算饥饿",
+          not any("等前置" in d or "等外部" in d for d in sv["detail"]),
+          str(sv["detail"])[:300])
+    check("tasks_health 修复建议含饥饿",
+          "待办饥饿" in ops.CHECK_FIXES["tasks_health"], ops.CHECK_FIXES["tasks_health"])
+
+    # ---- R12 文件租约巡检：冲突/任务绑定漂移/未登记持有者是真问题；过期未释放只报数
+    import datetime as _dt
+    lh_root = str(Path(tmp) / "hub_lh")
+    Path(lh_root).mkdir(parents=True, exist_ok=True)
+    (Path(lh_root) / "lease-proj").mkdir()
+    _b.init_db(lh_root)
+    lh0 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 空库通过", lh0["ok"] is True and "有效 0" in lh0["summary"], str(lh0)[:200])
+    _b.heartbeat_touch(lh_root, "qoder", "lease-proj")
+    _b.heartbeat_touch(lh_root, "beta", "lease-proj")
+    _, t_lh = _b.task_add(lh_root, "持锁任务", project="lease-proj")
+    _b.task_claim(lh_root, t_lh, "qoder")
+    err, lrow = _b.file_lease_acquire(lh_root, "lease-proj/a.py", "qoder", task_id=t_lh)
+    check("lease_health 前置：获取绑定租约", err == "", err)
+    lh1 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 正常租约不误报",
+          lh1["ok"] is True and "有效 1" in lh1["summary"], str(lh1)[:300])
+    soon = (_dt.datetime.now() + _dt.timedelta(minutes=30)).isoformat(timespec="seconds")
+    with _b.db_conn(lh_root) as conn:
+        conn.execute("UPDATE file_leases SET expires_at='2020-01-01T00:00:00' WHERE id=?",
+                     (lrow["id"],))
+    lh2 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 过期未释放只报数不判失败",
+          lh2["ok"] is True and "过期未释放 1" in lh2["summary"], str(lh2)[:300])
+    with _b.db_conn(lh_root) as conn:
+        conn.execute("UPDATE file_leases SET expires_at=? WHERE id=?", (soon, lrow["id"]))
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (t_lh,))
+    lh3 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 报任务绑定漂移",
+          lh3["ok"] is False and "任务绑定漂移 1" in lh3["summary"], str(lh3)[:400])
+    check("lease_health 漂移明细点名任务状态",
+          any("任务已完成" in d for d in lh3["detail"]), str(lh3["detail"])[:300])
+    with _b.db_conn(lh_root) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='qoder' WHERE id=?", (t_lh,))
+        _, key_dir, _, _ = _b._file_lock_path(lh_root, "lease-proj")
+        conn.execute(
+            "INSERT INTO file_leases(path, display_path, project, owner, task_id, reason, "
+            "ttl_min, fence, acquired_at, renewed_at, expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (key_dir, "lease-proj", "lease-proj", "beta", 0, "模拟冲突", 30, 1,
+             _b._now(), _b._now(), soon))
+    lh4 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 报活跃租约冲突",
+          lh4["ok"] is False and "冲突 1" in lh4["summary"], str(lh4)[:400])
+    check("lease_health 冲突明细点名对手",
+          any("beta" in d and "路径冲突" in d for d in lh4["detail"]), str(lh4["detail"])[:300])
+    with _b.db_conn(lh_root) as conn:
+        conn.execute("UPDATE file_leases SET owner='rogue' WHERE owner='beta'")
+    lh5 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 报未登记持有者",
+          lh5["ok"] is False and "持有者未登记 1" in lh5["summary"], str(lh5)[:300])
+    with _b.db_conn(lh_root) as conn:
+        conn.execute("UPDATE file_leases SET released_at=? WHERE released_at=''", (_b._now(),))
+    lh6 = ops.run_check("lease_health", "", lh_root)
+    check("lease_health 清理后转绿", lh6["ok"] is True, str(lh6)[:200])
+    check("lease_health 已注册且带修复建议",
+          "lease_health" in ops.PATROL_CHECKS and "hub_lock" in ops.CHECK_FIXES["lease_health"]
+          and "prune" in ops.CHECK_FIXES["lease_health"],
+          str(ops.CHECK_FIXES.get("lease_health")))
+
+    # ---- R18 备份健康口径：单份整包大于旧 1GB 线属正常（必要还原点），
+    #      缺失/陈旧/可清理积压/总量达整包 4 倍才判失败。用假盘点避免造 GB 级文件。
+    class _FakeBackupBrain:
+        def __init__(self, inv, prev):
+            self.inv, self.prev = inv, prev
+
+        def backup_inventory(self, _root):
+            return self.inv
+
+        def backup_prune(self, _root):
+            return self.prev
+
+    def _inv(total_mb, zip_mb, zip_count=1, age=1):
+        return {"families": {
+            "zip": {"count": zip_count, "bytes": zip_mb * 1048576, "label": "整包",
+                    "keep_default": 3, "dir": "", "items": []},
+            "snapshot": {"count": 2, "bytes": max(0, total_mb - zip_mb) * 1048576,
+                         "label": "快照", "keep_default": 10, "dir": "", "items": []}},
+            "total_count": 3, "total_bytes": total_mb * 1048576,
+            "newest": {"mtime": "2026-10-22 12:00", "age_days": age},
+            "oldest": {"mtime": "2026-10-01 12:00", "age_days": 21}}
+
+    _orig_import = ops._import_brain
+    _none = {"candidates": [], "candidate_bytes": 0}
+    try:
+        ops._import_brain = lambda: _FakeBackupBrain(_inv(1300, 1260), _none)
+        r = ops.run_check("backup_health", root=str(tmp))
+        check("backup_health 单份整包超 1GB 不误报（总量绝对值只作信息）",
+              r["ok"] and "整包" in r["summary"], str(r["summary"]))
+        check("backup_health detail 解释总量口径",
+              any("不按总量绝对值" in d for d in r["detail"]), str(r["detail"]))
+        ops._import_brain = lambda: _FakeBackupBrain(_inv(5750, 1150, zip_count=5), _none)
+        r = ops.run_check("backup_health", root=str(tmp))
+        check("backup_health 总量达整包 4 倍即判堆积",
+              (not r["ok"]) and "堆积" in r["summary"], str(r["summary"]))
+        ops._import_brain = lambda: _FakeBackupBrain(_inv(1300, 1260, age=9), _none)
+        r = ops.run_check("backup_health", root=str(tmp))
+        check("backup_health 最新备份超 7 天点名",
+              (not r["ok"]) and "最新备份已" in r["summary"], str(r["summary"]))
+        ops._import_brain = lambda: _FakeBackupBrain(_inv(1300, 1260, zip_count=0), _none)
+        r = ops.run_check("backup_health", root=str(tmp))
+        check("backup_health 无整包点名",
+              (not r["ok"]) and "无 zip 整包" in r["summary"], str(r["summary"]))
+        ops._import_brain = lambda: _FakeBackupBrain(
+            _inv(1300, 1260), {"candidates": [{"path": "x"}] * 3,
+                               "candidate_bytes": 600 * 1048576})
+        r = ops.run_check("backup_health", root=str(tmp))
+        check("backup_health 可清理积压超 512MB 点名",
+              (not r["ok"]) and "可清理" in r["summary"], str(r["summary"]))
+    finally:
+        ops._import_brain = _orig_import
+
+    # ---- R19 记录质量口径：标准上线后的记录判失败，历史存量只作参考
+    _std = ops.RECORD_QUALITY_STANDARD_SINCE
+    _good = "【目的】x\n【做了什么】y\n【验证结果】z\n【如何回滚】w"
+    _bad = "做了一堆事，没有四段式模板"
+    _ev = ops._record_quality_eval(
+        [{"agent": "legacy", "date": "2026-08-01", "content": _bad}] * 10
+        + [{"agent": "qoder", "date": _std, "content": _good}] * 4)
+    check("record_quality 标准上线后全达标即健康（1200 条级历史存量不拖累）",
+          _ev["base"]["rate"] == 100 and _ev["overall"]["rate"] < 40, str(_ev))
+    _ev2 = ops._record_quality_eval(
+        [{"agent": "workbuddy", "date": _std, "content": _good}] * 2
+        + [{"agent": "workbuddy", "date": "2026-10-18", "content": _bad}] * 3)
+    check("record_quality 上线后不达标仍判失败", _ev2["base"]["rate"] == 40, str(_ev2))
+    _ev3 = ops._record_quality_eval(
+        [{"agent": "legacy", "date": "2026-08-01", "content": _good}] * 2)
+    check("record_quality 无上线后记录时回退全期（不因没数据假装健康）",
+          (not _ev3["has_current"]) and _ev3["base"]["rate"] == 100, str(_ev3))
+    import brain as _brain_q
+    q_root = str(tmp / "hub_rq_r19")
+    Path(q_root).mkdir()
+    _brain_q.ensure_schema(q_root)
+    with _brain_q.db_conn(q_root) as _cq:
+        for _ in range(4):
+            _cq.execute(
+                "INSERT INTO records(project,agent,date,title,content,record_type,source,status) "
+                "VALUES(?,?,?,?,?,'work_log','hub','active')",
+                ("rq", "qoder", datetime.date.today().isoformat(), "t", _good))
+    rq = ops.run_check("record_quality", root=q_root)
+    check("record_quality 接线（summary 标明标准上线后口径）",
+          rq["ok"] and "标准上线后" in rq["summary"], str(rq["summary"]))
 
     print()
     if FAILED:

@@ -90,6 +90,43 @@ def t_init_and_migrate(tmp):
     assert "根目录不存在" in brain.init_db(str(Path(tmp) / "无"))
 
 
+def t_migrate_identity_stable(tmp):
+    """迁移身份必须跟内容走，不能跟行号走（2026-10-21 数据污染根因）。
+    反向验证：① 顶部插横幅导致全文件行号位移 → 不得新增记录；
+    ② 软删墓碑（date 清空）不得被清理逻辑硬删后复活；③ 正文真修订 → 才增量导入。"""
+    root = Path(tmp) / "hub_migrate_identity"
+    p = root / "迁移身份-项目"
+    p.mkdir(parents=True)
+    doc = p / core.RECORD_NAME
+    doc.write_text("## 2026-10-01（zcode）\n第一条正文\n"
+                   "## 2026-10-02（zcode）\n第二条正文\n", encoding="utf-8")
+    assert brain.init_db(str(root)) == ""
+    with brain.db_conn(str(root)) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id,title,status FROM records ORDER BY id")]
+    assert len(rows) == 2, rows
+    # 墓碑：软删 + 清空日期（旧清理 SQL 会把它硬删，下一次迁移就复活）
+    with brain.db_conn(str(root)) as conn:
+        conn.execute("UPDATE records SET status='deleted', date='' WHERE id=?", (rows[0]["id"],))
+    # 顶部插 2 行横幅，所有条目行号整体位移；文字内容不变
+    doc.write_text("# 文件头横幅\n> 已归档说明\n\n" + doc.read_text(encoding="utf-8"),
+                   encoding="utf-8")
+    assert brain.init_db(str(root)) == ""
+    with brain.db_conn(str(root)) as conn:
+        after = [dict(r) for r in conn.execute(
+            "SELECT id,title,status FROM records ORDER BY id")]
+    assert len(after) == 2, f"行号漂移导致重复导入：{after}"
+    assert after[0]["status"] == "deleted", "软删墓碑被清理逻辑硬删后复活"
+    assert {r["title"] for r in after} == {"2026-10-01（zcode）", "2026-10-02（zcode）"}
+    # 正文真修订 → 新内容应增量导入，旧条目保留可追溯
+    doc.write_text(doc.read_text(encoding="utf-8").replace("第二条正文", "第二条正文（已修订）"),
+                   encoding="utf-8")
+    brain.init_db(str(root))
+    with brain.db_conn(str(root)) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+    assert n == 3, f"正文修订应增量导入 1 条，实际 {n}"
+
+
 def t_memory_crud(tmp):
     root = str(Path(tmp) / "hub")
     a = brain.add_memory(root, "DMM直连不通需走代理", "fact", "网络,代理", "DMM-启动", "zcode", True)
@@ -277,6 +314,64 @@ def t_backup_brain(tmp):
     assert "不存在" in brain.backup_brain(str(Path(tmp) / "无2"))
 
 
+def t_backup_inventory_prune(tmp):
+    """R7：备份盘点四家族 + 清理默认预演；apply 只删超保留份数且过最小年龄者。
+    安全不变量：主库/非备份文件不动、最新 N 份永不清、未满 min_age 不动、删后 journal 可查。"""
+    import time
+    root = str(Path(tmp) / "hub_prune")
+    hub = Path(root) / core.DIR_META
+    (hub / "backup").mkdir(parents=True, exist_ok=True)
+    (hub / brain.BACKUP_DIR).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    now = time.time()
+
+    def mk(p, size, age):
+        p.write_bytes(b"x" * size)
+        os.utime(p, (now - age * 86400, now - age * 86400))
+        return p
+
+    snaps = [mk(hub / brain.BACKUP_DIR / f"brain-2026100{i}-000000.db", 1000 + i, 50 - i * 10)
+             for i in range(1, 6)]
+    zips = [mk(hub / "backup" / f"brain-2026100{i}-0000.zip", 2000, 50) for i in range(1, 3)]
+    legacy = [mk(hub / "backup" / f"brain-2026100{i}-0000.db", 500, 60) for i in range(1, 4)]
+    baks = [mk(hub / f"brain.db.bak-old{i}", 300, 70) for i in range(1, 4)]
+    unknown = mk(hub / "notes.txt", 10, 100)
+    maindb = brain.db_path(root)
+    inv = brain.backup_inventory(root)
+    assert inv["families"]["snapshot"]["count"] == 5
+    assert inv["families"]["zip"]["count"] == 2
+    assert inv["families"]["legacy_db"]["count"] == 3
+    assert inv["families"]["manual_bak"]["count"] == 3
+    assert inv["families"]["snapshot"]["items"][0]["path"] == str(snaps[4]), "盘点未按新在前排序"
+    assert inv["total_count"] == 13
+    # 预演：keep=0/2/1/1 → 9 个候选，但一份都不许删
+    r = brain.backup_prune(root, keep_zip=0, keep_snapshot=2, keep_legacy=1,
+                           keep_bak=1, min_age_days=0)
+    assert r["candidates"] and not r["deleted"] and not r["apply"]
+    assert len(r["candidates"]) == 9, [c["path"] for c in r["candidates"]]
+    assert all(Path(c["path"]).exists() for c in r["candidates"]), "预演不得删文件"
+    # 真删：只删候选；最新 2 份快照保留；主库与非备份文件不动
+    r2 = brain.backup_prune(root, keep_zip=0, keep_snapshot=2, keep_legacy=1,
+                            keep_bak=1, min_age_days=0, apply=True)
+    assert r2["ok"] and len(r2["deleted"]) == 9, r2["errors"]
+    assert r2["reclaimed_bytes"] > 0
+    assert snaps[3].exists() and snaps[4].exists(), "最新 2 份快照被误删"
+    assert not snaps[0].exists() and not snaps[1].exists() and not snaps[2].exists()
+    assert not any(p.exists() for p in zips + legacy[0:2] + baks[0:2])
+    assert legacy[2].exists(), "保留的最新旧库备份被误删"
+    assert baks[2].exists(), "保留的最新 .bak 被误删"
+    assert unknown.exists() and maindb.exists(), "非备份文件/主库被误删"
+    with brain.db_conn(root) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='backup_prune'").fetchone()[0]
+    assert n == 1, f"清理未留 journal：{n}"
+    # min_age：超保留份数但太新 → 不动
+    fresh = mk(hub / brain.BACKUP_DIR / "brain-20261020-999999.db", 777, 0)
+    r3 = brain.backup_prune(root, keep_snapshot=1, keep_zip=0, keep_legacy=0,
+                            keep_bak=0, min_age_days=7, apply=True)
+    assert not any(c["path"] == str(fresh) for c in r3["deleted"]), "未满最小年龄被删"
+    assert fresh.exists()
+
+
 def t_agents_registry(tmp):
     """agent 注册制：写动作自动登记/计数/在线标记/保留名过滤/回填幂等/并发登记。"""
     root = str(Path(tmp) / "hub")
@@ -372,6 +467,54 @@ def t_plasticity(tmp):
     s = con.execute("SELECT status FROM projects WHERE name='古董项目'").fetchone()[0]
     con.close()
     assert s == "stalled", s
+
+
+def t_project_lifecycle(tmp):
+    """R20 回归：项目活动口径与任务联动。
+    ① project_activity 按最后工作记录/任务算闲置，显式 stalled 与 active 漏标分开；
+    ② 停滞项目按修复建议 hub_task_add 写下下一步后自动恢复 active（此前写了任务仍停滞）；
+    ③ 记忆不算项目活动（从旧项目蒸馏的横向知识 ≠ 复工）；
+    ④ 归档项目不因新任务复活（与 add_record 同一守卫）。
+    """
+    root = str(Path(tmp) / "hub_lifecycle")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    assert brain.init_db(root) == ""
+    import datetime
+    old = (datetime.date.today() - datetime.timedelta(days=120)).isoformat()
+    today = datetime.date.today().isoformat()
+    with brain.db_conn(root) as conn:
+        for name, status in (("显式停滞", "stalled"), ("漏标活跃", "active")):
+            conn.execute("INSERT INTO projects(name,status,updated) VALUES(?,?,?)",
+                         (name, status, old))
+            conn.execute("INSERT INTO records(project,agent,date,title,content,status) "
+                         "VALUES(?,'X',?,'t','c','active')", (name, old))
+    # ① 显式标记 vs 状态漏标
+    snap = brain.project_activity(root)
+    assert [x["name"] for x in snap["labelled"]] == ["显式停滞"], snap
+    assert [x["name"] for x in snap["drift"]] == ["漏标活跃"], snap
+    assert snap["labelled"][0]["idle_days"] == 120, snap
+    assert snap["drift"][0]["source"] == "record", snap
+    # ② 写任务即恢复活跃（修复建议必须真能修）
+    err, tid = brain.task_add(root, "下一步", project="显式停滞", agent="X")
+    assert not err and tid, (err, tid)
+    with brain.db_conn(root) as conn:
+        p = dict(conn.execute("SELECT status,updated FROM projects WHERE name='显式停滞'").fetchone())
+    assert p["status"] == "active" and p["updated"] == today, p
+    # ③ 记忆不刷新项目活跃
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE projects SET status='stalled', updated=? WHERE name='显式停滞'", (old,))
+    brain.add_memory(root, "蒸馏自旧项目的横向知识", kind="fact",
+                     project="显式停滞", agent="Y")
+    with brain.db_conn(root) as conn:
+        p = dict(conn.execute("SELECT status FROM projects WHERE name='显式停滞'").fetchone())
+    assert p["status"] == "stalled", p
+    # ④ 归档项目不被任务复活
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE projects SET status='archived' WHERE name='显式停滞'")
+    brain.task_add(root, "归档后不该复活", project="显式停滞", agent="X")
+    with brain.db_conn(root) as conn:
+        p = dict(conn.execute("SELECT status FROM projects WHERE name='显式停滞'").fetchone())
+    assert p["status"] == "archived", p
 
 
 
@@ -1708,12 +1851,37 @@ def t_archive_project(tmp):
     assert "未找到" in brain.archive_project(str(root), "不存在的项目xyz")
     assert "已是归档状态" in brain.archive_project(str(root), "归档测试-项目")
     assert "必填" in brain.archive_project(str(root), "")
-    # 回滚路径：目录移回 + 状态改回（记录里承诺的可逆性验证）
-    import shutil as _sh
-    _sh.move(str(root / "99_Archive" / "归档测试-项目"), str(root / "归档测试-项目"))
+    # 回滚路径（R21）：restore_project 一步恢复状态与目录，updated 记今天（不被下次 init 打回 stalled）
+    import datetime as _dt
+    err = brain.restore_project(str(root), "归档测试-项目", agent="zcode")
+    assert err == "", err
     with brain.db_conn(str(root)) as conn:
-        conn.execute("UPDATE projects SET status='active' WHERE name='归档测试-项目'")
+        st3, upd = conn.execute(
+            "SELECT status, updated FROM projects WHERE name='归档测试-项目'").fetchone()
+    assert st3 == "active" and upd == _dt.date.today().isoformat(), (st3, upd)
     assert (root / "归档测试-项目").is_dir()
+    assert not (root / "99_Archive" / "归档测试-项目").exists()
+    # 错误分支：重复恢复 / 空名 / 不存在
+    assert "未归档" in brain.restore_project(str(root), "归档测试-项目")
+    assert "必填" in brain.restore_project(str(root), "")
+    assert "未找到" in brain.restore_project(str(root), "不存在的项目xyz")
+    # 碰撞拒绝：根目录已有同名目录时不覆盖、状态与归档目录都不动
+    assert brain.archive_project(str(root), "归档测试-项目") == ""
+    (root / "归档测试-项目").mkdir()
+    assert "已有同名" in brain.restore_project(str(root), "归档测试-项目")
+    with brain.db_conn(str(root)) as conn:
+        assert conn.execute("SELECT status FROM projects WHERE name='归档测试-项目'"
+                            ).fetchone()[0] == "archived"
+    assert (root / "99_Archive" / "归档测试-项目").is_dir()
+    (root / "归档测试-项目").rmdir()
+    # 目录缺失：状态照常恢复（归档时目录移动失败的项目也要能回到活跃视图）
+    import shutil as _sh
+    _sh.move(str(root / "99_Archive" / "归档测试-项目"), str(Path(tmp) / "挪走的归档目录"))
+    assert "无目录" in brain.restore_project(str(root), "归档测试-项目")
+    with brain.db_conn(str(root)) as conn:
+        assert conn.execute("SELECT status FROM projects WHERE name='归档测试-项目'"
+                            ).fetchone()[0] == "active"
+    _sh.rmtree(Path(tmp) / "挪走的归档目录")
 
 
 def t_ensure_schema(tmp):
@@ -1868,6 +2036,217 @@ def t_task_graph(tmp):
     assert (live, dead, ttl) == (2, 1, 3), (live, dead, ttl, s5)
 
 
+def t_task_evidence_nudge(tmp):
+    """R28：完成证据提示——空任务完成时结晶明说「无完成证据」（不阻断）；
+    有手工检查点/工作记录的任务不误报。"""
+    root = str(Path(tmp) / "hub_task_evidence")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    _, empty = brain.task_add(root, "只有任务卡", project="甲-问题", agent="zcode")
+    _, row = brain.task_update(root, empty, status="done", agent="zcode")
+    assert "结晶完成" in (row.get("crystal") or ""), row.get("crystal")
+    assert "无完成证据" in (row.get("crystal") or ""), row.get("crystal")
+    # 有手工检查点的任务：即使没有工作记录也不报（检查点就是断点证据）
+    _, withcp = brain.task_add(root, "有检查点", project="甲-问题", agent="zcode")
+    assert not brain.task_claim(root, withcp, "zcode")[0]
+    assert not brain.checkpoint_save(root, withcp, "zcode", "完成一半")[0]
+    _, row2 = brain.task_update(root, withcp, status="done", agent="zcode")
+    assert "结晶完成" in (row2.get("crystal") or ""), row2.get("crystal")
+    assert "无完成证据" not in (row2.get("crystal") or ""), row2.get("crystal")
+    # 有工作记录的任务：同样不报
+    _, withrec = brain.task_add(root, "有记录", project="甲-问题", agent="zcode")
+    brain.add_record(root, "甲-问题", "zcode", "2026-10-22", "真干了活", "正文")
+    _, row3 = brain.task_update(root, withrec, status="done", agent="zcode")
+    assert "无完成证据" not in (row3.get("crystal") or ""), row3.get("crystal")
+
+
+def t_task_state_integrity(tmp):
+    """R1（2026-10-21）：释放清阻塞标记 / blocked_by='-' / blocked 不可直接开工 /
+    task_update 不得绕过依赖门 / in_progress 必须署名 / due='-' 清除。"""
+    root = str(Path(tmp) / "hub_task_state")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    _, a = brain.task_add(root, "地基", project="甲-问题", agent="alpha")
+    _, b = brain.task_add(root, "上梁", project="甲-问题", agent="alpha",
+                          deps=str(a), blocked_by="等外部审批")
+    nxt = brain.task_next(root)
+    assert [t["id"] for t in nxt["ready"]] == [a], nxt
+    assert [t["id"] for t in nxt["waiting"]] == [b], nxt
+    # blocked 不可直接跳 in_progress
+    err, _ = brain.task_update(root, b, status="in_progress", agent="alpha")
+    assert "阻塞" in err, err
+    # 释放：status=pending 必须清 owner/claimed_at/blocked_by
+    err, row = brain.task_update(root, b, status="pending", agent="")
+    assert not err and row["blocked_by"] == "" and row["owner"] == "", (err, row)
+    # 依赖未完成，task_update 不得绕过认领门
+    err, _ = brain.task_update(root, b, status="in_progress", agent="alpha")
+    assert "前置未完成" in err, err
+    # in_progress 必须署名
+    _, c = brain.task_add(root, "无主任务", project="甲-问题")
+    err, _ = brain.task_update(root, c, status="in_progress", agent="")
+    assert "署名" in err, err
+    # 依赖满足后可正常开工，且开工即清阻塞标记
+    brain.task_update(root, a, status="done", agent="alpha")
+    err, row = brain.task_update(root, b, status="in_progress", agent="alpha")
+    assert not err and row["status"] == "in_progress" and row["blocked_by"] == "", (err, row)
+    # blocked_by='-' 单独清除残留标记（兼容老数据）
+    _, d = brain.task_add(root, "残留阻塞", project="甲-问题", blocked_by="旧原因")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET status='pending' WHERE id=?", (d,))
+    err, row = brain.task_update(root, d, blocked_by="-", agent="")
+    assert not err and row["blocked_by"] == "", (err, row)
+    # pending + 残留阻塞标记：认领必须拒绝（不能悄悄绕过前沿可视性）
+    _, e = brain.task_add(root, "残留标记认领", project="甲-问题")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET blocked_by='残留' WHERE id=?", (e,))
+    err, _ = brain.task_claim(root, e, "alpha")
+    assert "阻塞标记" in err, err
+    # due 清除（brain 层哨兵；MCP 层的 '-' 放行另测）
+    _, f = brain.task_add(root, "截止日", project="甲-问题", due="2026-10-30")
+    err, row = brain.task_update(root, f, due="-", agent="")
+    assert not err and row["due"] == "", (err, row)
+
+
+def t_dep_integrity(tmp):
+    """R3 依赖图完整性（2026-10-21）：自依赖/二元环/长环/前向引用成环一律拒绝；
+    拒绝后不落库、原 deps 不被污染；合法链与「指向不存在 id」的前向引用保留且可见。"""
+    root = str(Path(tmp) / "hub_dep_graph")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    _, a = brain.task_add(root, "A 地基", project="甲")
+    _, b = brain.task_add(root, "B 上梁", project="甲", deps=str(a))
+    _, c = brain.task_add(root, "C 封顶", project="甲", deps=str(b))
+    # 自依赖
+    err, _ = brain.task_update(root, a, deps=str(a))
+    assert "成环" in err and f"#{a} → #{a}" in err, err
+    # 二元环：A 依赖 B，而 B 依赖 A
+    err, _ = brain.task_update(root, a, deps=str(b))
+    assert "成环" in err, err
+    with brain.db_conn(root) as conn:
+        assert conn.execute("SELECT deps FROM tasks WHERE id=?", (a,)).fetchone()[0] == ""
+    # 三元环：A 依赖 C（现有链 C→B→A）→ A→C→B→A
+    err, _ = brain.task_update(root, a, deps=str(c))
+    assert "成环" in err and f"#{a}" in err and f"#{c}" in err, err
+    # 完成后的节点可被依赖（无环），合法更新正常生效
+    _, d = brain.task_add(root, "D 独立", project="甲")
+    brain.task_update(root, d, status="done", agent="")
+    err, row = brain.task_update(root, a, deps=str(d))
+    assert not err and row["deps"] == str(d), (err, row)
+
+    # 非法 id 串：报错，不再静默清空/写入空依赖
+    err, zid = brain.task_add(root, "坏依赖", deps="abc, xyz")
+    assert zid == 0 and "无合法" in err, (err, zid)
+    err, _ = brain.task_update(root, b, deps="abc")
+    assert "无合法" in err, err
+
+    # 前向引用：指向尚不存在的 id 允许（可能拼错，也要可见而不是静默放行）
+    _, x = brain.task_add(root, "前向引用", project="乙", deps="900")
+    nxt = brain.task_next(root, project="乙")
+    xt = [t for t in nxt["waiting"] if t["id"] == x]
+    assert xt and xt[0]["_wait"][0]["status"] == "missing", nxt
+
+    # 前向引用成环：旧任务指向「未来的下一个 id」，新任务恰好拿到该 id 且依赖旧任务
+    _, y = brain.task_add(root, "旧任务", project="乙")
+    future_id = y + 1
+    err, _ = brain.task_update(root, y, deps=str(future_id))
+    assert not err, err
+    err, sid = brain.task_add(root, "未来的环", project="乙", deps=str(y))
+    assert sid == 0 and "成环" in err, (err, sid)
+    with brain.db_conn(root) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM tasks WHERE id=?",
+                            (future_id,)).fetchone()[0] == 0, "成环任务未回滚"
+    # 被拒绝的任务不落库；id 序列可能不复用（AUTOINCREMENT），只要求之后能正常新建
+    err, same = brain.task_add(root, "替代任务", project="乙")
+    assert not err and same > future_id, (err, same, future_id)
+
+
+def t_graph_audit(tmp):
+    """R4 任务图巡检（2026-10-21）：存量脏数据（前置缺失/依赖成环/pending 残留阻塞）
+    可见且只读；修复后归零。"""
+    root = str(Path(tmp) / "hub_graph_audit")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    _, a = brain.task_add(root, "A", project="甲")
+    _, b = brain.task_add(root, "B", deps=str(a), project="甲")
+    _, c = brain.task_add(root, "C", deps=str(b), project="甲")
+    _, d = brain.task_add(root, "D 缺前置", deps="999", project="甲")
+    _, e = brain.task_add(root, "E 残留", project="甲", blocked_by="旧原因")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET status='pending' WHERE id=?", (e,))
+    before = brain.stats(root)
+    audit = brain.task_graph_audit(root)
+    assert [x["id"] for x in audit["dangling"]] == [d], audit
+    assert audit["dangling"][0]["_missing"] == [999], audit
+    assert [x["id"] for x in audit["residual_blocked"]] == [e], audit
+    assert audit["cycles"] == [], audit
+    # 绕过写入口直改库造环（模拟存量/外部脚本），巡检必须看见
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET deps=? WHERE id=?", (str(c), a))
+    audit2 = brain.task_graph_audit(root)
+    assert len(audit2["cycles"]) == 1, audit2
+    assert set(audit2["cycles"][0][:-1]) == {a, b, c}, audit2["cycles"]
+    # 修复后归零
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET deps='' WHERE id=?", (a,))
+    audit3 = brain.task_graph_audit(root)
+    assert audit3["cycles"] == [] and audit3["counts"]["dangling"] == 1, audit3
+    assert brain.stats(root) == before, "图巡检不应写库"
+
+
+def t_task_audit_timeline(tmp):
+    """R5 任务审计流水（2026-10-21）：新建/认领/接管/流转/检查点都进 journal；
+    hub_history(kind=task) 合并 journal+检查点+任务卡时点，且 #1 不得混入 #10 的流水。"""
+    root = str(Path(tmp) / "hub_task_history")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "alpha", "甲")
+    _, p = brain.task_add(root, "前置", project="甲", agent="alpha")
+    _, tid = brain.task_add(root, "审计任务", project="甲", agent="alpha",
+                            deps=str(p), due="2026-12-31")
+    brain.task_update(root, p, status="done", agent="alpha")
+    err, _ = brain.task_claim(root, tid, "alpha")
+    assert err == "", err
+    brain.task_update(root, tid, detail="一半了", agent="alpha")
+    err, cid = brain.checkpoint_save(root, tid, "alpha", "第一批完成")
+    assert err == "" and cid > 0, (err, cid)
+    # R27：把 updated 推离 progress_at（模拟心跳续租刷新），时间线必须分成两个事件
+    with brain.db_conn(root) as conn:
+        pa = conn.execute("SELECT progress_at FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+        bumped = (brain.datetime.datetime.fromisoformat(pa)
+                  + brain.datetime.timedelta(hours=3)).isoformat(timespec="seconds")
+        conn.execute("UPDATE tasks SET updated=? WHERE id=?", (bumped, tid))
+    h_mid = brain.history_of(root, "task", tid)
+    events_mid = [e["event"] for e in h_mid["timeline"]]
+    assert "最后改动" in events_mid and "最后推进" in events_mid, events_mid
+    assert "最后更新" not in events_mid, events_mid
+    c = h_mid["clocks"]
+    assert c["progress_at"] == pa and c["progress_age_h"] is not None, c
+    assert c["progress_age_h"] < brain.TASK_PROGRESS_STALL_HOURS and c["stalled"] is False, c
+    assert c["last_checkpoint"] and c["last_checkpoint_age_h"] is not None, c
+    assert c["heartbeat_at"] and c["heartbeat_age_h"] is not None, c
+    assert c["lease_state"] == "ok" and c["lease_left_h"] > 0, c
+    brain.task_update(root, tid, status="done", agent="alpha")
+    h = brain.history_of(root, "task", tid)
+    assert h["item"] and h["item"]["title"] == "审计任务", h["item"]
+    events = [e["event"] for e in h["timeline"]]
+    for want in ("任务新建", "认领任务", "任务检查点", "任务流转",
+                 "创建", "当前租约", "完成", "前置链", "截止日"):
+        assert want in events, (want, events)
+    assert any("manual" in e for e in events) and any("auto_claim" in e for e in events), events
+    stamps = [e["ts"] or "" for e in h["timeline"]]
+    assert stamps == sorted(stamps), stamps
+    # 精确 id 绑定：tasks#1 的变更史不得混入 tasks#10 的流水
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,note) "
+                     "VALUES(?,?,?,?,?)", (brain._now(), "alpha", "伪造事件",
+                                          f"tasks#{tid}0", "不该出现"))
+    h2 = brain.history_of(root, "task", tid)
+    assert "伪造事件" not in [e["event"] for e in h2["timeline"]], h2
+    assert brain.history_of(root, "task", 999)["item"] is None
+
+
 def t_signals(tmp):
     """M3 信号（2026-10-12）：点对点/广播/收件箱过滤/已读回执（幂等+非我勿动）/未读计数。
 
@@ -1958,6 +2337,188 @@ def t_checkpoints(tmp):
     assert r1[0] == "" and r2[0].startswith("认领失败"), (r1[0], r2[0])
     # 抢单胜者也有自动锚点
     assert len(brain.checkpoint_list(root, tid2)) == 1
+
+
+def t_lease_renewal(tmp):
+    """任务租约续期（2026-10-21）：心跳与进展更新必须续租，否则长任务 2h 后被误接管；
+    续租不是新认领，不得重复写开工资锚点；心跳只续当前项目的任务。"""
+    root = str(Path(tmp) / "hub_lease")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    _, tid = brain.task_add(root, "长任务-租约", project="甲-项目", agent="alpha")
+    err, row = brain.task_claim(root, tid, "alpha")
+    assert err == "" and row["owner"] == "alpha", (err, row)
+    assert len(brain.checkpoint_list(root, tid)) == 1
+    stale = "2020-01-01T00:00:00"
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (stale, tid))
+    # 心跳续租：项目内任务 claimed_at 被推到现在，别人抢不走
+    err, _ = brain.heartbeat_touch(root, "alpha", "甲-项目", "还在跑")
+    assert err == ""
+    with brain.db_conn(root) as conn:
+        got = conn.execute("SELECT claimed_at FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    assert got != stale, "心跳没有续租"
+    err, _ = brain.task_claim(root, tid, "beta")
+    assert err.startswith("认领失败") and "alpha" in err, err
+    # 同 owner 再次 claim = 续租，且不重复写自动锚点
+    err, row = brain.task_claim(root, tid, "alpha")
+    assert err == "" and row.get("_renewed") is True, (err, row)
+    assert len(brain.checkpoint_list(root, tid)) == 1, "续租不该重复写开工资锚点"
+    # 进展更新也续租
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (stale, tid))
+    err, row = brain.task_update(root, tid, detail="完成一半", agent="alpha")
+    assert err == "" and row["claimed_at"] != stale, (err, row)
+    # 心跳只续当前项目：乙-项目的任务不被甲-项目的心跳续租
+    _, tid2 = brain.task_add(root, "乙项目任务", project="乙-项目", agent="alpha")
+    brain.task_claim(root, tid2, "alpha")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (stale, tid2))
+    brain.heartbeat_touch(root, "alpha", "甲-项目", "继续")
+    with brain.db_conn(root) as conn:
+        got2 = conn.execute("SELECT claimed_at FROM tasks WHERE id=?", (tid2,)).fetchone()[0]
+    assert got2 == stale, "心跳跨项目误续租"
+
+
+def t_lease_selfheal(tmp):
+    """R2 租约自愈（2026-10-21）：历史数据/异常退出留下的 in_progress 无主或无租约任务
+    必须能被接管，不能永远卡死；接管有明确标注；无主任务不许借写检查点「隐身持有」。"""
+    root = str(Path(tmp) / "hub_lease_selfheal")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    _, tid = brain.task_add(root, "遗留无主任务", project="甲-项目")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='', claimed_at='' "
+                     "WHERE id=?", (tid,))
+    # 前沿队列：无主在办归入可接管，不是「进行中」
+    nxt = brain.task_next(root, project="甲-项目")
+    assert [t["id"] for t in nxt["takeover"]] == [tid], nxt
+    assert nxt["takeover"][0]["_takeover"] == "无主", nxt
+    assert nxt["doing"] == [] and nxt["ready"] == [], nxt
+    # 无主任务不收检查点（不能借写进展隐身持有）
+    err, cid = brain.checkpoint_save(root, tid, "alpha", "偷偷开工")
+    assert cid == 0 and "无持有者" in err and "hub_claim" in err, (err, cid)
+    # 接管成功：owner/租约落位、来源标注、开工资锚点照写
+    err, row = brain.task_claim(root, tid, "alpha")
+    assert err == "" and row["owner"] == "alpha" and row["claimed_at"], (err, row)
+    assert row.get("_takeover") == "无主任务接管", row
+    assert brain.checkpoint_list(root, tid)[0]["kind"] == "auto_claim"
+    # 有主但租约缺失：同样可接管，原因=租约缺失
+    _, tid2 = brain.task_add(root, "遗留无租约任务", project="甲-项目")
+    brain.task_claim(root, tid2, "beta")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='' WHERE id=?", (tid2,))
+    nxt2 = brain.task_next(root, project="甲-项目")
+    assert [t["id"] for t in nxt2["takeover"]] == [tid2], nxt2
+    assert nxt2["takeover"][0]["_takeover"] == "租约缺失", nxt2
+    err, row = brain.task_claim(root, tid2, "gamma")
+    assert err == "" and row["owner"] == "gamma", (err, row)
+    assert row.get("_takeover") == "租约缺失接管", row
+    # 同 owner 在租约缺失时再 claim 仍是续期，不是接管、不重复写锚点
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='' WHERE id=?", (tid2,))
+    n_before = len(brain.checkpoint_list(root, tid2))
+    err, row = brain.task_claim(root, tid2, "gamma")
+    assert err == "" and row.get("_renewed") is True, (err, row)
+    assert not row.get("_takeover"), row
+    assert len(brain.checkpoint_list(root, tid2)) == n_before, "续期重复写开工资锚点"
+    # 状态面点名：无主/租约缺失都进 stale_claims，并带原因
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET owner='', claimed_at='' WHERE id=?", (tid,))
+    s = brain.status_snapshot(root)
+    reasons = {t["id"]: t["reason"] for t in s["stale_claims"]}
+    assert reasons.get(tid) == "无主", s
+
+
+def t_checkpoint_fencing(tmp):
+    """R8 检查点围栏（2026-10-21）：在办任务只收持有者的检查点并顺手续租；
+    非持有者拒收且不落行；被接管后旧持有者的迟到补写必须拒收；待办任务不设限。"""
+    root = str(Path(tmp) / "hub_ckpt_fence")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.heartbeat_touch(root, "alpha", "丙-项目")
+    _, tid = brain.task_add(root, "长任务-围栏", project="丙-项目")
+    # 1) 还没人认领：任何署名 agent 都能留检查点（管理面不受持有者限制）
+    err, cid = brain.checkpoint_save(root, tid, "beta", "待办阶段先记一笔")
+    assert err == "" and cid > 0, (err, cid)
+    # 2) 持有者写检查点：成功 + 续租（写检查点=还在干活，不该被判 2h 失联）
+    err, _ = brain.task_claim(root, tid, "alpha")
+    assert err == "", err
+    stale = "2020-01-01T00:00:00"
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (stale, tid))
+    err, _ = brain.checkpoint_save(root, tid, "alpha", "第一批完成")
+    assert err == "", err
+    with brain.db_conn(root) as conn:
+        got = conn.execute("SELECT claimed_at FROM tasks WHERE id=?", (tid,)).fetchone()[0]
+    assert got != stale, "持有者写检查点没有续租"
+    before = len(brain.checkpoint_list(root, tid))
+    # 3) 非持有者：拒收且一行都不落（不许污染别人的进展时间线）
+    err, cid = brain.checkpoint_save(root, tid, "beta", "冒充补写")
+    assert cid == 0 and "持有" in err, (err, cid)
+    assert len(brain.checkpoint_list(root, tid)) == before, "拒收的检查点仍落库"
+    # 4) 租约过期被接管：旧持有者的迟到补写必须拒收
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (stale, tid))
+    err, row = brain.task_claim(root, tid, "beta")
+    assert err == "" and row["owner"] == "beta", (err, row)
+    err, cid = brain.checkpoint_save(root, tid, "alpha", "旧进程迟到补写")
+    assert cid == 0 and "beta" in err, (err, cid)
+    assert len(brain.checkpoint_list(root, tid)) == before + 1, "接管锚点后计数不对"
+    # 5) 新持有者写检查点：放行
+    err, cid = brain.checkpoint_save(root, tid, "beta", "接管后继续")
+    assert err == "" and cid > 0, (err, cid)
+
+
+def t_status_control_surface(tmp):
+    """hub_status 过程面（2026-10-21）：状态快照要能回答「在办什么、谁持有、哪条租约过期」，
+    且只读——调用前后不写库、不进 searches。"""
+    root = str(Path(tmp) / "hub_status_ctl")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    _, tid = brain.task_add(root, "状态面任务", project="甲-项目", agent="alpha")
+    brain.task_claim(root, tid, "alpha")
+    before = brain.stats(root)["records"]
+    s = brain.status_snapshot(root)
+    assert s["tasks_open_total"] == 1 and len(s["tasks_in_progress"]) == 1, s
+    assert s["tasks_in_progress"][0]["owner"] == "alpha"
+    assert s["claim_ttl_hours"] == brain.CLAIM_TTL_HOURS
+    # 过期租约必须被点名（可接管入口是 hub_claim）
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00' WHERE id=?", (tid,))
+    s2 = brain.status_snapshot(root)
+    assert [t["id"] for t in s2["stale_claims"]] == [tid], s2
+    # 心跳续租后从 stale 列表消失
+    brain.heartbeat_touch(root, "alpha", "甲-项目")
+    assert brain.status_snapshot(root)["stale_claims"] == []
+    assert brain.stats(root)["records"] == before, "状态快照不应写库"
+
+
+def t_heartbeat_concurrent(tmp):
+    """并发心跳不得丢会话：旧实现「读全表→DELETE 全表→重建」在两人同时心跳时会
+    丢掉另一方刚写入的行；改为只剪过期行 + UPSERT 本人。"""
+    root = str(Path(tmp) / "hub_hb_concurrent")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    agents = [f"hb{i}" for i in range(6)]
+    barrier = threading.Barrier(len(agents))
+    errs: list = []
+
+    def beat(a):
+        try:
+            barrier.wait(timeout=10)
+            brain.heartbeat_touch(root, a, "并发-项目", "同时开工")
+        except Exception as e:  # noqa: BLE001
+            errs.append(f"{a}:{type(e).__name__}:{e}")
+
+    threads = [threading.Thread(target=beat, args=(a,)) for a in agents]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join(timeout=20)
+    assert not errs, errs
+    live = {s["agent"] for s in brain.active_sessions(root)}
+    assert set(agents) <= live, f"并发心跳丢会话：期望 {set(agents)}，实际 {live}"
 
 
 def t_sentry(tmp):
@@ -2204,6 +2765,94 @@ def t_export_history(tmp):
     # 不存在 / 坏 kind 都不炸
     assert brain.history_of(root, "record", 99999)["item"] is None
     assert brain.history_of(root, "bogus", 1)["timeline"] == []
+
+
+def t_backup_reliability(tmp):
+    """R4 备份可靠性（2026-10-21）：同秒连续备份不得互相覆盖（秒级命名+冲突后缀）；
+    正式包只以完整形态出现（临时 zip 原子改名，无残留）；运营备份目录/旧库备份/锁
+    不进整包；坏 zip 与「zip 里装坏库」都返回错误文案而非抛异常；校验摘要带 quick_check。"""
+    import datetime as _dt
+    import re as _re
+    import zipfile as _zf
+    root = str(Path(tmp) / "hub_backup_r4")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_record(root, "甲-问题", "zcode", "2026-10-21", "记录一", "正文")
+    hub = Path(root) / "_hub"
+    for d in ("brain-backups", "backup", "locks"):
+        (hub / d).mkdir(parents=True, exist_ok=True)
+    (hub / "brain-backups" / "brain-old.db").write_bytes(b"x")
+    (hub / "backup" / "brain-old.zip").write_bytes(b"x")
+    (hub / "locks" / "brain.lock").write_text("x", encoding="utf-8")
+    (hub / "brain.db.bak-test").write_bytes(b"x")
+    proj = Path(root) / "甲-问题" / "output"
+    proj.mkdir(parents=True, exist_ok=True)
+    (proj / "交付.md").write_text("源文件", encoding="utf-8")
+    # 真实库曾因某文件 mtime 早于 1980 让整份备份抛 ValueError（zip 格式上限）
+    stale = proj / "旧时间戳.md"
+    stale.write_text("1980 前的 mtime", encoding="utf-8")
+    os.utime(stale, (0, 0))
+    # 构建/依赖目录可重建，不进整包（真实树 12GB，其中 _archive+deps 占大头）
+    (Path(root) / "工具" / "node_modules").mkdir(parents=True, exist_ok=True)
+    (Path(root) / "工具" / "node_modules" / "dep.js").write_text("x", encoding="utf-8")
+    (Path(root) / "工具" / "build_tmp").mkdir(parents=True, exist_ok=True)
+    (Path(root) / "工具" / "build_tmp" / "out.bin").write_bytes(b"x")
+    e1, p1 = brain.backup_db(root)
+    e2, p2 = brain.backup_db(root)
+    assert e1 == "" and e2 == "" and p1 and p2 and p1 != p2, (e1, p1, e2, p2)
+    with _zf.ZipFile(p2) as z:
+        names = z.namelist()
+    assert "brain.db" in names
+    assert any(n.endswith("甲-问题/output/交付.md") for n in names), names[-5:]
+    assert any(n.endswith("甲-问题/output/旧时间戳.md") for n in names), names[-5:]
+    assert not any("node_modules/" in n or "build_tmp/" in n for n in names), names[-8:]
+    assert brain.BACKUP_MANIFEST in names, names[-3:]
+    for bad in ("brain-backups/", "backup/", "locks/", "brain.db.bak-"):
+        assert not any(bad in n for n in names), (bad, [n for n in names if bad in n])
+    assert _re.search(r"brain-\d{8}-\d{6}(-\d+)?\.zip$", Path(p2).name), p2
+    assert not list((hub / "backup").glob(".tmp-brain-*")), "临时包残留"
+    # 正常校验：完整性结论可见、计数正确
+    verr, vmsg = brain.backup_verify(root, p2)
+    assert verr == "" and "records 1" in vmsg and "完整性 ok" in vmsg, (verr, vmsg)
+    listed = {Path(b["path"]).name for b in brain.backup_list(root)}
+    assert {Path(p1).name, Path(p2).name} <= listed, (p1, p2, listed)
+    # 同秒防覆盖：预占当前及随后两秒的基础名，备份必须改用带后缀的新名
+    dest = Path(tmp) / "hub_backup_r4_dest"
+    dest.mkdir(parents=True, exist_ok=True)
+    now = _dt.datetime.now()
+    for off in range(3):
+        s = (now + _dt.timedelta(seconds=off)).strftime("%Y%m%d-%H%M%S")
+        (dest / f"brain-{s}.zip").write_bytes(b"placeholder")
+    e3, p3 = brain.backup_db(root, str(dest))
+    assert e3 == "" and _re.search(r"-\d+\.zip$", Path(p3).name), (e3, p3)
+    assert brain.backup_verify(root, p3)[0] == ""
+    assert not list(dest.glob(".tmp-brain-*")), "临时包残留（dest）"
+    # 单文件上限：超限文件不打包，但清单必须点名（还原时不静默缺件）
+    (proj / "大文件.bin").write_bytes(b"\0" * (2 * 1024 * 1024))
+    dest2 = Path(tmp) / "hub_backup_r4_cap"
+    e4, p4 = brain.backup_db(root, str(dest2), max_file_mb=1)
+    assert e4 == "", e4
+    with _zf.ZipFile(p4) as z:
+        names4 = z.namelist()
+        man = z.read(brain.BACKUP_MANIFEST).decode("utf-8")
+    assert not any(n.endswith("大文件.bin") for n in names4), names4[-5:]
+    assert "skipped_file" in man and "大文件.bin" in man, man[:300]
+    verr4, vmsg4 = brain.backup_verify(root, p4)
+    assert verr4 == "" and "跳过 1 文件" in vmsg4, (verr4, vmsg4)
+    # 坏 zip：不许抛异常，错误要点出损坏
+    bad_zip = Path(tmp) / "hub_backup_r4_bad.zip"
+    bad_zip.write_bytes(b"not a zip at all")
+    e, m = brain.backup_verify(root, str(bad_zip))
+    assert e.startswith("读取备份失败"), (e, m)
+    # zip 结构正常但 brain.db 是垃圾：必须报错，不能返回「可读」
+    bad_db_zip = Path(tmp) / "hub_backup_r4_bad_db.zip"
+    with _zf.ZipFile(bad_db_zip, "w") as z:
+        z.writestr("brain.db", b"garbage" * 100)
+    e, m = brain.backup_verify(root, str(bad_db_zip))
+    assert e and ("读取备份失败" in e or "完整性" in e), (e, m)
+    # 目录当备份：明确拒收，不炸
+    e, m = brain.backup_verify(root, str(hub))
+    assert "不存在" in e, (e, m)
 
 
 def t_tool_schema_sync(tmp):
@@ -2589,6 +3238,7 @@ def t_usage_timeline(tmp):
         conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "workbuddy", "hub_search"))
         conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "workbuddy", "hub_search"))
         conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "zcode", "hub_health"))
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (fresh, "", "hub_get_progress"))
         conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?,?,?)", (old, "workbuddy", "hub_search"))
         conn.execute("INSERT INTO op_audit(ts,agent,tool,project,summary,undo_kind,undo_ref) "
                      "VALUES(?,?,?,?,?,?,?)", (fresh, "workbuddy", "hub_log_work", "p", "写了记录", "record", "7"))
@@ -2629,11 +3279,14 @@ def t_usage_timeline(tmp):
 
     # ② stats：聚合口径
     st = brain.usage_stats(rs, days=7)
-    assert st["totals"]["calls"] == 3, f"calls 口径错：{st['totals']}"       # 3 条 fresh
+    assert st["totals"]["calls"] == 4, f"calls 口径错：{st['totals']}"       # 4 条 fresh（含 1 条空归属）
     assert st["totals"]["audits"] == 1 and st["totals"]["searches"] == 6, st["totals"]
     assert st["totals"]["journal"] == 1, st["totals"]                          # 旧的被窗口滤掉
     by_tool = {r["tool"]: r["n"] for r in st["by_tool"]}
     assert by_tool.get("hub_search") == 2 and by_tool.get("hub_health") == 1, f"by_tool 错：{by_tool}"
+    att = st["attribution"]
+    assert (att["total"], att["named"], att["empty"], att["empty_pct"]) == (4, 3, 1, 25.0), \
+        f"归属覆盖口径错：{att}"
     assert st["last_seen"].get("hub_health", "").startswith(fresh[:10]), "last_seen 不是最新露面"
     zh = [r for r in st["zero_hit_searches"] if r["query"] == "不存在的词qwerty"]
     assert zh and zh[0]["n"] == 3, f"重复零命中没聚起来：{st['zero_hit_searches']}"
@@ -2646,10 +3299,12 @@ def t_usage_timeline(tmp):
     st_t = brain.usage_stats(rs, days=7, tool="hub_search")
     assert "journal" not in st_t["totals"], "tool 过滤时 journal 总计竟计入（口径漂移）"
     assert st_t["totals"]["calls"] == 2, st_t["totals"]
+    assert st_t["attribution"]["total"] == 2 and st_t["attribution"]["empty"] == 0, \
+        f"tool 过滤后归属口径没跟着过滤：{st_t['attribution']}"
 
     # ③ 只读：跑完前后四表计数不变
     with brain.db_conn(rs) as conn:
-        for tbl, want in (("tool_calls", 4), ("op_audit", 1), ("searches", 6), ("journal", 2)):
+        for tbl, want in (("tool_calls", 5), ("op_audit", 1), ("searches", 6), ("journal", 2)):
             got = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
             assert got == want, f"{tbl} 被写改了：{got} != {want}"
 
@@ -2657,6 +3312,8 @@ def t_usage_timeline(tmp):
     assert brain.usage_timeline(rs, days=7, agent="nobody") == []
     st_e = brain.usage_stats(rs, days=7, agent="nobody")
     assert st_e["totals"]["calls"] == 0 and not st_e["by_tool"], "空窗口应有零值不崩"
+    assert st_e["attribution"] == {"total": 0, "named": 0, "empty": 0, "empty_pct": 0.0}, \
+        f"空窗口归属口径应全零：{st_e['attribution']}"
 
 
 def t_batchA_memory_governance(tmp):
@@ -2876,7 +3533,7 @@ def t_coverage_gate(fresh):
 def t_semantic_batched_cosine(tmp):
     """B4 回归：语义第三路从「逐行 np.dot+norm 循环」改为「(N,D) 矩阵一次 (M@q) 批量点积」。
     验证：① 批量公式与旧逐行公式数值等价；② live 过滤（软删记录不得被语义召回）；
-    ③ 相似度门槛（_SEM_MIN_SIM=0.60）挡正交候选；④ 同方向最相似者排第一。
+    ③ 相似度门槛（_SEM_MIN_SIM 挡正交候选）；④ 同方向最相似者排第一。
     桩掉 embedding 模型（_ensure_emb/_encode）以确定性隔离本改动。"""
     import numpy as np
     rng = np.random.default_rng(0)
@@ -2918,6 +3575,49 @@ def t_semantic_batched_cosine(tmp):
         assert len(brain._semantic_rank(root, "语义测试 查询", "records", limit=10)) == 0
     finally:
         brain._ensure_emb, brain._encode = ensure_emb_save, encode_save
+
+
+def t_semantic_channel_balance(tmp):
+    """R6 回归：语义顶权与 BM25 对等，且 0.58 门槛的语义强候选能过覆盖度闸门。
+
+    真实库 2026-10-20 实测两处失败：① 目标语义 rank1 但词法 36/57，1.5 权重下融合只到
+    rank6（掉出 top5）；② 真相关余弦 0.5852 被 0.60 门槛剪掉，bm25 rank6 也救不回。
+    这里桩掉三条通道，只锁「通道 rank → 权重 → 名次」与「门槛 → 闸门」两段确定性逻辑。
+    """
+    root = str(Path(tmp) / "hub_sem_balance")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    a = brain.add_memory(root, "语义强但词法弱的目标", kind="lesson", agent="zcode")
+    b = brain.add_memory(root, "词法较强的对照条目", kind="lesson", agent="zcode")
+    rows = {r["id"]: r for r in brain.search_memories(root, "", limit=10)}
+    sem_a, row_b = dict(rows[a], _semantic_sim=0.90), dict(rows[b])
+
+    saves = (brain._memories_query, brain._bm25_rank, brain._semantic_rank,
+             brain._apply_graph_channel)
+    try:
+        brain._memories_query = lambda *args, **kw: []
+        # 对照只走 BM25 rank1：与语义 rank1 同分才叫「顶权对齐」；旧权重 1.5 时 B 会胜出
+        brain._bm25_rank = lambda *args, **kw: [row_b]
+        brain._semantic_rank = lambda *args, **kw: [(a, 1.0 / (brain._RRF_K + 1), sem_a)]
+        brain._apply_graph_channel = lambda *args, **kw: None
+        fused = brain._memories_search_fused(root, "zzz", ["zzz"], "", 10)
+        assert [r["id"] for r in fused][:2] == [a, b], \
+            f"语义 rank1 未按顶权胜出（权重失衡？）：{[r['id'] for r in fused]}"
+    finally:
+        (brain._memories_query, brain._bm25_rank, brain._semantic_rank,
+         brain._apply_graph_channel) = saves
+
+    # 门槛-闸门联动：0.585 是真实相关（R6 校准点），0.57 仍算弱；强候选存在时弱者被剪
+    q = "写记录的时候怎么自动拦截踩坑"
+    strong = {"id": 1, "content": "完全无关文本", "tags": "", "project": "", "title": "",
+              "_semantic_sim": 0.585}
+    weak = {"id": 2, "content": "完全无关文本", "tags": "", "project": "", "title": "",
+            "_semantic_sim": 0.57}
+    gated = brain._coverage_gate(root, [strong, weak], q)
+    assert [r["id"] for r in gated] == [1], \
+        f"语义门槛未在 0.58 生效（0.585 应强、0.57 应弱）：{[r['id'] for r in gated]}"
+    assert brain._RRF_W_SEMANTIC == brain._RRF_W_BM25 == 2.0, "记忆语义/BM25 顶权未对齐"
+    assert brain._RRF_W_SEMANTIC_RECORDS == 1.5, "记录语义权重被误改（快照 A/B：2.0 使 records H1 -1）"
 
 
 def t_similar_memories_bound(tmp):
@@ -3100,9 +3800,10 @@ def t_ghost_record_candidates(tmp):
     """C4 遗留项回归（2026-10-18 晚）：**记录版** ghost 检测——高相似却无取代关系的记录对。
     ghost_memory_candidates 只查 memories，但 records 同样有 superseded_by、同样会
     「记住太多版本」。验证：① 未标取代的高相似记录对会被报出；② 标 superseded_by 后
-    必须被排除；③ **两类机器模板记录不报**（migrated 拆分记录 / auto-hook 会话锚——
-    实测这两类占满 top 命中，是结构性噪音不是幽灵）；④ 剥四段式模板头：只差脚手架、
-    实质不同的两条不互报（模板给所有记录对发「基础相似度」是这个检测器最大的假阳性源）。
+    必须被排除；③ **三类机器记录不报**（migrated 拆分记录 / auto-hook 会话锚 /
+    source='auto' 的流程运行日志——2026-10-22 实测真实库 10 组候选 100% 来自 10-13
+    的 5 次 release 运行，备份文件名各不相同，是事件流不是知识版本）；④ 剥四段式模板头：
+    只差脚手架、实质不同的两条不互报（模板给所有记录对发「基础相似度」是最大假阳性源）。
     """
     root = str(Path(tmp) / "hub_ghost_rec")
     Path(root).mkdir(parents=True, exist_ok=True)
@@ -3147,15 +3848,78 @@ def t_ghost_record_candidates(tmp):
                      (proj, "zcode", "2026-10-12", "2026-10-12（auto-hook）· 会话 sess_x 轨迹锚点",
                       f"【目的】会话边界自动捕获\n【做了什么】会话 sess_x 结束一轮响应\n"
                       f"【验证结果】无\n【如何回滚】删"))
+        # 2026-10-22 R17：playbook 流程运行日志——同标题、极相似正文，只有备份文件名不同。
+        # 这是真实库 10 组幽灵候选的唯一来源（10-13 的 5 次 release），必须按事件流跳过。
+        for rdate, bak in (("2026-10-13", "brain-20261013-1018.db"),
+                           ("2026-10-14", "brain-20261014-1023.db")):
+            conn.execute("INSERT INTO records(project,agent,date,title,content,source,status) "
+                         "VALUES(?,?,?,?,?, 'auto', 'active')",
+                         (proj, "workbuddy", rdate, "发布流程自动执行",
+                          "playbook release 执行结果：语法=编译全部通过｜部署=11/11 一致｜"
+                          f"exe=发布一致｜备份={bak}"))
     cand3 = brain.ghost_record_candidates(root, threshold=0.55, limit=20)
     got = {p["a"] for p in cand3} | {p["b"] for p in cand3}
     with brain.db_conn(root) as conn:
         mig = [r[0] for r in conn.execute("SELECT id FROM records WHERE source LIKE 'migrated:%'")]
         hook = [r[0] for r in conn.execute("SELECT id FROM records WHERE title LIKE '%（auto-hook）%'")]
+        flow = [r[0] for r in conn.execute(
+            "SELECT id FROM records WHERE source='auto' AND title='发布流程自动执行'")]
     assert not (got & set(mig)), f"migrated 拆分记录不该进候选：{cand3}"
     assert not (got & set(hook)), f"auto-hook 会话锚不该进候选：{cand3}"
+    assert len(flow) == 2 and not (got & set(flow)), f"自动流程运行日志不该进候选：{cand3}"
+    assert brain.auto_record_count(root) == 4, f"自动记录计数应含 2 会话锚 + 2 流程日志：{brain.auto_record_count(root)}"
     # ④ 高阈值零噪音
     assert brain.ghost_record_candidates(root, threshold=1.5, limit=20) == []
+
+
+def t_record_supersede(tmp):
+    """v2.40.76 回归：记录侧取代——ghost 检查项能报「高相似记录对」，但此前没有执行出口。
+    验证：① 裁决后 drop 退出检索与现行集、keep 仍在；② 行与正文保留可追溯（取代≠删除）；
+    ③ 反向调用即撤销；④ 坏参/不存在/软删记录拒；⑤ 重复裁决幂等、不炸。"""
+    root = str(Path(tmp) / "hub_rec_sup")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    proj = "测试-记录取代"
+    kw = "蓝鲸端口回退预案"
+    mark_a, mark_b = "旧锚点词甲", "新锚点词乙"
+    a = brain.add_record(root, proj, "zcode", "2026-10-18", f"回退预案旧版{mark_a}",
+                         f"【目的】{kw}\n【做了什么】旧方案 {mark_a}\n【验证结果】旧\n【如何回滚】无")
+    b = brain.add_record(root, proj, "zcode", "2026-10-19", f"回退预案新版{mark_b}",
+                         f"【目的】{kw}\n【做了什么】新方案 {mark_b}\n【验证结果】新\n【如何回滚】无")
+
+    def _ids():
+        with brain.db_conn(root) as conn:
+            return {r["id"] for r in conn.execute(
+                "SELECT id FROM records WHERE " + brain._rec_live_sql())}
+
+    def _search(q):
+        return {r["id"] for r in brain.search_records(root, q, limit=20)}
+
+    assert {a, b} <= _ids(), "两条未裁决记录都应在现行集"
+    assert a in _search(mark_a) and b in _search(mark_b), "两条都应能被检索"
+    assert brain.supersede_record(root, a, b) == ""
+    assert b in _ids() and a not in _ids(), "drop 未退出现行集"
+    assert a not in _search(mark_a), "drop 仍被检索返回"
+    assert b in _search(mark_b), "keep 不该被连带排除"
+    rec = brain.get_record(root, a)
+    assert rec and "旧方案" in rec["content"], "正文必须保留可追溯"
+    assert int(rec["superseded_by"] or 0) == b, f"取代链未落：{rec}"
+    # 重复裁决幂等
+    assert brain.supersede_record(root, a, b) == ""
+    assert a not in _ids()
+    # 反向即撤销
+    assert brain.supersede_record(root, b, a) == ""
+    assert a in _ids() and b not in _ids()
+    assert a in _search(mark_a) and b not in _search(mark_b)
+    # 坏参
+    assert brain.supersede_record(root, 0, a)
+    assert brain.supersede_record(root, a, a)
+    assert brain.supersede_record(root, 999999, a)
+    assert brain.supersede_record(root, "x", a)
+    # 非 active 拒
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET status='deleted' WHERE id=?", (b,))
+    assert brain.supersede_record(root, b, a), "软删记录不能参与取代"
 
 
 def t_ghost_adjudication(tmp):
@@ -3349,6 +4113,31 @@ def t_agent_onboarding_store(tmp):
     assert any(r["agent"] == ag for r in brain.onboarding_get(root)), "全量查询应含该 agent"
     assert brain.onboarding_save(root, "", True, []) == "agent 必填"
 
+    # R6（2026-10-21）指纹绑定：dict 往返；旧调用不传 → 存空（不能沿用上一轮指纹冒充有效）
+    fp = {"brain.py": "aaa", "agenthub_mcp.py": "bbb"}
+    assert brain.onboarding_save(root, ag, True, got2[0]["steps"], "带指纹",
+                                 fingerprint=fp) == ""
+    assert brain.onboarding_get(root, ag)[0]["fingerprint"] == fp, brain.onboarding_get(root, ag)
+    assert brain.onboarding_save(root, ag, True, got2[0]["steps"], "旧格式") == ""
+    assert brain.onboarding_get(root, ag)[0]["fingerprint"] == {}, "旧调用必须清空指纹"
+    # R23（2026-10-22）代码树绑定：base 往返；不传则清空（不能沿用上一轮代码树）
+    assert brain.onboarding_save(root, ag, True, got2[0]["steps"], "带树",
+                                 fingerprint=fp, base="D:/src_tree") == ""
+    assert brain.onboarding_get(root, ag)[0]["base"] == "D:/src_tree"
+    assert brain.onboarding_save(root, ag, True, got2[0]["steps"], "带指纹") == ""
+    assert brain.onboarding_get(root, ag)[0]["base"] == "", "旧调用必须清空代码树"
+    # 旧库（建表时还没有 fingerprint 列）→ ensure_schema 幂等补列，旧行读成 {}
+    legacy = str(Path(tmp) / "hub_legacy_onboard")
+    (Path(legacy) / core.DIR_META).mkdir(parents=True, exist_ok=True)
+    with brain.db_conn(legacy) as conn:
+        conn.execute("CREATE TABLE agent_onboarding(agent TEXT PRIMARY KEY, ts TEXT DEFAULT '', "
+                     "ok INTEGER DEFAULT 0, steps TEXT DEFAULT '', note TEXT DEFAULT '')")
+        conn.execute("INSERT INTO agent_onboarding(agent,ts,ok,steps,note) "
+                     "VALUES('legacyagent','2020-01-01T00:00:00',1,'[]','old')")
+    assert brain.ensure_schema(legacy) == ""
+    old = brain.onboarding_get(legacy, "legacyagent")
+    assert old and old[0]["fingerprint"] == {} and old[0].get("base") == "" and old[0]["ok"] == 1, old
+
     today = _dt.date.today()
     old = (today - _dt.timedelta(days=60)).isoformat()
     brain.add_record(root, "R6-接入活跃度", ag, today.isoformat(), "今天",
@@ -3361,10 +4150,331 @@ def t_agent_onboarding_store(tmp):
     assert st90["count"] == 2 and st90["last"] == today.isoformat(), st90
 
 
-def t_runtime_staleness(tmp):
-    """R7 运行版本：重启检测只看服务目录顶层 .py，非 .py/子目录/容差内不算变更。
+def t_task_holdings(tmp):
+    """R7 控制面：在办任务按持有者归组，租约状态与认领/接管口径一致。
 
-    部署后没重启时进程仍在跑旧代码——判定必须保守（同秒误差不算、数据库/缓存不算），
+    hub_list_agents / hub_agent status 共用这份数据——过去只看得到「谁在线」，
+    看不到「谁手里压着活、哪条租约已过期可接管」。完成态不得混进持有面。"""
+    root = str(Path(tmp) / "hub_holdings")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    a = brain.task_add(root, "持有者A有效租约", project="p")[1]
+    b = brain.task_add(root, "持有者A过期租约", project="p")[1]
+    c = brain.task_add(root, "无主在办", project="p")[1]
+    d = brain.task_add(root, "租约缺失", project="p")[1]
+    e = brain.task_add(root, "已完成不算在办", project="p")[1]
+    assert brain.task_claim(root, a, "alpha")[0] == ""
+    assert brain.task_claim(root, b, "alpha")[0] == ""
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00' WHERE id=?", (b,))
+        conn.execute("UPDATE tasks SET status='in_progress', owner='' WHERE id=?", (c,))
+        conn.execute("UPDATE tasks SET status='in_progress', owner='beta', claimed_at='' "
+                     "WHERE id=?", (d,))
+        conn.execute("UPDATE tasks SET status='done' WHERE id=?", (e,))
+    hold = brain.task_holdings(root)
+    assert set(hold) == {"alpha", "beta", ""}, hold
+    assert [t["id"] for t in hold["alpha"]] == [a, b], hold["alpha"]
+    assert {t["id"]: t["_lease_state"] for t in hold["alpha"]} == {a: "ok", b: "expired"}, hold
+    assert hold["beta"][0]["_lease_state"] == "unleased", hold["beta"]
+    assert hold[""][0]["_lease_state"] == "ownerless", hold[""]
+    assert all(t["id"] != e for ts in hold.values() for t in ts), "完成态混进持有面"
+    left_a = next(t for t in hold["alpha"] if t["id"] == a)["_lease_left_h"]
+    left_b = next(t for t in hold["alpha"] if t["id"] == b)["_lease_left_h"]
+    assert isinstance(left_a, float) and 0 < left_a <= brain.CLAIM_TTL_HOURS, left_a
+    assert isinstance(left_b, float) and left_b < 0, left_b
+
+
+def t_task_annotate(tmp):
+    """R8 看板注解：截止紧迫度 / 前置完成度 / 残留阻塞 / 租约状态一次算齐，且只读。
+
+    hub_tasks / hub_next / CLI 共用同一份注解——过去截止日只在 hub_next 的 ready 段出现，
+    在办任务的租约缺失与 pending 上的残留阻塞标记在看板里完全不可见。"""
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_annotate")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    today = _dt.date.today()
+    dep = brain.task_add(root, "前置未完成", project="p")[1]
+    ready = brain.task_add(root, "今日到期", project="p", due=today.isoformat())[1]
+    overdue = brain.task_add(root, "已逾期", project="p",
+                             due=(today - _dt.timedelta(days=3)).isoformat())[1]
+    future = brain.task_add(root, "以后到期", project="p",
+                            due=(today + _dt.timedelta(days=2)).isoformat())[1]
+    with_dep = brain.task_add(root, "有前置", project="p", deps=str(dep))[1]
+    missing = brain.task_add(root, "前置不存在", project="p", deps="999999")[1]
+    residual = brain.task_add(root, "残留阻塞", project="p")[1]
+    claimed = brain.task_add(root, "在办有效租约", project="p")[1]
+    assert brain.task_claim(root, claimed, "alpha")[0] == ""
+    # R26：租约有效 ≠ 任务在走——心跳/租约新鲜但 updated 停在 8h 前应判停滞；
+    # 写检查点会刷新 updated，属于真实推进，不得误报。
+    stalled = brain.task_add(root, "心跳在线但停滞", project="p")[1]
+    assert brain.task_claim(root, stalled, "alpha")[0] == ""
+    progressed = brain.task_add(root, "检查点续命", project="p")[1]
+    assert brain.task_claim(root, progressed, "alpha")[0] == ""
+    old = (_dt.datetime.now() - _dt.timedelta(hours=brain.TASK_PROGRESS_STALL_HOURS + 2)) \
+        .isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET updated=?, progress_at=? WHERE id=?",
+                     (old, old, stalled))
+        conn.execute("UPDATE tasks SET updated=?, progress_at=? WHERE id=?",
+                     (old, old, progressed))
+    assert brain.checkpoint_save(root, progressed, "alpha", "继续推进")[0] == ""
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET blocked_by='等人' WHERE id=?", (residual,))
+    rows = {t["id"]: t for t in brain.task_annotate(root, brain.task_list(root, limit=50))}
+    assert rows[ready]["_due_state"] == "today" and rows[ready]["_due_days"] == 0, rows[ready]
+    assert rows[overdue]["_due_state"] == "overdue" and rows[overdue]["_due_days"] == -3
+    assert rows[future]["_due_state"] == "upcoming" and rows[future]["_due_days"] == 2
+    assert rows[with_dep]["_deps_info"][0]["id"] == dep
+    assert rows[with_dep]["_deps_info"][0]["status"] == "pending", rows[with_dep]["_deps_info"]
+    assert rows[missing]["_deps_info"][0]["status"] == "missing"
+    assert "残留标记" in rows[residual]["_block_note"], rows[residual]
+    assert rows[claimed]["_lease_state"] == "ok" and rows[claimed]["_lease_left_h"] > 0
+    assert rows[claimed]["_progress_stall"] is False, rows[claimed]
+    assert rows[stalled]["_lease_state"] == "ok" and rows[stalled]["_progress_stall"] is True
+    assert rows[stalled]["_progress_age_h"] >= brain.TASK_PROGRESS_STALL_HOURS, rows[stalled]
+    assert rows[progressed]["_progress_stall"] is False, rows[progressed]
+    # R26：心跳只续租、不刷 progress_at——否则「人在线、活停住」永远测不出来
+    pa_before = rows[stalled]["progress_at"]
+    brain.heartbeat_touch(root, "alpha", "p")
+    again = {t["id"]: t for t in brain.task_annotate(root, brain.task_list(root, limit=50))}
+    assert again[stalled]["progress_at"] == pa_before, again[stalled]
+    assert again[stalled]["updated"] > pa_before, again[stalled]
+    assert again[stalled]["_progress_stall"] is True, again[stalled]
+    # R27：四个钟分列——心跳是 agent 级刚打过、检查点缺失，二者不能冒充推进
+    assert again[stalled]["_heartbeat_at"] and again[stalled]["_heartbeat_age_h"] < 1, again[stalled]
+    assert again[stalled]["_last_cp"] == "" and again[stalled]["_last_cp_age_h"] is None, again[stalled]
+    assert again[progressed]["_last_cp"] and again[progressed]["_last_cp_age_h"] is not None
+    assert again[progressed]["_heartbeat_age_h"] < 1, again[progressed]
+    assert rows[dep]["_due_state"] == "" and rows[dep]["_deps_info"] == []
+    # 只读：注解不改库
+    before = brain.task_list(root, limit=50)
+    brain.task_annotate(root, before)
+    after = brain.task_list(root, limit=50)
+    assert [(t["id"], t["status"], t["owner"], t["due"]) for t in before] == \
+           [(t["id"], t["status"], t["owner"], t["due"]) for t in after]
+
+
+def t_task_starvation(tmp):
+    """R30 待办饥饿：能开工却长期没人认领的 pending 才算问题。
+
+    口径边界必须逐个钉死：等前置 / 显式阻塞是「还干不了」，在办是「有人干」，
+    新任务是「还没到时候」，缺失前置是结构缺陷——都不能混进饥饿计数，
+    否则巡检会退化成「待办多 = 报警」，被当成噪声关掉。
+    """
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_starve")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    old = (_dt.datetime.now() - _dt.timedelta(days=brain.TASK_STARVE_DAYS + 4)) \
+        .isoformat(timespec="seconds")
+    mid = (_dt.datetime.now() - _dt.timedelta(days=brain.TASK_STARVE_DAYS + 1)) \
+        .isoformat(timespec="seconds")
+
+    dep_done = brain.task_add(root, "已完成前置")[1]
+    assert brain.task_update(root, dep_done, status="done")[0] == ""
+    dep_open = brain.task_add(root, "未完成前置")[1]
+    ready_old = brain.task_add(root, "久置待办", priority=2)[1]
+    urgent_old = brain.task_add(root, "急件久置", priority=0)[1]
+    dep_ready_old = brain.task_add(root, "前置已完成仍久置", deps=str(dep_done),
+                                   priority=1)[1]
+    waiting = brain.task_add(root, "等前置", deps=str(dep_open), priority=0)[1]
+    blocked = brain.task_add(root, "显式阻塞", blocked_by="等外部", priority=0)[1]
+    doing = brain.task_add(root, "在办久置", priority=0)[1]
+    assert brain.task_claim(root, doing, "alpha")[0] == ""
+    missing_dep = brain.task_add(root, "前置不存在", deps="999999", priority=0)[1]
+    fresh = brain.task_add(root, "刚建的", priority=0)[1]
+    with brain.db_conn(root) as conn:
+        for tid in (ready_old, urgent_old, waiting, blocked, doing, missing_dep):
+            conn.execute("UPDATE tasks SET created=? WHERE id=?", (old, tid))
+        for tid in (urgent_old, dep_ready_old):
+            conn.execute("UPDATE tasks SET created=? WHERE id=?", (mid, tid))
+
+    st = brain.task_starvation(root)
+    ids = [t["id"] for t in st["starving"]]
+    # 最久优先；同龄时急件（priority=0，假值）必须排在前面
+    assert ids == [ready_old, urgent_old, dep_ready_old], \
+        [("id", i, "age", a) for i, a in zip(ids, [t["_age_days"] for t in st["starving"]])]
+    assert st["counts"]["starving"] == 3 and st["by_priority"] == {2: 1, 0: 1, 1: 1}, st
+    assert st["starving"][0]["_age_days"] >= brain.TASK_STARVE_DAYS + 4, st["starving"][0]
+    assert st["window_days"] == brain.TASK_STARVE_DAYS
+    for tid in (waiting, blocked, doing, missing_dep, fresh):
+        assert tid not in ids, f"#{tid} 不该算饥饿（边界串味）：{ids}"
+    rows = {t["id"]: t for t in brain.task_annotate(root, brain.task_list(root, limit=50))}
+    assert rows[ready_old]["_starve_days"] is not None, rows[ready_old]
+    assert rows[fresh]["_age_days"] is not None and rows[fresh]["_starve_days"] is None
+    assert rows[waiting]["_age_days"] is None and rows[doing]["_age_days"] is None
+    # 窗口可调：短窗口能抓到刚建的，长窗口清空；等待/在办在任何窗口都不进
+    wide = [t["id"] for t in brain.task_starvation(root, days=0)["starving"]]
+    assert fresh in wide and waiting not in wide and doing not in wide, wide
+    assert brain.task_starvation(root, days=100)["counts"]["starving"] == 0
+    assert brain.task_starvation(root, days=100)["oldest_days"] is None
+    # 认领即退出饥饿；空库不炸
+    assert brain.task_claim(root, ready_old, "alpha")[0] == ""
+    after = [t["id"] for t in brain.task_starvation(root)["starving"]]
+    assert ready_old not in after, after
+    empty = Path(tmp) / "hub_starve_empty"
+    empty.mkdir(parents=True, exist_ok=True)
+    brain.init_db(str(empty))
+    assert brain.task_starvation(str(empty))["counts"]["starving"] == 0
+
+
+def t_file_leases(tmp):
+    """R11 文件租约：并发写同一文件是多 agent 协作最高频失败源（共享状态并发写入）。
+
+    验证：冲突（同名/大小写变体/祖先子孙目录）、同主续租、过期接管与 fence 递增、
+    非持有者不能续/释放、任务绑定校验、心跳只续任务锁、任务完成/接管自动释放、
+    看板锁计数、项目动态、审计可查、检查只读。"""
+    root = str(Path(tmp) / "hub_locks")
+    proj = Path(root) / "p"
+    (proj / "sub").mkdir(parents=True)
+    (proj / "a.py").write_text("x = 1\n", encoding="utf-8")
+    (proj / "sub" / "b.py").write_text("x = 1\n", encoding="utf-8")
+    (proj / "other.py").write_text("x = 1\n", encoding="utf-8")
+    brain.init_db(root)
+
+    t = brain.task_add(root, "锁文件", project="p", agent="alpha")[1]
+    assert brain.task_claim(root, t, "alpha")[0] == ""
+
+    err, l1 = brain.file_lease_acquire(root, "p/a.py", "alpha", task_id=t,
+                                       ttl_min=30, reason="改解析器")
+    assert err == "", err
+    assert l1["owner"] == "alpha" and l1["project"] == "p" and l1["display_path"] == "p/a.py"
+    assert l1["fence"] == 1 and l1["task_id"] == t and l1["_active"], l1
+
+    # 同 agent 同路径再 acquire = 续租（不新增行、fence 不变）
+    err, l1b = brain.file_lease_acquire(root, "p/a.py", "alpha")
+    assert err == "" and l1b["id"] == l1["id"] and l1b["_renewed"] and l1b["fence"] == 1, l1b
+
+    # 不同写法（绝对路径/大小写）指向同一文件 → 必须判成同一把锁
+    p_abs = str((proj / "a.py").resolve())
+    variant = p_abs.upper() if os.name == "nt" else p_abs
+    err, holder = brain.file_lease_acquire(root, variant, "beta", reason="也想改")
+    assert "文件被占用" in err and holder["owner"] == "alpha" and "alpha" in err, err
+
+    # 祖先/子孙双向冲突：锁父目录覆盖子文件；改子目录也挡父目录
+    assert "文件被占用" in brain.file_lease_acquire(root, "p", "beta")[0]
+    err, l2 = brain.file_lease_acquire(root, "p/sub/b.py", "beta", ttl_min=60)
+    assert err == "" and l2["fence"] == 1, (err, l2)
+    err, _ = brain.file_lease_acquire(root, "p/sub", "alpha")
+    assert "文件被占用" in err and "beta" in err, err
+
+    # 只读查占：冲突/空闲/根目录保护；check 不写库
+    chk = brain.file_lease_check(root, "p/a.py")
+    assert chk["free"] is False and [h["owner"] for h in chk["holders"]] == ["alpha"], chk
+    assert brain.file_lease_check(root, "p/other.py")["free"] is True
+    assert "根目录" in brain.file_lease_check(root, ".")["error"]
+    with brain.db_conn(root) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM file_leases").fetchone()[0] == 2
+
+    # 非持有者不能续/释放
+    assert "只有持有者" in brain.file_lease_renew(root, l1["id"], "beta")[0]
+    assert "不能代释放" in brain.file_lease_release(root, l1["id"], agent="beta")[0]
+
+    # 按 path 释放自己的锁；重复释放给出明确提示
+    err, n = brain.file_lease_release(root, path="p/a.py", agent="alpha")
+    assert err == "" and n == 1, (err, n)
+    assert brain.file_lease_check(root, "p/a.py")["free"] is True
+    assert "没有找到" in brain.file_lease_release(root, path="p/a.py", agent="alpha")[0]
+
+    # 过期即失效：他人可接管，fence 递增，旧行标 released_by='expiry'
+    err, l3 = brain.file_lease_acquire(root, "p/a.py", "alpha", ttl_min=1)
+    assert err == "" and l3["fence"] == 2, (err, l3)
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE file_leases SET expires_at='2020-01-01T00:00:00' WHERE id=?",
+                     (l3["id"],))
+    err, l4 = brain.file_lease_acquire(root, "p/a.py", "beta", ttl_min=30)
+    assert err == "" and l4["owner"] == "beta" and l4["fence"] == 3, (err, l4)
+    with brain.db_conn(root) as conn:
+        old = conn.execute("SELECT released_at,released_by FROM file_leases WHERE id=?",
+                           (l3["id"],)).fetchone()
+    assert old["released_at"] and old["released_by"] == "expiry", dict(old)
+
+    # 任务绑定：必须存在、在办、且本人持有
+    assert "不存在" in brain.file_lease_acquire(root, "p/other.py", "alpha", task_id=9999)[0]
+    t_pending = brain.task_add(root, "未认领", project="p")[1]
+    assert "先 hub_claim" in brain.file_lease_acquire(
+        root, "p/other.py", "alpha", task_id=t_pending)[0]
+    assert "只有持有者" in brain.file_lease_acquire(
+        root, "p/other.py", "beta", task_id=t)[0]
+
+    # 心跳续租：只续挂在本人进行中任务上的锁，未挂任务的锁不自动续命
+    err, l5 = brain.file_lease_acquire(root, "p/other.py", "alpha", task_id=t, ttl_min=30)
+    assert err == "", err
+    err, l6 = brain.file_lease_acquire(root, "p/standalone.py", "alpha", ttl_min=30)
+    assert err == "", err
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE file_leases SET renewed_at='2020-01-01T00:00:00', "
+                     "expires_at='2020-01-01T00:00:00' WHERE id IN (?,?)",
+                     (l5["id"], l6["id"]))
+    assert brain.file_lease_renew_for_agent(root, "alpha") == 1
+    rows = {r["id"]: r for r in brain.file_lease_list(root, owner="alpha")}
+    assert rows[l5["id"]]["expires_at"] > "2021", rows[l5["id"]]
+    assert rows[l6["id"]]["expires_at"].startswith("2020"), rows[l6["id"]]
+
+    # 看板锁计数 + 项目动态（排除本人）
+    board = {x["id"]: x for x in brain.task_annotate(root, brain.task_list(root, limit=50))}
+    assert board[t]["_locks"] >= 1, board[t]
+    act = brain.file_lease_project_active(root, "p", exclude_agent="alpha")
+    assert act and all(x["owner"] == "beta" for x in act), act
+
+    # 任务完成 → 挂在其上的锁自动释放；未挂任务的不动
+    brain.task_update(root, t, status="done", agent="alpha")
+    rows = {r["id"]: r for r in brain.file_lease_list(
+        root, include_released=True, limit=100)}
+    assert rows[l5["id"]]["released_at"] and rows[l5["id"]]["released_by"] == "alpha", \
+        rows[l5["id"]]
+    assert rows[l6["id"]]["released_at"] == "", rows[l6["id"]]
+
+    # 接管 → 旧持有者挂在该任务上的锁释放，新主人不撞自己的锁
+    t2 = brain.task_add(root, "会被接管", project="p")[1]
+    assert brain.task_claim(root, t2, "beta")[0] == ""
+    err, lb = brain.file_lease_acquire(root, "p/take.py", "beta", task_id=t2, ttl_min=60)
+    assert err == "", err
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00' WHERE id=?", (t2,))
+    assert brain.task_claim(root, t2, "alpha")[0] == ""
+    rows = {r["id"]: r for r in brain.file_lease_list(
+        root, include_released=True, limit=100)}
+    assert rows[lb["id"]]["released_at"] and rows[lb["id"]]["released_by"] == "alpha", \
+        rows[lb["id"]]
+
+    # 历史倒序 + 全链路审计
+    hist = brain.file_lease_list(root, include_released=True, limit=100)
+    assert len(hist) >= 7
+    assert [h["id"] for h in hist] == sorted([h["id"] for h in hist], reverse=True)
+    acts = [j["action"] for j in brain.journal_list(root, 300)]
+    for want in ("获取文件租约", "续租文件", "释放文件租约", "释放任务文件租约"):
+        assert want in acts, (want, acts[:30])
+
+    # R13 过期租约安全回收：只动过期未释放；活跃租约永不触碰；幂等；审计可查
+    err, p1 = brain.file_lease_prune(root, agent="alpha")
+    assert err == "" and [r["id"] for r in p1] == [l6["id"]], (err, p1)
+    rows = {r["id"]: r for r in brain.file_lease_list(
+        root, include_released=True, limit=100)}
+    assert rows[l6["id"]]["released_by"] == "expiry", rows[l6["id"]]
+    assert rows[l2["id"]]["released_at"] == "" and rows[l4["id"]]["released_at"] == "", \
+        "prune 不得回收未过期租约"
+    assert brain.file_lease_prune(root)[1] == [], "重复 prune 必须幂等"
+    # 单次 limit 生效：两把过期锁分两次各回收一条
+    err, e1 = brain.file_lease_acquire(root, "p/e1.py", "alpha", ttl_min=1)
+    err2, e2 = brain.file_lease_acquire(root, "p/e2.py", "alpha", ttl_min=1)
+    assert err == err2 == "", (err, err2)
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE file_leases SET expires_at='2020-01-01T00:00:00' "
+                     "WHERE id IN (?,?)", (e1["id"], e2["id"]))
+    err, p2 = brain.file_lease_prune(root, limit=1)
+    assert err == "" and len(p2) == 1, (err, p2)
+    err, p3 = brain.file_lease_prune(root)
+    assert err == "" and len(p3) == 1 and p3[0]["id"] != p2[0]["id"], p3
+    acts = [j["action"] for j in brain.journal_list(root, 100)]
+    assert "回收过期文件租约" in acts, acts[:30]
+
+
+def t_runtime_staleness(tmp):
+    """R7 运行版本：只看服务目录顶层 .py；mtime 之外补内容指纹（copy2 保留旧时间也能抓到）。
+
+    部署后没重启时进程仍在跑旧代码——判定必须保守（数据库/缓存不算、显式目录走 mtime 回退），
     否则每次写库都会误报「需重启」。"""
     import datetime as _dt
     d = Path(tmp) / "rt_probe"
@@ -3392,6 +4502,29 @@ def t_runtime_staleness(tmp):
     assert core.files_newer_than(str(d), "not-a-time") == []
     assert core.files_newer_than(str(d / "不存在"), start_old) == []
 
+    # 部署 copy2 保留源码 mtime：内容变了、时间没变——mtime 判据漏报，内容指纹必须抓到
+    fp = core.file_fingerprints(str(d))
+    a.write_text("x = 2\n", encoding="utf-8")
+    os.utime(a, (now - 3600, now - 3600))
+    info3 = core.runtime_staleness(str(d), start_new, fingerprint=fp)
+    assert info3["known"] and info3["basis"] == "content", info3
+    assert info3["count"] == 1 and info3["stale"][0]["file"] == "a.py", info3
+    assert info3["stale"][0]["reason"] == "changed", info3
+    e = d / "c.py"
+    e.write_text("x = 3\n", encoding="utf-8")
+    info4 = core.runtime_staleness(str(d), start_new, fingerprint=fp)
+    assert {r["file"]: r["reason"] for r in info4["stale"]} == {
+        "a.py": "changed", "c.py": "added"}, info4
+    e.unlink()
+    info5 = core.runtime_staleness(str(d), start_new, fingerprint=fp)
+    assert {r["file"]: r["reason"] for r in info5["stale"]} == {"a.py": "changed"}, info5
+    g = d / "g.py"
+    g.write_text("x = 4\n", encoding="utf-8")
+    fp2 = core.file_fingerprints(str(d))
+    g.unlink()
+    info6 = core.runtime_staleness(str(d), start_new, fingerprint=fp2)
+    assert {r["file"]: r["reason"] for r in info6["stale"]} == {"g.py": "removed"}, info6
+
     saved = core.SERVER_STARTED_AT
     try:
         core.SERVER_STARTED_AT = ""
@@ -3399,11 +4532,130 @@ def t_runtime_staleness(tmp):
     finally:
         core.SERVER_STARTED_AT = saved
 
+    # R22：进程身份闸门——「导入过 agenthub_mcp」不等于「是长驻 MCP 进程」。
+    # CLI 的 call 会进程内 import，留下启动标记；此时若无条件判定，会报「与磁盘一致」的假阳性。
+    saved_flag = (core.SERVER_IS_MCP, core.SERVER_STARTED_AT, core.SERVER_DIR,
+                  core.SERVER_FINGERPRINT, core.SERVER_FINGERPRINT_AT,
+                  core.RUNTIME_MARKER_DIR)
+    try:
+        core.RUNTIME_MARKER_DIR = Path(tmp) / "rt_markers_r22_r24"
+        core.SERVER_FINGERPRINT, core.SERVER_FINGERPRINT_AT = {}, ""
+        core.SERVER_IS_MCP = False
+        core.SERVER_STARTED_AT = start_old
+        core.SERVER_DIR = str(d)
+        assert core.runtime_staleness()["known"] is False, "非 MCP 进程不得冒充并给出结论"
+        core.SERVER_IS_MCP = True
+        info7 = core.runtime_staleness()
+        assert info7["known"] is True and info7["count"] == 1, info7
+        assert info7["stale"][0]["file"] == "a.py", info7
+        # 显式传目录/时刻（测试、别的目录）不受进程身份闸门限制
+        assert core.runtime_staleness(str(d), start_old)["known"] is True
+
+        # R24：心跳标记让非 MCP 进程也能观测长驻服务
+        core.SERVER_IS_MCP = False
+        assert core.runtime_markers() == []
+        err = core.write_runtime_marker(root=str(tmp), agent="probe", version="probe",
+                                        base=str(d), started=start_old, fingerprint=fp)
+        assert err == "", err
+        marked = core.runtime_staleness()
+        assert marked["known"] is True and marked["source"] == "marker", marked
+        assert marked["count"] == 1 and marked["stale"][0]["file"] == "a.py", marked
+        assert marked["procs"][0]["agent"] == "probe", marked
+        marker_file = core._runtime_marker_path()
+        old_ts = _dt.datetime.now().timestamp() - core.RUNTIME_MARKER_TTL - 60
+        os.utime(marker_file, (old_ts, old_ts))
+        assert core.runtime_markers() == [], "心跳过期的标记必须被忽略"
+        assert core.runtime_staleness()["known"] is False
+        core.remove_runtime_marker()
+        assert core.runtime_markers() == []
+
+        # R25：标记是磁盘上的跨进程输入，畸形数据不得参与判定，更不能伪造「一致」
+        def _raw_marker(name, data):
+            p = core.RUNTIME_MARKER_DIR / name
+            p.write_text(json.dumps(data, ensure_ascii=False), encoding="utf-8")
+            return p
+        bad_fp = _raw_marker("serve-9001.json", {
+            "base": str(d), "started": start_old, "fingerprint": "oops"})
+        future = _raw_marker("serve-9002.json", {
+            "base": str(d), "started": "2999-01-01T00:00:00", "fingerprint": fp})
+        bad_time = _raw_marker("serve-9003.json", {
+            "base": str(d), "started": "not-a-time", "fingerprint": fp})
+        no_base = _raw_marker("serve-9004.json", {
+            "base": "", "started": start_old, "fingerprint": fp})
+        garbage = core.RUNTIME_MARKER_DIR / "serve-9005.json"
+        garbage.write_text("{not json", encoding="utf-8")
+        assert core.runtime_markers() == [], "坏指纹/未来时刻/坏时间/空目录/坏 JSON 都必须丢弃"
+        assert core.runtime_staleness()["known"] is False, "只有坏标记时不得给出结论"
+
+        err = core.write_runtime_marker(root=str(tmp), agent="good", version="probe",
+                                        base=str(d), started=start_old, fingerprint=fp)
+        assert err == "", err
+        mixed = core.runtime_staleness()
+        assert mixed["known"] is True and mixed["source"] == "marker", mixed
+        assert mixed["count"] == 1 and [p["agent"] for p in mixed["procs"]] == ["good"], mixed
+        assert len(core.runtime_markers()) == 1, "坏标记不得混入有效观测"
+        core.remove_runtime_marker()
+        for p in (bad_fp, future, bad_time, no_base, garbage):
+            p.unlink()
+        assert core.runtime_markers() == []
+    finally:
+        (core.SERVER_IS_MCP, core.SERVER_STARTED_AT, core.SERVER_DIR,
+         core.SERVER_FINGERPRINT, core.SERVER_FINGERPRINT_AT,
+         core.RUNTIME_MARKER_DIR) = saved_flag
+
+
+def t_deploy_atomic(tmp):
+    """R29：部署必须全有或全无——复制中段失败不得留下半新半旧模块。
+
+    旧实现逐文件 copy2：brain.py 已换新、agenthub_mcp.py 仍旧时，下一次 MCP
+    进程启动即 ImportError/AttributeError。新实现先全量复制到暂存目录并逐文件
+    校验，成功后整目录换入；失败旧部署原样保留。
+    """
+    import shutil as _sh
+
+    src = Path(tmp) / "deploy_src"
+    dst = Path(tmp) / "deployed"
+    src.mkdir(parents=True)
+    for f in core.SERVER_FILES:
+        p = src / f
+        p.parent.mkdir(parents=True, exist_ok=True)
+        p.write_text(f"# {f} v1\n", encoding="utf-8")
+
+    py, server = core.deploy_server(str(src), str(dst))
+    assert server and Path(server) == dst / "agenthub_mcp.py", server
+    assert (dst / "brain.py").read_text(encoding="utf-8") == "# brain.py v1\n"
+    assert not list(dst.parent.glob(f".{dst.name}.stage-*")), "成功路径残留暂存目录"
+    assert not list(dst.parent.glob(f".{dst.name}.old-*")), "成功路径残留旧目录"
+
+    (src / "brain.py").write_text("# brain.py v2\n", encoding="utf-8")
+    real = _sh.copy2
+
+    def flaky(a, b, *args, **kwargs):
+        if Path(a).name == "brain.py":
+            raise OSError("disk full")
+        return real(a, b, *args, **kwargs)
+
+    _sh.copy2 = flaky
+    try:
+        py2, server2 = core.deploy_server(str(src), str(dst))
+    finally:
+        _sh.copy2 = real
+    assert server2 == "", "复制失败必须返回空路径"
+    assert (dst / "brain.py").read_text(encoding="utf-8") == "# brain.py v1\n", "旧部署被半更新"
+    assert (dst / "agenthub_mcp.py").read_text(encoding="utf-8") == "# agenthub_mcp.py v1\n"
+    assert not list(dst.parent.glob(f".{dst.name}.stage-*")), "失败路径残留暂存目录"
+
+    py3, server3 = core.deploy_server(str(src), str(dst))
+    assert server3 and (dst / "brain.py").read_text(encoding="utf-8") == "# brain.py v2\n", \
+        "故障排除后重试未成功"
+
 
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
     case("建库+迁移（md/记忆/流水/错误/会话）+幂等+增量补迁", lambda: t_init_and_migrate(tmp))
+    case("迁移身份（横幅行号位移不重复/墓碑不复活/正文修订才增量）",
+         lambda: t_migrate_identity_stable(tmp))
     case("记忆CRUD（五类/检索/置顶/编辑/软删）", lambda: t_memory_crud(tmp))
     case("记录写入+栈式软删撤销（不误删迁移/他人）", lambda: t_records_and_undo(tmp))
     case("错误登记流转+操作流水", lambda: t_errors_and_journal(tmp))
@@ -3411,11 +4663,15 @@ def main():
     case("会话保留窗口（24h 剪枝 / 在线判定 30min 不被污染 / 超限必剪）", lambda: t_session_retain(tmp))
     case("agent注册制（写动作登记/计数/保留名过滤/回填幂等/并发登记）", lambda: t_agents_registry(tmp))
     case("反射弧+可塑性（记忆推送/唤起计数/检索日志/项目stalled迁移）", lambda: t_plasticity(tmp))
+    case("R20 项目生命周期（活动口径/显式停滞与漏标/任务恢复活跃/归档守卫）",
+         lambda: t_project_lifecycle(tmp))
     case("全脑检索+统计（记录/记忆/文件名）", lambda: t_search_all_and_stats(tmp))
     case("R4·IDF 加权覆盖度闸门（废话 0 命中/常见词沉底/稀缺弱标/短查询不闸）",
          lambda: t_coverage_gate(Path(tempfile.mkdtemp(prefix="agenthub_cov_"))))
     case("8线程双连接并发写不丢", lambda: t_concurrent_rw(tmp))
     case("大脑备份（在线备份/独立可开/30份轮转）", lambda: t_backup_brain(tmp))
+    case("R4 备份可靠（同秒不覆盖/原子落名/排除运营目录/坏包坏库友好报错）",
+         lambda: t_backup_reliability(tmp))
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
     case("待办提取对抗（复合词/引用/功能名不误抓+单条全文读取）", lambda: t_todo_extraction_adversarial(tmp))
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
@@ -3432,6 +4688,7 @@ def main():
     case("项目名拒绝agent前缀（此前只校验含连字符形同虚设）", lambda: t_project_name_prefix_guard(tmp))
     case("主动检索计入唤起（带query计数/空query不计/查重不计/对抗参）", lambda: t_active_recall_count(tmp))
     case("B4·语义第三路批量矩阵点积（数值等价/软删过滤/门槛/最相似优先）", lambda: t_semantic_batched_cosine(tmp))
+    case("R6·语义顶权校准（rank1 胜 BM25 rank3/0.58 门槛过闸/顶权对齐）", lambda: t_semantic_channel_balance(tmp))
     case("B5·相似记忆两两 Jaccard 上界短路（等价免建并集/多阈值/limit 早退一致）", lambda: t_similar_memories_bound(tmp))
     case("B11·schema 版本登记与降级检测（幂等/downgrade 不抹证据/低版本升级）", lambda: t_schema_version(tmp))
     case("B12·哨兵退出钩子唯一且真做 checkpoint（防第二个钩子架空/WAL 无残留/收尾后仍可写）",
@@ -3441,6 +4698,8 @@ def main():
          lambda: t_ghost_memory_candidates(tmp))
     case("C4 遗留·ghost 记录检测（未标取代必报/已标必排除/机器模板两类不报/剥模板头）",
          lambda: t_ghost_record_candidates(tmp))
+    case("v2.40.76 记录侧取代（退出检索/正文可追溯/反向撤销/坏参拒/软删除外）",
+         lambda: t_record_supersede(tmp))
     case("D5·确定性裁决建议（recency/质量tiebreak/冲突降级/完全打平/对调不变/只报不裁不写库）",
          lambda: t_ghost_adjudication(tmp))
     case("B10·写入热路径拦截扫描复用 token 缓存（结果等价/缓存生效/短内容短路）",
@@ -3459,7 +4718,7 @@ def main():
     case("人的随记A-Ⅰ（add/list/search_all互通/mood白名单/来源落回/空content拒绝/limit）", lambda: t_notes(tmp))
     case("随记创意批AB（收藏/每日回顾当日固定/周年回放/胶囊隐藏到期/热力图/get_note/开工视野/上下文）", lambda: t_notes_creative(tmp))
     case("交接协议（typed create/open清单/exactly once认领/8线程并发/对抗参/落痕）", lambda: t_handoff(tmp))
-    case("项目归档（状态+目录移动/不复活/错误分支/回滚验证）", lambda: t_archive_project(tmp))
+    case("项目归档/恢复（状态+目录移动/不复活/错误分支/restore 往返与碰撞）", lambda: t_archive_project(tmp))
     case("schema自愈（缺表补建/幂等/坏根目录容错）", lambda: t_ensure_schema(tmp))
     case("对抗参数（穿越/LIKE注入/畸形limit）", lambda: t_bad_params(tmp))
     case("批次A·记忆治理（取代链/双时相/证据链/置信度/latest-write-wins/治理统计）", lambda: t_batchA_memory_governance(tmp))
@@ -3474,8 +4733,28 @@ def main():
     case("agent 活跃度回填（存量补 last_seen/不覆盖/不妄填/幂等，修「谁静默了不可判定」）", lambda: t_agents_lastseen(tmp))
     case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
     case("任务工作图（M1：deps 阻塞/自动解阻/优先级前沿/认领门 + M2：完成自动结晶/幂等/force 重做）", lambda: t_task_graph(tmp))
+    case("R28 完成证据提示（空任务完成即明说无证据/检查点或记录存在不误报）",
+         lambda: t_task_evidence_nudge(tmp))
+    case("R1 任务状态机（释放清阻塞/blocked 不可直开/update 不绕依赖/必须署名/due 清除）",
+         lambda: t_task_state_integrity(tmp))
+    case("R3 依赖图完整性（自依赖/二元环/长环/前向引用成环拒绝且回滚/缺失前置可见）",
+         lambda: t_dep_integrity(tmp))
+    case("R4 任务图巡检（缺失前置/成环/残留阻塞可见/只读/修复归零）",
+         lambda: t_graph_audit(tmp))
+    case("R5 任务审计流水（新建/认领/流转/检查点入 journal/时间机器合并/id 精确绑定）",
+         lambda: t_task_audit_timeline(tmp))
     case("M3 信号（点对点/广播/收件箱过滤/已读回执幂等/非我勿动/未读计数排自发）", lambda: t_signals(tmp))
     case("M4 检查点（认领自动锚点/时间线/latest/拒空拒幽灵/并发认领不回归）", lambda: t_checkpoints(tmp))
+    case("任务租约续期（心跳/进展更新续租/续租不重复锚点/不跨项目误续）",
+         lambda: t_lease_renewal(tmp))
+    case("R2 租约自愈（无主/无租约可接管+标注/无主拒检查点/续期不重锚/状态面点名）",
+         lambda: t_lease_selfheal(tmp))
+    case("R8 检查点围栏（持有者写入续租/非持有者拒收不落行/接管后旧持有者拒收/待办不设限）",
+         lambda: t_checkpoint_fencing(tmp))
+    case("并发心跳不丢会话（6 agent 同时心跳，UPSERT 替代全表重建）",
+         lambda: t_heartbeat_concurrent(tmp))
+    case("状态过程面（在办任务/过期租约点名/心跳续租后消失/只读不写库）",
+         lambda: t_status_control_surface(tmp))
     case("M5 哨兵（全绿不报/造gap广播/同内容冷却/冷却过重发）", lambda: t_sentry(tmp))
     case("M6 记忆成熟度（draft缺省/人工标/用3次自动validated/pinned+10次core/只升不降/health分布）", lambda: t_maturity(tmp))
     case("M8+M11 隔离区与决策回路（隔离退检索可解除/到期队列/回顾结论/只记一次）", lambda: t_quarantine_review(tmp))
@@ -3486,8 +4765,19 @@ def main():
     case("R3 ghost 对内降序（旧版沉底+标注/只动对内顺序/不置信不动/三版链/不写库/折叠优先刻度不串）", lambda: t_ghost_pair_demotion(tmp))
     case("R4 新鲜度状态机（kind分档/max参考/valid_until优先/缺戳unknown/confirmed前向兼容/检索标注/不写库/深过期）", lambda: t_memory_freshness(tmp))
     case("R5 记忆复核闭环（老库补列/确认转fresh/不重写updated/跳过取代·作废·硬过期/批量kind+limit+remaining/幂等）", lambda: t_memory_confirm(tmp))
-    case("R6 接入快照（upsert一行/七步JSON往返/大小写归一/空agent拒/记录活跃度窗口）", lambda: t_agent_onboarding_store(tmp))
-    case("R7 运行版本检测（顶层py/非py与子目录不算/容差/缺启动标记不猜/坏时间不崩）", lambda: t_runtime_staleness(tmp))
+    case("R6 接入快照（upsert一行/七步JSON往返/代码树绑定/大小写归一/空agent拒/记录活跃度窗口）", lambda: t_agent_onboarding_store(tmp))
+    case("R7 任务持有面（按owner归组/租约有效·过期·缺失·无主/完成不计/剩余小时）",
+         lambda: t_task_holdings(tmp))
+    case("R8 看板注解（截止逾期·今日·未来/前置完成度与缺失/残留阻塞/租约/只读）",
+         lambda: t_task_annotate(tmp))
+    case("R30 待办饥饿（能开工才计/等待·阻塞·在办·新任务排除/最久优先·急件次之/认领即退出/窗口可调）",
+         lambda: t_task_starvation(tmp))
+    case("R11 文件租约（冲突含祖先子孙/同主续租/过期接管+fence/任务绑定/心跳续锁/完成与接管自动释放）",
+         lambda: t_file_leases(tmp))
+    case("R7 运行版本检测（顶层py/非py与子目录不算/容差/缺启动标记不猜/非 MCP 身份不冒充/坏时间不崩）", lambda: t_runtime_staleness(tmp))
+    case("R7 备份盘点与清理（四家族/预演不删/保留最新/年龄闸/主库不动/留痕）", lambda: t_backup_inventory_prune(tmp))
+    case("R29 部署原子化（全量暂存+校验/中段失败旧部署不变/无残留/故障后重试成功）",
+         lambda: t_deploy_atomic(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:

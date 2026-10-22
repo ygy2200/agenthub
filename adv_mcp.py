@@ -63,10 +63,86 @@ def fresh_hub(tmp, name) -> Path:
     return root
 
 
+def t_help_topics(root):
+    """R9 + R9'（2026-10-21）：hub_help 场景主题可发现——六个主题各有步骤，未知主题给出可选项；
+    运维手册必须真实存在且覆盖恢复/清理/发布/任务治理关键命令（防文档腐烂成空链接）。"""
+    for topic, needle in (("start", "hub_log_work"), ("search", "eval_search"),
+                          ("backup", "_AgentHub_备份清单"), ("tasks", "tasks_health"),
+                          ("recover", "runtime_health"), ("release", "build.bat")):
+        out = m.call_tool("hub_help", {"topic": topic}, str(root))
+        assert needle in out, (topic, out[:200])
+    # 客户端按 schema 先校验：主题只加进 HELP_TOPICS、没进 enum，就会在 handler 之前被挡成
+    # 「must be equal to one of the allowed values」（R9 的 tasks 主题正是这样漏了）
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_help")["inputSchema"]
+    assert set(schema["properties"]["topic"]["enum"]) == set(m.HELP_TOPICS), (
+        schema["properties"]["topic"]["enum"], list(m.HELP_TOPICS))
+    tasks_help = m.call_tool("hub_help", {"topic": "tasks"}, str(root))
+    assert "hub_lock" in tasks_help and "续租" in tasks_help, tasks_help[:400]
+    assert "lease_health" in tasks_help and "cli.py" in tasks_help, tasks_help[:500]
+    assert "prune" in tasks_help, tasks_help[:500]
+    bad = m.call_tool("hub_help", {"topic": "nope"}, str(root))
+    assert "未知主题" in bad and "recover" in bad, bad
+    base = m.call_tool("hub_help", {}, str(root))
+    assert "场景帮助" in base and "backup" in base, base[-300:]
+    doc = Path(__file__).parent / "docs" / "运维手册.md"
+    assert doc.is_file(), "缺 docs/运维手册.md"
+    text = doc.read_text(encoding="utf-8")
+    for needle in ("备份、校验与恢复", "backup-prune", "cli.py release", "runtime_health",
+                   "任务管控：看板、租约、依赖与追溯", "quick_check", "写入围栏",
+                   "### 4.5 文件租约", "hub_lock action=acquire", "fence",
+                   "cli.py locks", "lease_health", "hub_lock action=prune", "locks --prune",
+                   "hub_history(kind=\"task\"", "python cli.py --root <root> tasks"):
+        assert needle in text, f"运维手册缺关键步骤：{needle}"
+
+
+def t_backup_prune_surface(root):
+    """R7：hub_export backups/prune 工具面——盘点四家族；prune 默认预演不删，apply=true 才删并留 journal。"""
+    hub = fresh_hub(Path(root), "mcp_prune")
+    meta = hub / core.DIR_META
+    sdir = meta / brain.BACKUP_DIR
+    sdir.mkdir(parents=True, exist_ok=True)
+    (meta / "backup").mkdir(parents=True, exist_ok=True)
+    now = time.time()
+
+    def mk(p, age):
+        p.write_bytes(b"x" * 100)
+        os.utime(p, (now - age * 86400, now - age * 86400))
+        return p
+
+    olds = [mk(sdir / f"brain-2026010{i}-000000.db", 30 + i) for i in range(1, 4)]
+    newest = mk(sdir / "brain-20261020-000000.db", 1)
+    listing = m.call_tool("hub_export", {"action": "backups"}, str(hub))
+    assert "snapshot" in listing and "4 份" in listing, listing
+    preview = m.call_tool("hub_export", {"action": "prune", "keep_snapshot": 1,
+                                         "min_age_days": 7}, str(hub))
+    assert "预演" in preview and "可清理 3 份" in preview, preview
+    assert all(p.exists() for p in olds), "预演删了文件"
+    done = m.call_tool("hub_export", {"action": "prune", "keep_snapshot": 1,
+                                      "min_age_days": 7, "apply": True}, str(hub))
+    assert "已清理 3 份" in done and "journal" in done, done
+    assert not any(p.exists() for p in olds) and newest.exists(), done
+    with brain.db_conn(str(hub)) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='backup_prune'").fetchone()[0]
+    assert n == 1, f"清理未留 journal：{n}"
+
+
+def t_sentry_report(root):
+    """R8：hub_sentry action=report 只出自检报告（每条问题附修复建议），不广播信号。"""
+    hub = fresh_hub(Path(root), "mcp_doctor")
+    out = m.call_tool("hub_sentry", {"action": "report"}, str(hub))
+    assert "一键自检" in out and "修复：" in out, out[:400]
+    assert "已广播" not in out, "report 不应发广播"
+    with brain.db_conn(str(hub)) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+    assert n == 0, f"report 不应写 signals：{n}"
+
+
 def t_protocol(root):
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2025-06-18"}), str(root)))
     assert r["protocolVersion"] == "2025-06-18" and r["serverInfo"]["name"] == "agenthub"
-    assert r["serverInfo"]["version"] == "2.40.69"
+    # 版本号单一事实源：握手必须回显 SERVER_INFO，不在测试里再抄一份（抄一份=每轮发版必红）
+    assert r["serverInfo"]["version"] == m.SERVER_INFO["version"]
+    assert r["serverInfo"]["version"].count(".") == 2, "版本号应形如 x.y.z"
     assert m.handle_message({"jsonrpc": "2.0", "method": "notifications/initialized"}, str(root)) is None
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     names = {t["name"] for t in tools}
@@ -85,7 +161,7 @@ def t_protocol(root):
             "hub_skill_match", "hub_skill_sync"} <= names, names
     # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
     # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
-    assert len(names) == 73  # ...；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）
+    assert len(names) == 74  # ...；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -104,6 +180,24 @@ def t_protocol(root):
         "工具异常未自动登记错误"
     # ping
     assert "result" in m.handle_message(rpc("ping"), str(root))
+
+
+def t_initialize_instructions(root):
+    """R4：握手即拿到最小作业规程；说明不能提到不存在的工具（防改名后文案腐烂）。"""
+    r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2024-11-05"}), str(root)))
+    ins = r.get("instructions")
+    assert isinstance(ins, str) and ins.strip(), f"initialize 缺少 instructions：{r.keys()}"
+    assert len(ins) <= 900, f"instructions 超预算：{len(ins)} 字符"
+    must = ["hub_get_progress", "hub_memory_read", "hub_log_work", "hub_memory_write",
+            "hub_ops_run", "hub_memory_confirm", "hub_memory_supersede",
+            "hub_search_tools", "hub_call_tool", "hub_report_error"]
+    missing = [t for t in must if t not in ins]
+    assert not missing, f"instructions 未覆盖核心流程：{missing}"
+    known = {t["name"] for t in m.TOOLS}
+    ghosts = sorted(set(re.findall(r"hub_[a-z_]+", ins)) - known)
+    assert not ghosts, f"instructions 提到不存在的工具：{ghosts}"
+    # 协议字段是纯文本：不夹带 markdown 代码块/多段结构
+    assert "```" not in ins and ins.count("\n") == 0, "instructions 应为单段纯文本"
 
 
 def t_protocol_encoding(root):
@@ -467,6 +561,19 @@ def t_heartbeat_conflict(root):
     assert "撞车预警" in out, out
     out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "别的-项目"}, root)
     assert "无其他活跃会话" in out
+    # R6 任务级撞车预警：会话不活跃但别人持有在办任务，也要看见；自己的任务不刷
+    _, tid = brain.task_add(root, "迁移 500 条记忆", project="任务-项目")
+    brain.task_claim(root, tid, "hermes")
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "任务-项目"}, root)
+    assert "[任务预警]" in out and "hermes" in out and "迁移 500 条记忆" in out, out
+    _, tid2 = brain.task_add(root, "dsh 自己的活", project="任务-项目")
+    brain.task_claim(root, tid2, "dsh")
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "任务-项目"}, root)
+    assert "dsh 自己的活" not in out.split("[今日任务]")[0], out
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00' WHERE id=?", (tid,))
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "任务-项目"}, root)
+    assert "租约过期可接管" in out, out
     # 陈旧清理：手改 ts
     with brain.db_conn(root) as conn:
         conn.execute("UPDATE sessions SET ts='2026-09-30T08:00:00' WHERE agent='zcode'")
@@ -517,6 +624,105 @@ def t_heartbeat_today(root):
     # 自发广播不进发件人自己的未读（收件箱仍显示，留痕用）
     out2 = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "甲-问题"}, root)
     assert "未读信号" not in out2, out2
+
+
+def t_file_lease_surface(root):
+    """R11：hub_lock 工具面——check/acquire/冲突/续租/释放/list/dry_run/参数校验/
+    心跳预警与自动续租/看板锁计数/任务完成自动释放；worker 可见。"""
+    rs = str(root)
+    tool = next((t for t in m.TOOLS if t["name"] == "hub_lock"), None)
+    assert tool is not None, "hub_lock 未注册"
+    props = tool["inputSchema"]["properties"]
+    assert {"action", "path", "lease_id", "task_id", "ttl_min", "reason",
+            "include_released", "limit", "agent"} <= set(props), props
+    assert "hub_lock" in m.PROFILE_WORKER and "hub_lock" in m.WRITE_TOOLS
+
+    out = m.call_tool("hub_lock", {"path": "测试-项目/a.py"}, rs)
+    assert "空闲" in out, out
+    out = m.call_tool("hub_lock", {"action": "acquire", "path": "测试-项目/a.py",
+                                   "agent": "zcode", "reason": "改解析器"}, rs)
+    assert "已获取" in out and "fence 1" in out and "zcode" in out, out
+    leases = brain.file_lease_list(rs, path="测试-项目/a.py")
+    assert len(leases) == 1 and leases[0]["owner"] == "zcode", leases
+    lid = leases[0]["id"]
+    out = m.call_tool("hub_lock", {"path": "测试-项目/a.py"}, rs)
+    assert "被占用" in out and "zcode" in out and "改解析器" in out, out
+    out = m.call_tool("hub_lock", {"action": "acquire", "path": "测试-项目/a.py",
+                                   "agent": "dsh"}, rs)
+    assert "错误" in out and "zcode" in out and "不要并发编辑" in out, out
+    out = m.call_tool("hub_lock", {"action": "renew", "lease_id": lid, "agent": "dsh"}, rs)
+    assert "错误" in out and "只有持有者" in out, out
+    out = m.call_tool("hub_lock", {"action": "renew", "lease_id": lid, "agent": "zcode",
+                                   "ttl_min": 5}, rs)
+    assert "已续" in out and "剩 5 分钟" in out, out
+    out = m.call_tool("hub_lock", {"action": "list", "project": "测试-项目"}, rs)
+    assert f"#{lid}" in out and "测试-项目/a.py" in out and "剩" in out, out
+    # dry_run 不落库（走 handle_message 的写闸门，call_tool 直调会绕过）
+    dr = resp_ok(m.handle_message(rpc("tools/call", {
+        "name": "hub_lock",
+        "arguments": {"action": "acquire", "path": "测试-项目/b.py",
+                      "agent": "dsh", "dry_run": True}}), rs))
+    assert "dry_run" in dr["content"][0]["text"] and dr["isError"] is False, dr
+    assert brain.file_lease_list(rs, path="测试-项目/b.py") == [], "dry_run 不应落库"
+    # 参数校验
+    assert "错误" in m.call_tool("hub_lock", {"action": "acquire", "agent": "zcode"}, rs)
+    assert "错误" in m.call_tool("hub_lock", {"action": "renew", "lease_id": "abc",
+                                              "agent": "zcode"}, rs)
+    assert "只支持" in m.call_tool("hub_lock", {"action": "nope", "agent": "zcode"}, rs)
+
+    # 心跳预警：他人持锁可见，自己的锁不在自己心跳里刷
+    out = m.call_tool("hub_lock", {"action": "acquire", "path": "测试-项目/c.py",
+                                   "agent": "dsh", "reason": "改 GUI"}, rs)
+    assert "已获取" in out, out
+    out = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "测试-项目"}, rs)
+    assert "[文件租约]" in out and "dsh" in out and "测试-项目/c.py" in out, out
+    out = m.call_tool("hub_heartbeat", {"agent": "dsh", "project": "测试-项目"}, rs)
+    assert "· 测试-项目/c.py" not in out, out
+
+    # 心跳自动续租：只续挂在本人进行中任务上的锁
+    _, tid = brain.task_add(rs, "锁文件任务", project="测试-项目")
+    assert brain.task_claim(rs, tid, "zcode")[0] == ""
+    out = m.call_tool("hub_lock", {"action": "acquire", "path": "测试-项目/task.py",
+                                   "agent": "zcode", "task_id": tid}, rs)
+    assert "已获取" in out and f"任务 #{tid}" in out, out
+    tl = brain.file_lease_list(rs, path="测试-项目/task.py")[0]
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE file_leases SET expires_at='2020-01-01T00:00:00' WHERE id=?",
+                     (tl["id"],))
+    out = m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "测试-项目"}, rs)
+    assert "自动续文件租约 1 把" in out, out
+    fresh = brain.file_lease_list(rs, path="测试-项目/task.py")[0]
+    assert fresh["expires_at"] > "2021", fresh
+
+    # 看板「锁 N」；任务 done → 挂在其上的锁自动释放
+    out = m.call_tool("hub_tasks", {"project": "测试-项目"}, rs)
+    assert "锁 1" in out, out
+    out = m.call_tool("hub_task_update", {"task_id": tid, "status": "done",
+                                          "agent": "zcode"}, rs)
+    assert "已更新" in out, out
+    fresh = brain.file_lease_list(rs, path="测试-项目/task.py", include_released=True)[0]
+    assert fresh["released_at"], fresh
+    out = m.call_tool("hub_lock", {"action": "release", "lease_id": lid, "agent": "zcode"}, rs)
+    assert "已释放" in out, out
+    assert brain.file_lease_check(rs, "测试-项目/a.py")["free"] is True
+
+    # R13 过期租约回收：只动过期未释放；dry_run 不落库；活跃租约不受影响
+    _, xp = brain.file_lease_acquire(rs, "测试-项目/expired.py", "dsh", ttl_min=1)
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE file_leases SET expires_at='2020-01-01T00:00:00' WHERE id=?",
+                     (xp["id"],))
+    dr = resp_ok(m.handle_message(rpc("tools/call", {
+        "name": "hub_lock", "arguments": {"action": "prune", "dry_run": True}}), rs))
+    assert "dry_run" in dr["content"][0]["text"] and dr["isError"] is False, dr
+    assert brain.file_lease_list(rs, path="测试-项目/expired.py")[0]["released_at"] == "", \
+        "dry_run 不应回收"
+    out = m.call_tool("hub_lock", {"action": "prune", "agent": "zcode"}, rs)
+    assert "已回收 1 条" in out and f"#{xp['id']}" in out, out
+    fresh = brain.file_lease_list(rs, path="测试-项目/expired.py", include_released=True)[0]
+    assert fresh["released_by"] == "expiry", fresh
+    assert brain.file_lease_check(rs, "测试-项目/c.py")["free"] is False, "活跃租约不得被回收"
+    out = m.call_tool("hub_lock", {"action": "prune"}, rs)
+    assert "没有过期未释放" in out, out
 
 
 def t_handoff_tool(root):
@@ -692,6 +898,7 @@ def t_end_to_end(root):
             lines.append(json.loads(line))
         assert len(lines) == 3
         assert lines[0]["result"]["serverInfo"]["name"] == "agenthub"
+        assert lines[0]["result"].get("instructions"), "真实子进程握手未返回 instructions"
         assert any(t["name"] == "hub_log_work" for t in lines[1]["result"]["tools"])
         assert "测试-项目" in lines[2]["result"]["content"][0]["text"]
         # 坏行不影响后续
@@ -965,18 +1172,30 @@ def t_health_acceptance_output(tmp):
 
 
 def t_archive_tool(tmp):
-    """hub_archive_project（v2.7）：归档成功（状态+目录）/未找到报错/重复归档报错。"""
+    """hub_archive_project（v2.7/R21）：归档成功（状态+目录）/未找到报错/重复归档报错/
+    restore=true 一步恢复（状态+目录）/重复恢复与未归档报错。"""
     root = Path(tmp) / "hub_archive_tool"
     build_hub(root)
     root_s = str(root)
     out = m.call_tool("hub_archive_project", {"project": "测试-项目", "agent": "zcode"}, root_s)
     assert "已归档" in out and "99_Archive" in out, out
+    assert "restore=true" in out, out
     assert (root / "99_Archive" / "测试-项目").is_dir(), "目录未移入归档区"
     assert not (root / "测试-项目").exists()
     out2 = m.call_tool("hub_archive_project", {"project": "测试-项目"}, root_s)
     assert "已是归档状态" in out2, out2
     out3 = m.call_tool("hub_archive_project", {"project": "不存在的项目xyz"}, root_s)
     assert "未找到" in out3, out3
+    out3b = m.call_tool("hub_archive_project", {"project": "不存在的项目xyz", "restore": True}, root_s)
+    assert "未找到" in out3b, out3b
+    # R21 恢复通道：restore=true 一步回滚状态与目录
+    out4 = m.call_tool("hub_archive_project",
+                       {"project": "测试-项目", "restore": True, "agent": "zcode"}, root_s)
+    assert "已恢复" in out4 and "active" in out4, out4
+    assert (root / "测试-项目").is_dir()
+    assert not (root / "99_Archive" / "测试-项目").exists()
+    out5 = m.call_tool("hub_archive_project", {"project": "测试-项目", "restore": True}, root_s)
+    assert "未归档" in out5, out5
 
 
 def t_distill_mark(tmp):
@@ -1573,6 +1792,77 @@ def t_p3_tasks_events(tmp):
     err9, row9 = brain.task_claim(rs, tid3, "dsh")
     assert not err9 and row9["status"] == "in_progress"
 
+    # R1：due="-" 必须被放行并清除；释放时 blocked_by 自动清空；blocked 不能直接开工
+    r4 = m.call_tool("hub_task_add", {"title": "清截止", "due": "2026-10-30", "agent": "zcode"}, rs)
+    tid4 = int(r4.split("#")[1].split("：")[0])
+    assert "已更新" in m.call_tool(
+        "hub_task_update", {"task_id": tid4, "due": "-", "agent": "zcode"}, rs)
+    with brain.db_conn(rs) as conn:
+        assert conn.execute("SELECT due FROM tasks WHERE id=?", (tid4,)).fetchone()[0] == ""
+    r5 = m.call_tool("hub_task_add", {"title": "清阻塞", "blocked_by": "旧依赖", "agent": "zcode"}, rs)
+    tid5 = int(r5.split("#")[1].split("：")[0])
+    assert "阻塞" in m.call_tool(
+        "hub_task_update", {"task_id": tid5, "status": "in_progress", "agent": "zcode"}, rs)
+    assert "已更新" in m.call_tool(
+        "hub_task_update", {"task_id": tid5, "status": "pending", "agent": "zcode"}, rs)
+    with brain.db_conn(rs) as conn:
+        assert conn.execute("SELECT blocked_by FROM tasks WHERE id=?", (tid5,)).fetchone()[0] == ""
+
+    # R2：无主/无租约的遗留 in_progress 可经 MCP 认领接管，提示要说明是接管
+    r6 = m.call_tool("hub_task_add", {"title": "遗留无主", "agent": "zcode"}, rs)
+    tid6 = int(r6.split("#")[1].split("：")[0])
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='', claimed_at='' "
+                     "WHERE id=?", (tid6,))
+    out6 = m.call_tool("hub_claim", {"task_id": tid6, "agent": "dsh"}, rs)
+    assert "无主任务接管成功" in out6 and "dsh" in out6, out6
+    r7 = m.call_tool("hub_task_add", {"title": "遗留无租约", "agent": "zcode"}, rs)
+    tid7 = int(r7.split("#")[1].split("：")[0])
+    assert not brain.task_claim(rs, tid7, "zcode")[0]
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='' WHERE id=?", (tid7,))
+    out7 = m.call_tool("hub_claim", {"task_id": tid7, "agent": "dsh"}, rs)
+    assert "租约缺失接管成功" in out7, out7
+    # 无主任务：hub_next 可接管段点名原因；写检查点被拒（先认领）
+    r8 = m.call_tool("hub_task_add", {"title": "无主前沿", "project": "测试-项目",
+                                      "agent": "zcode"}, rs)
+    tid8 = int(r8.split("#")[1].split("：")[0])
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='', claimed_at='' "
+                     "WHERE id=?", (tid8,))
+    out8 = m.call_tool("hub_next", {"project": "测试-项目", "agent": "zcode"}, rs)
+    assert "无主前沿" in out8 and "无主" in out8, out8
+    out9 = m.call_tool("hub_checkpoint", {"task_id": tid8, "agent": "dsh",
+                                          "content": "偷偷开工"}, rs)
+    assert "无持有者" in out9 and "hub_claim" in out9, out9
+    # R5：任务变更史（journal + 检查点 + 任务卡时点）可经 hub_history(kind=task) 追溯
+    assert "检查点已存" in m.call_tool(
+        "hub_checkpoint", {"task_id": tid6, "agent": "dsh", "content": "接管后进展"}, rs)
+    # R27：让 updated 领先 progress_at（心跳续租的形态），推进与改动必须分成两个时点
+    with brain.db_conn(rs) as conn:
+        pa6 = conn.execute("SELECT progress_at FROM tasks WHERE id=?", (tid6,)).fetchone()[0]
+        conn.execute("UPDATE tasks SET updated=? WHERE id=?",
+                     ((datetime.datetime.fromisoformat(pa6)
+                       + datetime.timedelta(hours=2)).isoformat(timespec="seconds"), tid6))
+    hist6 = m.call_tool("hub_history", {"kind": "task", "id": tid6}, rs)
+    assert ("变更史" in hist6 and "任务新建" in hist6 and "接管任务" in hist6
+            and "检查点（manual）" in hist6), hist6
+    # R27：时间口径四钟一行；updated 只作「最后改动」，推进必须单独可读
+    assert "时间口径" in hist6 and "最后推进" in hist6 and "最后检查点" in hist6, hist6
+    assert "agent 级" in hist6 and "不代表进展" in hist6, hist6
+    # R3：依赖成环在 MCP 面被拒绝；非法 deps 不静默清空
+    r10 = m.call_tool("hub_task_add", {"title": "环A", "agent": "zcode"}, rs)
+    tid10 = int(r10.split("#")[1].split("：")[0])
+    r11 = m.call_tool("hub_task_add", {"title": "环B", "deps": str(tid10),
+                                       "agent": "zcode"}, rs)
+    tid11 = int(r11.split("#")[1].split("：")[0])
+    out11 = m.call_tool("hub_task_update",
+                        {"task_id": tid10, "deps": str(tid11), "agent": "zcode"}, rs)
+    assert "错误" in out11 and "成环" in out11, out11
+    out_bad = m.call_tool("hub_task_add", {"title": "坏依赖", "deps": "abc",
+                                           "agent": "zcode"}, rs)
+    assert "错误" in out_bad and "无合法" in out_bad, out_bad
+
     # 列表排序契约：进行中 → 阻塞 → 待办 → 完成（各类可能缺项，按秩单调性断言）
     rows = brain.task_list(rs, limit=50)
     rank = {"in_progress": 0, "blocked": 1, "pending": 2, "done": 3}
@@ -2163,6 +2453,27 @@ def t_idem_key(hub):
         conn.execute("UPDATE idem_keys SET ts='2020-01-01T00:00:00' WHERE agent='zcode' AND key IN ('m1','n1')")
     r9 = m.call_tool("hub_memory_write", dict(ma), rs)
     assert "已写入大脑记忆" in r9 and "幂等重放" not in r9, f"过期键被重放：{r9[:120]}"
+    # ⑦ R16 占位：另一请求已占位但未完成 → 不重复执行；超过保护期才允许接管
+    pa = {"project": "幂等-测试", "agent": "zcode",
+          "content": "【目的】占位\n【做了什么】未完成\n【验证结果】无\n【如何回滚】删",
+          "idem_key": "p1"}
+    digest = _b.idem_digest(m._idem_fields("hub_log_work", pa))
+    with _b.db_conn(rs) as conn:
+        conn.execute("INSERT INTO idem_keys(agent,key,tool,digest,result,ref,ts) "
+                     "VALUES(?,?,?,?,'',NULL,?)",
+                     ("zcode", "p1", "hub_log_work", digest, _b._now()))
+    before = _b.records_count(rs, project="幂等-测试")
+    rp = m.call_tool("hub_log_work", dict(pa), rs)
+    assert "正在处理中" in rp and "records#" not in rp, rp
+    assert _b.records_count(rs, project="幂等-测试") == before, "占位中不该重复执行"
+    old_ts = (datetime.datetime.now()
+              - datetime.timedelta(seconds=_b.IDEM_PENDING_GRACE_SEC + 10)
+              ).isoformat(timespec="seconds")
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE idem_keys SET ts=? WHERE agent='zcode' AND key='p1'", (old_ts,))
+    rp2 = m.call_tool("hub_log_work", dict(pa), rs)
+    assert "records#" in rp2 and "正在处理中" not in rp2, rp2
+    assert _b.records_count(rs, project="幂等-测试") == before + 1
 
 
 def t_schema_dialect_safety(root):
@@ -2343,6 +2654,95 @@ def t_usage_trace_completeness(hub):
         raise AssertionError(f"留痕路径对任意工具名失败：{e}") from e
 
 
+def t_call_attribution(hub):
+    """R28 控制面归因：tool_calls.agent 必须记「谁在调用」，而不是「在查谁」或空。
+
+    背景：库内 417/622 条 tool_calls 归属为空，且筛选类工具（agent 参数语义是
+    查询对象）会把 qoder 查 workbuddy 记成 workbuddy 调用——控制面拿这种数据做
+    画像/治理，结论会整体偏。验证四层：
+    ① --agent 锁定（生产接入主路径）最可信：调用参数里写别家也不改归属；
+    ② 无锁定时用 initialize 的 clientInfo 兜底（旧接入不再产生空归属）；
+    ③ 筛选类工具的查询对象绝不能被当成调用者（有无 clientInfo 都成立）；
+    ④ 无锁定、无 clientInfo 的筛选调用记空——宁可空，不可错；
+    ⑤ 同一身份兜底必须覆盖写入类工具：工作记录归属不能退化成 unknown；
+       陌生客户端（未注册名）仍走 unknown 放行，不能因身份推断反而写不进去。
+    """
+    import brain as _b
+    rs = str(hub)
+
+    def _last_agent(tool):
+        with _b.db_conn(rs) as conn:
+            row = conn.execute(
+                "SELECT agent FROM tool_calls WHERE tool=? ORDER BY id DESC LIMIT 1",
+                (tool,)).fetchone()
+        return row["agent"] if row else None
+
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        # ① 进程锁定身份优先（apply_server_agent 会覆盖入参，但日志读的是原 args）
+        m.SERVER_AGENT, m.CLIENT_NAME = "qoder", "someoneelse"
+        m.handle_message(rpc("tools/call", {
+            "name": "hub_tasks", "arguments": {"agent": "workbuddy"}}), rs)
+        assert _last_agent("hub_tasks") == "qoder", \
+            f"锁定身份被入参覆盖：{_last_agent('hub_tasks')}"
+
+        # ② 无锁定 → clientInfo 兜底（规范化："Qoder CLI" → qoder）
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+        m.handle_message(rpc("initialize", {
+            "protocolVersion": "2024-11-05",
+            "clientInfo": {"name": "Qoder CLI", "version": "test"}}), rs)
+        assert m.CLIENT_NAME == "qoder", f"clientInfo 未规范化：{m.CLIENT_NAME!r}"
+        m.handle_message(rpc("tools/call", {
+            "name": "hub_status", "arguments": {}}), rs)
+        assert _last_agent("hub_status") == "qoder", \
+            f"clientInfo 兜底失效：{_last_agent('hub_status')!r}"
+
+        # ⑤ 写入类工具同样吃 clientInfo 兜底（记录不再退化成 unknown）。
+        # 临时库内置注册表没有 qoder，用 zcode 验证同一机制。
+        content = "目的：验证归属\n做了什么：写一条记录\n验证结果：见断言\n如何回滚：删记录"
+        m.CLIENT_NAME = "zcode"
+        r = m.handle_message(rpc("tools/call", {
+            "name": "hub_log_work",
+            "arguments": {"project": "归属-项目", "content": content}}), rs)
+        assert "error" not in r and not r["result"].get("isError"), r
+        with _b.db_conn(rs) as conn:
+            who = conn.execute("SELECT agent FROM records ORDER BY id DESC LIMIT 1").fetchone()["agent"]
+        assert who == "zcode", f"clientInfo 未用于记录归属：{who!r}"
+        m.SERVER_AGENT, m.CLIENT_NAME = "qoder", "zcode"
+        m.handle_message(rpc("tools/call", {
+            "name": "hub_log_work",
+            "arguments": {"project": "归属-项目", "content": content}}), rs)
+        with _b.db_conn(rs) as conn:
+            who = conn.execute("SELECT agent FROM records ORDER BY id DESC LIMIT 1").fetchone()["agent"]
+        assert who == "qoder", f"锁定身份未覆盖写入归属：{who!r}"
+        m.SERVER_AGENT, m.CLIENT_NAME = "", "qoder"
+
+        # ③ 筛选类工具：查询对象不得冒充调用者
+        m.handle_message(rpc("tools/call", {
+            "name": "hub_usage_timeline", "arguments": {"agent": "workbuddy"}}), rs)
+        assert _last_agent("hub_usage_timeline") == "qoder", \
+            f"查询对象被记成调用者：{_last_agent('hub_usage_timeline')}"
+
+        # ④ 无任何身份线索时记空，不拿查询对象凑数
+        m.CLIENT_NAME = ""
+        m.handle_message(rpc("tools/call", {
+            "name": "hub_usage_timeline", "arguments": {"agent": "workbuddy"}}), rs)
+        assert _last_agent("hub_usage_timeline") == "", \
+            f"无身份线索仍应记空：{_last_agent('hub_usage_timeline')!r}"
+
+        # ⑥ 未注册客户端：不注入、不拒收，写入仍按 unknown 放行
+        m.CLIENT_NAME = "cursor"
+        r = m.handle_message(rpc("tools/call", {
+            "name": "hub_log_work",
+            "arguments": {"project": "归属-项目", "content": content}}), rs)
+        assert "error" not in r and not r["result"].get("isError"), r
+        with _b.db_conn(rs) as conn:
+            who = conn.execute("SELECT agent FROM records ORDER BY id DESC LIMIT 1").fetchone()["agent"]
+        assert who == "unknown", f"陌生客户端应保持 unknown：{who!r}"
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
 def t_memory_supersede_exit(hub):
     """R9 回归：D5 的**执行路径**——`hub_memory_supersede`（两条既有记忆裁决谁胜出）。
 
@@ -2435,6 +2835,62 @@ def t_memory_supersede_exit(hub):
     assert _count() == n1, "裁决后总数必须不变（新增/删除都不是它该做的事）"
 
 
+def t_record_supersede_surface(hub):
+    """v2.40.76：记录侧取代出口——ghost 检查项报出「高相似记录对」后，agent 能执行裁决。
+    ① target=record 落取代链、drop 退出检索；② 正文保留，hub_get_record 明确标注取代关系；
+    ③ 反向即撤销；④ 非法 target / 不存在 id 拒；⑤ journal 留痕；⑥ schema 声明 target 枚举。"""
+    import brain as _b
+    rs = str(hub)
+    proj = "测试-项目"
+    kw = "灰鲸迁移批次"
+    a = int(_b.add_record(rs, proj, "zcode", "2026-10-18", "迁移旧版",
+                          f"【目的】{kw}\n【做了什么】旧\n【验证结果】旧\n【如何回滚】无"))
+    b = int(_b.add_record(rs, proj, "zcode", "2026-10-19", "迁移新版",
+                          f"【目的】{kw}\n【做了什么】新\n【验证结果】新\n【如何回滚】无"))
+
+    def _live():
+        with _b.db_conn(rs) as conn:
+            return {r["id"] for r in conn.execute(
+                "SELECT id FROM records WHERE " + _b._rec_live_sql())}
+
+    assert {a, b} <= _live()
+    r = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                            "arguments": {"target": "record",
+                                                          "keep_id": b, "drop_id": a}}), rs)["result"]
+    assert not r.get("isError"), r["content"][0]["text"]
+    assert "记录" in r["content"][0]["text"]
+    live = _live()
+    assert b in live and a not in live, f"记录裁决未生效：{live}"
+    rec = m.handle_message(rpc("tools/call", {"name": "hub_get_record",
+                                              "arguments": {"record_id": a}}), rs)["result"]
+    text = rec["content"][0]["text"]
+    assert f"已被 #{b} 取代" in text and "旧" in text, text[:200]
+    with _b.db_conn(rs) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='record_supersede'"
+                         ).fetchone()[0]
+    assert n > 0, "记录裁决必须留 journal"
+    # 反向撤销
+    r2 = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                             "arguments": {"target": "record",
+                                                           "keep_id": a, "drop_id": b}}), rs)["result"]
+    assert not r2.get("isError")
+    live2 = _live()
+    assert a in live2 and b not in live2, "反向裁决未生效"
+    # 非法 target / 不存在
+    bad = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                              "arguments": {"target": "paper",
+                                                            "keep_id": a, "drop_id": b}}), rs)["result"]
+    assert bad.get("isError") and "target" in bad["content"][0]["text"], bad
+    missing = m.handle_message(rpc("tools/call", {"name": "hub_memory_supersede",
+                                                  "arguments": {"target": "record",
+                                                                "keep_id": 999999, "drop_id": a}}),
+                               rs)["result"]
+    assert missing.get("isError"), "不存在的记录应拒"
+    spec = next(t for t in m.TOOLS if t["name"] == "hub_memory_supersede")
+    enum = spec["inputSchema"]["properties"]["target"]["enum"]
+    assert enum == ["memory", "record"], enum
+
+
 def t_usage_timeline_surface(hub):
     """D10/R4 回归：`hub_usage_timeline` 工具面。
 
@@ -2473,9 +2929,13 @@ def t_usage_timeline_surface(hub):
     assert "hub_search" in rt["content"][0]["text"], "造的调用没出现在时间线里"
     rstats = _call({"days": 7, "view": "stats"})
     assert not rstats.get("isError"), rstats["content"][0]["text"][:200]
-    for sec in ("四源总量", "按工具", "零命中检索"):
+    for sec in ("四源总量", "归属覆盖", "按工具", "零命中检索"):
         assert sec in rstats["content"][0]["text"], f"stats 缺段：{sec}"
     assert "零命中探针" in rstats["content"][0]["text"], "零命中查询没进 stats"
+    attr_line = next(l for l in rstats["content"][0]["text"].splitlines()
+                     if l.startswith("归属覆盖"))
+    assert "有主 1" in attr_line and "空 1" in attr_line, \
+        f"归属覆盖应如实显示 1 条有主 / 1 条空（本工具自身调用无身份线索）：{attr_line}"
 
     # ④ 未知 view 回落 timeline 不炸
     rv = _call({"view": "bogus"})
@@ -2599,9 +3059,16 @@ def t_agent_onboard_surface(hub):
     vtext = r["content"][0]["text"]
     assert not r.get("isError") and "已写验证快照" in vtext, vtext[:300]
     import brain as _b
+    import core as _core
     snap = _b.onboarding_get(rs, ag)
     assert len(snap) == 1 and len(snap[0]["steps"]) == 8, snap
     assert snap[0]["note"] == "R6 测试快照", snap
+    # R6（2026-10-21）：verify 必须绑定「此刻在跑的代码」指纹，而不是留空靠 mtime
+    assert snap[0]["fingerprint"] == _core.SERVER_FINGERPRINT, snap[0]["fingerprint"]
+    assert "绑定" in vtext and "源码文件指纹" in vtext, vtext
+    # R23（2026-10-22）：快照必须记录代码树，跨树复查不得冒充过期/一致
+    assert snap[0]["base"] == _core.SERVER_DIR, (snap[0]["base"], _core.SERVER_DIR)
+    assert "代码树" in vtext, vtext
 
     r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
                                             "arguments": {"action": "status", "agent": ag}}), rs)["result"]
@@ -2618,10 +3085,12 @@ def t_agent_onboard_surface(hub):
     expired = r["content"][0]["text"]
     assert "快照已过期" in expired and 'hub_agent(action="verify"' in expired, expired
 
-    # R7：运行版本落后（把启动时刻拨到 2020）——清单与进度页都必须当场告警
+    # R7：运行版本落后（把启动时刻拨到 2020，并显式声明为 MCP 进程）——清单与进度页都必须当场告警
     import core as _core
     old_start = _core.SERVER_STARTED_AT
+    old_flag = _core.SERVER_IS_MCP
     try:
+        _core.SERVER_IS_MCP = True
         _core.SERVER_STARTED_AT = "2020-01-01T00:00:00"
         r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
                                                 "arguments": {"action": "status", "agent": ag}}), rs)["result"]
@@ -2632,12 +3101,118 @@ def t_agent_onboard_surface(hub):
         gp = r["content"][0]["text"]
         assert gp.lstrip().startswith("⚠") and "旧代码" in gp, gp[:200]
     finally:
+        _core.SERVER_IS_MCP = old_flag
         _core.SERVER_STARTED_AT = old_start
 
     r = m.handle_message(rpc("tools/call", {"name": "hub_agent",
                                             "arguments": {"action": "bogus", "agent": ag}}), rs)["result"]
     body = r["content"][0]["text"]
     assert r.get("isError") is True and "status/plan/verify" in body, body[:300]
+
+
+def t_agent_holdings_surface(hub):
+    """R7 回归：Agent 控制面显示「谁手里压着活、租约是否有效」。
+
+    ① hub_list_agents 在持有者行尾追加在办任务与租约徽章，空闲 agent 不出现噪音；
+    ② hub_agent status 对该 agent 追加同一份持有摘要；
+    ③ 无主在办单独点名（可接管），不能被算到任意 agent 名下。"""
+    rs = str(hub)
+    ag = "HoldProbe"
+    m.handle_message(rpc("tools/call", {"name": "hub_heartbeat",
+                                        "arguments": {"agent": ag, "project": "R7测试"}}), rs)
+    m.handle_message(rpc("tools/call", {"name": "hub_heartbeat",
+                                        "arguments": {"agent": "IdleProbe", "project": "R7测试"}}), rs)
+    import brain as _b
+    tid = _b.task_add(rs, "R7 持有面任务", project="R7测试")[1]
+    assert _b.task_claim(rs, tid, ag)[0] == "", "测试前置：认领失败"
+    listing = m.handle_message(rpc("tools/call", {"name": "hub_list_agents",
+                                                  "arguments": {}}), rs)["result"]["content"][0]["text"]
+    line = next((ln for ln in listing.splitlines() if ln.startswith("- holdprobe")), "")
+    assert "在办 1 项" in line and f"#{tid}" in line and "租约剩" in line, listing
+    assert "推进" in line and "检查点" not in line, listing  # R27 默认单行只带推进
+    idle = next((ln for ln in listing.splitlines() if ln.startswith("- idleprobe")), "")
+    assert idle and "在办" not in idle, listing
+
+    out = m.handle_message(rpc("tools/call", {"name": "hub_agent",
+                                              "arguments": {"action": "status", "agent": ag}}),
+                           rs)["result"]["content"][0]["text"]
+    assert "在办 1 项" in out and f"#{tid}" in out, out
+    # R27：status 是详版——检查点与心跳（agent 级）都要露面，且心跳明确标注归属层级
+    assert "检查点" in out and "心跳" in out and "（agent）" in out, out
+
+    # R26：持有者在心跳在线、任务无推进时，控制面直接标「进展停滞」
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET updated='2020-01-01T00:00:00', "
+                     "progress_at='2020-01-01T00:00:00' WHERE id=?", (tid,))
+    listing = m.handle_message(rpc("tools/call", {"name": "hub_list_agents",
+                                                  "arguments": {}}), rs)["result"]["content"][0]["text"]
+    line = next((ln for ln in listing.splitlines() if ln.startswith("- holdprobe")), "")
+    assert "进展停滞" in line, listing
+
+    tid2 = _b.task_add(rs, "R7 无主任务", project="R7测试")[1]
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET status='in_progress', owner='', claimed_at='' WHERE id=?",
+                     (tid2,))
+    listing = m.handle_message(rpc("tools/call", {"name": "hub_list_agents",
+                                                  "arguments": {}}), rs)["result"]["content"][0]["text"]
+    assert "无主在办（可接管）" in listing and f"#{tid2}" in listing, listing
+
+
+def t_task_board_surface(hub):
+    """R8 回归：任务看板/前沿队列把 due、前置、租约、阻塞原因直接显示。
+
+    过去 hub_tasks 只在 blocked 时显示 blocked_by，截止日只在 hub_next 的 ready 段出现，
+    在办任务的租约缺失与 pending 上的残留阻塞标记完全不可见——看板看不出「为什么不能动」。"""
+    import datetime as _dt
+    rs = str(hub)
+    import brain as _b
+    today = _dt.date.today()
+    dep = _b.task_add(rs, "R8 前置任务", project="R8")[1]
+    ready = _b.task_add(rs, "R8 今天到期", project="R8", due=today.isoformat())[1]
+    late = _b.task_add(rs, "R8 已逾期", project="R8",
+                       due=(today - _dt.timedelta(days=2)).isoformat())[1]
+    blocked = _b.task_add(rs, "R8 等别人", project="R8", blocked_by="等外部回复")[1]
+    withdep = _b.task_add(rs, "R8 有前置", project="R8", deps=str(dep))[1]
+    lostdep = _b.task_add(rs, "R8 前置不存在", project="R8", deps="999999")[1]
+    lost = _b.task_add(rs, "R8 无租约在办", project="R8")[1]
+    assert _b.task_claim(rs, lost, "boardprobe")[0] == ""
+    stalled = _b.task_add(rs, "R26 心跳在线活停", project="R8")[1]
+    assert _b.task_claim(rs, stalled, "boardprobe")[0] == ""
+    starving = _b.task_add(rs, "R30 久置没人做", project="R8", priority=1)[1]
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='' WHERE id=?", (lost,))
+        conn.execute("UPDATE tasks SET updated='2020-01-01T00:00:00', "
+                     "progress_at='2020-01-01T00:00:00' WHERE id=?", (stalled,))
+        conn.execute("UPDATE tasks SET created=? WHERE id=?",
+                     ((_dt.datetime.now()
+                       - _dt.timedelta(days=_b.TASK_STARVE_DAYS + 2))
+                      .isoformat(timespec="seconds"), starving))
+    board = m.handle_message(rpc("tools/call", {"name": "hub_tasks",
+                                                "arguments": {"project": "R8"}}),
+                             rs)["result"]["content"][0]["text"]
+    line = lambda tid: next(ln for ln in board.splitlines() if ln.startswith(f"- #{tid}"))
+    assert "进展停滞" in line(stalled), board
+    assert "待办饥饿" in line(starving), board
+    assert "今天到期" in line(ready), board
+    assert "逾期 2 天" in line(late), board
+    assert "阻塞：等外部回复" in line(blocked), board
+    assert "前置 0/1 完成" in line(withdep), board
+    assert "前置不存在 #999999" in line(lostdep), board
+    assert "租约缺失" in line(lost) and "@boardprobe" in line(lost), board
+
+    nxt = m.handle_message(rpc("tools/call", {"name": "hub_next",
+                                              "arguments": {"project": "R8"}}),
+                           rs)["result"]["content"][0]["text"]
+    assert f"#{ready}" in nxt and "今天到期" in nxt, nxt
+    assert f"#{late}" in nxt and "逾期" in nxt, nxt
+    assert "前置未完成" in nxt and f"#{dep}" in nxt, nxt
+    assert f"#{lostdep}" in nxt and "不存在" in nxt, nxt
+    assert "可接管" in nxt and f"#{lost}" in nxt, nxt
+    assert "待办饥饿" in nxt and f"#{starving}" in nxt, nxt
+    status = m.handle_message(rpc("tools/call", {"name": "hub_status",
+                                                 "arguments": {}}),
+                              rs)["result"]["content"][0]["text"]
+    assert "待办饥饿" in status and f"#{starving}" in status, status
 
 
 def t_freshness_surface(hub):
@@ -2864,6 +3439,8 @@ def t_error_taxonomy(root):
     # ③/⑥ 分类函数本身的边界（不依赖具体工具，直接测三桶判定）
     assert m._error_kind("错误：project 必填") == "permanent"
     assert m._error_kind("错误：项目不存在") == "permanent"
+    assert m._error_kind("错误：项目未归档，无需恢复：X（当前状态 active）") == "permanent"
+    assert m._error_kind("错误：未恢复：根目录已有同名 X\\（未改动状态与文件）") == "permanent"
     assert m._error_kind("错误：触发速率限制（工具 hub_status，agent=zcode）") == "transient"
     assert m._error_kind("错误：数据库被锁定，请稍后再试") == "transient"
     assert m._error_kind("错误：某种全新的未知故障形态") == "ambiguous", "未命中任何关键词应兜底为 ambiguous"
@@ -2954,13 +3531,38 @@ def t_rate_limit_loop_guard(root):
             os.environ.pop(k, None)
 
 
+def t_new_project_hint(hub):
+    """R28：首次写入的项目名给「新建 + 相近项目」提示（不阻断）；已登记项目静默。"""
+    rs = str(hub)
+    content = "目的：x\n做了什么：y\n验证结果：z\n如何回滚：w"
+    # 空项目库（无目录、无 projects 行）首写：相近名计算曾因空列表 min(int) 抛
+    # TypeError，把整条 log_work 拖垮——GUI test_journal_undo 抓到的真回归。
+    bare = Path(rs).parent / "hint_bare"
+    bare.mkdir()
+    m.brain.init_db(str(bare))
+    empty = m.call_tool("hub_log_work", {"project": "甲", "agent": "zcode",
+                                         "content": content}, str(bare))
+    assert "已记入大脑" in empty and "首次出现" in empty, empty
+    first = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                         "content": content}, rs)
+    assert "首次出现" not in first, first
+    typo = m.call_tool("hub_log_work", {"project": "测试-項木", "agent": "zcode",
+                                        "content": content}, rs)
+    assert "首次出现" in typo and "测试-项目" in typo, typo
+    again = m.call_tool("hub_log_work", {"project": "测试-項木", "agent": "zcode",
+                                         "content": content}, rs)
+    assert "首次出现" not in again, again
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
-    case("MCP协议（握手/50工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/73工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("R4·初始化说明渐进披露（instructions 非空/核心流程覆盖/无幽灵工具名/单段预算内）",
+         lambda: t_initialize_instructions(root))
     case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
     case("响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）", lambda: t_response_size_guard())
     case("协议健壮性（畸形请求-32600 / 异常不外泄路径SQL）", lambda: t_handle_message_robustness(root))
@@ -2974,6 +3576,8 @@ def main():
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp, fresh_hub(tmp, "conc")))
     case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
     case("M10 心跳开工推送今日任务（空库不刷/项目过滤/回退全局/P排序）", lambda: t_heartbeat_today(fresh_hub(tmp, "hbt")))
+    case("R11 文件租约工具面（查占/获取/冲突/续租/释放/list/dry_run/心跳预警与续租/看板锁计数）",
+         lambda: t_file_lease_surface(fresh_hub(tmp, "hublock")))
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))
     case("撤销（只切自己最新段/误伤检查/栈式撤销）", lambda: t_undo_log(fresh_hub(tmp, "undo")))
     case("新工具（get_rules/create_project+注入拒绝）", lambda: t_new_tools(tmp))
@@ -2985,7 +3589,7 @@ def main():
     case("memory_read零命中兜底（记录线索/#id可精读/命中不附/真无线索）", lambda: t_memory_read_fallback(tmp))
     case("写入时踩坑拦截（相似lesson提醒/无关不附）", lambda: t_log_work_intercept(tmp))
     case("体检验收达成度输出（协议级）", lambda: t_health_acceptance_output(tmp))
-    case("项目归档工具（状态+目录/未找到/重复归档）", lambda: t_archive_tool(tmp))
+    case("项目归档/恢复工具（状态+目录/未找到/重复归档/restore 往返）", lambda: t_archive_tool(tmp))
     case("引导注入（幂等/移除还原/自动创建/四家目标）", lambda: t_bootstrap(tmp))
     case("端到端子进程握手", lambda: t_end_to_end(root))
     case("root动态跟随（迁移后旧进程写新库/不误写旧库）", lambda: t_root_follow(tmp))
@@ -3031,7 +3635,7 @@ def main():
          lambda: t_tool_schema_compat(root))
     case("C6·速率限制/循环保护（默认放行/单工具超限即拦/被拦不计额/窗口恢复/off开关/agent级配额/反向验证）",
          lambda: t_rate_limit_loop_guard(root))
-    case("D1·写工具幂等键（重试原样重放不重复记/同键异内容拒收/agent 命名空间/过期不重放/memory+note 同效）",
+    case("D1·写工具幂等键（重试原样重放不重复记/同键异内容拒收/agent 命名空间/过期不重放/占位不重复执行/超时接管/memory+note 同效）",
          lambda: t_idem_key(fresh_hub(tmp, "hub_idem")))
     case("D4·tools/list 缓存提示+确定性排序（2026-07-28 SEP-2549：resultType/ttlMs≥0/private/逐字节一致/切片保序/env 可调）",
          lambda: t_list_cache_hints(fresh_hub(tmp, "hub_list")))
@@ -3039,10 +3643,14 @@ def main():
          lambda: t_schema_dialect_safety(root))
     case("D6·使用留痕全覆盖（写工具/原留痕内/原留痕外三类都留/失败不留/fail-open 不反噬业务）",
          lambda: t_usage_trace_completeness(fresh_hub(tmp, "hub_trace")))
+    case("R28·调用归属（锁定身份优先/clientInfo兜底/筛选对象不冒充调用者/无线索记空）",
+         lambda: t_call_attribution(fresh_hub(tmp, "hub_attr")))
     case("D8·错误分类学三桶（permanent不诱导重试/transient提示退避/ambiguous兜底+幂等键/error_kind机器可读）",
          lambda: t_error_taxonomy(root))
     case("D5出口·hub_memory_supersede（裁决后退出检索/数据保留/j撤销/坏参拒/过闸门/留痕/总数不变）",
          lambda: t_memory_supersede_exit(fresh_hub(tmp, "hub_supersede")))
+    case("v2.40.76·记录侧取代出口（target=record 退出检索/正文可追溯+标注/反向撤销/journal/schema枚举）",
+         lambda: t_record_supersede_surface(fresh_hub(tmp, "hub_rec_supersede")))
     case("D10·hub_usage_timeline 工具面（worker切片/只读契约/两视图/未知view回落/整数守卫/过滤透传/只读不改数）",
          lambda: t_usage_timeline_surface(fresh_hub(tmp, "hub_usage_surface")))
     case("R3·多版本处置可见性（ghost对旧版行标注现行版/近重复折叠留新版+回溯/行格式不破）",
@@ -3055,6 +3663,19 @@ def main():
          lambda: t_agent_registry_surface(fresh_hub(tmp, "hub_registry_surface")))
     case("R6/R7·接入状态机（未注册也出清单/plan只列缺口/verify落快照/快照过期/运行版本告警/坏action拒）",
          lambda: t_agent_onboard_surface(fresh_hub(tmp, "hub_onboard_surface")))
+    case("R7·Agent 控制面持有任务（列表在办+租约/空闲无噪音/单agent状态追加/无主点名）",
+         lambda: t_agent_holdings_surface(fresh_hub(tmp, "hub_holdings_surface")))
+    case("R8·任务看板可见性（hub_tasks截止·前置·阻塞·租约 / hub_next逾期·前置缺失·可接管）",
+         lambda: t_task_board_surface(fresh_hub(tmp, "hub_board_surface")))
+    case("R7·备份清理工具面（backups 盘点/预演不删/apply 才删并留 journal）",
+         lambda: t_backup_prune_surface(tmp))
+    case("R8·一键自检工具面（action=report 出报告+修复建议/不广播信号）",
+         lambda: t_sentry_report(tmp))
+    case("R9·场景帮助与运维手册（六主题/未知主题列可选/文档覆盖恢复·发布·任务治理）",
+         lambda: t_help_topics(tmp))
+    case("R28·新项目拼写提示（首次出现+相近项目/已登记静默）",
+         lambda: t_new_project_hint(fresh_hub(tmp, "hub_new_project")))
+
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

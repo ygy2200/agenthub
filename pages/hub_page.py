@@ -4,6 +4,13 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+
+
+def memory_badge(fr: dict) -> str:
+    """列表徽标：只标需要行动的陈旧/过期；fresh 不加视觉噪音。"""
+    return {"stale": "◐陈旧 ", "expired": "⛔过期 "}.get((fr or {}).get("state", ""), "")
+
+
 class HubPage(QWidget):
     """Agent 中心：聚合电脑上各 agent 的技能 / MCP / 记忆 / 全局配置；
     记忆可增删改，配置文件可编辑（自动备份）。"""
@@ -98,6 +105,15 @@ class HubPage(QWidget):
         self.histBtn.setEnabled(False)
         self.histBtn.clicked.connect(self.show_history)
         editRow.addWidget(self.histBtn)
+        self.confirmBtn = PushButton(ic("CHECK", "INFO"), "复核选中")
+        self.confirmBtn.setEnabled(False)
+        self.confirmBtn.setToolTip("把「现在还成立」写进 confirmed：只重置新鲜度，不改内容与更新时间")
+        self.confirmBtn.clicked.connect(self.confirm_selected_memory)
+        editRow.addWidget(self.confirmBtn)
+        staleBtn = PushButton(ic("SYNC", "INFO"), "复核陈旧")
+        staleBtn.setToolTip("批量复核 stale/expired 记忆（单次上限 200；valid_until 硬过期跳过）")
+        staleBtn.clicked.connect(self.confirm_stale_memories)
+        editRow.addWidget(staleBtn)
         editRow.addStretch(1)
         newMemBtn = PushButton(ic("ADD", "INFO"), "新建记忆")
         newMemBtn.clicked.connect(self.new_memory)
@@ -159,6 +175,7 @@ class HubPage(QWidget):
         """大脑记忆视图：SQLite memories 表（条目 data = mem:<id>），支持内容/标签过滤。"""
         self.memList.clear()
         self._mem_rows = []
+        self._mem_fresh = {}
         kw = self.memFilter.text().strip().lower() if hasattr(self, "memFilter") else ""
         try:
             self._mem_rows = brain.search_memories(self.win.root, "", "", 500)
@@ -167,11 +184,20 @@ class HubPage(QWidget):
         for m in self._mem_rows:
             if kw and kw not in m["content"].lower() and kw not in (m["tags"] or "").lower():
                 continue
+            fr = brain.memory_freshness(m)
+            self._mem_fresh[m["id"]] = fr
             flag = "★" if m["pinned"] else "·"
             tags = f" #{m['tags']}" if m["tags"] else ""
             src = f" @{m['agent']}" if m["agent"] and m["agent"] != "migrated" else ""
-            self.memList.addItem(f"{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]{tags}{src}  {m['content'][:90]}")
-            self.memList.item(self.memList.count() - 1).setData(Qt.UserRole, f"mem:{m['id']}")
+            self.memList.addItem(
+                f"{memory_badge(fr)}{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]"
+                f"{tags}{src}  {m['content'][:90]}")
+            it = self.memList.item(self.memList.count() - 1)
+            it.setData(Qt.UserRole, f"mem:{m['id']}")
+            age = fr.get("age_days")
+            it.setToolTip(
+                f"新鲜度 {fr['state']}（{age if age is not None else '?'} 天，依据 {fr.get('basis') or '-'}）"
+                + (f"\n最后复核 {m.get('confirmed')}" if m.get("confirmed") else "\n从未显式复核"))
         if not self._mem_rows:
             self.memList.addItem("（大脑记忆为空——用下方「新建记忆」或让 agent 调 hub_memory_write）")
             self.memList.item(0).setData(Qt.UserRole, "")
@@ -296,6 +322,7 @@ class HubPage(QWidget):
         path = item.data(Qt.UserRole)
         self.cur_path = path
         self.cur_editable = False
+        self.confirmBtn.setEnabled(False)
         if not path:
             self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>无内容</p>")
             return
@@ -316,11 +343,21 @@ class HubPage(QWidget):
             self.editBtn.setEnabled(True)
             self.editBtn.setText("编辑这条记忆")
             self.histBtn.setEnabled(True)
+            self.confirmBtn.setEnabled(True)
             m = next((x for x in self._mem_rows if x["id"] == int(path[4:])), None)
             if m:
+                fr = getattr(self, "_mem_fresh", {}).get(m["id"]) or brain.memory_freshness(m)
+                state_cn = {"fresh": "新鲜", "stale": "陈旧", "expired": "已过期",
+                            "unknown": "未知（缺时间戳）"}
+                age = fr.get("age_days")
                 meta = f"类型 {brain.KIND_CN.get(m['kind'], m['kind'])} · 置顶{'是' if m['pinned'] else '否'}" \
                        f" · 标签 {m['tags'] or '无'} · {m['created']}"
-                self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>{meta}</p>" + md_to_html(m["content"]))
+                fresh = (f"新鲜度 {state_cn.get(fr['state'], fr['state'])}"
+                         f"（{age if age is not None else '?'} 天，依据 {fr.get('basis') or '-'}；"
+                         f"阈值 {fr['fresh_days']}/{fr['expire_days']} 天）"
+                         f" · 最后复核 {m.get('confirmed') or '从未'}")
+                self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>{meta}<br>{fresh}</p>"
+                                     + md_to_html(m["content"]))
             return
         p = Path(path)
         if self.stack.currentIndex() == 1:  # MCP：只显示来源，不读内容（防密钥外泄到界面日志）
@@ -381,6 +418,57 @@ class HubPage(QWidget):
             core.journal(self.win.root, "user", "memory_append", f"brain:memories#{mid}", note=dlg.kind())
             InfoBar.success("已写入大脑记忆", f"#{mid}", duration=2500, parent=self.win)
             self.fill_memories()
+
+    def confirm_selected_memory(self):
+        """复核选中记忆：只写 confirmed（复核≠重写，内容与 updated 都不动）。"""
+        if not self.win.root:
+            InfoBar.warning("先选择根目录", "到「设置」页选择数据根目录后再操作", duration=2500, parent=self.win)
+            return
+        if not (isinstance(self.cur_path, str) and self.cur_path.startswith("mem:")):
+            InfoBar.warning("先选中一条记忆", "在上方记忆列表里选中一条，再点此按钮", duration=2500, parent=self.win)
+            return
+        mid = int(self.cur_path[4:])
+        r = brain.confirm_memories(self.win.root, ids=[mid])
+        if r["confirmed"]:
+            core.journal(self.win.root, "user", "memory_confirm", f"brain:memories#{mid}")
+            InfoBar.success("已复核", f"#{mid} 的新鲜度已重置（内容未改动）", duration=2500, parent=self.win)
+            self.fill_memories()
+        else:
+            reason = r["skipped"][0]["reason"] if r["skipped"] else "未确认"
+            InfoBar.warning("未复核", f"#{mid}：{reason}", duration=3500, parent=self.win)
+
+    def confirm_stale_memories(self):
+        """批量复核陈旧/过期记忆（valid_until 硬过期不解除，由写入者改有效期）。"""
+        if not self.win.root:
+            InfoBar.warning("先选择根目录", "到「设置」页选择数据根目录后再操作", duration=2500, parent=self.win)
+            return
+        try:
+            rows = brain.search_memories(self.win.root, "", "", 1000)
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("读取记忆失败", str(e), duration=4000, parent=self.win)
+            return
+        stale = []
+        for m in rows:
+            fr = brain.memory_freshness(m)
+            if fr["state"] in ("stale", "expired") and fr["basis"] != "valid_until":
+                stale.append(m["id"])
+        if not stale:
+            InfoBar.success("复核完成", "当前没有陈旧/过期记忆", duration=2500, parent=self.win)
+            return
+        box = MessageBox("复核陈旧记忆？",
+                         f"将把 {len(stale)} 条 stale/expired 记忆的 confirmed 置为当前时间——"
+                         "只改复核时间，不改内容与 updated；valid_until 已过的硬过期不在此列。",
+                         self.win)
+        if not box.exec():
+            return
+        r = brain.confirm_memories(self.win.root, all_stale=True, limit=200)
+        n = len(r["confirmed"])
+        core.journal(self.win.root, "user", "memory_confirm_batch", f"{n} 条")
+        msg = f"已复核 {n} 条"
+        if r["remaining"]:
+            msg += f"；还有 {r['remaining']} 条超出单次上限 200，请再点一次"
+        InfoBar.success("批量复核完成", msg, duration=3500, parent=self.win)
+        self.fill_memories()
 
     def delete_memory(self):
         if not self.cur_path or not (isinstance(self.cur_path, str) and self.cur_path.startswith("mem:")):

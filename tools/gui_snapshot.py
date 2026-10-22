@@ -32,7 +32,6 @@ import json
 import os
 import re
 import sys
-import time
 from collections import Counter
 from pathlib import Path
 
@@ -53,6 +52,8 @@ THEME = "dark"
 
 # 动态内容归一化：凡是「每次跑都可能变」的文本，一律打码后再入快照
 _DYNAMIC = (
+    # 总览问候语随时间变化（上午/下午/晚上好）：不归一化的话，基线在 18:00 后必红
+    (re.compile(r"(?:早上好|上午好|中午好|下午好|晚上好|你好)"), "<GREETING>"),
     (re.compile(r"\d{4}[-/]\d{1,2}[-/]\d{1,2}"), "<DATE>"),
     (re.compile(r"\d{1,2}:\d{2}(:\d{2})?"), "<TIME>"),
     (re.compile(r"[A-Za-z]:[\\/][^\s\"']*"), "<PATH>"),
@@ -123,7 +124,7 @@ def capture(update_shots: bool = False) -> dict:
     import core
     import tokens
     import ui
-    from helpers import pump
+    from helpers import pump, settle
 
     # 与 tests/gui/conftest 同法指向临时库。**必须 try/finally 还原**：core.get_root 是
     # 模块级全局，在 pytest 进程内改了不还原会污染后续所有测试（只跑这一个用例时看不出来，
@@ -158,9 +159,9 @@ def capture(update_shots: bool = False) -> dict:
                 out["pages"][attr] = {"error": "页面不存在"}
                 continue
             w.switchTo(page)
-            for _ in range(6):
-                app.processEvents()
-                time.sleep(0.02)
+            # 固定 120ms 在机器负载高时采到半加载页面（playbook/signal 的 agent 下拉
+            # 文案时有时无）——改为等事件队列真正安静，最多 1.5s。
+            settle(app, max_s=1.5)
             widgets = page.findChildren(QWidget)
             texts = []
             for wd in widgets:

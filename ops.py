@@ -49,7 +49,7 @@ CHECKS = {
     "env": ("环境预检：Python/es.exe/代理端口/大脑库与备份/磁盘剩余——开工先跑，不现场探测", False),
     "brain": ("大脑健康一行摘要（记录/记忆/结晶率/待办/检索累计）", False),
     "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
-    "stalled": ("停滞项目清单（90 天无活动，供归档清理决策）", False),
+    "stalled": ("停滞项目清单（R20）：按最后工作记录/任务活动算真实闲置天数；显式标记属待决策不算故障，活跃项目超 90 天无活动=状态漏标才失败——归档清理供用户拍板", False),
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
@@ -60,16 +60,78 @@ CHECKS = {
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
     "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
+    "backup_health": ("备份健康（R7/R18）：四类备份（整包 zip/旧库/在线快照/手工 bak）的份数与体积、最新备份年龄、清理候选——无整包=只备库不备源文件，还原会丢项目文件；最新超 7 天、可清理超 512MB 或总量达整包 4 倍（堆积）会点名，单份整包的大小只作信息（不按总量绝对值误报）；只报不动手", False),
     "graph_health": ("知识图谱健康（2026-10-13）：结构边数/已连条目/孤岛数/最大簇——孤岛变多=该补标签的信号，边归零=图谱接线坏了", False),
-    "ghost_memory": ("幽灵候选检测（2026-10-18，C4；同日晚扩展 records）：内容高度相似却互无 supersedes 取代关系的**记忆对+记录对**——多版本事实共存、没人裁决，检索时会被一起捞出来让模型从混合物里综合（业界称 ghost memory）。记录口径：近90天/同项目/剥四段式模板头/排除 migrated 拆分与 auto-hook 会话锚。只报不裁，交给 agent/用户决定谁取代谁", False),
+    "ghost_memory": ("幽灵候选检测（2026-10-18，C4；同日晚扩展 records）：内容高度相似却互无 supersedes 取代关系的**记忆对+记录对**——多版本事实共存、没人裁决，检索时会被一起捞出来让模型从混合物里综合（业界称 ghost memory）。记录口径：近90天/同项目/剥四段式模板头/排除 migrated 拆分、auto-hook 会话锚与全部 source=auto 自动捕获记录（流程运行日志是事件流，同标题多次运行属正常节奏）。只报不裁，交给 agent/用户决定谁取代谁", False),
     "date_health": ("日期格式健康（2026-10-13）：date-only 列（记录日期/决策回顾日/任务截止/记忆有效期）是否全是 YYYY-MM-DD——格式一歪，「到期提醒」会静默不提醒（v2.40.13 修的就是这个静默失效）", False),
     "stdout_guard": ("stdout 污染守卫（2026-10-13）：MCP stdio 协议下任何 print 落到 stdout 都会让客户端 JSON-RPC 解析失败、工具全消失——外部检索列的头号致命缺陷。扫描 MCP 进程加载的模块", True),
     "schema_drift": ("工具 schema 漂移检查（2026-10-13）：TOOLS 里声明的 action enum 与 call_tool 分发代码实际处理的值是否一致——漂移的后果是 agent 调到不存在的 action 只得到一句错误（2026-10-03 出过一次同类事故）", False),
     "desc_quality": ("工具描述质量守卫（2026-10-17）：核心工具描述必须含示例+使用时机+必填参数说明，全部工具描述不得过短——描述是 agent 的 UI，缺示例准确率掉约 18 个点（外部调研 72%→90%，tsecurity/agentpatterns/cloudappi 三处一致）", False),
-    "record_quality": ("记录模板遵守率（2026-10-17 R7）：近 90 天 work_log 四段式（目的/做了什么/验证结果/如何回滚）俱全率+缺段分布——铁律没有守卫必然腐烂（实测基线仅 48%）。只测不拦，软提示在 hub_log_work 回显", False),
+    "record_quality": ("记录模板遵守率（R7/R19）：近 90 天 work_log 四段式（目的/做了什么/验证结果/如何回滚）俱全率+缺段分布——以 2026-10-17 标准上线后的记录判失败（实测当前 89%），上线前历史存量只作参考（全期 27% 不据此误报）。只测不拦，软提示在 hub_log_work 回显", False),
     "profile_surface": ("被动上下文预算（2026-10-18 R8，C7）：tools/list 每会话推一次，是被动 token 成本——外部研究（wavespeed：模型过 ~40 工具开始退化；上下文爆炸 5 server×12 tool×800 token≈48k）。实测三档 profile 工具数与序列化体积，admin 超预算即 warn，防工具描述无声膨胀。R8 评估结论：默认保持 admin（切 worker 只省 3.8K tok 却藏起 5 个在用工具，不划算）", False),
     "stale_health": ("陈旧健康（2026-10-18 R3，D3）：① 硬不变量——已标 superseded_by 的旧事实不得被检索返回（泄漏=检索管线回归）；② 陈旧 fact 清单（写入 >45 天且零唤起 → 该复核候选）。由来：外部研究一致把 staleness rate 列为记忆系统第一指标（persistence≠truth）。不发明真相预言机，只让泄漏可抓、陈旧可见", False),
+    "tasks_health": ("任务治理巡检（R5 2026-10-21）：在办任务的过期租约/无主/持有者心跳已停/截止日已过——认领了没人续、人走了任务还挂着，都会让「谁在干什么」失真；只报不动手（接管 hub_claim，改派 hub_task_update）", False),
+    "lease_health": ("文件租约巡检（R12 2026-10-21）：活跃租约互相冲突/任务绑定漂移/持有者未登记一次点名；过期未释放只报数供清理，不算失败——租约不拦写盘，但冲突看不见就会让两个 agent 同时改同一文件；只报不动手（list 看台账、release 释放、先 signal 协调）", False),
 }
+
+# R8 一键自检：巡哪些项 + 每项失败时「下一步怎么做」（修复建议必须可执行，
+# 不是「请检查」这类把活推回人的废话）。巡检项刻意不含需要 target 的（回归/部署比对）。
+PATROL_CHECKS = ("env", "runtime_health", "db_health", "backup_health", "rules_health",
+                 "stale_health", "ghost_memory", "dup_mem", "record_quality",
+                 "date_health", "tasks_health", "lease_health", "inbox", "stalled")
+CHECK_FIXES = {
+    "env": "按 detail 点名项修环境（Python/代理/磁盘/库路径）；装依赖用 pip install -e .",
+    "runtime_health": "重启各 agent 的 agenthub MCP 进程（旧进程仍跑旧代码）；部署先 cli.py deploy",
+    "db_health": "重启连接清理 -wal/-shm；journal_mode 非 WAL 时检查连接参数；必要时 sqlite VACUUM",
+    "backup_health": "hub_export action=backup 生成整包；清理用 action=prune（确认后 apply=true）",
+    "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门",
+    "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
+    "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
+    "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
+    "record_quality": "hub_log_work 的 content 按四段式写：目的/做了什么/验证结果/如何回滚",
+    "date_health": "把 date/valid_until/截止日改成 YYYY-MM-DD（格式歪了到期提醒会静默失效）",
+    "tasks_health": "过期/失联持有者：确认后 hub_claim 接管；不再做则 hub_task_update 改派或释放；逾期任务重排截止日；待办饥饿：hub_next 认领，或改优先级/关单",
+    "lease_health": "冲突：先 hub_signal_send 协调，再由一方 hub_lock action=release；任务绑定漂移：brain 会在任务完成/换主时自动释放，出现漂移先 release 再查 journal；过期未释放：hub_lock action=prune 一键回收（只标记释放，活跃不受影响）",
+    "inbox": "把 00_Inbox 文件分拣进对应项目目录（或 hub_search_files 找回）",
+    "stalled": "显式标记项：归档 hub_archive_project（需拍板）或 hub_task_add 写下下一步（任务写入会自动恢复 active）；[漏标] 项核实最后活动后归档或补记",
+    "profile_surface": "精简工具描述或切 profile（config.agents.json 的 profile 字段）",
+    "stdout_guard": "删掉被 MCP 进程加载模块里的 print/控制台输出（stdio 下会毁掉 JSON-RPC）",
+    "schema_drift": "把 TOOLS 声明的 action enum 与 call_tool 分发代码对齐",
+    "agent_onboard": "按清单逐项补：注册表/引导注入/MCP 配置/规则闸门/技能索引",
+}
+
+
+def run_patrol(root: str, checks=None) -> dict:
+    """R8 一键自检：串行跑 PATROL_CHECKS，聚合成「通过/问题+修复建议」。
+    单项炸了只记该为问题（检查实现故障不等于大脑故障），不拖垮整轮。"""
+    names = tuple(checks or PATROL_CHECKS)
+    issues, passed, skipped = [], [], []
+    t0 = time.time()
+    for name in names:
+        if name not in CHECKS:
+            skipped.append({"name": name, "why": "未注册的检查项"})
+            continue
+        _, needs_target = CHECKS[name]
+        if needs_target:
+            skipped.append({"name": name, "why": "需要 target 目录，体检不代跑"})
+            continue
+        try:
+            r = run_check(name, "", root)
+        except Exception as e:  # noqa: BLE001  单项炸不拖垮整轮
+            issues.append({"name": name, "summary": f"检查自身异常：{e}",
+                           "fix": "修 ops 检查实现（这是体检器故障，不是大脑数据故障）",
+                           "detail": []})
+            continue
+        if r.get("ok"):
+            passed.append(name)
+        else:
+            issues.append({"name": name, "summary": r.get("summary") or "未通过",
+                           "fix": CHECK_FIXES.get(name, "看 hub_ops_run 的 detail 逐项处理"),
+                           "detail": (r.get("detail") or [])[:5]})
+    return {"ok": not issues, "checked": len(names) - len(skipped),
+            "issues": issues, "passed": passed, "skipped": skipped,
+            "elapsed_ms": round((time.time() - t0) * 1000)}
+
 
 # C7 被动上下文预算（R8 标定）：admin 面 tools/list 的估算 token 上限。
 # 基线（2026-10-18 实测）：reader 7 工具 ~1.4K / worker 51 ~15.5K / admin 69 ~19.3K。
@@ -116,6 +178,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _coverage_gate(t)
     elif name == "db_health":
         r = _db_health(root)
+    elif name == "backup_health":
+        r = _backup_health(root)
     elif name == "graph_health":
         r = _graph_health(root)
     elif name == "ghost_memory":
@@ -130,10 +194,14 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _desc_quality()
     elif name == "record_quality":
         r = _record_quality(root)
+    elif name == "lease_health":
+        r = _lease_health(root)
     elif name == "profile_surface":
         r = _profile_surface()
     elif name == "stale_health":
         r = _stale_health(root)
+    elif name == "tasks_health":
+        r = _tasks_health(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -677,51 +745,82 @@ def _desc_quality(src: str = "", check_core_stale: bool = True) -> dict:
             "detail": []}
 
 
+RECORD_QUALITY_STANDARD_SINCE = "2026-10-17"   # R7 软提示 + 四段式度量的上线日
+
+
+def _record_quality_eval(rows: list, since: str = RECORD_QUALITY_STANDARD_SINCE) -> dict:
+    """四段式遵守率的纯统计（不读库，便于回归用合成行验证口径）。
+
+    2026-10-22 R19：真实现状——全期 27%，但标准上线后 89%（87 条：qoder 36/36、
+    workbuddy 40/49），差距全部来自上线前的 1200 条历史存量（22%）。旧口径拿
+    「历史平均」判失败，机制的成效反而看不见。判据改为「标准上线后」，全期只作
+    信息；上线后还没有记录时回退全期（不能因为没数据就假装健康）。
+    """
+    import re  # noqa: PLC0415
+    parts = (("目的", "目的"), ("做了什么", "做了什么"), ("验证结果", "验证"), ("如何回滚", "回滚"))
+
+    def _one(rs):
+        full = 0
+        miss = {k: 0 for k, _ in parts}
+        by_agent: dict = {}
+        for r in rs:
+            txt = r["content"] or ""
+            lack = [k for k, pat in parts if not re.search(pat, txt)]
+            if not lack:
+                full += 1
+            for k in lack:
+                miss[k] += 1
+            a = r["agent"] or "未知"
+            stat = by_agent.setdefault(a, {"n": 0, "full": 0})
+            stat["n"] += 1
+            stat["full"] += 0 if lack else 1
+        n = len(rs)
+        return {"n": n, "full": full, "rate": full * 100 // n if n else 0,
+                "miss": miss, "by_agent": by_agent}
+
+    cur = _one([r for r in rows if (r["date"] or "") >= since])
+    alls = _one(rows)
+    return {"current": cur, "overall": alls, "base": cur if cur["n"] else alls,
+            "since": since, "has_current": cur["n"] > 0}
+
+
 def _record_quality(root: str) -> dict:
-    """R7·记录模板遵守率（2026-10-17）：近 90 天 active work_log 的四段式俱全率。
+    """R7/R19·记录模板遵守率：以标准上线后的 active work_log 为准，全期作参考。
 
     为什么值得一个检查项：铁律「content 含 目的/做了什么/验证结果/如何回滚」
     写在规范里，但 2026-10-17 实测近 200 条记录四段俱全率仅 48%（缺目的 46%/
     缺回滚 22%）——标准没有度量就没有遵守（教训 #177 同族：没有守卫的标准
     必然腐烂）。配套软提示已进 hub_log_work 回显（缺段时点一句，不阻断）。
     判读：率低≠要刷数据，是提醒后续记录补段；todo/note/crystal 等类型不适用
-    四段式，不在统计口径内。
+    四段式，不在统计口径内。历史存量不作失败依据——那是标准上线前的账。
     """
-    import re  # noqa: PLC0415
     if not root or not Path(root).is_dir():
         return {"ok": False, "summary": "record_quality 需要 root（数据根目录）", "detail": []}
     brain = _import_brain()
     try:
         with brain.db_conn(root) as conn:
             rows = conn.execute(
-                "SELECT agent, content FROM records WHERE status='active' "
+                "SELECT agent, date, content FROM records WHERE status='active' "
                 "AND (record_type='work_log' OR record_type='' OR record_type IS NULL) "
                 "AND date >= date('now', '-90 days')").fetchall()
     except Exception as e:  # noqa: BLE001 老库可能没有 record_type 列
         return {"ok": False, "summary": f"读取记录失败：{e}", "detail": []}
     if not rows:
         return {"ok": True, "summary": "近 90 天无 work_log 记录（口径外或空库）", "detail": []}
-    parts = (("目的", "目的"), ("做了什么", "做了什么"), ("验证结果", "验证"), ("如何回滚", "回滚"))
-    full = 0
-    miss = {k: 0 for k, _ in parts}
-    by_agent: dict = {}
-    for r in rows:
-        txt = r["content"] or ""
-        lack = [k for k, pat in parts if not re.search(pat, txt)]
-        if not lack:
-            full += 1
-        for k in lack:
-            miss[k] += 1
-        a = r["agent"] or "未知"
-        stat = by_agent.setdefault(a, {"n": 0, "full": 0})
-        stat["n"] += 1
-        stat["full"] += 0 if lack else 1
-    n = len(rows)
-    rate = full * 100 // n
-    detail = [f"缺「{k}」{v} 条（{v * 100 // n}%）" for k, v in miss.items() if v]
-    detail += [f"{a}: {s['full']}/{s['n']}" for a, s in sorted(by_agent.items(), key=lambda x: -x[1]["n"])[:5]]
+    ev = _record_quality_eval(rows)
+    base, cur, alls = ev["base"], ev["current"], ev["overall"]
+    n, full, rate = base["n"], base["full"], base["rate"]
+    detail = [f"缺「{k}」{v} 条（{v * 100 // n}%）" for k, v in base["miss"].items() if v]
+    detail += [f"{a}: {s['full']}/{s['n']}"
+               for a, s in sorted(base["by_agent"].items(), key=lambda x: -x[1]["n"])[:5]]
+    if ev["has_current"] and alls["n"] > cur["n"]:
+        legacy_n = alls["n"] - cur["n"]
+        detail.append(f"历史存量：{legacy_n} 条全期合计 {alls['rate']}%"
+                      f"（{ev['since']} 前，仅作参考，不作为失败依据）")
+    scope = (f"自 {ev['since']} 标准上线后 work_log；全期 {alls['rate']}%/{alls['n']} 条"
+             if ev["has_current"] else "近90天 work_log；尚无标准上线后的记录，按全期判读")
     return {"ok": rate >= 60,
-            "summary": f"四段式俱全率 {rate}%（{full}/{n}，近90天 work_log；软提示已进 hub_log_work 回显）",
+            "summary": f"四段式俱全率 {rate}%（{full}/{n}，{scope}）",
             "detail": detail[:8]}
 
 
@@ -778,9 +877,11 @@ def _ghost_memory(root: str) -> dict:
     给检索证据打状态标签后冲突准确率 +0.240、temporal F1 0.030→0.171。
     本项**只报不裁**——谁取代谁是 agent/用户的判断，系统负责把候选摆出来。
     记录版口径（brain.similar_records）：近 90 天、同项目内比、剥四段式模板头、
-    排除 migrated 拆分记录与 auto-hook 会话锚（实测这两类占满 top 命中，是噪音不是幽灵）；
-    真实库首跑抓到 10-13 release playbook 的 5 条运行日志簇（经研判是同日两次真实运行、
-    非重复记录——侦测器负责摆出来，判断留给人）。
+    排除 migrated 拆分记录、auto-hook 会话锚与全部 source='auto' 自动捕获记录
+    （2026-10-22 更正：真实库 10 组候选 100% 来自 10-13 的 5 次 release 运行，
+    备份文件名/exe 时间各不相同，是事件流不是知识版本——自动记录的重复性归生产方
+    幂等性管，知识侧 ghost 只盯人工/agent 写的 hub 记录）。跳过的自动记录条数
+    在 summary 里如实报出，排除不静默。
 
     D5 增量（2026-10-19）：detail 每对额外附**确定性裁决建议**（`p['suggestion']`）——
     「较新的一条留、较旧的一条退」由代码按固定规则算出（不是模型采样），并在质量信号
@@ -794,9 +895,14 @@ def _ghost_memory(root: str) -> dict:
         rec_pairs = brain.ghost_record_candidates(root, threshold=0.55, limit=10)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"检测失败（{type(e).__name__}）：{e}", "detail": []}
+    auto_n = brain.auto_record_count(root)
+    auto_note = (f"；另有 {auto_n} 条自动捕获记录按事件流跳过（会话锚/流程日志重复属正常节奏）"
+                 if auto_n else "")
     total = len(mem_pairs) + len(rec_pairs)
     if not total:
-        return {"ok": True, "summary": "无幽灵候选（高相似记忆/记录都已标明取代关系）", "detail": []}
+        return {"ok": True,
+                "summary": "无幽灵候选（高相似记忆/记录都已标明取代关系）" + auto_note,
+                "detail": []}
     low_conf = 0
     detail = []
     for p in mem_pairs[:6]:
@@ -818,8 +924,8 @@ def _ghost_memory(root: str) -> dict:
     tail = f"；其中 {low_conf} 组的建议仅供参考（新版并不更可信，请人工看一眼）" if low_conf else ""
     return {"ok": False,
             "summary": f"{total} 组疑似幽灵（记忆 {len(mem_pairs)} + 记录 {len(rec_pairs)}，"
-                       "多版本共存未裁决——也可能是同日多次真实运行，摆出来供判断）"
-                       f"{tail}；每组已附谁退谁留的确定性建议，裁决仍由人做",
+                       "多版本共存未裁决，摆出来供判断）"
+                       f"{tail}{auto_note}；每组已附谁退谁留的确定性建议，裁决仍由人做",
             "detail": detail[:8]}
 
 
@@ -1024,17 +1130,62 @@ def _file_hash(path: Path, algo: str = "md5") -> str:
 
 
 def _release_sources(root: Path) -> dict:
-    """本次构建的输入快照：根目录运行时代码 + 图标。
-    排除回归/一次性修复脚本——它们不参与 exe，改了不该触发「需重打包」。"""
+    """本次构建的输入快照：根目录运行时代码 + pages 页面 + 图标。
+    排除回归/一次性修复脚本——它们不参与 exe，改了不该触发「需重打包」。
+    pages/ 必须纳入（2026-10-22 任务 #4）：页面是 GUI 主体，只扫根目录会让
+    「改完 UI 后 release 仍报一致」——发布检查的结论直接失真。
+    键统一用相对路径（pages/x.py），与 _release 的 target / name 对上。"""
     out = {}
-    for p in sorted(root.glob("*.py")):
-        if p.name.startswith(RELEASE_SKIP_PREFIXES) or p.name in RELEASE_SKIP_FILES:
+    for base in (root, root / "pages"):
+        if not base.is_dir():
             continue
-        out[p.name] = _file_hash(p, "md5")
+        for p in sorted(base.glob("*.py")):
+            if p.name.startswith(RELEASE_SKIP_PREFIXES) or p.name in RELEASE_SKIP_FILES:
+                continue
+            out[p.relative_to(root).as_posix()] = _file_hash(p, "md5")
     ico = root / "assets" / "agenthub.ico"
     if ico.is_file():
         out["assets/agenthub.ico"] = _file_hash(ico, "md5")
     return out
+
+
+def _bundled_sources(root: Path, snapshot: dict) -> dict:
+    """把 start 的「候选快照」收窄为本次真正进包的源码。
+    根目录里 cli.py、adv_* 等不参与 GUI，改了不该逼人重打包；TOC 读不到时保守保留全部。"""
+    toc_path = root / "build" / "AgentHub" / "Analysis-00.toc"
+    try:
+        toc = ast.literal_eval(toc_path.read_text(encoding="utf-8"))
+    except (OSError, ValueError, SyntaxError):
+        return snapshot
+    used = set()
+    root_r = root.resolve()
+    root_s = os.path.normcase(str(root_r)) + os.sep
+    for part in toc:
+        if not isinstance(part, list):
+            continue
+        for item in part:
+            if not (isinstance(item, tuple) and len(item) >= 3 and item[2] == "PYMODULE"):
+                continue
+            src = item[1]
+            if not isinstance(src, str):
+                continue
+            try:
+                p = Path(src)
+                if not p.is_absolute():  # PyInstaller TOC 常写相对路径，须按源码根解析
+                    p = root_r / p
+                p = p.resolve()
+            except OSError:
+                continue
+            if os.path.normcase(str(p)).startswith(root_s):
+                try:
+                    # 快照键是相对路径（pages/x.py），按 basename 匹配会把
+                    # 子目录源码在 finish 阶段整批裁掉——发布检查又变回盲的。
+                    used.add(p.relative_to(root_r).as_posix())
+                except ValueError:
+                    continue
+    if not used:
+        return snapshot
+    return {k: v for k, v in snapshot.items() if k in used or k == "assets/agenthub.ico"}
 
 
 def _app_version(root: Path) -> str:
@@ -1082,6 +1233,8 @@ def build_manifest(root: str | Path, phase: str = "start") -> dict:
             return {"ok": False, "summary": "打包产物 dist/AgentHub.exe 不存在，无法完成清单"}
         data["exe"] = {"sha256": _file_hash(exe, "sha256"), "size": exe.stat().st_size,
                        "mtime": exe.stat().st_mtime}
+        if data.get("source"):
+            data["source"] = _bundled_sources(root, data["source"])
         data["finished"] = datetime.datetime.now().isoformat(timespec="seconds")
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"ok": True, "manifest": str(path),
@@ -1392,6 +1545,47 @@ def _rules_health(root: str) -> dict:
     return {"ok": gaps == 0, "summary": summary, "detail": detail[:10]}
 
 
+def _fingerprint_delta(saved: dict, current: dict) -> list:
+    """对比两组代码指纹（文件名→md5），返回可读差异清单。纯函数，便于单测。"""
+    out = []
+    for name in sorted(saved):
+        if name not in current:
+            out.append(f"{name}（已移除）")
+        elif current[name] != saved[name]:
+            out.append(f"{name}（已修改）")
+    for name in sorted(current):
+        if name not in saved:
+            out.append(f"{name}（新增）")
+    return out
+
+
+def _onboard_snapshot_staleness(core, snap: dict) -> dict:
+    """判定接入验证快照是否过期（R6）：有指纹比内容，旧快照回落 mtime。
+
+    返回 {"stale", "files", "basis", "base"}；basis=fingerprint/mtime/other-tree/""。
+    R23：快照记录了指纹来源代码树（base）。与当前进程的 SERVER_DIR 不同时返回
+    other-tree——跨树比对会把「另一棵树多出的文件」误报成过期/同步，两者都是假结论；
+    此时如实说「无法据此判断」。旧快照无 base 时沿用原口径（保守比对）。
+    """
+    saved = snap.get("fingerprint") or {}
+    base = getattr(core, "SERVER_DIR", "")
+    snap_base = str(snap.get("base") or "")
+    if saved and base and snap_base:
+        same = os.path.normcase(os.path.abspath(snap_base)) == \
+            os.path.normcase(os.path.abspath(base))
+        if not same:
+            return {"stale": False, "files": [], "basis": "other-tree", "base": snap_base}
+    current = core.file_fingerprints(base)
+    if saved and current:
+        files = _fingerprint_delta(saved, current)
+        return {"stale": bool(files), "files": files, "basis": "fingerprint", "base": snap_base}
+    if not base:
+        return {"stale": False, "files": [], "basis": "", "base": snap_base}
+    changed = core.files_newer_than(base, str(snap.get("ts") or ""))
+    return {"stale": bool(changed), "basis": "mtime", "base": snap_base,
+            "files": [f"{c['file']}（更新）" for c in changed]}
+
+
 def agent_onboard_status(root: str, agent: str) -> dict:
     """接入清单逐项体检（R6）。hub_agent 与 ops.agent_onboard 共用这一份实现。
 
@@ -1505,16 +1699,18 @@ def agent_onboard_status(root: str, agent: str) -> dict:
 
     _rt = _core.runtime_staleness()
     if not _rt.get("known"):
-        add("runtime", "运行版本", "unknown", "非 MCP 进程调用，无法判断加载的代码是否最新",
-            "在 agent 会话里调 hub_agent 复查")
+        add("runtime", "运行版本", "unknown", "没有心跳中的 MCP 进程标记，无法判断加载的代码是否最新",
+            "确认 agent 客户端里的 MCP 进程在运行；服务重启后会自动登记运行标记，再复查")
     elif _rt["count"]:
         _top = _rt["stale"][0]
+        _when = f" {_top['mtime'][5:16]}" if _top.get("mtime") else ""
         add("runtime", "运行版本", "warn",
-            f"正在跑旧代码：进程启动 {_rt['started'][5:16]} 后有 {_rt['count']} 个文件更新"
-            f"（最近 {_top['file']} {_top['mtime'][5:16]}）",
+            f"正在跑旧代码：与进程启动 {_rt['started'][5:16]} 时加载的代码不一致"
+            f"（{_rt['count']} 个文件，最近 {_top['file']}{_when}）",
             "重启该 agent 的会话/客户端，让 MCP 进程加载新代码")
     else:
-        add("runtime", "运行版本", "ok", f"与磁盘一致（进程启动 {_rt['started'][5:16]}）")
+        _via = "（观测运行中进程）" if _rt.get("source") == "marker" else ""
+        add("runtime", "运行版本", "ok", f"与磁盘一致（进程启动 {_rt['started'][5:16]}）{_via}")
 
     snap = _brain.onboarding_get(root, key)
     if not snap:
@@ -1522,14 +1718,21 @@ def agent_onboard_status(root: str, agent: str) -> dict:
             f'hub_agent(action="verify", agent="{agent}")')
     elif snap[0].get("ok"):
         _ts = str(snap[0].get("ts") or "")
-        _changed = _core.files_newer_than(getattr(_core, "SERVER_DIR", ""), _ts)
-        if _changed:
+        _st = _onboard_snapshot_staleness(_core, snap[0])
+        if _st["basis"] == "other-tree":
+            add("verify", "验证快照", "unknown",
+                f"上次验证通过 {_ts[5:16]}，但绑定的是另一代码树（{_st['base']}），"
+                "无法据此判断当前进程的代码",
+                f'在 agent 会话里重跑 hub_agent(action="verify", agent="{agent}")')
+        elif _st["stale"]:
             add("verify", "验证快照", "warn",
-                f"上次验证通过 {_ts[5:16]}，但之后 {len(_changed)} 个文件更新"
-                f"（最近 {_changed[0]['file']}）——快照已过期",
+                f"上次验证通过 {_ts[5:16]}，但之后 {len(_st['files'])} 个代码文件已变"
+                f"（{_st['files'][0]}）——快照已过期",
                 f'hub_agent(action="verify", agent="{agent}")')
         else:
-            add("verify", "验证快照", "ok", f"上次验证通过 {_ts[5:16]}")
+            _how = {"fingerprint": "代码指纹一致", "mtime": "mtime 无更新"}.get(
+                _st["basis"], "无法比对代码（非 MCP 进程）")
+            add("verify", "验证快照", "ok", f"上次验证通过 {_ts[5:16]}（{_how}）")
     else:
         add("verify", "验证快照", "warn", f"上次验证未通过 {str(snap[0].get('ts') or '')[5:16]}",
             'hub_agent(action="plan") 看缺口')
@@ -1581,7 +1784,8 @@ def _runtime_health(root: str = "") -> dict:
 
     部署≠生效：MCP 是长驻子进程，部署目录文件更新后，没重启的会话仍在跑旧代码。
     这类问题最难查——「明明改了却没生效」会被误判成代码 bug。此检查当场点名需重启的文件。
-    非 MCP 进程（没有启动标记）无法判断，诚实返回 ok（不能凭空报红）。
+    R24：非 MCP 进程优先读运行中 serve 的心跳标记（core.runtime_markers），能观测到
+    长驻服务；没有任何新鲜标记时才诚实返回无法判断（不能凭空报红，也不能凭空报绿）。
     """
     import brain as _brain  # noqa: PLC0415
     core = _import_core()
@@ -1589,20 +1793,30 @@ def _runtime_health(root: str = "") -> dict:
     info = core.runtime_staleness()
     if not info["known"]:
         return {"ok": True,
-                "summary": "运行版本：非 MCP 进程，无法判断（在 agent 会话里跑 hub_ops_run 才有意义）",
-                "detail": [f"服务目录：{info['base'] or '未知'}（导入 agenthub_mcp 时记录启动时刻）"]}
+                "summary": "运行版本：无法判断（没有心跳中的 MCP 进程标记；服务重启后才会登记）",
+                "detail": [f"服务目录：{info['base'] or '未知'}（进入 stdio 主循环时登记运行标记）"]}
+    reasons = {"changed": "内容变更", "added": "新增", "removed": "已删除"}
+    basis = "内容指纹" if info.get("basis") == "content" else "文件 mtime"
+    via_marker = info.get("source") == "marker"
+    procs = info.get("procs") or []
+    origin = "运行中 MCP 进程" if via_marker else "当前进程"
     if info["count"]:
         top = info["stale"][0]
-        summary = (f"运行版本：落后 {info['count']} 个文件"
-                   f"（最近 {top['file']} {fmt(top['mtime'])}）——需重启 MCP 进程"
-                   f"（当前加载的是 {fmt(info['started'])} 之前的代码）")
-        detail = [f"{r['file']}  {fmt(r['mtime'])}" for r in info["stale"][:5]]
+        summary = (f"运行版本：落后 {info['count']} 个文件（{top['file']}）——需重启 MCP 进程"
+                   f"（{origin}加载的是 {fmt(info['started'])} 启动时的代码）")
+        detail = [f"{r['file']}  {fmt(r['mtime'])}（{reasons.get(r.get('reason'), '更新')}）"
+                  for r in info["stale"][:5]]
         if len(info["stale"]) > 5:
             detail.append(f"…另有 {len(info['stale']) - 5} 个文件")
+        detail.append(f"判定依据：{basis}")
     else:
-        summary = f"运行版本：一致（进程启动 {fmt(info['started'])}，磁盘无更新）"
+        summary = f"运行版本：一致（{origin}启动 {fmt(info['started'])}，磁盘代码与加载时相同）"
         detail = [f"服务目录：{info['base']}",
-                  f"进程启动：{fmt(info['started'])}，磁盘 .py 无更新"]
+                  f"进程启动：{fmt(info['started'])}，判定依据：{basis}"]
+    if via_marker and procs and len(detail) < 8:
+        who = "、".join(f"{p.get('agent') or '?'}#{p.get('pid')}" for p in procs[:3])
+        more = f" 等 {len(procs)} 个" if len(procs) > 3 else ""
+        detail.append(f"观测来源：心跳中的 MCP 进程 {who}{more}")
 
     if root and os.path.isdir(root):
         try:
@@ -1611,15 +1825,63 @@ def _runtime_health(root: str = "") -> dict:
             snaps = []
         if snaps and len(detail) < 8:
             s0 = snaps[0]
-            changed = core.files_newer_than(getattr(core, "SERVER_DIR", ""),
-                                            str(s0.get("ts") or ""))
-            if changed:
+            st = _onboard_snapshot_staleness(core, s0)
+            if st["basis"] == "other-tree":
                 detail.append(f"验证快照 {s0.get('agent')} {fmt(str(s0.get('ts') or ''))}："
-                              f"之后 {len(changed)} 个文件更新 → 建议重新 hub_agent verify")
+                              f"来自另一代码树（{st['base']}），不据此判断是否过期")
+            elif st["stale"]:
+                detail.append(f"验证快照 {s0.get('agent')} {fmt(str(s0.get('ts') or ''))}："
+                              f"之后 {len(st['files'])} 个代码文件已变 → 建议重新 hub_agent verify")
             else:
                 detail.append(f"验证快照 {s0.get('agent')} {fmt(str(s0.get('ts') or ''))}："
                               "与当前代码同步")
     return {"ok": info["count"] == 0, "summary": summary, "detail": detail[:8]}
+
+
+def _backup_health(root: str) -> dict:
+    """R7 备份健康：盘点四类备份 + 清理预演。只报不动手——删除由 backup_prune --apply 执行。"""
+    if err := _need_root(root):
+        return err
+    _brain = _import_brain()
+    inv = _brain.backup_inventory(root)
+    preview = _brain.backup_prune(root)  # 纯预演：不传 apply
+    fams = inv["families"]
+    total_mb = inv["total_bytes"] / 1048576
+    zip_mb = fams["zip"]["bytes"] / 1048576
+    newest = inv["newest"]
+    prunable_mb = preview["candidate_bytes"] / 1048576
+    issues = []
+    if not fams["zip"]["count"]:
+        issues.append("无 zip 整包（只备库不备源文件）")
+    if not inv["total_count"]:
+        issues.append("没有任何备份")
+    # 总量绝对值不再单独判失败（2026-10-22 R18）：整包自身 1259.9MB 就超过旧的 1GB 线，
+    # 而可清理仅 114.3MB——阈值低于必要还原点，怎么清都不可能达标，只会天天狼来了。
+    # 改为「总量达整包 4 倍」判堆积：单份整包健康，4 份以上全量备份约 5GB 才值得点名。
+    if fams["zip"]["count"]:
+        ratio = inv["total_bytes"] / max(fams["zip"]["bytes"], 1)
+        if ratio > 4:
+            issues.append(f"总量 {total_mb:.0f}MB 达整包 {zip_mb:.0f}MB 的 {ratio:.1f} 倍（备份堆积）")
+    if newest and newest["age_days"] > 7:
+        issues.append(f"最新备份已 {newest['age_days']} 天")
+    if prunable_mb > 512:
+        issues.append(f"可清理 {prunable_mb:.0f}MB")
+    detail = [f"{k}: {v['count']} 份 / {v['bytes'] / 1048576:.1f}MB（{v['label']}）"
+              for k, v in fams.items() if v["count"]]
+    if fams["zip"]["count"]:
+        detail.append(f"总量 {total_mb:.0f}MB 中整包 {zip_mb:.0f}MB（必要还原点，随数据树增长）；"
+                      "健康判定看缺失/陈旧/清理积压/总量是否达整包 4 倍，不按总量绝对值")
+    if newest:
+        detail.append(f"最新：{newest['mtime']}（{newest['age_days']} 天前）")
+    if preview["candidates"]:
+        detail.append(f"清理预演：{len(preview['candidates'])} 份 / "
+                      f"{prunable_mb:.1f}MB"
+                      "（hub_export action=prune 或 cli.py backup-prune --apply）")
+    detail.append("整包备份：hub_export action=backup（一致性库+文件树单一 zip）")
+    summary = ("备份健康：" + ("；".join(issues) if issues else
+               f"{inv['total_count']} 份 / {total_mb:.1f}MB（整包 {zip_mb:.1f}MB），"
+               f"最新 {newest['age_days']} 天前；可清理 {prunable_mb:.1f}MB 未超阈值"))
+    return {"ok": not issues, "summary": summary, "detail": (detail or ["（无备份）"])[:8]}
 
 
 def _hygiene(root: str) -> dict:
@@ -1688,20 +1950,244 @@ def _inbox(root: str) -> dict:
 
 
 def _stalled(root: str) -> dict:
+    """R20 项目停滞巡检：显式标记是决策队列，状态漏标才是故障。
+
+    旧版直接读 `status='stalled'` 并宣称「90 天无活动」，但该字段可能是历史批量
+    标记/人工判定——2026-10-22 实测 8 个停滞项目真实闲置只 6–47 天。判断依据
+    改为最后一条工作记录/任务活动：active 却超 90 天无活动=漏标（ok=False），
+    显式 stalled 只列清单给用户决策（ok=True，与 inbox 同口径——决策队列不是故障）。
+    """
     if err := _need_root(root):
         return err
     try:
         brain = _import_brain()
-        with brain.db_conn(root) as conn:
-            rows = [dict(r) for r in conn.execute(
-                "SELECT name, updated FROM projects WHERE status='stalled' ORDER BY updated LIMIT 8")]
+        snap = brain.project_activity(root)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
-    if not rows:
-        return {"ok": True, "summary": "无停滞项目（90 天无活动才标记）", "detail": []}
+
+    def _line(it: dict, tag: str = "") -> str:
+        if it["idle_days"] is None:
+            base = f"{it['name']}（无工作记录，项目更新 {(it['updated'] or '未知')[:10]}）"
+        else:
+            src = "任务" if it["source"] == "task" else "记录"
+            base = (f"{it['name']}（闲置 {it['idle_days']} 天，"
+                    f"最后活动 {it['last_activity']}，来源{src}）")
+        return tag + base
+
+    drift, labelled = snap["drift"], snap["labelled"]
+    if drift:
+        detail = [_line(x, "[漏标] ") for x in drift]
+        detail += [_line(x, "[已标] ") for x in labelled]
+        return {"ok": False,
+                "summary": (f"{len(drift)} 个活跃项目实际已 ≥{snap['stall_days']} 天无活动"
+                            f"（状态漏标）；另有 {len(labelled)} 个显式标记停滞待决策"),
+                "detail": detail[:8]}
+    if labelled:
+        idles = [x["idle_days"] for x in labelled if x["idle_days"] is not None]
+        span = f"{min(idles)}–{max(idles)} 天" if idles else "无可判定活动"
+        over = sum(1 for d in idles if d >= snap["stall_days"])
+        tail = (f"其中 {over} 个已达 {snap['stall_days']} 天自动判定线，可优先归档"
+                if over else f"均未达 {snap['stall_days']} 天自动判定线")
+        detail = [_line(x, "[已标] ") for x in labelled]
+        detail += [_line(x, "[无记录] ") for x in snap["no_activity"]]
+        return {"ok": True,
+                "summary": (f"显式标记停滞 {len(labelled)} 个（真实闲置 {span}；{tail}；"
+                            "归档走 hub_archive_project，需用户拍板）"),
+                "detail": detail[:8]}
+    if snap["no_activity"]:
+        return {"ok": True,
+                "summary": f"{len(snap['no_activity'])} 个活跃项目无工作记录（无法判定闲置，未计入停滞）",
+                "detail": [_line(x, "[无记录] ") for x in snap["no_activity"]][:8]}
+    return {"ok": True, "summary": "无停滞项目（活跃项目均有近期活动）", "detail": []}
+
+
+def _tasks_health(root: str) -> dict:
+    """R5 任务治理巡检（2026-10-21）：在办任务的租约/归属/持有者活跃/截止日。
+    「认领了没人续、人走了任务还挂着」会让谁在干什么失真；只报不动手——
+    接管走 hub_claim，改派/释放走 hub_task_update。持有者活跃度取心跳与任务
+    updated 的较新者：长任务可能几小时不心跳，但每次写进展都会续租+刷新 updated。
+    R2：租约缺失（in_progress 但 claimed_at 空）单独点名——这类任务旧版看板看不见、
+    也没有可接管的过期时间，属于「隐身死单」。
+    R26：新增「进展停滞」——心跳在线但任务超过 TASK_PROGRESS_STALL_HOURS 没有检查点/
+    更新时点名。租约与心跳只证明持有者在，不证明任务在走；两类问题分开计数不重叠。
+    推进口径是 progress_at（心跳不刷）+ 手工检查点，认领自动锚点不计入。
+    R30：新增「待办饥饿」——能开工（无阻塞/前置全完成）却 ≥ TASK_STARVE_DAYS 没人认领
+    的 pending。在办任务出问题有人可找，没人认领的活连「找谁」都没有，此前完全不可见。"""
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        now = datetime.datetime.now()
+        claim_cutoff = brain._claim_cutoff()
+        idle_cutoff = (now - datetime.timedelta(hours=brain.CLAIM_TTL_HOURS)) \
+            .isoformat(timespec="seconds")
+        today = now.date().isoformat()
+        with brain.db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id,project,title,owner,claimed_at,due,status,updated,progress_at,"
+                "(SELECT MAX(ts) FROM checkpoints c WHERE c.task_id=tasks.id "
+                " AND c.kind<>'auto_claim') AS last_cp "
+                "FROM tasks WHERE status!='done' ORDER BY priority, id")]
+            sessions = {r["agent"]: r["ts"] for r in conn.execute(
+                "SELECT agent, ts FROM sessions")}
+            registered = {r["name"] for r in conn.execute("SELECT name FROM agents")}
+        audit = brain.task_graph_audit(root)
+        starve = brain.task_starvation(root, limit=1000)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}",
+                "detail": []}
+    counts = {"stale": 0, "unleased": 0, "ownerless": 0, "idle": 0, "stalled": 0,
+              "starving": 0, "overdue": 0, "unregistered": 0, "dangling": 0, "cycles": 0,
+              "residual": 0}
+    starve_map = {r["id"]: r["_age_days"] for r in starve["starving"]}
+    # 结构缺陷挂到具体任务上（与租约/归属原因合并展示），看板/巡检口径同源
+    struct: dict = {}
+    for r in audit["dangling"]:
+        struct.setdefault(r["id"], []).append(
+            "前置不存在 " + "、".join(f"#{x}" for x in r["_missing"]))
+    for r in audit["residual_blocked"]:
+        struct.setdefault(r["id"], []).append("残留阻塞标记")
+    for cyc in audit["cycles"]:
+        for n in cyc[:-1]:
+            struct.setdefault(n, []).append("依赖成环")
+    counts["dangling"] = audit["counts"]["dangling"]
+    counts["cycles"] = audit["counts"]["cycles"]
+    counts["residual"] = audit["counts"]["residual_blocked"]
+    problems = []
+    for r in rows:
+        reasons = []
+        owner = (r["owner"] or "").strip()
+        if r["status"] == "in_progress":
+            if not owner:
+                counts["ownerless"] += 1
+                reasons.append("无主")
+            lease = (r["claimed_at"] or "").strip()
+            if not lease:
+                counts["unleased"] += 1
+                reasons.append("租约缺失")
+            elif lease < claim_cutoff:
+                counts["stale"] += 1
+                reasons.append("租约过期")
+            if owner and owner not in registered and owner not in brain._NON_AGENT:
+                counts["unregistered"] += 1
+                reasons.append("持有者未登记")
+            if owner:
+                progress_seen = max(r["updated"] or "", r["last_cp"] or "")
+                seen = max(sessions.get(owner, ""), progress_seen)
+                if not seen or seen < idle_cutoff:
+                    counts["idle"] += 1
+                    reasons.append(f"{brain.CLAIM_TTL_HOURS}h 无心跳/进展")
+                else:
+                    age, stalled = brain._task_progress(r, r["last_cp"], now)
+                    if stalled:
+                        counts["stalled"] += 1
+                        age_txt = f"{age:g}h" if age is not None else "无推进记录"
+                        reasons.append(f"进展停滞 {age_txt}（心跳在线，无检查点/任务更新）")
+        due = (r["due"] or "").strip()
+        if re.fullmatch(r"\d{4}-\d{2}-\d{2}", due) and due < today:
+            counts["overdue"] += 1
+            reasons.append(f"逾期 {due}")
+        if r["status"] == "pending" and r["id"] in starve_map:
+            counts["starving"] += 1
+            reasons.append(f"待办饥饿 {starve_map[r['id']]:g} 天无人认领")
+        for extra in dict.fromkeys(struct.get(r["id"], [])):
+            reasons.append(extra)
+        if reasons:
+            problems.append((r, reasons))
+    in_prog = sum(1 for r in rows if r["status"] == "in_progress")
+    if not problems:
+        return {"ok": True,
+                "summary": f"任务治理：在办 {in_prog} 项 / 未完成 {len(rows)} 项，"
+                           "租约·归属·进展·待办·截止·依赖图均正常",
+                "detail": []}
+    detail = [f"#{r['id']} [{(r['owner'] or '无主')}@{r['project'] or '无项目'}] "
+              f"{r['title'][:30]}（{'、'.join(reasons)}）" for r, reasons in problems[:8]]
     return {"ok": False,
-            "summary": f"{len(rows)} 个停滞项目——归档清理走 hub_archive_project（需用户拍板，可逆）",
-            "detail": [f"{r['name']}（最后活动 {r['updated'][:10]}）" for r in rows]}
+            "summary": (f"任务治理：{len(problems)} 项需关注（过期租约 {counts['stale']} / "
+                        f"租约缺失 {counts['unleased']} / "
+                        f"无主 {counts['ownerless']} / 持有者失联 {counts['idle']} / "
+                        f"进展停滞 {counts['stalled']} / "
+                        f"待办饥饿 {counts['starving']} / "
+                        f"未登记 {counts['unregistered']} / "
+                        f"前置缺失 {counts['dangling']} / 依赖成环 {counts['cycles']} / "
+                        f"残留阻塞 {counts['residual']} / "
+                        f"逾期 {counts['overdue']}）——接管 hub_claim，改派 hub_task_update，"
+                        "长期没人做的待办用 hub_next 认领或关单"),
+            "detail": detail}
+
+
+def _lease_health(root: str) -> dict:
+    """R12 文件租约巡检（2026-10-21）：租约不冲突、任务绑定不漂移、持有者在册。
+
+    过期未释放的租约**不拦人**（check/acquire 只认未过期的），所以只报数目供清理，
+    不判失败；判失败的是三种真问题：
+      · 活跃租约互相冲突——brain 层本不该产生，出现即并发/直写库的事故；
+      · 任务绑定漂移——任务已完成/退回/换主，租约却没被自动释放；
+      · 持有者未登记——改名/下线后留下的锁，没人知道该找谁协调。
+    """
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        rows = brain.file_lease_list(root, include_released=False, limit=1000)
+        with brain.db_conn(root) as conn:
+            tasks = {r["id"]: dict(r) for r in conn.execute(
+                "SELECT id,status,owner FROM tasks")}
+            registered = {r["name"] for r in conn.execute("SELECT name FROM agents")}
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}",
+                "detail": []}
+    active = [r for r in rows if r["_active"]]
+    expired = [r for r in rows if r["_expired"]]
+    problems = []
+    drift = 0
+    for r in active:
+        tid = int(r.get("task_id") or 0)
+        if not tid:
+            continue
+        t = tasks.get(tid)
+        if not t:
+            reasons = ["绑定任务不存在"]
+        elif t["status"] != "in_progress":
+            reasons = [f"任务已{brain.TASK_CN.get(t['status'], t['status'])}"]
+        elif (t.get("owner") or "") != (r.get("owner") or ""):
+            reasons = [f"任务持有者已变为 {t.get('owner') or '无主'}"]
+        else:
+            reasons = []
+        if reasons:
+            drift += 1
+            problems.append((r, reasons))
+    unregistered = 0
+    for r in active:
+        owner = (r.get("owner") or "").strip()
+        if owner and owner not in registered and owner not in brain._NON_AGENT:
+            unregistered += 1
+            problems.append((r, ["持有者未登记"]))
+    conflicts = []
+    for i, a in enumerate(active):
+        for b in active[i + 1:]:
+            if (a.get("owner") or "") == (b.get("owner") or ""):
+                continue
+            if brain._file_lock_conflict(a["path"], b["path"]):
+                conflicts.append((a, b))
+    for a, b in conflicts:
+        problems.append((a, [f"与 #{b['id']}@{b.get('owner') or '无主'} 路径冲突"]))
+    if not problems:
+        tail = f"，过期未释放 {len(expired)} 条可清理" if expired else ""
+        return {"ok": True,
+                "summary": f"文件租约：有效 {len(active)} 把 / 无冲突、无任务绑定漂移{tail}",
+                "detail": []}
+    detail = []
+    for r, reasons in problems[:8]:
+        left = f"{r['_left_min']}m" if r["_active"] else "已过期"
+        detail.append(f"#{r['id']} {r['display_path'] or r['path']} ← "
+                      f"{r['owner'] or '无主'}（{left}｜{ '、'.join(reasons)}）")
+    return {"ok": False,
+            "summary": (f"文件租约：{len(problems)} 把需关注（冲突 {len(conflicts)} / "
+                        f"任务绑定漂移 {drift} / 持有者未登记 {unregistered}；"
+                        f"另过期未释放 {len(expired)} 条）——"
+                        "hub_lock action=list 看台账，release 释放，冲突先 hub_signal_send 协调"),
+            "detail": detail}
 
 
 def _dup_mem(root: str) -> dict:

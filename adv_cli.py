@@ -162,6 +162,127 @@ def t_cli_bad_args(tmp):
     assert rc != 0 or "错误" in out or "未知" in out, (rc, out[:200])
 
 
+def t_task_cli(tmp):
+    """R9 回归：CLI 任务操作与 MCP 同状态机/同注解。
+
+    此前 headless 只能 status/onboard，任务操作要靠 `call hub_task_* key=value` 拼参；
+    这里守住 tasks/next 的可见性（截止/前置/阻塞/租约）、claim 的依赖闸门、
+    update 的流转、checkpoint 的持有者围栏，以及 argparse 子命令真的接上了。"""
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_tasks_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    import brain
+    brain.ensure_schema(root)
+    rc, out = _capture(cli.cmd_tasks, root)
+    assert rc == 0 and "暂无任务" in out, (rc, out[:200])
+
+    today = _dt.date.today().isoformat()
+    a = brain.task_add(root, "CLI 可认领", project="CLI", due=today)[1]
+    b = brain.task_add(root, "CLI 有前置", project="CLI", deps=str(a))[1]
+    c = brain.task_add(root, "CLI 阻塞", project="CLI", blocked_by="等回复")[1]
+    rc, out = _capture(cli.cmd_tasks, root, "", "CLI", "", 50)
+    assert rc == 0 and f"#{a}" in out and "今天到期" in out, out
+    assert f"#{b}" in out and "前置 0/1 完成" in out, out
+    assert f"#{c}" in out and "阻塞：等回复" in out, out
+    rc, out = _capture(cli.cmd_tasks, root, "bogus")
+    assert rc == 2 and "只能是" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_next, root, "CLI", "", 5)
+    assert rc == 0 and f"#{a}" in out and "今天到期" in out, out
+    assert "等待中" in out and f"#{b}" in out and f"#{c}" in out, out
+
+    rc, out = _capture(cli.cmd_claim, root, a, "cliagent")
+    assert rc == 0 and "认领成功" in out and "@cliagent" in out, (rc, out)
+    rc, out = _capture(cli.cmd_claim, root, b, "cliagent")
+    assert rc == 1 and "前置未完成" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_claim, root, a, "cliagent")
+    assert rc == 0 and "续期成功" in out, (rc, out)
+    rc, out = _capture(cli.cmd_update, root, a, "done", "cliagent")
+    assert rc == 0 and "已更新" in out and "完成" in out, (rc, out)
+    rc, out = _capture(cli.cmd_update, root, b, "in_progress", "cliagent")
+    assert rc == 0 and "进行中" in out and "@cliagent" in out, (rc, out)
+    rc, out = _capture(cli.cmd_checkpoint, root, b, "进度 50%", "cliagent")
+    assert rc == 0 and "检查点已写入" in out, (rc, out)
+    rc, out = _capture(cli.cmd_checkpoint, root, b, "偷写", "other")
+    assert rc == 1 and "持有" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_update, root, c, "pending", "")
+    assert rc == 0, (rc, out)
+    rc, out = _capture(cli.cmd_next, root, "CLI", "", 5)
+    assert f"#{c}" in out and "阻塞：" not in out.split(f"#{c}")[1].splitlines()[0], out
+
+    rc, out = _capture(cli.cmd_claim, root, 999999, "cliagent")
+    assert rc == 1 and "不存在" in out, (rc, out)
+    rc, out = _capture(cli.cmd_update, root, 999999, "done")
+    assert rc == 1 and "不存在" in out, (rc, out)
+
+    # argparse 子命令接线（含 --root）
+    rc, out = _capture(cli.main, ["--root", root, "tasks", "--project", "CLI"])
+    assert rc == 0 and "任务" in out and f"#{a}" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "checkpoint", str(b), "CLI 主入口写入",
+                                  "--agent", "cliagent"])
+    assert rc == 0 and "检查点已写入" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "update", str(c), "--status", "pending"])
+    assert rc == 0 and "已更新" in out, (rc, out)
+
+
+def t_lock_cli(tmp):
+    """R12 文件租约 CLI：台账/查占/获取/冲突拒绝/释放归属/任务完成自动释放。
+
+    headless 场景（脚本、CI、无 MCP 客户端）过去只能 `call hub_lock key=value` 拼参；
+    这里守三条最容易静默错的口径：冲突必须非零退出、只能释放自己的、任务完成即释放。
+    """
+    import brain
+    root = str(Path(tmp) / "hub_locks_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    (Path(root) / "lock-proj").mkdir()
+    brain.ensure_schema(root)
+    rc, out = _capture(cli.cmd_locks, root)
+    assert rc == 0 and "暂无文件租约" in out, (rc, out[:200])
+
+    _, t = brain.task_add(root, "CLI 持锁任务", project="lock-proj")
+    rc, out = _capture(cli.cmd_claim, root, t, "cliagent")
+    assert rc == 0, (rc, out)
+    rc, out = _capture(cli.cmd_lock, root, "lock-proj/a.py", "cliagent", t, 30, "改模块")
+    assert rc == 0 and "获取成功" in out and "fence 1" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_lock, root, "lock-proj", "other", None, 30, "")
+    assert rc == 1 and "文件被占用" in out, (rc, out)
+    rc, out = _capture(cli.cmd_locks, root, "", "", "lock-proj/a.py")
+    assert rc == 0 and "被占用" in out and "cliagent" in out, (rc, out)
+    rc, out = _capture(cli.cmd_locks, root, "lock-proj", "cliagent")
+    assert rc == 0 and "有效 1" in out and "任务 #" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_unlock, root, None, "lock-proj/a.py", "other")
+    assert rc == 1 and "释放失败" in out, (rc, out)
+    rc, out = _capture(cli.cmd_unlock, root)
+    assert rc == 2 and "lease_id" in out, (rc, out)
+
+    rc, out = _capture(cli.main, ["--root", root, "locks", "--project", "lock-proj"])
+    assert rc == 0 and "cliagent" in out, (rc, out)
+
+    # 任务完成 → 绑定租约自动释放（CLI 与 MCP 同生命周期）
+    rc, out = _capture(cli.cmd_update, root, t, "done", "cliagent")
+    assert rc == 0 and "已更新" in out, (rc, out)
+    rc, out = _capture(cli.cmd_locks, root, "", "", "lock-proj/a.py")
+    assert rc == 0 and "空闲" in out, (rc, out)
+
+    # R13 locks --prune：回收过期未释放，活跃租约保留；再跑为空操作
+    _, xp = brain.file_lease_acquire(root, "lock-proj/expired.py", "cliagent", ttl_min=1)
+    err, _ = brain.file_lease_acquire(root, "lock-proj/active.py", "cliagent", ttl_min=60)
+    assert err == "", err
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE file_leases SET expires_at='2020-01-01T00:00:00' WHERE id=?",
+                     (xp["id"],))
+    rc, out = _capture(cli.main, ["--root", root, "locks", "--prune"])
+    assert rc == 0 and "已回收 1 条" in out and "expired.py" in out, (rc, out)
+    rc, out = _capture(cli.cmd_locks, root, prune=True, agent="cliagent")
+    assert rc == 0 and "没有过期未释放" in out, (rc, out)
+    rc, out = _capture(cli.cmd_locks, root)
+    assert rc == 0 and "有效 1" in out and "active.py" in out, (rc, out)
+
+
 def _free_port() -> int:
     s = socket.socket()
     s.bind(("127.0.0.1", 0))
@@ -438,6 +559,10 @@ def main():
     case("B7·cli 只读命令（status/tools/call/discover 返回 0 且有输出；release 不抛且有结论）",
          lambda: t_cli_readonly(tmp))
     case("B7·cli 坏参拒绝（无参/未知子命令/未知工具均非零）", lambda: t_cli_bad_args(tmp))
+    case("R9·CLI 任务操作（tasks/next 可见性、claim 依赖闸门、update/checkpoint、子命令接线）",
+         lambda: t_task_cli(tmp))
+    case("R12·CLI 文件租约（台账/查占/获取/冲突拒/释放归属/任务完成自动释放/子命令接线）",
+         lambda: t_lock_cli(tmp))
     case("C8·onboard 全量 tmp 重定向（MCP外科写入+引导注入+备份+幂等+参数落账）",
          lambda: t_onboard_tmp_redirect(tmp))
     case("C8·onboard 拒绝路径（未知agent/坏JSON拒写且原样保留/无mcp段只注入引导）",

@@ -125,14 +125,68 @@ class BrainPage(QWidget):
         # 任务看板（P3-2 状态机视图）：状态胶囊 + 认领人 + 阻塞信息
         clear(self.taskBox)
         try:
-            tasks = brain.task_list(root, limit=12)
+            # R14 与 MCP/CLI 同口径：注解一次带出任务租约状态、截止紧迫度、文件锁计数；
+            # 此前 GUI 自己重算租约/逾期，文件锁则完全看不见（控制面在桌面断了一截）。
+            tasks = brain.task_annotate(root, brain.task_list(root, limit=12))
         except Exception:
             tasks = []
+        try:
+            leases = brain.file_lease_list(root, include_released=False, limit=200)
+        except Exception:
+            leases = []
         chip_key = {"in_progress": "accent", "blocked": "warning", "done": "success"}
+        lease_label = {"expired": "租约过期", "ownerless": "无主", "unleased": "缺租约"}
+        lease_tip = {
+            "expired": lambda t: (f"认领于 {t['claimed_at'][:16]}，超过 "
+                                  f"{brain.CLAIM_TTL_HOURS}h 未续租——可被 hub_claim 接管"),
+            "ownerless": lambda t: "在办但无持有者——可被 hub_claim 接管",
+            "unleased": lambda t: "在办但缺认领时间——可被 hub_claim 接管",
+        }
         for t in tasks:
             r = QHBoxLayout()
             r.addWidget(status_chip(brain.TASK_CN.get(t["status"], t["status"]),
                                     chip_key.get(t["status"], "text_secondary")))
+            # R7 任务治理可见性：过期/无主/缺租约直接标在桌面，不用去跑 hub_ops_run
+            state = t.get("_lease_state") or ""
+            if state in lease_label:
+                chip = status_chip(lease_label[state], "warning")
+                chip.setToolTip(lease_tip[state](t))
+                r.addWidget(chip)
+            if t.get("_due_state") == "overdue":
+                due = (t.get("due") or "").strip()
+                days = t.get("_due_days")
+                chip = status_chip(f"逾期 {due[5:10]}", "warning")
+                chip.setToolTip(f"截止 {due} 已过 {abs(days) if days is not None else '?'} 天；"
+                                "改期用 hub_task_update(due=...)")
+                r.addWidget(chip)
+            # R26 进展停滞：心跳在线不等于任务在走——只看租约的桌面会漏掉「人在、活停」
+            if t.get("_progress_stall"):
+                age = t.get("_progress_age_h")
+                chip = status_chip(f"进展停滞 {age:g}h" if isinstance(age, (int, float))
+                                   else "进展停滞", "warning")
+                chip.setToolTip(
+                    f"超过 {brain.TASK_PROGRESS_STALL_HOURS}h 没有检查点/任务更新"
+                    "（心跳不计入推进）；写进展用 hub_checkpoint(action=save)")
+                r.addWidget(chip)
+            # R30 待办饥饿：能开工却长期没人认领——空转的活也要在桌面上看见
+            if t.get("_starve_days") is not None:
+                chip = status_chip(f"待办饥饿 {t['_starve_days']:g} 天", "warning")
+                chip.setToolTip(
+                    f"任务创建后 {t['_starve_days']:g} 天一直可直接开工，却无人认领；"
+                    "还该做就 hub_claim，不做就 hub_task_update 调整优先级或关单")
+                r.addWidget(chip)
+            # R14 文件租约可见性：挂在本任务上的活跃锁（与 hub_tasks 行尾「锁 N」同口径）
+            locks = t.get("_locks") or 0
+            if locks:
+                chip = status_chip(f"文件锁 {locks}", "accent")
+                mine = [x for x in leases
+                        if x.get("task_id") == t["id"] and x.get("_active")]
+                detail = "；".join(
+                    f"{x['display_path'] or x['path']} ← {x['owner'] or '无主'}"
+                    f"（剩 {x.get('_left_min', 0)}m）" for x in mine[:5])
+                chip.setToolTip("挂在本任务上的文件租约："
+                                + (detail or f"{locks} 把有效锁"))
+                r.addWidget(chip)
             who = f" @{t['owner']}" if t["owner"] else ""
             blk = (f"（等待 {t['blocked_by'][:20]}）"
                    if t["status"] == "blocked" and t["blocked_by"] else "")

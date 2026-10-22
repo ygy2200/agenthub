@@ -8,6 +8,7 @@ MRR / Hit@1/3/5（强断言）与 weak 达成、逐查询耗时 p50/max。
 基线数字回填 07 计划修订记录；P4.2/P4.3/P4.4 每步复测对比，负优化即回滚。
 
 运行：python tools/eval_search.py
+      python tools/eval_search.py --root D:\tmp\hub-snapshot   # 指定语料根（同库复测）
 """
 from __future__ import annotations
 
@@ -23,14 +24,23 @@ import brain  # noqa: E402
 import core  # noqa: E402
 
 
-def load_cases(path: Path, table: str = "memories") -> list:
+def _opt(flag: str) -> str:
+    """取 `--flag value`；缺值/后接另一个 flag 时返回空串（不静默吃错参数）。"""
+    if flag in sys.argv:
+        i = sys.argv.index(flag)
+        if i + 1 < len(sys.argv) and not sys.argv[i + 1].startswith("--"):
+            return sys.argv[i + 1]
+    return ""
+
+
+def load_cases(path: Path, table: str = "memories", root: str = "") -> list:
     """加载并校验评测集：缺字段/空集/重复查询/目标 id 不在库 → 报错退出不静默。"""
     if not path.is_file():
         raise SystemExit(f"评测集缺失：{path}")
     raw = json.loads(path.read_text(encoding="utf-8"))
     if not isinstance(raw, list) or not raw:
         raise SystemExit("评测集为空或不是数组")
-    with brain.db_conn(core.get_root()) as conn:
+    with brain.db_conn(root or core.get_root()) as conn:
         valid_ids = {r[0] for r in conn.execute(
             f"SELECT id FROM {table} WHERE status='active'")}
     seen, cases = set(), []
@@ -52,22 +62,29 @@ def load_cases(path: Path, table: str = "memories") -> list:
 
 def main() -> None:
     base = Path(__file__).resolve().parent
-    root = core.get_root()
+    root = _opt("--root") or core.get_root()
+    if not Path(root).is_dir():
+        raise SystemExit(f"根目录不存在：{root}")
+    with brain.db_conn(root) as conn:
+        n_mem = conn.execute("SELECT COUNT(*) FROM memories WHERE status='active'").fetchone()[0]
+        n_rec = conn.execute("SELECT COUNT(*) FROM records WHERE status='active'").fetchone()[0]
+    print(f"根目录：{root}")
+    print(f"语料：memories {n_mem} 条 · records {n_rec} 条（数字务必随结果一起报告）")
     if "--records" in sys.argv:
         # P4.3b：records 检索评测（search_records 主路径，cases 为记录 id）
-        cases = load_cases(base / "eval_records_cases.json", table="records")
+        cases = load_cases(base / "eval_records_cases.json", table="records", root=root)
         mode = "records_fused"
 
         def do_search(q: str) -> list:
             return brain.search_records(root, q)  # count_hits 语义不适用于 records
     elif "--bm25" in sys.argv:
-        cases = load_cases(base / "eval_cases.json")
+        cases = load_cases(base / "eval_cases.json", root=root)
         mode = "bm25"
 
         def do_search(q: str) -> list:
             return brain._bm25_rank(root, q)  # BM25 通道本身只读不计唤起
     else:
-        cases = load_cases(base / "eval_cases.json")
+        cases = load_cases(base / "eval_cases.json", root=root)
         mode = "fused"  # P4.3 起默认模式即融合主路径
 
         def do_search(q: str) -> list:

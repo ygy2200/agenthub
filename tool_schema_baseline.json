@@ -375,6 +375,24 @@
     },
     "required": []
   },
+  "hub_lock": {
+    "props": {
+      "action": "string",
+      "agent": "string",
+      "confirm": "boolean",
+      "dry_run": "boolean",
+      "include_released": "boolean",
+      "lease_id": "integer",
+      "limit": "integer",
+      "max_chars": "integer",
+      "path": "string",
+      "project": "string",
+      "reason": "string",
+      "task_id": "integer",
+      "ttl_min": "integer"
+    },
+    "required": []
+  },
   "hub_log_work": {
     "props": {
       "agent": "string",

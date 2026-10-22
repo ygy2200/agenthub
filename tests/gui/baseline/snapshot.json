@@ -37,12 +37,12 @@
         "ScrollBarHandle": 2
       },
       "texts": [
+        "<GREETING>，<DATE>",
         "Agent 阵容（Agent 中心探测）",
         "ZCode",
         "agent 开工调 hub_heartbeat 后显示",
         "● Seed Agent A：技能 <N> · MCP <N> · 记忆 <N>",
         "● Seed Agent B：技能 <N> · MCP <N> · 记忆 <N>",
-        "下午好，<DATE>",
         "今日动态",
         "低落",
         "兴奋",
@@ -329,10 +329,10 @@
     },
     "hub_page": {
       "title": "Agent 中心",
-      "widget_count": 132,
+      "widget_count": 134,
       "class_count": {
         "PageTitleLabel": 1,
-        "PushButton": 6,
+        "PushButton": 8,
         "PrimaryPushButton": 1,
         "CaptionLabel": 4,
         "QWidget": 22,
@@ -361,6 +361,8 @@
         "~/.seed-b",
         "删除选中记忆",
         "单击预览 · 双击打开所在目录 · 右键更多操作 · MCP 出于安全只显示名称与来源，不显示密钥内容",
+        "复核选中",
+        "复核陈旧",
         "技能 <N> · MCP <N> · 记忆 <N> · 配置 0",
         "技能库",
         "新建记忆",

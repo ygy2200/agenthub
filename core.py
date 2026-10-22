@@ -9,6 +9,7 @@ init_hub / journal / heartbeat / report_error / undo_log / bootstrap 注入，
 from __future__ import annotations
 
 import datetime
+import hashlib
 import json
 import os
 import re
@@ -31,6 +32,13 @@ RULES_NAME = "rules.md"
 CONFIG_DIR = Path.home() / ".agenthub"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+# R24：运行中 MCP 进程的标记目录。serve() 启动时写一份并每 30s 刷新心跳；
+# 非 MCP 进程（CLI/GUI/doctor）据此观测长驻服务是否在跑旧代码。
+# 心跳停超过 TTL 的标记视为遗留、不参与判定——宁可 unknown，不猜。
+RUNTIME_MARKER_DIR = (Path(os.environ["AGENTHUB_RUNTIME_DIR"]).expanduser()
+                      if os.environ.get("AGENTHUB_RUNTIME_DIR") else CONFIG_DIR / "runtime")
+RUNTIME_MARKER_TTL = 120
+
 # 历史上各 agent 建平行目录用的前缀，对账时识别
 AGENT_PREFIX_RE = re.compile(r"^(deepseek|hermes|claude|zcode|codex)\s*-\s*", re.IGNORECASE)
 # 历史前缀归一白名单（deepseek 已并入 dsh，但历史目录/记录仍以此名存在，故保留）
@@ -44,6 +52,9 @@ AGENT_KNOWN = AGENT_LEGACY
 # 运行进程版本标记：agenthub_mcp 导入时写入。ops 据此判断「部署后没重启，仍在跑旧代码」。
 SERVER_DIR = ""
 SERVER_STARTED_AT = ""
+SERVER_FINGERPRINT = {}   # 启动时顶层 .py 的内容指纹；部署 copy2 保留旧 mtime，只比时间会漏报
+SERVER_FINGERPRINT_AT = ""  # 指纹对应的启动时刻；外部覆盖 SERVER_STARTED_AT 时退回 mtime
+SERVER_IS_MCP = False     # 只有真正进入 stdio 主循环的进程才为 True（agenthub_mcp.serve 置位）
 
 
 def files_newer_than(base_dir: str, since_iso: str, pattern: str = "*.py",
@@ -79,14 +90,231 @@ def files_newer_than(base_dir: str, since_iso: str, pattern: str = "*.py",
     return out
 
 
-def runtime_staleness(base_dir: str = "", started_at: str = "") -> dict:
-    """当前进程加载的代码是否落后于磁盘（known=False 表示不在 MCP 进程内，不能猜）。"""
+def file_fingerprints(base_dir: str, pattern: str = "*.py") -> dict:
+    """服务目录顶层 .py 的内容指纹（启动时快照，用来判定进程加载的代码是否已变）。"""
+    if not base_dir:
+        return {}
+    d = Path(base_dir)
+    if not d.is_dir():
+        return {}
+    out = {}
+    for p in d.glob(pattern):
+        try:
+            if p.is_file():
+                out[p.name] = hashlib.md5(p.read_bytes()).hexdigest()
+        except OSError:
+            continue
+    return out
+
+
+def _file_mtime(p: Path):
+    try:
+        mt = p.stat().st_mtime
+    except OSError:
+        return "", 0.0
+    return datetime.datetime.fromtimestamp(mt).isoformat(timespec="seconds"), mt
+
+
+def runtime_staleness(base_dir: str = "", started_at: str = "", fingerprint=None) -> dict:
+    """当前进程加载的代码是否落后于磁盘（known=False 表示不在 MCP 进程内，不能猜）。
+
+    「MCP 进程」以 SERVER_IS_MCP 为准，而不是「导入过 agenthub_mcp」：CLI 的 call 命令
+    在进程内导入本模块，若只看导入时写下的 SERVER_STARTED_AT，就会把一次性 CLI 进程
+    误当成在跑的长驻服务，报出「与磁盘一致」的假阳性——这个结论随后会被当成部署已生效
+    的证据。显式传 base_dir/started_at（测试或别的目录）不受该闸门限制。
+
+    优先比内容指纹：部署可能保留源码 mtime（copy2），只看 mtime 会把「内容已换、时间未变」
+    误判成一致。指纹只对本进程启动时记录的 SERVER_DIR 有效，显式传目录时退回 mtime。
+    """
     started = started_at or SERVER_STARTED_AT
     base = base_dir or SERVER_DIR
+    if not base_dir and not started_at and not SERVER_IS_MCP:
+        # R24：非 MCP 进程不再一律 unknown——若目录里有心跳仍新鲜的 serve 标记，
+        # 就用那个长驻进程的启动时刻/指纹判断它是否在跑旧代码（CLI/doctor 恢复视野）
+        marked = _marker_staleness()
+        if marked:
+            return marked
+        return {"known": False, "count": 0, "stale": [], "started": "", "base": base,
+                "basis": ""}
     if not started:
-        return {"known": False, "count": 0, "stale": [], "started": "", "base": base}
+        return {"known": False, "count": 0, "stale": [], "started": "", "base": base,
+                "basis": ""}
+    fp = fingerprint
+    if fp is None and not base_dir and not started_at:
+        if SERVER_FINGERPRINT and started == SERVER_FINGERPRINT_AT:
+            fp = SERVER_FINGERPRINT
+    if fp:
+        current = file_fingerprints(base)
+        stale = []
+        for name, digest in fp.items():
+            if name not in current:
+                stale.append({"file": name, "mtime": "", "mtime_ts": 0.0,
+                              "reason": "removed"})
+            elif current[name] != digest:
+                mt_s, mt = _file_mtime(Path(base) / name)
+                stale.append({"file": name, "mtime": mt_s, "mtime_ts": mt,
+                              "reason": "changed"})
+        for name in current:
+            if name not in fp:
+                mt_s, mt = _file_mtime(Path(base) / name)
+                stale.append({"file": name, "mtime": mt_s, "mtime_ts": mt,
+                              "reason": "added"})
+        stale.sort(key=lambda r: r["mtime_ts"], reverse=True)
+        return {"known": True, "count": len(stale), "stale": stale, "started": started,
+                "base": base, "basis": "content"}
     stale = files_newer_than(base, started)
-    return {"known": True, "count": len(stale), "stale": stale, "started": started, "base": base}
+    return {"known": True, "count": len(stale), "stale": stale, "started": started,
+            "base": base, "basis": "mtime"}
+
+
+def _runtime_marker_path(pid: int | None = None) -> Path:
+    return RUNTIME_MARKER_DIR / f"serve-{pid or os.getpid()}.json"
+
+
+def write_runtime_marker(root: str = "", agent: str = "", version: str = "",
+                         base: str = "", started: str = "", fingerprint=None) -> str:
+    """写/刷新本进程的运行标记（serve 启动时写，心跳线程每 30s 重写一次）。
+
+    只描述「这个进程加载了哪份代码、何时启动」，不含业务数据。写失败返回错误串、
+    绝不抛出——观测能力缺失不能拖垮服务本身。
+    """
+    try:
+        RUNTIME_MARKER_DIR.mkdir(parents=True, exist_ok=True)
+        data = {
+            "pid": os.getpid(),
+            "agent": agent or "",
+            "root": root or "",
+            "base": str(base or SERVER_DIR),
+            "started": started or SERVER_STARTED_AT,
+            "fingerprint": SERVER_FINGERPRINT if fingerprint is None else fingerprint,
+            "version": version or "",
+            "ts": datetime.datetime.now().isoformat(timespec="seconds"),
+        }
+        path = _runtime_marker_path()
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, sort_keys=True), encoding="utf-8")
+        os.replace(str(tmp), str(path))
+        return ""
+    except OSError as e:
+        return f"运行标记写入失败：{e}"
+
+
+def remove_runtime_marker(pid: int | None = None) -> None:
+    try:
+        _runtime_marker_path(pid).unlink()
+    except OSError:
+        pass
+
+
+def prune_runtime_markers(ttl: int = 0) -> int:
+    """清掉心跳早已停止的遗留标记（进程被强杀时会留下）。返回删除数。"""
+    limit = ttl or RUNTIME_MARKER_TTL * 20
+    now = time.time()
+    removed = 0
+    try:
+        files = list(RUNTIME_MARKER_DIR.glob("serve-*.json"))
+    except OSError:
+        return 0
+    for p in files:
+        try:
+            if now - p.stat().st_mtime > limit:
+                p.unlink()
+                removed += 1
+        except OSError:
+            continue
+    return removed
+
+
+def _marker_time_ok(started) -> bool:
+    """标记里的启动时刻必须可解析且不是未来（容忍 5 分钟时钟偏差）。
+
+    未来时刻会让 files_newer_than 把全部文件判成「启动后没改过」——corrupt 标记
+    因此能伪造「一致」。宁可丢弃这条观测，也不能给出假结论。
+    """
+    try:
+        t = datetime.datetime.fromisoformat(str(started))
+    except (TypeError, ValueError):
+        return False
+    if t.tzinfo is not None:
+        t = t.astimezone().replace(tzinfo=None)
+    return t <= datetime.datetime.now() + datetime.timedelta(minutes=5)
+
+
+def runtime_markers(ttl: int = 0) -> list[dict]:
+    """读取心跳仍新鲜的运行标记（默认 120s 内），按启动时刻升序；坏文件跳过。
+
+    标记是跨进程输入（磁盘上的普通 JSON），必须当成不可信数据校验：字段类型不对、
+    启动时刻不可解析/在未来、指纹不是字典，一律跳过而不是带病参与判定。
+    """
+    limit = ttl or RUNTIME_MARKER_TTL
+    now = time.time()
+    out = []
+    try:
+        files = list(RUNTIME_MARKER_DIR.glob("serve-*.json"))
+    except OSError:
+        return []
+    for p in files:
+        try:
+            age = now - p.stat().st_mtime
+            if age > limit:
+                continue
+            d = json.loads(p.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(d, dict):
+            continue
+        base, started, fp = d.get("base"), d.get("started"), d.get("fingerprint")
+        if not isinstance(base, str) or not base:
+            continue
+        if not isinstance(started, str) or not started or not _marker_time_ok(started):
+            continue
+        if fp is not None:
+            if not isinstance(fp, dict):
+                continue
+            d["fingerprint"] = {k: v for k, v in fp.items()
+                                if isinstance(k, str) and isinstance(v, str)}
+        d.setdefault("pid", 0)
+        d["age"] = round(age, 1)
+        d["marker"] = p.name
+        out.append(d)
+    out.sort(key=lambda d: str(d.get("started") or ""))
+    return out
+
+
+def _marker_staleness() -> dict | None:
+    """用运行中 MCP 进程的标记判断代码是否落后；无可用标记返回 None。
+
+    优先看部署目录（MCP_SERVER_DIR）上的进程——那才是 agent 实际连的服务；
+    多个进程取落后文件最多的（最保守），procs 里列出全部观测对象。
+    """
+    procs = runtime_markers()
+    if not procs:
+        return None
+    deployed = os.path.normcase(os.path.abspath(str(MCP_SERVER_DIR)))
+    same = [p for p in procs
+            if os.path.normcase(os.path.abspath(str(p["base"]))) == deployed]
+    pool = same or procs
+    worst = None
+    seen = []
+    for p in pool:
+        try:
+            info = runtime_staleness(str(p["base"]), str(p["started"]),
+                                     fingerprint=p.get("fingerprint") or None)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue  # 单条畸形标记只丢弃自身，不能拖垮整个观测视图
+        if not info.get("known"):
+            continue
+        seen.append({"pid": p.get("pid", 0), "agent": p.get("agent", ""),
+                     "started": p.get("started", ""), "base": p["base"],
+                     "count": info["count"], "version": p.get("version", "")})
+        if worst is None or info["count"] > worst["count"]:
+            worst = info
+    if worst is None:
+        return None
+    out = dict(worst)
+    out["source"] = "marker"
+    out["procs"] = seen
+    return out
 
 
 # 工作记录段头：## 或 ### 开头
@@ -987,22 +1215,54 @@ def find_python() -> str:
     return ""
 
 
-def deploy_server() -> tuple:
-    """把 MCP server 三件套部署到稳定路径 ~/.agenthub/mcp_server/（打包 exe 后
+def _copy_verified(src: Path, dst: Path) -> None:
+    """复制并读回校验；不一致按部署失败处理——半套部署比明确失败更危险。"""
+    shutil.copy2(src, dst)
+    if hashlib.md5(src.read_bytes()).digest() != hashlib.md5(dst.read_bytes()).digest():
+        raise OSError(f"部署校验失败：{src.name}")
+
+
+def deploy_server(src_dir: str = "", dst_dir: str = "") -> tuple:
+    """把 MCP server 文件部署到稳定路径 ~/.agenthub/mcp_server/（打包 exe 后
     __file__ 在临时解包目录，agent 需要一个不消失的路径）。返回 (python, server_py)
-    或 (python, "") 部署失败。"""
-    src = Path(__file__).resolve().parent
+    或 (python, "") 部署失败。
+
+    全量复制到同盘暂存目录并逐文件校验，成功后整目录原子换入：复制中断/校验
+    不符时旧部署原样保留。此前逐文件 copy2 中途失败会留下 brain.py 新、server
+    旧的混版，MCP 进程下次启动即崩。src_dir/dst_dir 仅供回归注入，生产不传。
+    """
+    src = Path(src_dir) if src_dir else Path(__file__).resolve().parent
+    dst = Path(dst_dir) if dst_dir else MCP_SERVER_DIR
+    stage = None
     try:
-        MCP_SERVER_DIR.mkdir(parents=True, exist_ok=True)
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        stage = dst.parent / f".{dst.name}.stage-{os.getpid()}-{int(time.time() * 1000)}"
+        if stage.exists():
+            shutil.rmtree(stage)
+        stage.mkdir(parents=True)
         for f in SERVER_FILES:
             rel = Path(f)
-            dst = MCP_SERVER_DIR / rel
-            if rel.parent != Path("."):
-                dst.parent.mkdir(parents=True, exist_ok=True)
-            shutil.copy2(src / rel, dst)
+            target = stage / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            _copy_verified(src / rel, target)
+        old = None
+        if dst.exists():
+            old = dst.parent / f".{dst.name}.old-{os.getpid()}-{int(time.time() * 1000)}"
+            os.replace(dst, old)
+        try:
+            os.replace(stage, dst)
+        except OSError:
+            if old is not None:
+                os.replace(old, dst)  # 换入失败：把旧部署换回来
+            raise
+        stage = None
+        if old is not None:
+            shutil.rmtree(old, ignore_errors=True)
     except OSError:
+        if stage is not None:
+            shutil.rmtree(stage, ignore_errors=True)
         return find_python(), ""
-    return find_python(), str(MCP_SERVER_DIR / "agenthub_mcp.py")
+    return find_python(), str(dst / "agenthub_mcp.py")
 
 
 def _mcp_entry(python_exe: str, server_py: str, root: str = "", agent: str = "",

@@ -165,7 +165,8 @@ def t_multiprocess_stress():
     for k in range(_WORKER_PROCS):
         procs.append(subprocess.Popen(
             [sys.executable, os.path.abspath(__file__), "--stress-worker", root, f"w{k}"],
-            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8"))
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+            errors="replace"))
     bad = []
     for k, p in enumerate(procs):
         _out, err = p.communicate(timeout=300)
@@ -187,6 +188,171 @@ def t_multiprocess_stress():
     assert wal_sz < 64 * 1024 * 1024, f"WAL 无界增长（{wal_sz/1024/1024:.1f}MB）——khive#580 形态"
 
 
+def _lease_worker(root: str, tag: str, start_at: str) -> int:
+    """子进程入口：等到同一时刻再抢同一路径的文件租约，结果打到 stdout。"""
+    import time
+    while time.time() < float(start_at):
+        pass
+    err, row = brain.file_lease_acquire(root, "并发-项目/共享.py", tag, ttl_min=30)
+    # stdout 只放 ASCII 判定（中文错误文案走 stderr 的 traceback 之外不输出）：
+    # 子进程 stdout 走系统代码页，父进程按 UTF-8 解码会炸。
+    print(("OK\t" + str(row.get("id", 0))) if not err else "ERR", flush=True)
+    return 0
+
+
+def t_lease_mutex_across_processes():
+    """R11/R13 回归：多进程同时 acquire 同一文件——必须恰好一个成功、台账恰好一把活跃锁。
+
+    文件租约是咨询式的，但「同路径同时只该有一个持有者」是它的核心承诺；并发下双持有
+    会让两个 agent 都以为可以改同一文件（正是它要防的事故）。另断言 fence 从 1 开始、
+    journal 只记一条「获取文件租约」，防「抢到了但审计重复」。"""
+    import subprocess
+    import time
+    root = _fresh()
+    start_at = time.time() + 2.5
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    procs = [subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--lease-worker",
+         root, f"L{k}", str(start_at)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace", env=env)
+        for k in range(4)]
+    results, bad = [], []
+    for k, p in enumerate(procs):
+        out, err = p.communicate(timeout=120)
+        if p.returncode != 0:
+            bad.append(f"L{k} 退出码 {p.returncode}: {err[-200:]}")
+            continue
+        parts = out.strip().split("\t")
+        results.append((k, parts[0] if parts else "", parts[1] if len(parts) > 1 else ""))
+    assert not bad, "抢锁子进程失败：\n  " + "\n  ".join(bad)
+    winners = [r for r in results if r[1] == "OK"]
+    assert len(winners) == 1, f"同一文件必须恰好一个赢家，实际 {len(winners)}：{results}"
+    leases = [r for r in brain.file_lease_list(root, include_released=False) if r["_active"]]
+    assert len(leases) == 1, f"台账活跃锁应恰好 1 把，实际 {len(leases)}：{leases}"
+    assert leases[0]["owner"] == f"l{winners[0][0]}", (leases[0], winners)
+    assert leases[0]["fence"] == 1, leases[0]
+    acts = [j for j in brain.journal_list(root, 100) if j["action"] == "获取文件租约"]
+    assert len(acts) == 1, f"获取租约审计应只有 1 条，实际 {len(acts)}"
+
+
+def _idem_worker(root: str, tag: str, start_at: str, key: str) -> int:
+    """子进程入口：同一时刻携同一幂等键调用真实 MCP 写工具，直到拿到首次结果或重放。"""
+    import time
+    import agenthub_mcp as m
+    while time.time() < float(start_at):
+        pass
+    args = {"project": "并发幂等-项目", "agent": "zcode",
+            "content": "【目的】幂等并发\n【做了什么】同键同时写\n【验证结果】待验\n【如何回滚】删",
+            "idem_key": key}
+    deadline = time.time() + 90
+    attempts = 0
+    while time.time() < deadline:
+        out = m.call_tool("hub_log_work", dict(args), root)
+        attempts += 1
+        if "records#" in out:
+            kind = "replay" if "幂等重放" in out else "first"
+            print(f"{tag}\t{kind}\t{attempts}", flush=True)
+            return 0
+        if "正在处理中" in out:
+            time.sleep(0.2)
+            continue
+        print(f"{tag}\terr\t{attempts}", flush=True)
+        sys.stderr.write(out[:300] + "\n")
+        return 1
+    print(f"{tag}\ttimeout\t{attempts}", flush=True)
+    return 1
+
+
+def t_idem_mutex_across_processes():
+    """R16 回归：4 进程同键并发调用 hub_log_work——只允许一条记录、其余全部重放。
+
+    幂等键此前是 lookup（事务 A）+ store（事务 B）：并发重试双方都读到「未见」，
+    于是各写一次，超时重试仍会重复记账。修复后 precheck 即原子占位，同键只有一个
+    请求拿到 go；其余等首次结果落库后重放（占位中则稍后重试，不重复执行）。"""
+    import subprocess
+    import time
+    root = _fresh()
+    key = "conc-idem-1"
+    start_at = time.time() + 3.0
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    procs = [subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--idem-worker",
+         root, f"P{k}", str(start_at), key],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace", env=env)
+        for k in range(4)]
+    results, bad = [], []
+    for k, p in enumerate(procs):
+        out, err = p.communicate(timeout=180)
+        if p.returncode != 0:
+            bad.append(f"P{k} 退出码 {p.returncode}: {err[-300:]}")
+            continue
+        parts = out.strip().split("\t")
+        results.append((k, parts[1] if len(parts) > 1 else "",
+                        parts[2] if len(parts) > 2 else ""))
+    assert not bad, "幂等并发子进程失败：\n  " + "\n  ".join(bad)
+    kinds = [r[1] for r in results]
+    assert len(results) == 4, results
+    assert kinds.count("first") == 1, f"同键必须恰好一个首次执行，实际 {results}"
+    assert all(k in ("first", "replay") for k in kinds), f"存在未收敛的调用：{results}"
+    with brain.db_conn(root) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM records WHERE project='并发幂等-项目'").fetchone()[0]
+        row = conn.execute("SELECT result FROM idem_keys WHERE agent='zcode' AND key=?",
+                           (key,)).fetchone()
+    assert n == 1, f"同键并发必须只落一条记录，实际 {n}"
+    assert row is not None and (row["result"] or "").strip(), f"占位未补成首次结果：{row}"
+
+
+def _migrate_worker(root: str, tag: str, start_at: str) -> int:
+    """子进程入口：同一时刻对老库跑增量补列。"""
+    import time
+    while time.time() < float(start_at):
+        pass
+    try:
+        brain._migrate_columns(root)
+    except Exception as e:  # noqa: BLE001
+        print(f"{tag}\tERR\t{type(e).__name__}", flush=True)
+        sys.stderr.write(f"{type(e).__name__}: {e}\n")
+        return 1
+    print(f"{tag}\tOK", flush=True)
+    return 0
+
+
+def t_migrate_columns_across_processes():
+    """R16 回归：老库缺列时 4 进程同时补列——不得出现 duplicate column。
+
+    旧实现 PRAGMA 读列与 ALTER 补列在延迟事务里：两个新版本进程同时首启都能读到缺列，
+    后一个 ALTER 会失败并让整个 init_db 报「schema 初始化失败」。修复后先 BEGIN IMMEDIATE
+    再读列，检查与补列串行。"""
+    import subprocess
+    import time
+    root = _fresh()
+    with brain.db_conn(root) as conn:
+        conn.execute("ALTER TABLE memories DROP COLUMN confirmed")
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+    assert "confirmed" not in cols, "测试前置：confirmed 列应已移除"
+    start_at = time.time() + 1.5
+    env = {**os.environ, "PYTHONIOENCODING": "utf-8"}
+    procs = [subprocess.Popen(
+        [sys.executable, os.path.abspath(__file__), "--migrate-worker", root,
+         f"M{k}", str(start_at)],
+        stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True, encoding="utf-8",
+        errors="replace", env=env)
+        for k in range(4)]
+    bad = []
+    for k, p in enumerate(procs):
+        out, err = p.communicate(timeout=120)
+        if p.returncode != 0:
+            bad.append(f"M{k} 退出码 {p.returncode}: {err[-300:]}")
+    assert not bad, "并发补列失败：\n  " + "\n  ".join(bad)
+    with brain.db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
+        integ = conn.execute("PRAGMA integrity_check").fetchone()[0]
+    assert "confirmed" in cols, "并发补列后 confirmed 列仍缺失"
+    assert integ == "ok", f"补列后完整性异常：{integ}"
+
+
 def main():
     print("=== adv_concurrency：SQLite 并发与 WAL 收尾（外部已知缺陷防线）===")
     case("PRAGMA 生效（wal / busy_timeout≥15s / synchronous=NORMAL，哨兵同源）", t_pragmas)
@@ -195,6 +361,12 @@ def main():
     case("退出收尾（checkpoint 后无 -wal/-shm 残留，库仍可写）", t_wal_exit_cleanup)
     case("D2·多进程压测（6 子进程同库混合读写：零失败/零丢失/完整性/WAL 有界）",
          t_multiprocess_stress)
+    case("R11/R13·多进程抢同一文件锁（恰好一个赢家/台账一把/fence=1/审计一条）",
+         t_lease_mutex_across_processes)
+    case("R16·多进程同键幂等写（恰好一条记录/其余重放/占位补结果）",
+         t_idem_mutex_across_processes)
+    case("R16·老库多进程并发补列（零 duplicate column/列补齐/完整性 ok）",
+         t_migrate_columns_across_processes)
     print()
     if _FAILED:
         print(f"未通过 {len(_FAILED)} 项：{'、'.join(_FAILED)}")
@@ -204,6 +376,30 @@ def main():
 
 
 if __name__ == "__main__":
+    if len(sys.argv) >= 6 and sys.argv[1] == "--idem-worker":
+        try:
+            sys.exit(_idem_worker(sys.argv[2], sys.argv[3], sys.argv[4], sys.argv[5]))
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            sys.stderr.write(f"[idem-worker {sys.argv[3]}] {type(e).__name__}: {e}\n")
+            sys.exit(1)
+    if len(sys.argv) >= 5 and sys.argv[1] == "--migrate-worker":
+        try:
+            sys.exit(_migrate_worker(sys.argv[2], sys.argv[3], sys.argv[4]))
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            sys.stderr.write(f"[migrate-worker {sys.argv[3]}] {type(e).__name__}: {e}\n")
+            sys.exit(1)
+    if len(sys.argv) >= 5 and sys.argv[1] == "--lease-worker":
+        try:
+            sys.exit(_lease_worker(sys.argv[2], sys.argv[3], sys.argv[4]))
+        except Exception as e:  # noqa: BLE001
+            import traceback
+            traceback.print_exc()
+            sys.stderr.write(f"[lease-worker {sys.argv[3]}] {type(e).__name__}: {e}\n")
+            sys.exit(1)
     if len(sys.argv) >= 4 and sys.argv[1] == "--stress-worker":
         # 子进程模式：混合操作模拟一个 MCP 接入的请求面；任何异常都非零退出
         try:

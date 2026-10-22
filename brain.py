@@ -18,6 +18,7 @@ import re
 import sqlite3
 import sys
 import threading
+import time
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -208,6 +209,18 @@ def db_conn(root: str):
         conn.close()
 
 
+def _begin_write(conn) -> str:
+    """显式抢占写锁（BEGIN IMMEDIATE），供「先查后写」的操作跨进程串行。
+
+    WAL 的延迟事务里两个连接可以同时读到「无冲突」，再先后提交就造成双持有——
+    文件租约的检查/续租/回收都必须先拿写锁再读，否则检查与写入之间是可乘之隙。"""
+    try:
+        conn.execute("BEGIN IMMEDIATE")
+        return ""
+    except sqlite3.OperationalError as e:
+        return f"数据库繁忙，请稍后重试（{e}）"
+
+
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT);
 CREATE TABLE IF NOT EXISTS projects (
@@ -334,7 +347,9 @@ CREATE TABLE IF NOT EXISTS agent_onboarding (
     ts TEXT DEFAULT "",
     ok INTEGER DEFAULT 0,
     steps TEXT DEFAULT "",
-    note TEXT DEFAULT ""
+    note TEXT DEFAULT "",
+    fingerprint TEXT DEFAULT "",
+    base TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS env_items (
     category TEXT,
@@ -385,6 +400,7 @@ CREATE TABLE IF NOT EXISTS tasks (
     due TEXT DEFAULT "",
     created TEXT DEFAULT "",
     updated TEXT DEFAULT "",
+    progress_at TEXT DEFAULT "",
     done_at TEXT DEFAULT "",
     created_by TEXT DEFAULT ""
 );
@@ -443,6 +459,30 @@ CREATE TABLE IF NOT EXISTS checkpoints (
     kind TEXT DEFAULT "manual",
     content TEXT DEFAULT ""
 );
+-- R11 文件租约（2026-10-21）：任务租约防「撞任务」，文件租约防「撞文件」。
+-- 多家 agent 同仓并发改同一文件是并行协作最高频的失败源（共享状态并发写入）；
+-- 本表是**咨询式**租约：不拦截写盘，但 acquire/check 报冲突、心跳提示本项目谁在写。
+-- path 为规范化绝对路径（Windows 小写、正斜杠），display_path 面向用户（根内相对路径）。
+-- fence 按同一 path 单调递增，供「迟到写入」识别；expires_at 过期即可被他人接管。
+CREATE TABLE IF NOT EXISTS file_leases (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    path TEXT NOT NULL,
+    display_path TEXT DEFAULT "",
+    project TEXT DEFAULT "",
+    owner TEXT DEFAULT "",
+    task_id INTEGER DEFAULT 0,
+    reason TEXT DEFAULT "",
+    ttl_min INTEGER DEFAULT 30,
+    fence INTEGER DEFAULT 1,
+    acquired_at TEXT DEFAULT "",
+    renewed_at TEXT DEFAULT "",
+    expires_at TEXT DEFAULT "",
+    released_at TEXT DEFAULT "",
+    released_by TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_file_leases_path ON file_leases(path, released_at);
+CREATE INDEX IF NOT EXISTS idx_file_leases_owner ON file_leases(owner, released_at);
+CREATE INDEX IF NOT EXISTS idx_file_leases_expires ON file_leases(expires_at);
 CREATE TABLE IF NOT EXISTS events (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT DEFAULT "",
@@ -650,27 +690,42 @@ def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, recor
     conn.execute(f"UPDATE agents SET {','.join(sets)} WHERE name=?", args)
 
 
-def onboarding_save(root: str, agent: str, ok: bool, steps: list, note: str = "") -> str:
-    """写接入验证快照（每 agent 一行，覆盖上一次）。返回错误或 ""。"""
+def onboarding_save(root: str, agent: str, ok: bool, steps: list, note: str = "",
+                    fingerprint: dict | str = "", base: str = "") -> str:
+    """写接入验证快照（每 agent 一行，覆盖上一次）。返回错误或 ""。
+
+    fingerprint 记录验证时加载的代码内容指纹（文件名→md5）：部署 copy2 保留旧 mtime 时，
+    只比时间会把「代码已换」判成「仍然一致」。base 记录这份指纹来自哪个代码树（源码目录
+    还是部署目录）——同一个 agent 可能被 CLI 从源码树验证、又被 MCP 从部署树复查，跨树
+    比对会把「另一个树里多出的文件」误判成代码变更。旧调用不传则存空，读取时沿用旧口径。
+    """
     key = _norm_agent(agent)
     if not key:
         return "agent 必填"
+    if isinstance(fingerprint, dict):
+        fingerprint = json.dumps(fingerprint, sort_keys=True, ensure_ascii=False)
     ensure_schema(root)
     try:
         with db_conn(root) as conn:
             conn.execute(
-                "INSERT INTO agent_onboarding(agent,ts,ok,steps,note) VALUES(?,?,?,?,?) "
+                "INSERT INTO agent_onboarding(agent,ts,ok,steps,note,fingerprint,base) "
+                "VALUES(?,?,?,?,?,?,?) "
                 "ON CONFLICT(agent) DO UPDATE SET ts=excluded.ts, ok=excluded.ok, "
-                "steps=excluded.steps, note=excluded.note",
-                (key, _now(), 1 if ok else 0, json.dumps(steps or [], ensure_ascii=False), note or ""))
+                "steps=excluded.steps, note=excluded.note, fingerprint=excluded.fingerprint, "
+                "base=excluded.base",
+                (key, _now(), 1 if ok else 0, json.dumps(steps or [], ensure_ascii=False),
+                 note or "", fingerprint or "", (base or "").strip()))
         return ""
     except sqlite3.Error as e:
         return f"接入快照写入失败：{e}"
 
 
 def onboarding_get(root: str, agent: str = "") -> list:
-    """读接入验证快照。agent 为空返回全部；表不存在（旧库未跑 ensure_schema）返回 []。"""
-    sql = "SELECT agent, ts, ok, steps, note FROM agent_onboarding"
+    """读接入验证快照。agent 为空返回全部；表不存在（旧库未跑 ensure_schema）返回 []。
+
+    fingerprint 解析为 dict；旧快照无指纹返回 {}（调用方据此回落 mtime 判定）。
+    """
+    sql = "SELECT agent, ts, ok, steps, note, fingerprint, base FROM agent_onboarding"
     args: list = []
     if agent:
         sql += " WHERE agent=?"
@@ -685,6 +740,12 @@ def onboarding_get(root: str, agent: str = "") -> list:
                     d["steps"] = json.loads(d.get("steps") or "[]")
                 except ValueError:
                     d["steps"] = []
+                try:
+                    d["fingerprint"] = json.loads(d.get("fingerprint") or "{}")
+                except ValueError:
+                    d["fingerprint"] = {}
+                if not isinstance(d["fingerprint"], dict):
+                    d["fingerprint"] = {}
                 rows.append(d)
             return rows
     except sqlite3.OperationalError:
@@ -796,29 +857,43 @@ def init_db(root: str) -> str:
 
 # ---------------------------------------------------------------- 迁移（幂等增量）
 
+def _migration_fingerprint(project: str, title: str, body: str) -> tuple:
+    """迁移条目的稳定身份：项目 + 标题 + 正文全文哈希。
+
+    刻意**不含行号/文件名**：行号在文件顶部插入横幅/章节时会整体位移，旧实现把它当身份，
+    2026-10-21 实测因 4 行横幅一次性多出 32 条假记录；文件名变更同样不该让旧内容复活。
+    标题和正文都参与：正文修订 = 文档内容真的变了，应作为新条目导入（旧条目保留可追溯）。
+    """
+    import hashlib
+    h = hashlib.sha1(f"{title or ''}\x00{body or ''}".encode("utf-8")).hexdigest()
+    return (project, h)
+
+
 def _migrate_records(root: str) -> int:
     """扫描全部项目目录导入记录；所有非保留目录登记进 projects。返回本次导入条数。
 
     对齐 core.scan 的记录提取语义：
     - 有 工作记录.md 用之；否则用目录下最新 md/txt 顶上，整篇无段头按 "[主文档]" 一条
     - 段头/段内解析不出日期时用文档 mtime 兜底（fallback_date）
-    幂等：先清掉 date 为空的旧迁移记录（早期版本未传 fallback_date 的缺日期数据），
-    再按 (project,date,agent,title,content) 去重增量导入，可安全重复跑。
-    去重键含 content：同一项目里存在段头完全相同的多条段（如同名 "## 日期（agent）"），
+    幂等：先清掉 date 为空的**活跃**旧迁移记录（早期版本未传 fallback_date 的缺日期数据；
+    软删行是墓碑，必须保留参与去重，否则下一次会复活），再按内容指纹增量导入，可安全重复跑。
+    去重键含正文全文：同一项目里存在段头完全相同的多条段（如同名 "## 日期（agent）"），
     只按段头去重会吞掉第二条的内容。"""
     n = 0
     with db_conn(root) as conn:
-        conn.execute("DELETE FROM records WHERE source LIKE 'migrated:%' AND date=''")
-        # ★ 去重键 = (project, source, title, content[:256])，**不含 agent、也不含 date**（2026-10-10 修）：
-        #   · 不含 agent：agent 是派生值，会随解析规则改进变化（白名单补全/fallback 调整），
-        #     放进去会让"同一段文字在两套规则下算出不同 agent"被误判为新记录、整批重插。
-        #   · 不含 date：无段内日期的条目用**文件 mtime** 兜底，而 agent 每次追加记录都会改 mtime，
-        #     于是这些条目会反复被判定为新增（实测：追加一段后重跑，105→164 条）。
-        #   · 用 source（migrated:<文件>:<行号>）作稳定身份——追加到文件末尾不影响既有行号。
-        #   ⚠ 改这里必须同步改下方 key 的构造，两者结构必须完全一致（上一版只改此处漏改对方，
-        #     导致键结构不匹配、去重彻底失效、每次 init_db 全量重插 451 条）。
-        known = {(r["project"], r["source"] or "", r["title"], (r["content"] or "")[:256])
-                 for r in conn.execute("SELECT project,source,title,content FROM records")}
+        conn.execute("DELETE FROM records WHERE source LIKE 'migrated:%' AND date='' "
+                     "AND status='active'")
+        # ★ 去重身份 = (project, sha1(title + 正文全文))，**不含行号、文件名、agent、date**：
+        #   · 不含行号：顶部插横幅/章节会让后续行号整体位移，旧 key 会把同一段文字当新记录
+        #     重插（2026-10-21 实测 32 条假记录，项目最后活动日被污染）。
+        #   · 不含文件名：同内容换文件名（INDEX→其他）不该复活历史条目。
+        #   · 不含 agent：agent 是派生值，会随解析规则改进变化。
+        #   · 不含 date：无段内日期的条目用文件 mtime 兜底，追加记录会改 mtime。
+        #   · 查询不过滤 status：软删行是墓碑，必须继续参与去重（"失效≠删除"）。
+        known = set()
+        for r in conn.execute(
+                "SELECT project,title,content FROM records WHERE source LIKE 'migrated:%'"):
+            known.add(_migration_fingerprint(r["project"], r["title"], r["content"] or ""))
         for entry in os.scandir(root):
             if not entry.is_dir() or entry.name in core.RESERVED:
                 continue
@@ -848,12 +923,8 @@ def _migrate_records(root: str) -> int:
                                             agent_raw="", title=f"[主文档] {src.name}", line_no=0,
                                             body=core.read_text(src)[:4000])]
             for r in entries:
-                # ★ key 必须与上面 known 的元素**同结构**（2026-10-10 二次修复）：
-                #   known = (project, source, title, content[:256])，本处同构。
-                #   上一版只改了 known、没改这里，两套键永不相等 → 去重彻底失效、
-                #   每次 init_db 全量重插（实测临时库两次跑 210→420）。
-                key = (entry.name, f"migrated:{src.name}:{r.line_no}", r.title,
-                       (r.body or "")[:256])
+                # key 必须与上面 known 的元素**同结构**（内容指纹，不含行号/文件名）。
+                key = _migration_fingerprint(entry.name, r.title, r.body or "")
                 if key in known:
                     continue
                 conn.execute(
@@ -1014,6 +1085,9 @@ def _migrate_columns(root: str) -> None:
     """老库增量补列（幂等）：memories 用进废退、projects 生命周期；projects.updated 按 records 回填，
     超过 STALL_DAYS 无活动标 stalled。"""
     with db_conn(root) as conn:
+        # 先拿写锁再 PRAGMA：两个新版本进程同时首启时，都读到缺列再先后 ALTER，
+        # 后一个会以 duplicate column 失败——检查与补列必须串行（R15 同型竞态）。
+        conn.execute("BEGIN IMMEDIATE")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(memories)")}
         if "use_count" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN use_count INTEGER DEFAULT 0")
@@ -1067,6 +1141,21 @@ def _migrate_columns(root: str) -> None:
                          ("due", "TEXT DEFAULT ''")):
             if col not in tcols:
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
+        # R26（2026-10-22）进展时间戳：心跳续租同样刷新 updated，拿 updated 当「任务在走」
+        # 的证据会让「人在线、活停住」永远不可见。progress_at 只由真实任务动作写
+        # （认领/流转/改详情/写检查点），心跳不碰；老行以迁移时的 updated 起步，此后靠
+        # 新写入自愈（迁移前心跳污染过的值最多让首次停滞发现晚一轮）。
+        if "progress_at" not in tcols:
+            conn.execute("ALTER TABLE tasks ADD COLUMN progress_at TEXT DEFAULT ''")
+            conn.execute("UPDATE tasks SET progress_at=updated "
+                         "WHERE progress_at IS NULL OR progress_at=''")
+        # R6（2026-10-21）接入验证快照补指纹列：旧快照默认空，读取时回落 mtime 判定
+        # R23（2026-10-22）再补 base 列：记录指纹来自哪个代码树，跨树比对不判过期
+        acols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_onboarding)")}
+        if acols and "fingerprint" not in acols:
+            conn.execute("ALTER TABLE agent_onboarding ADD COLUMN fingerprint TEXT DEFAULT ''")
+        if acols and "base" not in acols:
+            conn.execute("ALTER TABLE agent_onboarding ADD COLUMN base TEXT DEFAULT ''")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -1900,9 +1989,9 @@ def _records_search_fused(root: str, kw: str, words: list, limit: int) -> list:
     for rank, r in enumerate(bm25_rows):
         scores[r["id"]] = scores.get(r["id"], 0.0) + _RRF_W_BM25 / (_RRF_K + rank + 1)
         channels.setdefault(r["id"], {})["bm25"] = rank + 1
-    sem_rows = _semantic_rank(root, kw, "records") if _RRF_W_SEMANTIC > 0 else []  # P0-3 语义第三路
+    sem_rows = _semantic_rank(root, kw, "records") if _RRF_W_SEMANTIC_RECORDS > 0 else []  # P0-3 语义第三路
     for eid, s, _ in sem_rows:
-        scores[eid] = scores.get(eid, 0.0) + _RRF_W_SEMANTIC * s
+        scores[eid] = scores.get(eid, 0.0) + _RRF_W_SEMANTIC_RECORDS * s
         channels.setdefault(eid, {})["semantic"] = round(s, 4)
     by_id = {r["id"]: r for r in [*like_rows, *bm25_rows]}
     for eid, _, r in sem_rows:
@@ -2032,6 +2121,8 @@ def usage_stats(root: str, days: int = 7, agent: str = "", tool: str = "") -> di
     """窗口内使用聚合（只读，不写任何数据）：
     · totals：四源各自条数（journal 在 tool 过滤时不计，口径同 usage_timeline）；
     · by_tool / by_agent：tool_calls 权威口径（R6 起全工具留痕）下的排行；
+    · attribution：调用归属覆盖（有主/空/占比）——空归属高说明调用方没带
+      --agent 或仍在跑未修复的旧进程，控制面数据可信度的直接指标；
     · last_seen：每工具最后露面时间——「零调用」断言的活校验（脚本快照会过期，这个不会）；
     · zero_hit_searches：窗口内零命中检索——**反复出现的零命中查询=索引/描述问题的信号**，
       比工具计数更早暴露「有需求没满足」；
@@ -2044,7 +2135,7 @@ def usage_stats(root: str, days: int = 7, agent: str = "", tool: str = "") -> di
     tl = tool.strip()
     out: dict = {"window_days": int(days) if days > 0 else 0, "totals": {},
                  "by_tool": [], "by_agent": [], "last_seen": {},
-                 "zero_hit_searches": [], "repeated_queries": []}
+                 "attribution": {}, "zero_hit_searches": [], "repeated_queries": []}
     with db_conn(root) as conn:
         conds, args = [], []
         if cutoff:
@@ -2080,6 +2171,16 @@ def usage_stats(root: str, days: int = 7, agent: str = "", tool: str = "") -> di
         out["by_agent"] = [dict(r) for r in conn.execute(
             f"SELECT agent, COUNT(*) n FROM tool_calls{w} GROUP BY agent ORDER BY n DESC, agent LIMIT 30",
             args)]
+        arow = conn.execute(
+            f"SELECT COUNT(*) total,"
+            f" SUM(CASE WHEN TRIM(COALESCE(agent,''))='' THEN 1 ELSE 0 END) empty"
+            f" FROM tool_calls{w}", args).fetchone()
+        atotal = int(arow["total"] or 0)
+        aempty = int(arow["empty"] or 0)
+        out["attribution"] = {
+            "total": atotal, "named": atotal - aempty, "empty": aempty,
+            "empty_pct": round(aempty * 100.0 / atotal, 1) if atotal else 0.0,
+        }
         out["last_seen"] = {r["tool"]: r["last"] for r in conn.execute(
             f"SELECT tool, MAX(ts) last FROM tool_calls{w} GROUP BY tool ORDER BY tool", args)}
         zc, za = [], []
@@ -2152,7 +2253,17 @@ def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:
 TASK_STATUSES = ("pending", "in_progress", "blocked", "done")
 TASK_CN = {"pending": "待办", "in_progress": "进行中", "blocked": "阻塞", "done": "完成"}
 CLAIM_TTL_HOURS = 2   # 认领超时自动释放（防死锁）：claimed_at 早于该时长的 in_progress 可被接管
+# R26：在办任务「有推进」的容忍时长。租约/心跳只能证明人还在，证明不了任务在走；
+# 超过该时长既没有检查点也没有任务更新，就标「进展停滞」（不自动释放，只点名）。
+TASK_PROGRESS_STALL_HOURS = 6
+# R30：待办饥饿——「现在就能开工」却长期没人认领的 pending 任务。等前置/显式阻塞的
+# 任务是在等待，不是没人干；3 天覆盖一个正常交付周期，避免把刚建的任务当问题。
+TASK_STARVE_DAYS = 3
 DEFAULT_PRIORITY = 2  # M1（2026-10-12）：任务缺省优先级（0急 1高 2中 3低）
+# R11 文件租约 TTL（分钟）：短锁防「忘了释放」把别人挡在门外；上限 8h 防长期占坑。
+FILE_LEASE_TTL_MIN = 30
+FILE_LEASE_TTL_FLOOR = 1
+FILE_LEASE_TTL_CAP = 480
 CRYSTAL_PREFIX = "结晶 #"  # M2：完成链结晶记录的标题前缀（幂等识别用）
 # M10：前沿队列四段中文名（hub_next / GUI 工作台 / 心跳开工推送同源，防文案漂移）
 TASK_GROUP_CN = {"ready": "可认领", "doing": "进行中", "takeover": "可接管", "waiting": "等待依赖"}
@@ -2166,12 +2277,26 @@ def _claim_cutoff() -> str:
         .isoformat(timespec="seconds")
 
 
+def _touch_project_activity(conn, project: str, date: str = "") -> None:
+    """任务生命周期也刷新项目活跃（R20）：停滞项目的修复建议是「hub_task_add 写下下一步」，
+    此前写任务既不更新 updated 也不改 status，照着建议做项目仍显示停滞。
+    与 add_record 同一守卫：archived 项目不因新任务复活。"""
+    name = (project or "").strip()
+    if not name:
+        return
+    conn.execute(
+        "UPDATE projects SET updated=?, status='active' WHERE name=? AND status!='archived'",
+        ((date or _now())[:10], name))
+
+
 def task_add(root: str, title: str, project: str = "", detail: str = "",
              blocked_by: str = "", agent: str = "", priority=2,
              deps: str = "", due: str = "") -> tuple:
     """新建任务（P3-2 状态机入口；M1 加工作图字段）。
     priority：0急~3低（缺省 2）；deps：前置任务 id 逗号分隔（未完成前不会被 hub_next
-    推荐、不可认领）；due：截止日（可空）。返回 (错误或 "", 任务 id)。"""
+    推荐、不可认领）；due：截止日（可空）。R3：deps 拒绝自依赖与环（含对「未来 id」的
+    前向引用成环——插入后校验，成环则回滚该任务）；不存在的 id 仍允许（前向引用），
+    由看板/巡检标「(不存在)」。返回 (错误或 "", 任务 id)。"""
     title = (title or "").strip()
     if not title:
         return "title 必填", 0
@@ -2179,16 +2304,31 @@ def task_add(root: str, title: str, project: str = "", detail: str = "",
         pr = max(0, min(int(priority), 3))
     except (TypeError, ValueError):
         pr = DEFAULT_PRIORITY
-    deps_norm = ",".join(str(x) for x in _parse_task_deps(deps))[:200]
+    deps_raw = (deps or "").strip()
+    dep_ids = _parse_task_deps(deps_raw)
+    if deps_raw and not dep_ids:
+        return f"deps 无合法任务 id：{deps_raw[:40]}（用逗号分隔任务编号）", 0
+    deps_norm = ",".join(str(x) for x in dep_ids)[:200]
     with db_conn(root) as conn:
         cur = conn.execute(
             "INSERT INTO tasks(project,title,detail,status,blocked_by,priority,deps,due,"
-            "created,updated,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            "created,updated,progress_at,created_by) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
             (project.strip(), title[:200], (detail or "").strip()[:2000],
              "blocked" if (blocked_by or "").strip() else "pending",
              (blocked_by or "").strip()[:200], pr, deps_norm, (due or "").strip()[:20],
-             _now(), _now(), _norm_agent(agent) or ""))
-        return "", cur.lastrowid
+             _now(), _now(), _now(), _norm_agent(agent) or ""))
+        tid = cur.lastrowid
+        if dep_ids:
+            cyc = _dep_cycle_path(conn, tid, dep_ids)
+            if cyc:
+                conn.execute("DELETE FROM tasks WHERE id=?", (tid,))
+                return (f"依赖成环：{_dep_path_text(cyc)}（任务未创建；"
+                        "前置关系必须是有向无环图）"), 0
+        _touch_project_activity(conn, project)
+        _journal_row(conn, _norm_agent(agent), "任务新建", f"tasks#{tid}",
+                     f"{title[:60]}" + (f"｜deps={deps_norm}" if deps_norm else "")
+                     + (f"｜project={project.strip()}" if project.strip() else ""))
+        return "", tid
 
 
 def task_list(root: str, status: str = "", owner: str = "", project: str = "",
@@ -2216,7 +2356,9 @@ def task_claim(root: str, tid, agent: str) -> tuple:
     """原子认领（P3-2）：pending → in_progress(owner)。M1：前置（deps）未全部完成时拒绝认领。
     并发安全：单条 UPDATE…WHERE（前置条件全写进 SQL）+ rowcount 判胜负（SQLite 写事务天然串行，
     两家同时 claim 只可能一家 rowcount=1）。超时自动释放：in_progress 且 claimed_at 早于 TTL
-    的可被他人接管（防死锁）。返回 (错误或 "", 任务行 dict)。"""
+    的可被他人接管（防死锁）。R2：在办但无人可归（owner 空）或租约缺失（claimed_at 空）的
+    任务同样可被认领——否则旧数据/异常退出留下的 in_progress 永远卡死，谁也接不了。
+    返回 (错误或 "", 任务行 dict)；接管时行内含 _takeover 说明。"""
     who = _norm_agent(agent) or ""
     if not who:
         return "agent 必填（认领必须署名）", {}
@@ -2231,6 +2373,15 @@ def task_claim(root: str, tid, agent: str) -> tuple:
         if pre is None:
             return f"任务 #{tid} 不存在", {}
         pre = dict(pre)
+        renewed = bool(pre["status"] == "in_progress" and pre["owner"] == who)
+        takeover = ""
+        if pre["status"] == "in_progress" and pre["owner"] != who:
+            if not (pre["owner"] or "").strip():
+                takeover = "无主任务接管"
+            elif not (pre["claimed_at"] or "").strip():
+                takeover = "租约缺失接管"
+            elif pre["claimed_at"] < cutoff:
+                takeover = "租约过期接管"
         waiting = _task_deps_waiting(conn, pre)
         if waiting:
             names = "、".join(
@@ -2238,24 +2389,41 @@ def task_claim(root: str, tid, agent: str) -> tuple:
                 for w in waiting[:4])
             more = " 等" if len(waiting) > 4 else ""
             return f"认领失败：任务 #{tid} 前置未完成——等待 {names}{more}", pre
+        if pre["status"] == "pending" and (pre.get("blocked_by") or "").strip():
+            return (f"认领失败：任务 #{tid} 仍有阻塞标记「{pre['blocked_by'][:40]}」；"
+                    "确认解除后先 hub_task_update(blocked_by=\"-\") 清除"), pre
         cur = conn.execute(
-            "UPDATE tasks SET status='in_progress', owner=?, claimed_at=?, updated=? "
+            "UPDATE tasks SET status='in_progress', owner=?, claimed_at=?, updated=?, "
+            "progress_at=? "
             "WHERE id=? AND status<>'done' AND ("
             "  status='pending' "
             "  OR (status='in_progress' AND owner=?) "
-            "  OR (status='in_progress' AND claimed_at<>'' AND claimed_at < ?))",
-            (who, now, now, tid, who, cutoff))
+            "  OR (status='in_progress' AND claimed_at<>'' AND claimed_at < ?) "
+            "  OR (status='in_progress' AND (owner='' OR claimed_at='')))",
+            (who, now, now, now, tid, who, cutoff))
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
         if row is None:
             return f"任务 #{tid} 不存在", {}
         row = dict(row)
         if cur.rowcount == 1:
-            pass  # 认领成功：M4 开工资锚点移到 conn 事务外补写（见下方）
+            _touch_project_activity(conn, row["project"], now)
+            # 同一 owner 再次认领 = 续租，不是新认领；调用方据此给用户准确提示。
+            row["_renewed"] = renewed
+            if takeover:
+                row["_takeover"] = takeover
+                # R11：接管后旧持有者的文件租约立即失效，否则新主人一开工就撞自己的锁。
+                _release_leases_for_task(conn, tid, who, takeover)
+            _journal_row(
+                conn, who,
+                "续租任务" if renewed else (f"接管任务（{takeover}）" if takeover else "认领任务"),
+                f"tasks#{tid}", f"owner={who}｜{row['title'][:60]}")
+            # 认领成功：M4 开工资锚点移到 conn 事务外补写（见下方）
         elif row["status"] == "done":
             return f"认领失败：任务 #{tid} 已完成（{row['done_at'][:10]}）", row
         elif row["status"] == "in_progress" and row["owner"] != who:
             return (f"认领失败：任务 #{tid} 已被 {row['owner']} 认领"
-                    f"（{row['claimed_at'][:16]}；超 {CLAIM_TTL_HOURS}h 未更新可自动接管）"), row
+                    f"（{(row['claimed_at'] or '租约时间缺失')[:16]}；"
+                    f"超 {CLAIM_TTL_HOURS}h 未更新可自动接管）"), row
         elif row["status"] == "blocked":
             return (f"认领失败：任务 #{tid} 处于阻塞（等待 {row['blocked_by'] or '未知'}）；"
                     "解除后用 hub_task_update status=pending"), row
@@ -2265,13 +2433,14 @@ def task_claim(root: str, tid, agent: str) -> tuple:
     # 检查点时间线的起点）。必须在 conn 事务**外**写：嵌套连接会被写锁挡（busy_timeout
     # 后 OperationalError，被 except 吞了就静默丢失——2026-10-12 实测踩坑）。
     # 失败只降级，不影响认领结果。
-    try:
-        checkpoint_save(root, tid, who,
-                        f"开工：{row['title']}" + (f"——{row['detail'][:200]}"
-                                                  if row["detail"] else ""),
-                        kind="auto_claim")
-    except Exception:  # noqa: BLE001
-        pass
+    if not row.get("_renewed"):
+        try:
+            checkpoint_save(root, tid, who,
+                            f"开工：{row['title']}" + (f"——{row['detail'][:200]}"
+                                                      if row["detail"] else ""),
+                            kind="auto_claim")
+        except Exception:  # noqa: BLE001
+            pass
     return "", row
 
 
@@ -2280,9 +2449,13 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
                 deps: str = "", due: str = "") -> tuple:
     """任务状态流转（P3-2 + M1）：pending/in_progress/blocked/done。
     持有者约束：in_progress 任务只有 owner 本人（或空 agent=管理面）可流转；
-    →pending 释放并清 owner；→done 记 done_at 并**自动结晶**（M2：独立事务，失败只降级为
+    →pending 释放并清 owner/claimed_at/blocked_by（否则残留阻塞标记会让任务永远进不了前沿）；
+    →in_progress 必须署名，且与 hub_claim 同等地校验前置依赖——不能绕过认领闸门；
+    blocked 必须先 →pending 解除，不能直接跳 in_progress；blocked_by 传 "-" 可单独清除。
+    →done 记 done_at 并**自动结晶**（M2：独立事务，失败只降级为
     提示、不影响状态流转，结果附在返回行的 crystal 键）；done 后不可再改。
     M1 新字段：priority(0~3) / deps(前置 id，传 "-" 清除) / due(截止日，传 "-" 清除)。
+    R3：deps 拒绝自依赖与环（前向引用允许，成环拒绝），非法 id 串直接报错不静默清空。
     返回 (错误或 "", 行 dict)。"""
     who = _norm_agent(agent) or ""
     try:
@@ -2302,6 +2475,25 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
         if (row["status"] == "in_progress" and row["owner"] and who
                 and row["owner"] != who):
             return f"任务 #{tid} 由 {row['owner']} 持有，只有持有者（或空传 agent）可流转", row
+        blocked_raw = (blocked_by or "").strip()
+        if status == "in_progress":
+            if not who and not (row["owner"] or "").strip():
+                return f"任务 #{tid} 转 in_progress 必须署名（用 hub_claim 或 agent=...）", row
+            if row["status"] == "blocked":
+                return (f"任务 #{tid} 处于阻塞（{row['blocked_by'] or '未写原因'}）；"
+                        "先用 status=pending 解除，再认领"), row
+            if row["status"] == "pending":
+                waiting = _task_deps_waiting(conn, row)
+                if waiting:
+                    names = "、".join(
+                        f"#{w['id']} {w['title'][:20]}（{TASK_CN.get(w['status'], w['status'])}）"
+                        for w in waiting[:4])
+                    more = " 等" if len(waiting) > 4 else ""
+                    return f"任务 #{tid} 前置未完成——等待 {names}{more}", row
+            if (row["owner"] or "").strip() and who and row["owner"] != who:
+                return f"任务 #{tid} 由 {row['owner']} 持有，只有持有者（或空传 agent）可流转", row
+        if status == "blocked" and not (blocked_raw or (row["blocked_by"] or "").strip()):
+            return f"任务 #{tid} 转 blocked 需写明 blocked_by", row
         became_done = bool(status == "done" and row["status"] != "done")
         sets: list = []
         args: list = []
@@ -2311,17 +2503,25 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
             if status == "done":
                 sets.append("done_at=?")
                 args.append(_now())
-            if status == "pending":
+            elif status == "pending":
+                # 释放必须把阻塞标记一起清掉：pending + blocked_by 的组合会被前沿队列
+                # 当成「等待中」而永远不推荐，也会让认领多一道无谓拦截。
                 sets.append("owner=''")
                 sets.append("claimed_at=''")
-            if status == "in_progress" and not row["owner"] and who:
-                sets.append("owner=?")
-                args.append(who)
+                sets.append("blocked_by=''")
+            elif status == "in_progress":
+                if who:
+                    sets.append("owner=?")
+                    args.append(who)
                 sets.append("claimed_at=?")
                 args.append(_now())
-        if (blocked_by or "").strip():
-            sets.append("blocked_by=?")
-            args.append(blocked_by.strip()[:200])
+                sets.append("blocked_by=''")
+        if blocked_raw and status not in ("pending", "done", "in_progress"):
+            if blocked_raw == "-":
+                sets.append("blocked_by=''")
+            else:
+                sets.append("blocked_by=?")
+                args.append(blocked_raw[:200])
         if (detail or "").strip():
             sets.append("detail=?")
             args.append(detail.strip()[:2000])
@@ -2336,8 +2536,15 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
             if ds == "-":
                 sets.append("deps=''")
             else:
+                dep_ids = _parse_task_deps(ds)
+                if not dep_ids:
+                    return f"deps 无合法任务 id：{ds[:40]}（用逗号分隔任务编号）", row
+                cyc = _dep_cycle_path(conn, tid, dep_ids)
+                if cyc:
+                    return (f"依赖成环：{_dep_path_text(cyc)}（未更新；"
+                            "前置关系必须是有向无环图）"), row
                 sets.append("deps=?")
-                args.append(",".join(str(x) for x in _parse_task_deps(ds))[:200])
+                args.append(",".join(str(x) for x in dep_ids)[:200])
         du = (due or "").strip()
         if du:
             if du == "-":
@@ -2345,13 +2552,52 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
             else:
                 sets.append("due=?")
                 args.append(du[:20])
+        # 持有者在更新进展时顺手续租：任务被持续编辑说明人还在干，
+        # 不应因为忘了重新 hub_claim 就被 2h TTL 判死。
+        if (row["status"] == "in_progress" and row["owner"] and row["owner"] == who
+                and not any(s.startswith("claimed_at") for s in sets)):
+            sets.append("claimed_at=?")
+            args.append(_now())
         if not sets:
             return ("没有要更新的字段（status/blocked_by/detail/priority/deps/due "
                     "至少传一个）", row)
+        now_u = _now()
         sets.append("updated=?")
-        args.append(_now())
+        args.append(now_u)
+        # R26：真实任务动作才推进 progress_at；心跳续租不经过这里，故不计入推进。
+        sets.append("progress_at=?")
+        args.append(now_u)
         conn.execute(f"UPDATE tasks SET {', '.join(sets)} WHERE id=?", (*args, tid))
         out = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+        _touch_project_activity(conn, out["project"], out["updated"])
+        changes = []
+        if out["status"] != row["status"]:
+            changes.append(f"状态 {TASK_CN.get(row['status'], row['status'])}→"
+                           f"{TASK_CN.get(out['status'], out['status'])}")
+        if out["owner"] != row["owner"]:
+            changes.append(f"owner {row['owner'] or '无'}→{out['owner'] or '无'}")
+        if (out["blocked_by"] or "") != (row["blocked_by"] or ""):
+            changes.append("blocked_by " + ("清除" if not out["blocked_by"]
+                                            else out["blocked_by"][:40]))
+        if out["deps"] != row["deps"]:
+            changes.append("deps " + ("清除" if not out["deps"] else out["deps"][:40]))
+        if out["due"] != row["due"]:
+            changes.append("due " + ("清除" if not out["due"] else out["due"][:20]))
+        if out["priority"] != row["priority"]:
+            changes.append(f"priority {row['priority']}→{out['priority']}")
+        if (out["detail"] or "") != (row["detail"] or ""):
+            changes.append("detail 更新")
+        if out["claimed_at"] != row["claimed_at"] and out["status"] == "in_progress":
+            changes.append("租约更新")
+        # R11：任务离开在办（done/pending/blocked）或换人时，挂在其上的文件租约一并释放。
+        if row["status"] == "in_progress" and (
+                out["status"] != "in_progress"
+                or (out["owner"] or "") != (row["owner"] or "")):
+            _release_leases_for_task(
+                conn, tid, who or out["owner"] or "user",
+                "任务" + TASK_CN.get(out["status"], out["status"]))
+        _journal_row(conn, who or out["owner"] or "user", "任务流转", f"tasks#{tid}",
+                     "｜".join(changes) or "更新（字段值未变）")
     if became_done:
         # M2 完成链自动结晶：独立事务，失败只降级为提示、不影响状态流转
         try:
@@ -2378,6 +2624,38 @@ def _parse_task_deps(deps) -> list:
     return out
 
 
+def _dep_cycle_path(conn, tid: int, deps: list):
+    """R3：把 tid 的出边临时设为 deps，检测是否存在经过 tid 的依赖环。
+    有环返回 [tid, …, tid] 路径，无环返回 None（BFS，避免深链递归爆栈）。"""
+    graph = {r["id"]: _parse_task_deps(r["deps"]) for r in conn.execute(
+        "SELECT id, deps FROM tasks")}
+    graph[tid] = list(deps)
+    parent = {tid: None}
+    queue = [tid]
+    head = 0
+    while head < len(queue):
+        cur = queue[head]
+        head += 1
+        for nxt in graph.get(cur, []):
+            if nxt == tid:
+                path = []
+                x = cur
+                while x is not None:
+                    path.append(x)
+                    x = parent[x]
+                path.reverse()
+                path.append(tid)
+                return path
+            if nxt not in parent:
+                parent[nxt] = cur
+                queue.append(nxt)
+    return None
+
+
+def _dep_path_text(path: list) -> str:
+    return " → ".join(f"#{x}" for x in path)
+
+
 def _task_deps_waiting(conn, row: dict) -> list:
     """任务的未完成前置清单 [{'id','title','status'}]；全完成 → []。
     前置 id 不存在也算等待（拼写错误要可见——静默放行比卡住更坏）。"""
@@ -2397,8 +2675,61 @@ def _task_deps_waiting(conn, row: dict) -> list:
     return waiting
 
 
+def task_graph_audit(root: str) -> dict:
+    """R4 任务图结构审计（只读）：前置缺失 / 依赖成环 / pending 残留阻塞标记。
+    R3 已在写入口拒绝成环；这里兜存量数据与绕过接口直改库的情况，供巡检与看板共用。"""
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id,project,title,status,owner,blocked_by,deps FROM tasks")]
+    ids = {r["id"] for r in rows}
+    graph = {r["id"]: _parse_task_deps(r["deps"]) for r in rows}
+    dangling, residual = [], []
+    for r in rows:
+        missing = [d for d in graph[r["id"]] if d not in ids]
+        if missing:
+            r["_missing"] = missing
+            dangling.append(r)
+        if r["status"] == "pending" and (r["blocked_by"] or "").strip():
+            residual.append(r)
+    cycles, seen = [], set()
+    state: dict = {}
+    for start in sorted(ids):
+        if state.get(start, 0):
+            continue
+        state[start] = 1
+        stack = [(start, iter(graph.get(start, [])))]
+        path = [start]
+        while stack:
+            node, it = stack[-1]
+            try:
+                nxt = next(it)
+            except StopIteration:
+                state[node] = 2
+                stack.pop()
+                path.pop()
+                continue
+            if nxt not in ids:
+                continue
+            st = state.get(nxt, 0)
+            if st == 0:
+                state[nxt] = 1
+                stack.append((nxt, iter(graph.get(nxt, []))))
+                path.append(nxt)
+            elif st == 1:
+                cyc = path[path.index(nxt):] + [nxt]
+                key = frozenset(cyc)
+                if key not in seen:
+                    seen.add(key)
+                    cycles.append(cyc)
+    cycles.sort(key=lambda c: min(c))
+    return {"dangling": dangling, "cycles": cycles, "residual_blocked": residual,
+            "counts": {"dangling": len(dangling), "cycles": len(cycles),
+                       "residual_blocked": len(residual)}}
+
+
 def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> dict:
     """M1 前沿队列（Frontier）：依赖已满足、可直接开工的待办推荐；附进行中/可接管/等待。
+    R2：可接管段同时收「租约过期」「无主」「租约缺失」三类（附 _takeover 原因）。
     排序：priority（0 急 → 3 低）→ id（先来先做）。纯只读。返回结构化 dict 供 MCP 层排版。"""
     try:
         lim = max(1, min(int(limit or 5), 20))
@@ -2420,10 +2751,19 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
             except (TypeError, ValueError):
                 r["_priority"] = DEFAULT_PRIORITY
             if r["status"] == "in_progress":
-                expired = bool(r["claimed_at"]) and r["claimed_at"] < cutoff
-                if expired and r["owner"] != me:
+                owner_s = (r["owner"] or "").strip()
+                lease_s = (r["claimed_at"] or "").strip()
+                expired = bool(lease_s) and lease_s < cutoff
+                # R2：无主/无租约的在办任务是「可接管」而不是「进行中」——
+                # 否则看板会把一条谁也认领不了（旧代码）或没人负责的活当成有人在干。
+                unleased = (not owner_s) or (not lease_s)
+                if unleased and (not owner_s or owner_s != me):
+                    r["_takeover"] = "无主" if not owner_s else "租约缺失"
                     takeover.append(r)
-                elif (not me) or r["owner"] == me:
+                elif expired and owner_s != me:
+                    r["_takeover"] = "租约过期"
+                    takeover.append(r)
+                elif (not me) or owner_s == me:
                     doing.append(r)
                 continue
             wait = _task_deps_waiting(conn, r)
@@ -2439,6 +2779,624 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
             "waiting": waiting[:lim],
             "counts": {"ready": len(ready), "doing": len(doing),
                        "takeover": len(takeover), "waiting": len(waiting)}}
+
+
+def _age_hours(stamp: str, now: datetime.datetime):
+    """时间戳 → 距今小时数（一位小数）；空/坏时间返回 None，不猜。"""
+    if not (stamp or "").strip():
+        return None
+    try:
+        return round((now - datetime.datetime.fromisoformat(stamp)).total_seconds() / 3600, 1)
+    except (TypeError, ValueError):
+        return None
+
+
+def _task_progress(row: dict, last_cp: str, now: datetime.datetime) -> tuple:
+    """在办任务的最后推进 → (距今小时数, 是否停滞)。
+
+    推进信号取 tasks.progress_at 与最新**手工**检查点的较新者：认领、状态流转、改详情、
+    写检查点都会写 progress_at，检查点单独取一次防「只存进展、任务行没动」。不能用
+    tasks.updated——心跳续租也会刷它，等于把「人在线」冒充成「任务在走」，停滞永远不可见。
+    老行无 progress_at（迁移前由旧进程写入）时回落 updated，宁可晚发现也不误报。
+    非在办任务返回 (None, False)；无推进证据返回 (None, True)。
+    """
+    if row.get("status") != "in_progress":
+        return None, False
+    own = (row.get("progress_at") or "").strip() or (row.get("updated") or "").strip()
+    last = max(own, (last_cp or "").strip())
+    if not last:
+        return None, True
+    age = _age_hours(last, now)
+    if age is None:
+        return None, True
+    return age, age >= TASK_PROGRESS_STALL_HOURS
+
+
+def _checkpoint_index(conn) -> dict:
+    """任务 → 最新手工检查点时间（一次批量查询，供看板/巡检共用）。
+
+    认领自动锚点（auto_claim）是系统写的起点标记，不是推进证据；认领本身已写
+    progress_at，计入锚点会让「领了就停」的任务多骗一个停滞窗口。
+    """
+    return {r["task_id"]: r["ts"] for r in conn.execute(
+        "SELECT task_id, MAX(ts) AS ts FROM checkpoints "
+        "WHERE kind<>'auto_claim' GROUP BY task_id")}
+
+
+def _sessions_index(conn) -> dict:
+    """agent → 最近心跳时间（同一 agent 多项目会话取最新；一次批量查询）。"""
+    return {r["agent"]: r["ts"] for r in conn.execute(
+        "SELECT agent, MAX(ts) AS ts FROM sessions GROUP BY agent")}
+
+
+def _task_clock_fields(row: dict, cps: dict, sessions: dict,
+                       now: datetime.datetime) -> dict:
+    """R27 任务时间口径：推进/检查点/心跳分开，谁都不能冒充谁。
+
+    心跳是 **agent 级** 的存活信号（owner 的最近心跳），不是任务级进度；
+    检查点是任务级断点，但认领自动锚点不算推进；推进以 progress_at 为准。
+    """
+    cp = (cps or {}).get(row.get("id"), "") or ""
+    hb = (sessions or {}).get(_norm_agent(row.get("owner") or "") or "", "") or ""
+    age, stalled = _task_progress(row, cp, now)
+    return {"_last_cp": cp,
+            "_last_cp_age_h": _age_hours(cp, now),
+            "_heartbeat_at": hb,
+            "_heartbeat_age_h": _age_hours(hb, now),
+            "_progress_age_h": age,
+            "_progress_stall": stalled}
+
+
+def _task_lease(row: dict, cutoff: str, now: datetime.datetime) -> tuple:
+    """在办任务租约状态 → (state, 剩余小时)；非在办返回 ("", None)。
+
+    口径与 task_claim/task_next 一致：无主/租约缺失可接管，claimed_at 早于 cutoff 过期。
+    """
+    if row.get("status") != "in_progress":
+        return "", None
+    if not (row.get("owner") or "").strip():
+        return "ownerless", None
+    lease = (row.get("claimed_at") or "").strip()
+    if not lease:
+        return "unleased", None
+    left = None
+    try:
+        left = round(CLAIM_TTL_HOURS
+                     - (now - datetime.datetime.fromisoformat(lease)).total_seconds() / 3600, 1)
+    except ValueError:
+        pass
+    return ("expired" if lease < cutoff else "ok"), left
+
+
+def task_holdings(root: str) -> dict:
+    """在办任务按持有者归组（R7 控制面）：谁手里压着活、租约是否还有效。
+
+    一次只读查询供 hub_list_agents / hub_agent status 共用；空 owner 的行归到 "" 键
+    （无主在办不隐藏）。每行附 _lease_state ∈ ok/unleased/expired/ownerless 与
+    _lease_left_h（剩余小时，租约时间不可解析时为 None）。
+    """
+    now = datetime.datetime.now()
+    cutoff = _claim_cutoff()
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, project, title, status, owner, claimed_at, due, priority, updated, "
+            "progress_at FROM tasks WHERE status='in_progress' ORDER BY id")]
+        cps = _checkpoint_index(conn)
+        sessions = _sessions_index(conn)
+    groups: dict = {}
+    for r in rows:
+        state, left = _task_lease(r, cutoff, now)
+        r["_lease_state"] = state
+        r["_lease_left_h"] = left
+        r.update(_task_clock_fields(r, cps, sessions, now))
+        groups.setdefault(_norm_agent(r.get("owner") or ""), []).append(r)
+    return groups
+
+
+def task_annotate(root: str, rows: list) -> list:
+    """给任务行补看板注解（R8）：截止紧迫度、前置完成度、阻塞原因、租约状态。
+
+    hub_tasks / hub_next / CLI 共用；一次批量取前置状态，不逐行查库。纯只读、原地补字段：
+    _due_state(overdue/today/upcoming/invalid) / _due_days / _deps_info[{id,title,status}] /
+    _block_note / _lease_state / _lease_left_h / _locks / _progress_age_h / _progress_stall /
+    R27 时钟：_last_cp / _last_cp_age_h / _heartbeat_at / _heartbeat_age_h（心跳为 agent 级）。
+    R30 饥饿：_age_days（可开工的 pending 建了几天）/ _starve_days（≥ TASK_STARVE_DAYS 时同上）。
+    """
+    now = datetime.datetime.now()
+    today = now.date()
+    cutoff = _claim_cutoff()
+    with db_conn(root) as conn:
+        ref = {r["id"]: dict(r) for r in conn.execute(
+            "SELECT id, title, status FROM tasks")}
+        lock_counts = {r["task_id"]: r["n"] for r in conn.execute(
+            "SELECT task_id, COUNT(*) AS n FROM file_leases "
+            "WHERE task_id>0 AND released_at='' AND expires_at>? GROUP BY task_id",
+            (_now(),))}
+        cps = _checkpoint_index(conn)
+        sessions = _sessions_index(conn)
+    for t in rows:
+        due = (t.get("due") or "").strip()
+        t["_due_state"], t["_due_days"] = "", None
+        if due and t.get("status") != "done":
+            try:
+                days = (datetime.date.fromisoformat(due[:10]) - today).days
+                t["_due_days"] = days
+                t["_due_state"] = ("overdue" if days < 0
+                                   else "today" if days == 0 else "upcoming")
+            except ValueError:
+                t["_due_state"] = "invalid"
+        t["_deps_info"] = []
+        for i in _parse_task_deps(t.get("deps") or ""):
+            dep = ref.get(i)
+            t["_deps_info"].append({"id": i,
+                                    "title": (dep or {}).get("title", ""),
+                                    "status": (dep or {}).get("status", "missing")})
+        block = (t.get("blocked_by") or "").strip()
+        if not block or t.get("status") not in ("blocked", "pending"):
+            t["_block_note"] = ""
+        elif t.get("status") == "blocked":
+            t["_block_note"] = block
+        else:
+            t["_block_note"] = f"{block}（残留标记，可清除）"
+        # R30 待办饥饿：pending、无显式阻塞、前置全完成，却建了很久没人认领。
+        # 等依赖/等外部条件不是「没人干」而是「还干不了」，单独归 waiting/blocked。
+        t["_age_days"] = None
+        t["_starve_days"] = None
+        if (t.get("status") == "pending" and not block
+                and all(d["status"] == "done" for d in t["_deps_info"])):
+            age_days = _age_hours(t.get("created"), now)
+            if age_days is not None:
+                t["_age_days"] = round(age_days / 24, 1)
+                if t["_age_days"] >= TASK_STARVE_DAYS:
+                    t["_starve_days"] = t["_age_days"]
+        state, left = _task_lease(t, cutoff, now)
+        t["_lease_state"], t["_lease_left_h"] = state, left
+        t["_locks"] = lock_counts.get(t.get("id"), 0)
+        t.update(_task_clock_fields(t, cps, sessions, now))
+    return rows
+
+
+def _task_priority(row: dict) -> int:
+    """任务优先级归一（0 是合法急件，不能用 `or DEFAULT_PRIORITY` 吞掉）。"""
+    try:
+        return int(row.get("priority"))
+    except (TypeError, ValueError):
+        return DEFAULT_PRIORITY
+
+
+def task_starvation(root: str, days=None, limit: int = 20) -> dict:
+    """R30 待办饥饿清单（只读）：能开工却长期没人认领的 pending 任务。
+
+    与「等待」区分：前置未完成、显式 blocked_by 的任务不算饥饿——还干不了，不是没人干；
+    前置 id 不存在的属于结构缺陷（tasks_health 已单列），同样不算。
+    年龄取 created，时间不可解析不猜（跳过）。排序：最久优先，同龄急件优先。
+    """
+    try:
+        window = float(days) if days is not None else float(TASK_STARVE_DAYS)
+    except (TypeError, ValueError):
+        window = float(TASK_STARVE_DAYS)
+    rows = task_list(root, status="pending", limit=500)
+    task_annotate(root, rows)
+    starving = [r for r in rows
+                if r.get("_age_days") is not None and r["_age_days"] >= window]
+    starving.sort(key=lambda t: (-t["_age_days"], _task_priority(t), t["id"]))
+    by_priority: dict = {}
+    for r in starving:
+        pr = _task_priority(r)
+        by_priority[pr] = by_priority.get(pr, 0) + 1
+    try:
+        lim = max(1, min(int(limit), 200))
+    except (TypeError, ValueError):
+        lim = 20
+    return {"starving": starving[:lim], "window_days": window,
+            "oldest_days": starving[0]["_age_days"] if starving else None,
+            "by_priority": by_priority,
+            "counts": {"starving": len(starving)}}
+
+
+# ---------------------------------------------------------------- R11 文件租约（咨询式）
+
+def _file_lock_ttl(ttl_min) -> int:
+    try:
+        n = int(ttl_min)
+    except (TypeError, ValueError):
+        return FILE_LEASE_TTL_MIN
+    return max(FILE_LEASE_TTL_FLOOR, min(n, FILE_LEASE_TTL_CAP))
+
+
+def _file_lock_path(root: str, path: str) -> tuple:
+    """路径规范化 → (错误或 "", 规范 key, 展示路径, 根内首段项目名或 "")。
+
+    接受根内相对路径（相对数据根）与任意绝对路径（部署目录/agent 工作区也能锁）。
+    key 用 normcase + 正斜杠统一大小写与分隔符——Windows 上同一文件的多种写法
+    必须判成同一把锁，否则冲突检测形同虚设。"""
+    raw = (path or "").strip().strip('"').strip("'")
+    if not raw:
+        return "path 必填", "", "", ""
+    if "\x00" in raw:
+        return "path 含非法字符 NUL", "", "", ""
+    if len(raw) > 500:
+        return f"path 过长（{len(raw)} > 500）", "", "", ""
+    expanded = os.path.expanduser(raw)
+    if not os.path.isabs(expanded):
+        expanded = os.path.join(root, expanded)
+    absolute = os.path.abspath(os.path.normpath(expanded))
+    root_abs = os.path.abspath(os.path.normpath(root))
+    if os.path.normcase(absolute).rstrip("\\/") == os.path.normcase(root_abs).rstrip("\\/"):
+        return "不能锁数据根目录本身（等于锁全机）；请锁具体文件或子目录", "", "", ""
+    key = os.path.normcase(absolute).replace("\\", "/").rstrip("/")
+    display = absolute.replace("\\", "/")
+    project = ""
+    try:
+        rel = os.path.relpath(absolute, root_abs)
+    except ValueError:
+        rel = ""
+    if rel and rel != ".." and not rel.startswith(".." + os.sep) and not os.path.isabs(rel):
+        display = rel.replace(os.sep, "/")
+        first = rel.split(os.sep)[0]
+        # 根内首段是真实目录才算项目；根下散文件、_hub 等保留目录不冒充项目
+        if first and not first.startswith("_") and os.path.isdir(os.path.join(root_abs, first)):
+            project = first
+    return "", key, display, project
+
+
+def _file_lock_conflict(a: str, b: str) -> bool:
+    """两个规范路径是否覆盖同一范围：相等，或互为祖先/子孙（锁目录=覆盖其下文件）。"""
+    return a == b or a.startswith(b + "/") or b.startswith(a + "/")
+
+
+def _file_lock_row(row: dict, now: datetime.datetime) -> dict:
+    out = dict(row)
+    left = None
+    try:
+        left = (datetime.datetime.fromisoformat(out["expires_at"]) - now).total_seconds() / 60
+    except (TypeError, ValueError):
+        left = None
+    out["_expired"] = left is None or left <= 0
+    out["_left_min"] = max(0, int(round(left))) if left is not None else 0
+    out["_active"] = not out.get("released_at") and not out["_expired"]
+    return out
+
+
+def file_lease_acquire(root: str, path: str, agent: str, task_id=None,
+                       ttl_min=FILE_LEASE_TTL_MIN, reason: str = "",
+                       project: str = "") -> tuple:
+    """R11 获取文件/目录租约（咨询式：不拦写盘，但让后来者看见冲突）。
+
+    同一 agent 对同一路径再次 acquire = 续租（不新增行、fence 不变）。
+    冲突判定含祖先/子孙；冲突时返回持有人、租约号、剩余分钟、任务与理由，供调用方协调。
+    过期租约在 acquire 时顺带标记 released_by='expiry'，不阻塞后来者。
+    挂任务（task_id）时必须「任务在办且本人持有」——租约跟任务生命周期走。
+    返回 (错误或 "", 租约行 dict)。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填（租约必须署名）", {}
+    err, key, display, derived = _file_lock_path(root, path)
+    if err:
+        return err, {}
+    ttl = _file_lock_ttl(ttl_min)
+    tid = 0
+    raw_tid = task_id.strip() if isinstance(task_id, str) else task_id
+    if raw_tid not in (None, ""):
+        try:
+            tid = int(raw_tid)
+        except (TypeError, ValueError):
+            return f"任务 id 非法：{task_id!r}", {}
+    now_dt = datetime.datetime.now()
+    now = now_dt.isoformat(timespec="seconds")
+    expires = (now_dt + datetime.timedelta(minutes=ttl)).isoformat(timespec="seconds")
+    with db_conn(root) as conn:
+        busy = _begin_write(conn)
+        if busy:
+            return busy, {}
+        if tid:
+            trow = conn.execute(
+                "SELECT status,owner FROM tasks WHERE id=?", (tid,)).fetchone()
+            if trow is None:
+                return f"任务 #{tid} 不存在（文件租约必须挂真实任务）", {}
+            if trow["status"] != "in_progress":
+                return (f"任务 #{tid} 当前是 {TASK_CN.get(trow['status'], trow['status'])}；"
+                        "先 hub_claim 认领，锁文件才挂得上"), {}
+            if (trow["owner"] or "").strip() != who:
+                return (f"任务 #{tid} 由 {trow['owner'] or '无主'} 持有；"
+                        "只有持有者能给它锁文件（先 hub_claim）"), {}
+        actives = [dict(r) for r in conn.execute(
+            "SELECT * FROM file_leases WHERE released_at=''")]
+        same_own, conflicts = [], []
+        for r in actives:
+            if not _file_lock_conflict(key, r["path"]):
+                continue
+            dec = _file_lock_row(r, now_dt)
+            if not dec["_active"]:
+                conn.execute(
+                    "UPDATE file_leases SET released_at=?, released_by='expiry' "
+                    "WHERE id=? AND released_at=''", (now, r["id"]))
+            elif r["owner"] == who:
+                same_own.append(r)
+            else:
+                conflicts.append(dec)
+        if conflicts:
+            c = conflicts[0]
+            more = f"；另有 {len(conflicts) - 1} 条冲突" if len(conflicts) > 1 else ""
+            tid_s = f"｜任务 #{c['task_id']}" if c["task_id"] else ""
+            reason_s = f"｜{c['reason'][:60]}" if c["reason"] else ""
+            return (f"文件被占用：{c['display_path'] or c['path']} 由 {c['owner']} 持有"
+                    f"（租约 #{c['id']}，剩 {c['_left_min']} 分钟{tid_s}{reason_s}）{more}。"
+                    "不要并发编辑——等其释放、改走别的文件，或 hub_signal_send 协调。"), c
+        for r in same_own:
+            if r["path"] == key:  # 同路径再 acquire = 续租
+                conn.execute(
+                    "UPDATE file_leases SET renewed_at=?, expires_at=?, ttl_min=?, "
+                    "task_id=?, reason=? WHERE id=?",
+                    (now, expires, ttl, tid or r["task_id"],
+                     (reason or "").strip()[:200] or r["reason"], r["id"]))
+                row = dict(conn.execute(
+                    "SELECT * FROM file_leases WHERE id=?", (r["id"],)).fetchone())
+                out = _file_lock_row(row, now_dt)
+                out["_renewed"] = True
+                _journal_row(conn, who, "续租文件", f"lock#{r['id']}",
+                             f"{display}｜TTL {ttl}min")
+                return "", out
+        fence = conn.execute(
+            "SELECT COALESCE(MAX(fence),0)+1 FROM file_leases WHERE path=?",
+            (key,)).fetchone()[0]
+        cur = conn.execute(
+            "INSERT INTO file_leases(path,display_path,project,owner,task_id,reason,ttl_min,"
+            "fence,acquired_at,renewed_at,expires_at) VALUES(?,?,?,?,?,?,?,?,?,?,?)",
+            (key, display, (project or "").strip()[:200] or derived, who, tid,
+             (reason or "").strip()[:200], ttl, fence, now, now, expires))
+        lid = cur.lastrowid
+        row = dict(conn.execute(
+            "SELECT * FROM file_leases WHERE id=?", (lid,)).fetchone())
+        _journal_row(conn, who, "获取文件租约", f"lock#{lid}",
+                     f"{display}｜TTL {ttl}min" + (f"｜tasks#{tid}" if tid else ""))
+        return "", _file_lock_row(row, now_dt)
+
+
+def file_lease_renew(root: str, lease_id, agent: str, ttl_min=None) -> tuple:
+    """R11 续租（仅持有者）。过期但未被别人抢走仍可续——任务还在自己手里时不该因
+    忘了续锁而被自己锁在门外；已被他人持有则拒绝并说明冲突。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填（续租必须署名）", {}
+    try:
+        lid = int(lease_id)
+    except (TypeError, ValueError):
+        return f"租约 id 非法：{lease_id!r}", {}
+    now_dt = datetime.datetime.now()
+    now = now_dt.isoformat(timespec="seconds")
+    with db_conn(root) as conn:
+        busy = _begin_write(conn)
+        if busy:
+            return busy, {}
+        row = conn.execute("SELECT * FROM file_leases WHERE id=?", (lid,)).fetchone()
+        if row is None:
+            return f"租约 #{lid} 不存在", {}
+        row = dict(row)
+        if row["released_at"]:
+            return (f"租约 #{lid} 已释放（{row['released_by'] or '?'}｜"
+                    f"{row['released_at'][:16]}）；需要时重新 acquire"), row
+        if row["owner"] != who:
+            return f"租约 #{lid} 由 {row['owner']} 持有，只有持有者可续租", row
+        for other in [dict(r) for r in conn.execute(
+                "SELECT * FROM file_leases WHERE released_at='' AND id<>?", (lid,))]:
+            if other["owner"] == who or not _file_lock_conflict(row["path"], other["path"]):
+                continue
+            dec = _file_lock_row(other, now_dt)
+            if dec["_active"]:
+                return (f"续租失败：{row['display_path']} 已被 {other['owner']} 持有"
+                        f"（租约 #{other['id']}，剩 {dec['_left_min']} 分钟）；改走协调"), other
+        ttl = _file_lock_ttl(ttl_min if ttl_min is not None else row["ttl_min"])
+        expires = (now_dt + datetime.timedelta(minutes=ttl)).isoformat(timespec="seconds")
+        conn.execute(
+            "UPDATE file_leases SET renewed_at=?, expires_at=?, ttl_min=? "
+            "WHERE id=? AND released_at=''", (now, expires, ttl, lid))
+        fresh = dict(conn.execute("SELECT * FROM file_leases WHERE id=?", (lid,)).fetchone())
+        _journal_row(conn, who, "续租文件", f"lock#{lid}",
+                     f"{fresh['display_path']}｜TTL {ttl}min")
+        return "", _file_lock_row(fresh, now_dt)
+
+
+def file_lease_release(root: str, lease_id=None, path: str = "", agent: str = "",
+                       reason: str = "") -> tuple:
+    """R11 释放（仅持有者）：lease_id 精确释放；只给 path 则释放自己在该路径的活跃租约。
+    返回 (错误或 "", 释放条数)。fence 保留——历史租约仍是迟到写入的对照凭据。"""
+    who = _norm_agent(agent)
+    if not who:
+        return "agent 必填（释放必须署名，防他人代释放）", 0
+    now = _now()
+    with db_conn(root) as conn:
+        busy = _begin_write(conn)
+        if busy:
+            return busy, 0
+        if lease_id not in (None, ""):
+            try:
+                lid = int(lease_id)
+            except (TypeError, ValueError):
+                return f"租约 id 非法：{lease_id!r}", 0
+            row = conn.execute("SELECT * FROM file_leases WHERE id=?", (lid,)).fetchone()
+            if row is None:
+                return f"租约 #{lid} 不存在", 0
+            if row["owner"] != who:
+                return f"租约 #{lid} 由 {row['owner']} 持有，不能代释放", 0
+            if row["released_at"]:
+                return (f"租约 #{lid} 已于 {row['released_at'][:16]} 释放"
+                        f"（{row['released_by'] or '?'}）"), 0
+            conn.execute(
+                "UPDATE file_leases SET released_at=?, released_by=? "
+                "WHERE id=? AND released_at=''", (now, who, lid))
+            _journal_row(conn, who, "释放文件租约", f"lock#{lid}",
+                         f"{row['display_path']}" + (f"｜{reason[:80]}" if reason else ""))
+            return "", 1
+        err, key, display, _ = _file_lock_path(root, path)
+        if err:
+            return err, 0
+        cur = conn.execute(
+            "UPDATE file_leases SET released_at=?, released_by=? "
+            "WHERE path=? AND owner=? AND released_at=''", (now, who, key, who))
+        if not cur.rowcount:
+            return f"没有找到你在 {display} 上的活跃租约（用 action=list 查看）", 0
+        _journal_row(conn, who, "释放文件租约", f"path:{display}",
+                     f"{cur.rowcount} 个" + (f"｜{reason[:80]}" if reason else ""))
+        return "", cur.rowcount
+
+
+def file_lease_prune(root: str, agent: str = "", limit: int = 200) -> tuple:
+    """R13 回收过期未释放的租约（安全 GC）：只动 `released_at=''` 且已过期的行。
+
+    为什么需要：过期租约本身不拦人（check/acquire 只认未过期），但没人再 acquire
+    同一路径时它们会永久留在台账里——巡检只能报数、CLI 又不能代他人释放，形成
+    「看得见清不掉」的卫生死角。回收只把行标记为 released_by='expiry'，保留记录
+    （fence/历史仍是迟到写入的对照凭据）。活跃租约**永不触碰**。
+    返回 (错误或 "", 被回收的行列表)；重复调用幂等。
+    """
+    who = _norm_agent(agent) or "system"
+    now = _now()
+    try:
+        cap = max(1, min(int(limit or 200), 500))
+    except (TypeError, ValueError):
+        cap = 200
+    with db_conn(root) as conn:
+        busy = _begin_write(conn)
+        if busy:
+            return busy, []
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM file_leases WHERE released_at='' AND expires_at<=? "
+            "ORDER BY id LIMIT ?", (now, cap))]
+        if not rows:
+            return "", []
+        # 只统计真正更新成功的行：并发 prune 时另一进程可能已先释放（rowcount=0），
+        # 把它计入回报/审计会制造「回收了 N 条」的假账。
+        released = []
+        for r in rows:
+            cur = conn.execute(
+                "UPDATE file_leases SET released_at=?, released_by='expiry' "
+                "WHERE id=? AND released_at=''", (now, r["id"]))
+            if cur.rowcount:
+                r["released_at"], r["released_by"] = now, "expiry"
+                released.append(r)
+        if not released:
+            return "", []
+        ids = "、".join(f"#{r['id']}" for r in released[:10])
+        more = f" 等 {len(released)} 条" if len(released) > 10 else ""
+        _journal_row(conn, who, "回收过期文件租约", "expired",
+                     f"{len(released)} 条：{ids}{more}")
+    return "", released
+
+
+def file_lease_list(root: str, path: str = "", project: str = "", owner: str = "",
+                    include_released: bool = False, limit: int = 50) -> list:
+    """R11 租约台账（新在前）：默认只看未释放（含已过期未清理的，标 _expired）。
+    传 path 按规范化后的**同一路径**过滤；project/owner 同样可过滤。"""
+    q = "SELECT * FROM file_leases WHERE 1=1"
+    args: list = []
+    if path:
+        err, key, _, _ = _file_lock_path(root, path)
+        if err:
+            return []
+        q += " AND path=?"
+        args.append(key)
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    if owner:
+        q += " AND owner=?"
+        args.append(_norm_agent(owner))
+    if not include_released:
+        q += " AND released_at=''"
+    q += " ORDER BY id DESC LIMIT ?"
+    args.append(max(1, min(int(limit or 50), 200)))
+    now = datetime.datetime.now()
+    with db_conn(root) as conn:
+        return [_file_lock_row(dict(r), now) for r in conn.execute(q, args)]
+
+
+def file_lease_check(root: str, path: str) -> dict:
+    """R11 只读查占：某路径当前是否被谁持有（冲突含祖先/子孙）。不写库。"""
+    err, key, display, derived = _file_lock_path(root, path)
+    if err:
+        return {"error": err, "path": "", "display_path": "", "project": "", "free": None,
+                "holders": []}
+    now = datetime.datetime.now()
+    fresh = now.isoformat(timespec="seconds")
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM file_leases WHERE released_at='' AND expires_at>?", (fresh,))]
+        project = derived
+        for r in rows:
+            if _file_lock_conflict(key, r["path"]):
+                project = r["project"] or project
+                break
+        holders = []
+        for r in rows:
+            if not _file_lock_conflict(key, r["path"]):
+                continue
+            dec = _file_lock_row(r, now)
+            if dec["_active"]:
+                holders.append(dec)
+    return {"path": key, "display_path": display, "project": project,
+            "free": not holders, "holders": holders}
+
+
+def file_lease_renew_for_agent(root: str, agent: str) -> int:
+    """R11 心跳续租：只续「挂在本人正在进行任务上」的租约。返回续租条数。
+
+    未挂任务的租约**不**自动续——一把忘记释放的锁若被心跳永久续命，反而制造死锁。
+    """
+    who = _norm_agent(agent)
+    if not who:
+        return 0
+    now_dt = datetime.datetime.now()
+    now = now_dt.isoformat(timespec="seconds")
+    renewed = 0
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT l.* FROM file_leases l JOIN tasks t ON l.task_id=t.id "
+            "WHERE l.owner=? AND l.released_at='' AND l.task_id>0 "
+            "AND t.status='in_progress' AND t.owner=?", (who, who))]
+        for row in rows:
+            expires = (now_dt + datetime.timedelta(
+                minutes=_file_lock_ttl(row["ttl_min"]))).isoformat(timespec="seconds")
+            cur = conn.execute(
+                "UPDATE file_leases SET renewed_at=?, expires_at=? "
+                "WHERE id=? AND released_at=''", (now, expires, row["id"]))
+            renewed += cur.rowcount
+    return renewed
+
+
+def file_lease_project_active(root: str, project: str, exclude_agent: str = "",
+                              limit: int = 5) -> list:
+    """R11 心跳提示：本项目当前被**其他 agent** 持有的活跃文件租约（按到期先后）。"""
+    if not project:
+        return []
+    now_dt = datetime.datetime.now()
+    now = now_dt.isoformat(timespec="seconds")
+    who = _norm_agent(exclude_agent)
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM file_leases WHERE project=? AND released_at='' "
+            "AND expires_at>? AND owner<>? ORDER BY expires_at ASC LIMIT ?",
+            (project, now, who, max(1, min(int(limit or 5), 20))))]
+    return [_file_lock_row(r, now_dt) for r in rows]
+
+
+def _release_leases_for_task(conn, task_id, agent: str, reason: str = "") -> int:
+    """R11 任务生命周期联动：任务离开本人手中时，挂在它上面的文件租约一并释放。
+    与任务流转同事务，供 task_claim 接管 / task_update 流转（done/pending/blocked/换人）调用。"""
+    try:
+        tid = int(task_id or 0)
+    except (TypeError, ValueError):
+        return 0
+    if not tid:
+        return 0
+    cur = conn.execute(
+        "UPDATE file_leases SET released_at=?, released_by=? "
+        "WHERE task_id=? AND released_at=''",
+        (_now(), _norm_agent(agent) or "system", tid))
+    if cur.rowcount:
+        _journal_row(conn, agent, "释放任务文件租约", f"tasks#{tid}",
+                     f"{cur.rowcount} 个｜{reason[:80]}")
+    return cur.rowcount
 
 
 def task_crystallize(root: str, tid, force: bool = False) -> tuple:
@@ -2474,6 +3432,9 @@ def task_crystallize(root: str, tid, force: bool = False) -> tuple:
             rec_args.append(row["done_at"])
         rec_sql += " ORDER BY id ASC LIMIT 50"
         recs = [dict(r) for r in conn.execute(rec_sql, rec_args)]
+        cp_count = conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE task_id=? AND kind!='auto_claim'",
+            (tid,)).fetchone()[0]
     # 组装正文（事务外）：任务卡 + 关联记录清单
     owner = (row.get("owner") or "").strip()
     span = f"{(row['created'] or '')[:10]} → {(row.get('done_at') or row.get('updated') or '')[:10]}"
@@ -2500,7 +3461,11 @@ def task_crystallize(root: str, tid, force: bool = False) -> tuple:
         with db_conn(root) as conn2:
             conn2.execute("UPDATE records SET status='deleted', valid_until=? WHERE id=?",
                           (_now()[:10], oid))
-    return "", f"结晶完成：记录 #{rid}（关联 {len(recs)} 条）｜任务 #{tid}「{row['title'][:40]}」"
+    summary = (f"结晶完成：记录 #{rid}（关联 {len(recs)} 条）｜任务 #{tid}「{row['title'][:40]}」")
+    if not recs and not cp_count:
+        summary += ("｜⚠️ 无完成证据：任务期间没有工作记录或手工检查点，"
+                    "结晶只有任务卡——下次完成前先 hub_checkpoint 或 hub_log_work")
+    return "", summary
 
 
 def event_add(root: str, content: str, kind: str = "progress", project: str = "",
@@ -2691,9 +3656,12 @@ def _live_sql(a: str = "") -> str:
 
 
 def _rec_live_sql(a: str = "") -> str:
-    """records 版「现行有效」条件（P1-1）：未软删 + 未失效。撤销 = status 软删 + valid_until 落值，
-    行保留可追溯（双时相"失效≠删除"）；检索/召回路径一律走本过滤。"""
-    return f"{a}status='active' AND ({a}valid_until='' OR {a}valid_until>=date('now'))"
+    """records 版「现行有效」条件（P1-1）：未软删 + 未被取代 + 未失效。撤销 = status 软删 +
+    valid_until 落值；被新版本取代 = superseded_by 指过去。行一律保留可追溯（双时相
+    "失效≠删除"），检索/召回路径走本过滤。
+    COALESCE 兜 NULL：老库/手工 UPDATE 可能留下 NULL（`NULL=0` 为假会把记录静默漏掉）。"""
+    return (f"{a}status='active' AND COALESCE({a}superseded_by,0)=0 "
+            f"AND ({a}valid_until='' OR {a}valid_until>=date('now'))")
 
 
 def live_version(root: str, mid: int) -> int:
@@ -2731,6 +3699,32 @@ def supersede_memory(root: str, old_id: int, new_id: int) -> str:
                      (new_id, _now(), old_id))
         conn.execute("UPDATE memories SET superseded_by=0, updated=? WHERE id=?",
                      (_now(), new_id))
+    return ""
+
+
+def supersede_record(root: str, old_id: int, new_id: int) -> str:
+    """显式「#new 取代 #old」：给已存在的两条工作记录建立取代关系。返回错误或 ""。
+
+    与记忆版同语义：旧条退出检索/时间线汇总（_rec_live_sql 过滤 superseded_by=0），
+    但行、正文与双链保留——hub_get_record 仍可按 id 精读，便于追溯。
+    反向调用即撤销（keep/drop 互换）。"""
+    try:
+        old_id, new_id = int(old_id or 0), int(new_id or 0)
+    except (TypeError, ValueError):
+        return "old_id / new_id 必须是正整数"
+    if old_id <= 0 or new_id <= 0:
+        return "old_id / new_id 必须是正整数"
+    if old_id == new_id:
+        return "不能自己取代自己"
+    with db_conn(root) as conn:
+        a = conn.execute("SELECT id, status FROM records WHERE id=?", (old_id,)).fetchone()
+        b = conn.execute("SELECT id, status FROM records WHERE id=?", (new_id,)).fetchone()
+        if not a or not b:
+            return f"记录 #{old_id} 或 #{new_id} 不存在"
+        if a["status"] != "active" or b["status"] != "active":
+            return f"记录 #{old_id} 或 #{new_id} 非 active（已撤销/隔离），不能建立取代关系"
+        conn.execute("UPDATE records SET superseded_by=? WHERE id=?", (new_id, old_id))
+        conn.execute("UPDATE records SET superseded_by=0 WHERE id=?", (new_id,))
     return ""
 
 
@@ -3076,7 +4070,12 @@ _RRF_W_RECENCY = 0.0  # recency 加成（P4.4）：评测三档定档 β=0.10→
 # 当前规模（79 条记忆条条常被唤起）recency 与相关性负相关，默认关闭；机制保留（对抗用例验证），
 # 触发重评条件=记忆规模显著增长或唤起分布变化（07 计划 v1.5）
 _RRF_ENABLED = True  # 融合回滚开关：False 即回 LIKE 单路旧行为
-_RRF_W_SEMANTIC = 1.5  # 语义路权重（P0-3 embedding 第三路；eval 标定；0=关闭独立降级到两路）
+_RRF_W_SEMANTIC = 2.0  # 记忆语义路权重：与 BM25 顶权对齐（1.5 时语义 rank1 会被 BM25 rank1 压过——实测
+# 「多个 agent 同时改一个项目怎么防冲突」目标语义 rank1、词法 36/57，融合后只到 rank6；2.0 后进 top5。
+# 2026-10-20 R6 冻结快照实测：MRR 0.839→0.842、Hit@5 26/28→28/28（与阈值 0.58 联动）；0=关闭独立降级到两路）
+_RRF_W_SEMANTIC_RECORDS = 1.5  # 记录语义路权重刻意与记忆分开：同一快照 A/B 实测 2.0 让 records
+# MRR 0.856→0.838、Hit@1 23/29→22/29（记录更长、语义召回的头部噪声更大）；阈值 0.58 对 records
+# 无影响（0.58/1.5 与 0.60/1.5 逐位相同）。两表语料特性不同，不追求同一常数。
 # 图路（第四路，Y3 接线 2026-10-13）：Graphiti/Zep 的检索是「向量 + BM25 + 图遍历」三路 RRF，
 # 我们此前只有词法两路 + 语义一路，图谱造好了却没接进检索——与查询词**零重叠**的条目永远捞不回。
 # 权重低于 BM25（主路），因为图路是补充召回不是主排序依据；0=关闭（可独立降级）。
@@ -3567,7 +4566,11 @@ _HAS_ST = False
 #    留下的大多有语义背书价值（覆盖度闸门只信 ≥0.60 的），被剪掉的真查询有词汇路兜底
 #    （截图 冒烟 0.526、部署 漂移 0.559 两词均在库中，词汇覆盖度照样强命中）。
 #    语义路的定位因此收窄为：字面词不存在时的 paraphrase 桥（如「关掉错误」→关闭错误 0.638）。
-_SEM_MIN_SIM = 0.60
+# ③ 余弦 ≥ 0.58——2026-10-20 R6 在真实库 30 查询评测集上重标定：真相关 #44「写记录时自动踩坑拦截」
+#    余弦 0.5852 被 0.60 挡在门外（BM25 rank6 也救不回，覆盖度闸门把它当弱候选丢掉）；
+#    0.55 放入 52 条候选、MRR 0.839→0.819（噪声回潮），0.58 只放入 19 条且那条进 top5、
+#    无 top5 回归。仍是「剪噪声底」而非分离器——不要再用单个阈值追求语义精度。
+_SEM_MIN_SIM = 0.58
 _SEM_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 try:
     from sentence_transformers import SentenceTransformer  # 可选依赖（本机可无）
@@ -4236,6 +5239,12 @@ def project_exists(root: str, name: str) -> bool:
         return conn.execute("SELECT 1 FROM projects WHERE name=?", (name,)).fetchone() is not None
 
 
+def project_names(root: str) -> list[str]:
+    """全部已登记项目名（防拼错提示用，只取名字不做统计）。"""
+    with db_conn(root) as conn:
+        return [r["name"] for r in conn.execute("SELECT name FROM projects")]
+
+
 # ---------------------------------------------------------------- 检索与进度
 
 def get_progress(root: str, limit: int = 30) -> list:
@@ -4803,6 +5812,16 @@ def stats(root: str) -> dict:
 
 # ---------------------------------------------------------------- 流水 / 错误 / 会话
 
+def _journal_row(conn, agent: str, action: str, target: str = "", note: str = "") -> None:
+    """与主操作同事务写流水（审计旁路：流水失败不拖垮主操作，也不另开连接避免写锁）。"""
+    try:
+        conn.execute(
+            "INSERT INTO journal(ts,agent,action,target,backup,note) VALUES(?,?,?,?,?,?)",
+            (_now(), _norm_agent(agent) or "", action, target, "", (note or "")[:500]))
+    except sqlite3.Error:
+        pass
+
+
 def journal_add(root: str, agent: str, action: str, target: str = "",
                 backup: str = "", note: str = "") -> None:
     try:
@@ -5038,7 +6057,12 @@ def checkpoint_save(root: str, task_id, agent: str, content: str,
     """M4 存检查点：任务级进展快照（断点续跑用）。返回 (错误或 "", 检查点 id)。
 
     kind=auto_claim 由 task_claim 自动存（开工资锚点）；manual 由 agent 在长任务
-    执行中主动存。任务必须存在（防把检查点挂到幽灵任务上）。"""
+    执行中主动存。任务必须存在（防把检查点挂到幽灵任务上）。
+
+    R8 围栏（2026-10-21）：在办任务只收持有者的检查点——接管后旧进程的迟到补写
+    会把别人的进展时间线搅浑；写入成功同时续租（写检查点=还在干活，不该因 2h
+    没更新任务就被判死）。条件 UPDATE 与 INSERT 同事务，接管竞争只可能一方成功。
+    R2：在办但无主的任务不收检查点（不能借写进展「隐身持有」）——先 hub_claim 认领。"""
     who = _norm_agent(agent)
     if not who:
         return "agent 必填", 0
@@ -5051,13 +6075,33 @@ def checkpoint_save(root: str, task_id, agent: str, content: str,
     except (TypeError, ValueError):
         return f"任务 id 非法：{task_id!r}", 0
     with db_conn(root) as conn:
-        row = conn.execute("SELECT id FROM tasks WHERE id=?", (tid,)).fetchone()
+        row = conn.execute("SELECT status,owner FROM tasks WHERE id=?", (tid,)).fetchone()
         if not row:
             return f"任务 #{tid} 不存在", 0
+        if row["status"] == "in_progress":
+            owner_s = (row["owner"] or "").strip()
+            if not owner_s:
+                return (f"检查点未写入：任务 #{tid} 在办但无持有者；"
+                        "先 hub_claim 认领再写进展"), 0
+            if owner_s != who:
+                return (f"检查点未写入：任务 #{tid} 由 {row['owner']} 持有"
+                        "（接管后旧持有者的补写会污染进展时间线）"), 0
+            now = _now()
+            cur = conn.execute(
+                "UPDATE tasks SET claimed_at=?, updated=?, progress_at=? "
+                "WHERE id=? AND status='in_progress' AND owner=?",
+                (now, now, now, tid, who))
+            if cur.rowcount != 1:
+                fresh = conn.execute(
+                    "SELECT status,owner FROM tasks WHERE id=?", (tid,)).fetchone()
+                return (f"检查点未写入：任务状态/持有者已变化"
+                        f"（当前 {fresh['status']} @{fresh['owner'] or '无主'}）"), 0
         cur = conn.execute(
             "INSERT INTO checkpoints(task_id,agent,ts,kind,content) VALUES(?,?,?,?,?)",
             (tid, who, _now(), kind, content[:2000]))
-        return "", cur.lastrowid
+        cid = cur.lastrowid
+        _journal_row(conn, who, "任务检查点", f"tasks#{tid}", f"{kind}｜{content[:80]}")
+        return "", cid
 
 
 def checkpoint_list(root: str, task_id, limit: int = 20) -> list:
@@ -5090,25 +6134,21 @@ def checkpoint_latest(root: str, task_id):
 # 哨兵巡检项：全部**只读且无需 target 参数**（MCP server 进程里跑，不知道仓库路径）；
 # 要 target 的（py_compile/git_status/deploy_diff/release/regression）由 agent 侧
 # hub_ops_run 显式跑——哨兵只包「大脑自身健康」这类随时随地可判的。
-SENTRY_CHECKS = ("rules_health", "brain", "hygiene", "dup_mem", "inbox", "stalled")
+SENTRY_CHECKS = ("runtime_health", "db_health", "backup_health", "rules_health",
+                 "dup_mem", "inbox", "stalled")
 
 
-def sentry_sweep(root: str, cooldown_hours: int = 24) -> tuple:
+def sentry_sweep(root: str, cooldown_hours: int = 24, checks=None) -> tuple:
     """M5 哨兵：跑关键体检项，把 gap 聚合成一条**广播 alert 信号**（所有 agent 开工即见，
     不用各自跑体检才知道大脑有情况）。返回 (摘要文本, 信号 id 或 0——0=无可报/去重跳过)。
 
     去重：与最近一条 system 广播 alert 内容相同且不足 cooldown_hours 不重复发（防刷屏）。
-    检查项本身炸了（缺依赖等）跳过该项，不拖垮整轮。"""
+    R8 起每条 gap 附「修复：…」——广播不是告警终点，收到的人要知道下一步做什么。
+    检查项本身炸了记成一条问题（体检器故障也不静默），不拖垮整轮。"""
     import ops  # noqa: PLC0415  延迟导入：ops 反向依赖 brain，模块级导入会成环
-    gaps: list = []
-    for name in SENTRY_CHECKS:
-        try:
-            r = ops.run_check(name, "", root)
-        except Exception:  # noqa: BLE001  单项炸不拖垮整轮
-            continue
-        if r.get("ok"):
-            continue
-        gaps.append(f"· {name}：{(r.get('summary') or '')[:80]}")
+    report = ops.run_patrol(root, checks or SENTRY_CHECKS)
+    gaps = [f"· {i['name']}：{(i.get('summary') or '')[:80]}\n  修复：{i['fix'][:100]}"
+            for i in report["issues"]]
     if not gaps:
         return "哨兵巡检：全部通过（无可报项）", 0
     # content 不带时间戳——时间戳信号表 ts 已有（收件箱会显示），带了反而让
@@ -5519,65 +6559,143 @@ def export_all(root: str, fmt: str = "markdown", limit: int = 5000) -> tuple:
         return "", str(path)
 
 
-def backup_db(root: str, dest: str = "") -> tuple:
+def _db_quick_check(conn: sqlite3.Connection) -> str:
+    """返回 "" 表示完整性 ok，否则返回可读原因（不抛异常）。"""
+    try:
+        row = conn.execute("PRAGMA quick_check").fetchone()
+    except sqlite3.Error as e:
+        return f"quick_check 执行失败：{e}"
+    if not row or row[0] != "ok":
+        return f"quick_check 未通过：{row[0] if row else '无结果'}"
+    return ""
+
+
+def _zip_write_safe(zf, path: Path, arcname: str) -> None:
+    """文件 mtime 早于 1980 时 zip 格式无法表达（from_file 抛 ValueError）。
+    用固定时间戳流式写入，不让一个坏时间戳毁掉整份备份。"""
+    import shutil
+    import zipfile
+    try:
+        zf.write(path, arcname=arcname)
+    except ValueError:
+        zi = zipfile.ZipInfo(arcname, date_time=(1980, 1, 1, 0, 0, 0))
+        zi.compress_type = zipfile.ZIP_DEFLATED
+        with open(path, "rb") as src, zf.open(zi, "w") as dst:
+            shutil.copyfileobj(src, dst)
+
+
+BACKUP_MANIFEST = "_AgentHub_备份清单.txt"
+BACKUP_MAX_FILE_MB = int(os.environ.get("AGENTHUB_BACKUP_MAX_FILE_MB", "50") or 0)
+
+
+def _backup_skip_dir(name: str) -> bool:
+    """构建产物/缓存/依赖目录不进整包（可重建，且常占几个 GB）。"""
+    n = name.lower()
+    return (n in {"backup", "brain-backups", "locks", "__pycache__", ".git",
+                  "node_modules", ".venv", "venv", ".next", ".pytest_cache",
+                  ".mypy_cache", "target"}
+            or n == "build" or n.startswith("build_")
+            or n == "dist" or n.startswith("dist_"))
+
+
+def backup_db(root: str, dest: str = "", max_file_mb=None) -> tuple:
     """X3 备份：① 先走 sqlite3 官方 backup API 取**含 WAL 的一致性库快照**（**不用
     shutil 复制文件**——WAL 未 checkpoint 时 copy 出的库会丢数据，2026-10-12 实测假备份）；
-    ② 再把这个一致库 + 整个磁盘项目文件树打包成单个 .zip（排除运营目录 backup/__pycache__/.git
-    与库文件本体）。单一还原单元，避免「只备库、还原丢源文件」。dest 可指定目录（不存在则建）。
-    返回 (错误或 "", zip 路径)。旧 .db 备份仍可被 backup_verify/backup_list 识别。"""
+    ② 对快照跑 quick_check，坏快照不产出备份；③ 打包成单个 .zip：库里 + 磁盘项目文件树
+    （排除构建/缓存/依赖/备份目录与超过 max_file_mb 的单文件，默认 50MB，0=不限；
+    跳过项写进包内清单，还原时不静默缺件），**先写临时 zip 再原子改名**，半成品不会以
+    正式备份名出现。单一还原单元，避免「只备库、还原丢源文件」。dest 可指定目录
+    （不存在则建）。返回 (错误或 "", zip 路径)。旧 .db 备份仍可被 backup_verify 识别。"""
     import zipfile
     src = db_path(root)
     if not src.exists():
         return "源库不存在", ""
+    cap_mb = BACKUP_MAX_FILE_MB if max_file_mb is None else max(0, int(max_file_mb))
+    cap_bytes = cap_mb * 1024 * 1024
     out_dir = Path(dest).expanduser() if dest else db_path(root).parent / "backup"
     try:
         out_dir.mkdir(parents=True, exist_ok=True)
     except OSError as e:
         return f"备份目录创建失败：{e}", ""
-    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M")
+    stamp = datetime.datetime.now().strftime("%Y%m%d-%H%M%S")
     zip_path = out_dir / f"brain-{stamp}.zip"
-    tmp = out_dir / f".tmp-brain-{stamp}.db"
+    n = 1
+    while zip_path.exists():
+        zip_path = out_dir / f"brain-{stamp}-{n}.zip"
+        n += 1
+    tmp = out_dir / f".tmp-brain-{stamp}-{os.getpid()}-{time.time_ns()}.db"
+    tmp_zip = out_dir / f".tmp-brain-{stamp}-{os.getpid()}-{time.time_ns()}.zip"
     s_conn = d_conn = None
     try:
         # ① 一致性库快照（含 WAL）
         s_conn = sqlite3.connect(str(src), timeout=5)
         d_conn = sqlite3.connect(str(tmp), timeout=5)
         s_conn.backup(d_conn)
+        # ② 快照完整性：坏快照宁可不备份，也不产出「看起来成功」的损坏包
+        bad = _db_quick_check(d_conn)
+        if bad:
+            d_conn.close()
+            d_conn = None
+            s_conn.close()
+            s_conn = None
+            tmp.unlink(missing_ok=True)
+            return f"备份失败：库快照完整性校验未通过（{bad}）", ""
         d_conn.close()
+        d_conn = None
         s_conn.close()
-        # ② 打包：库快照 + 磁盘文件树
+        s_conn = None
+        # ③ 打包：库快照 + 磁盘文件树
         root_p = Path(root)
-        EXCLUDE_DIRS = {"backup", "__pycache__", ".git"}
         EXCLUDE_FILES = {src.name, src.name + "-wal", src.name + "-shm", tmp.name}
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
+        skipped_dirs = set()
+        skipped_files = []
+        with zipfile.ZipFile(tmp_zip, "w", zipfile.ZIP_DEFLATED, compresslevel=6) as zf:
             zf.write(tmp, arcname="brain.db")  # 一致库放根
-            n_files = 0
             for p in root_p.rglob("*"):
                 if p.is_dir():
                     continue
                 rel = p.relative_to(root_p)
-                if any(part in EXCLUDE_DIRS for part in rel.parts):
+                hit = next((part for part in rel.parts[:-1] if _backup_skip_dir(part)), "")
+                if hit:
+                    idx = rel.parts.index(hit)
+                    skipped_dirs.add("/".join(rel.parts[:idx + 1]))
                     continue
-                if rel.name in EXCLUDE_FILES:
+                if rel.name in EXCLUDE_FILES or rel.name.startswith("brain.db.bak-"):
                     continue
-                zf.write(p, arcname=str(rel).replace("\\", "/"))
-                n_files += 1
+                try:
+                    size = p.stat().st_size
+                except OSError:
+                    size = 0
+                if cap_bytes and size > cap_bytes:
+                    skipped_files.append((str(rel).replace("\\", "/"), size))
+                    continue
+                _zip_write_safe(zf, p, str(rel).replace("\\", "/"))
+            cap_note = f"单文件 > {cap_mb}MB" if cap_mb else "未设上限"
+            lines = ["# AgentHub 备份清单",
+                     f"# 生成时间: {stamp}",
+                     f"# 跳过文件: {len(skipped_files)}（{cap_note}）",
+                     f"# 跳过目录: {len(skipped_dirs)}（构建/缓存/依赖/备份）"]
+            for d in sorted(skipped_dirs):
+                lines.append(f"skipped_dir\t{d}")
+            for rel_path, size in skipped_files[:500]:
+                lines.append(f"skipped_file\t{rel_path}\t{size / 1048576:.1f}MB")
+            if len(skipped_files) > 500:
+                lines.append(f"# 其余 {len(skipped_files) - 500} 个超限文件省略")
+            zf.writestr(BACKUP_MANIFEST, "\n".join(lines) + "\n")
+        os.replace(tmp_zip, zip_path)  # 同盘原子落名：要么完整备份，要么没有
         tmp.unlink(missing_ok=True)
-    except (sqlite3.Error, OSError, zipfile.BadZipFile) as e:
+    except (sqlite3.Error, OSError, zipfile.BadZipFile, ValueError) as e:
         for c in (d_conn, s_conn):
             try:
                 if c:
                     c.close()
             except sqlite3.Error:
                 pass
-        try:
-            tmp.unlink(missing_ok=True)
-        except OSError:
-            pass
-        try:
-            zip_path.unlink(missing_ok=True)
-        except OSError:
-            pass
+        for leftover in (tmp, tmp_zip):
+            try:
+                leftover.unlink(missing_ok=True)
+            except OSError:
+                pass
         return f"备份失败：{e}", ""
     return "", str(zip_path)
 
@@ -5599,114 +6717,193 @@ def backup_list(root: str) -> list:
 
 
 def backup_verify(root: str, path: str) -> tuple:
-    """X3 校验备份：只读打开 + 关键表计数（不写、不恢复——恢复是人的手工动作）。
-    支持 .zip（库+文件，逐项校验完整性并报告文件数）与旧 .db（仅库）。
-    返回 (错误或 "", 摘要)。"""
+    """X3 校验备份：只读打开 + quick_check 完整性 + 关键表计数（不写、不恢复——恢复是
+    人的手工动作）。支持 .zip（库+文件，逐项校验并报告文件数）与旧 .db（仅库）。
+    坏 zip / 坏库都返回错误文案，不向调用方抛异常。返回 (错误或 "", 摘要)。"""
     import zipfile
     import tempfile
     p = Path(path).expanduser()
-    if not p.exists():
+    if not p.is_file():
         return f"备份文件不存在：{p}", ""
     try:
         if p.suffix == ".zip":
             with zipfile.ZipFile(p) as zf:
-                if zf.testzip() is not None:
-                    return "压缩包损坏（testzip 失败）", ""
+                bad_member = zf.testzip()
+                if bad_member is not None:
+                    return f"压缩包损坏（{bad_member} CRC 校验失败）", ""
                 names = zf.namelist()
                 if "brain.db" not in names:
                     return "备份缺少 brain.db（不是有效的 AgentHub 备份）", ""
+                manifest = (zf.read(BACKUP_MANIFEST).decode("utf-8", "replace")
+                            if BACKUP_MANIFEST in names else "")
                 data = zf.read("brain.db")
             tf = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
             tf.write(data)
             tf.close()
+            conn = None
             try:
                 conn = sqlite3.connect(f"file:{tf.name}?mode=ro", uri=True, timeout=5)
+                bad = _db_quick_check(conn)
+                if bad:
+                    return f"备份库完整性校验未通过（{bad}）", ""
                 got = {}
                 for tbl in ("records", "memories", "projects"):
                     try:
-                        got[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                        got[tbl] = conn.execute(
+                            f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
                     except sqlite3.Error:
                         got[tbl] = -1
-                conn.close()
             finally:
+                if conn is not None:
+                    try:
+                        conn.close()
+                    except sqlite3.Error:
+                        pass
                 try:
                     Path(tf.name).unlink(missing_ok=True)
                 except OSError:
                     pass
-            n_files = sum(1 for n in names if n != "brain.db")
+            n_files = sum(1 for n in names if n not in ("brain.db", BACKUP_MANIFEST))
+            skip_note = ""
+            m = re.search(r"# 跳过文件: (\d+).*?# 跳过目录: (\d+)", manifest, re.S)
+            if m:
+                skip_note = f" · 跳过 {m.group(1)} 文件/{m.group(2)} 目录（见清单）"
             return "", ("备份可读：DB(" + " · ".join(f"{k} {v}" for k, v in got.items())
-                        + f") · 文件 {n_files} 个")
+                        + f") · 文件 {n_files} 个 · 完整性 ok" + skip_note)
         # 旧 .db 备份（仅库）
         conn = sqlite3.connect(f"file:{p}?mode=ro", uri=True, timeout=5)
-        got = {}
-        for tbl in ("records", "memories", "projects"):
+        try:
+            bad = _db_quick_check(conn)
+            if bad:
+                return f"备份库完整性校验未通过（{bad}）", ""
+            got = {}
+            for tbl in ("records", "memories", "projects"):
+                try:
+                    got[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                except sqlite3.Error:
+                    got[tbl] = -1
+        finally:
             try:
-                got[tbl] = conn.execute(f"SELECT COUNT(*) FROM {tbl}").fetchone()[0]
+                conn.close()
             except sqlite3.Error:
-                got[tbl] = -1
-        conn.close()
-    except (sqlite3.Error, zipfile.BadZipFile, OSError) as e:
+                pass
+    except (sqlite3.Error, zipfile.BadZipFile, OSError, EOFError, RuntimeError) as e:
         return f"读取备份失败：{e}", ""
-    return "", "备份可读：" + " · ".join(f"{k} {v}" for k, v in got.items())
+    return "", "备份可读：" + " · ".join(
+        f"{k} {v}" for k, v in got.items()) + " · 完整性 ok"
 
 
 # ---------------------------------------------------------------- 时间机器（X4）
 
 def history_of(root: str, kind: str = "record", oid=0) -> dict:
-    """X4 时间机器：某条记录/记忆的完整变更史（三源合并，按时间升序）。
-    源：①journal（target 含 records#N / memories#N 的动作流水）②supersede 链
-    （前驱/后继：谁取代了它、它取代了谁）③自身关键时点（创建/失效/取代/最后唤起）。
-    返回 {"kind","id","item","timeline":[{"ts","source","event","detail"}]}。"""
+    """X4 时间机器：某条记录/记忆/任务的完整变更史（多源合并，按时间升序）。
+    记录/记忆：journal 流水 + supersede 链 + 自身关键时点；
+    任务（R5）：journal 流水 + 检查点时间线 + 任务卡关键时点（创建/租约/完成/依赖/截止）。
+    任务另返回 clocks（R27）：推进/检查点/心跳/租约四钟分列，updated 只作「最后改动」，
+    即使被心跳续租刷新也不会冒充推进。
+    返回 {"kind","id","item","timeline":[{"ts","source","event","detail"}],"clocks"}。"""
     kind = (kind or "record").strip()
-    if kind not in ("record", "memory"):
+    if kind not in ("record", "memory", "task"):
         return {"kind": kind, "id": oid, "item": None, "timeline": []}
     try:
         oid = int(oid)
     except (TypeError, ValueError):
         return {"kind": kind, "id": oid, "item": None, "timeline": []}
-    table = "records" if kind == "record" else "memories"
-    mark = "records" if kind == "record" else "memories"
+    table = {"record": "records", "memory": "memories", "task": "tasks"}[kind]
+    mark = table
     tl: list = []
+    clocks: dict = {}
     with db_conn(root) as conn:
         row = conn.execute(f"SELECT * FROM {table} WHERE id=?", (oid,)).fetchone()
         item = dict(row) if row else None
         if not item:
             return {"kind": kind, "id": oid, "item": None, "timeline": []}
-        # ① journal 流水（target 两种写法都认：records#N 与 brain:records#N）
+        # ① journal 流水（target 两种写法都认：records#N 与 brain:records#N；
+        # LIKE 只是粗筛，末尾必须精确匹配 id——否则查 #1 会混入 #10/#11 的流水）
         for r in conn.execute(
                 "SELECT ts, action, agent, target, note FROM journal WHERE target LIKE ? "
                 "ORDER BY id", (f"%{mark}#{oid}",)):
+            if not re.search(rf"(?:^|:){re.escape(mark)}#{oid}$", r["target"] or ""):
+                continue
             tl.append({"ts": r["ts"], "source": "journal",
                        "event": r["action"], "detail": (r["note"] or "")[:120]})
-        # ② supersede 链
-        if item.get("superseded_by"):
-            tl.append({"ts": item.get("updated") or "", "source": "supersede",
-                       "event": "被取代", "detail": f"→ #{item['superseded_by']}（仍可追溯）"})
-        # 摘要列两表不同（records 有 title；memories 只有 content——同 M8 的坑）
-        tcol = "title" if table == "records" else "substr(content,1,40) AS title"
-        for r in conn.execute(
-                f"SELECT id, {tcol} FROM {table} WHERE superseded_by=?", (oid,)):
-            tl.append({"ts": "", "source": "supersede", "event": "取代了",
-                       "detail": f"→ #{r['id']} {(r['title'] or '')[:40]}"})
-        # ③ 自身关键时点
-        if item.get("created"):
-            tl.append({"ts": item["created"], "source": "item", "event": "创建",
-                       "detail": f"by {item.get('agent') or '未署名'}"})
-        if item.get("valid_until"):
-            tl.append({"ts": item["valid_until"], "source": "item", "event": "失效期止",
-                       "detail": "过期后退出检索（失效≠删除）"})
-        if item.get("last_hit"):
-            tl.append({"ts": item["last_hit"], "source": "item", "event": "最后唤起",
-                       "detail": f"累计 {item.get('use_count') or 0} 次"})
-        if item.get("status") != "active":
-            tl.append({"ts": item.get("updated") or "", "source": "item",
-                       "event": f"状态 {item['status']}", "detail": "非 active=退出检索"})
+        if kind == "task":
+            now = datetime.datetime.now()
+            cf = _task_clock_fields(item, _checkpoint_index(conn),
+                                    _sessions_index(conn), now)
+            lease_state, lease_left = _task_lease(item, _claim_cutoff(), now)
+            clocks = {"progress_at": (item.get("progress_at") or "").strip(),
+                      "progress_age_h": cf["_progress_age_h"],
+                      "stalled": cf["_progress_stall"],
+                      "last_checkpoint": cf["_last_cp"],
+                      "last_checkpoint_age_h": cf["_last_cp_age_h"],
+                      "heartbeat_at": cf["_heartbeat_at"],
+                      "heartbeat_age_h": cf["_heartbeat_age_h"],
+                      "lease_state": lease_state, "lease_left_h": lease_left}
+            # ② 检查点时间线（断点续跑视角的进展史）
+            for r in conn.execute(
+                    "SELECT ts, agent, kind, content FROM checkpoints WHERE task_id=? "
+                    "ORDER BY id", (oid,)):
+                tl.append({"ts": r["ts"], "source": "checkpoint",
+                           "event": f"检查点（{r['kind']}）",
+                           "detail": f"{r['agent']}：{r['content'][:100]}"})
+            # ③ 任务卡关键时点
+            if item.get("created"):
+                tl.append({"ts": item["created"], "source": "item", "event": "创建",
+                           "detail": f"by {item.get('created_by') or '未署名'}"
+                                     f"｜{item.get('project') or '无项目'}"})
+            if item.get("claimed_at"):
+                tl.append({"ts": item["claimed_at"], "source": "item", "event": "当前租约",
+                           "detail": f"@{item.get('owner') or '无主'}"
+                                     f"（{CLAIM_TTL_HOURS}h 无心跳/更新可接管）"})
+            if item.get("done_at"):
+                tl.append({"ts": item["done_at"], "source": "item", "event": "完成",
+                           "detail": f"@{item.get('owner') or '未署名'}"})
+            if item.get("updated") and item.get("updated") != item.get("created"):
+                tl.append({"ts": item["updated"], "source": "item", "event": "最后改动",
+                           "detail": f"status={TASK_CN.get(item['status'], item['status'])}"
+                                     "（心跳续租也会刷新，不代表进展）"})
+            pa = (item.get("progress_at") or "").strip()
+            if pa and pa != (item.get("updated") or "").strip():
+                tl.append({"ts": pa, "source": "item", "event": "最后推进",
+                           "detail": "最后一条真实任务动作（认领/流转/改详情/写检查点）"})
+            if (item.get("deps") or "").strip():
+                tl.append({"ts": item.get("created") or "", "source": "item",
+                           "event": "前置链", "detail": item["deps"]})
+            if (item.get("due") or "").strip():
+                tl.append({"ts": item.get("created") or "", "source": "item",
+                           "event": "截止日", "detail": item["due"]})
+        else:
+            # ② supersede 链
+            if item.get("superseded_by"):
+                tl.append({"ts": item.get("updated") or "", "source": "supersede",
+                           "event": "被取代", "detail": f"→ #{item['superseded_by']}（仍可追溯）"})
+            # 摘要列两表不同（records 有 title；memories 只有 content——同 M8 的坑）
+            tcol = "title" if table == "records" else "substr(content,1,40) AS title"
+            for r in conn.execute(
+                    f"SELECT id, {tcol} FROM {table} WHERE superseded_by=?", (oid,)):
+                tl.append({"ts": "", "source": "supersede", "event": "取代了",
+                           "detail": f"→ #{r['id']} {(r['title'] or '')[:40]}"})
+            # ③ 自身关键时点
+            if item.get("created"):
+                tl.append({"ts": item["created"], "source": "item", "event": "创建",
+                           "detail": f"by {item.get('agent') or '未署名'}"})
+            if item.get("valid_until"):
+                tl.append({"ts": item["valid_until"], "source": "item", "event": "失效期止",
+                           "detail": "过期后退出检索（失效≠删除）"})
+            if item.get("last_hit"):
+                tl.append({"ts": item["last_hit"], "source": "item", "event": "最后唤起",
+                           "detail": f"累计 {item.get('use_count') or 0} 次"})
+            if item.get("status") != "active":
+                tl.append({"ts": item.get("updated") or "", "source": "item",
+                           "event": f"状态 {item['status']}", "detail": "非 active=退出检索"})
     tl.sort(key=lambda x: x["ts"] or "")
-    return {"kind": kind, "id": oid, "item": item, "timeline": tl}
+    return {"kind": kind, "id": oid, "item": item, "timeline": tl, "clocks": clocks}
 
 
 def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") -> tuple:
-    """更新心跳并重建会话表（清掉超出 SESSION_RETAIN 的条目），返回 (错误或"", 同项目活跃会话)。
+    """更新心跳（只剪超出 SESSION_RETAIN 的会话行 + UPSERT 本人，绝不整表重建），
+    返回 (错误或"", 同项目活跃会话)。
 
     注意「剪枝窗口 ≠ 在线窗口」：剪枝按 SESSION_RETAIN（24h，服务展示），
     返回的 active 按 SESSION_ACTIVE（5 分钟，同项目正在工作的并发判定）——两者互不影响。"""
@@ -5714,30 +6911,39 @@ def heartbeat_touch(root: str, agent: str, project: str = "", note: str = "") ->
     if not agent:
         return "agent 必填", []
     now = datetime.datetime.now()
+    now_s = now.isoformat(timespec="seconds")
+    retain_cutoff = (now - datetime.timedelta(seconds=SESSION_RETAIN)) \
+        .isoformat(timespec="seconds")
+    active_cutoff = (now - datetime.timedelta(seconds=SESSION_ACTIVE)) \
+        .isoformat(timespec="seconds")
     with db_conn(root) as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM sessions")]
-        fresh = []
-        for s in rows:
-            if s["agent"] == agent:
-                continue
-            try:
-                ts = datetime.datetime.fromisoformat(s["ts"])
-            except (ValueError, TypeError):
-                continue
-            # 2026-10-11：此处原用 SESSION_TTL（30 分钟在线窗口）→ 会话记录活不过 30 分钟，
-            # 展示层再放宽也读不到；改用独立的保留窗口 SESSION_RETAIN。
-            if (now - ts).total_seconds() < SESSION_RETAIN:
-                fresh.append(s)
-        conn.execute("DELETE FROM sessions")  # 重建语义：超出保留窗口者一并清除
-        for s in fresh:
-            conn.execute("INSERT INTO sessions(agent,project,note,ts) VALUES(?,?,?,?)",
-                         (s["agent"], s["project"], s["note"], s["ts"]))
-        conn.execute("INSERT INTO sessions(agent,project,note,ts) VALUES(?,?,?,?)",
-                     (agent.strip(), project or "", note or "", now.isoformat(timespec="seconds")))
+        # 只剪自己之外的过期行，绝不 DELETE 全表再重建：两个 agent 并发心跳时，
+        # 「先读快照 → 后写重建」会丢掉另一方刚写进去的会话（Windows/SQLite 下还可能直接锁冲突）。
+        # 2026-10-11 之前用 SESSION_TTL（30 分钟）剪枝还会让展示层拿不到更早数据；
+        # 保留窗口与在线判定必须分开，这里用 SESSION_RETAIN 剪、SESSION_ACTIVE 判在线。
+        conn.execute("DELETE FROM sessions WHERE ts < ?", (retain_cutoff,))
+        conn.execute(
+            "INSERT INTO sessions(agent,project,note,ts) VALUES(?,?,?,?) "
+            "ON CONFLICT(agent) DO UPDATE SET project=excluded.project, "
+            "note=excluded.note, ts=excluded.ts",
+            (agent.strip(), project or "", note or "", now_s))
+        # 心跳即续租：agent 还在干活就不该因 2h 没写任务而被别人接管。
+        # 有项目时只续该项目下的任务，避免跨项目误续；无项目时续本人全部在办任务。
+        if project:
+            conn.execute(
+                "UPDATE tasks SET claimed_at=?, updated=? "
+                "WHERE status='in_progress' AND owner=? AND project=?",
+                (now_s, now_s, agent, project))
+        else:
+            conn.execute(
+                "UPDATE tasks SET claimed_at=?, updated=? "
+                "WHERE status='in_progress' AND owner=?",
+                (now_s, now_s, agent))
         _upsert_agent(conn, agent, project, beat=True)
-    active = [s for s in fresh
-              if project and s.get("project") == project
-              and _ts_age(s.get("ts", ""), now) < SESSION_ACTIVE]
+        active = [dict(r) for r in conn.execute(
+            "SELECT agent,project,note,ts FROM sessions "
+            "WHERE project=? AND agent<>? AND ts>=? ORDER BY ts DESC",
+            (project, agent, active_cutoff))] if project else []
     return "", active
 
 
@@ -5811,11 +7017,143 @@ def status_snapshot(root: str) -> dict:
             "SELECT name FROM projects WHERE status='stalled' ORDER BY name LIMIT 5")]
         out["stalled_total"] = conn.execute(
             "SELECT COUNT(*) FROM projects WHERE status='stalled'").fetchone()[0]
+        # 过程可见性（2026-10-21）：不只知道谁在线，还要知道在办什么、哪条租约快过期/可接管。
+        # 只读查询，不写 searches，保持 status 的高频调用不污染读写比口径。
+        out["tasks_open_total"] = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status!='done'").fetchone()[0]
+        out["tasks_in_progress"] = [dict(r) for r in conn.execute(
+            "SELECT id,project,title,owner,claimed_at,due,priority FROM tasks "
+            "WHERE status='in_progress' ORDER BY priority, id LIMIT 10")]
+        cutoff = _claim_cutoff()
+        # R2：无主（owner 空）与租约缺失（claimed_at 空）同样属于「可接管」，
+        # 不能只按过期时间过滤——那样这些任务在状态面上完全隐身。
+        stale_claims = []
+        for r in conn.execute(
+                "SELECT id,project,title,owner,claimed_at FROM tasks "
+                "WHERE status='in_progress' "
+                "AND (owner='' OR claimed_at='' OR claimed_at < ?) "
+                "ORDER BY claimed_at, id LIMIT 10", (cutoff,)):
+            d = dict(r)
+            if not (d["owner"] or "").strip():
+                d["reason"] = "无主"
+            elif not (d["claimed_at"] or "").strip():
+                d["reason"] = "租约缺失"
+            else:
+                d["reason"] = "租约过期"
+            stale_claims.append(d)
+        out["stale_claims"] = stale_claims
+        out["claim_ttl_hours"] = CLAIM_TTL_HOURS
     out["todos"] = extract_todos(root, limit=5)
     return out
 
 
 # ---------------------------------------------------------------- 备份
+
+# 备份家族（R7）：一处定义「有哪些备份、默认留几份」，盘点/清理/体检共用，
+# 防三处各写一套 glob 后口径漂移（漏掉的家族永远不会被盘点，也就永远不会被清理）。
+# key: (相对 _hub 的子目录, 文件名模式, 默认保留份数, 人读说明)
+BACKUP_FAMILIES = {
+    "zip": ("backup", "brain-*.zip", 3, "库+文件树整包（唯一可整盘还原的备份）"),
+    "legacy_db": ("backup", "brain-*.db", 1, "旧版仅库备份（不含源文件）"),
+    "snapshot": (BACKUP_DIR, "brain-*.db", 10, "在线库快照（backup_brain 自动轮转）"),
+    "manual_bak": (".", "brain.db.bak-*", 2, "手工改动前的库快照"),
+}
+
+
+def backup_inventory(root: str) -> dict:
+    """R7 备份盘点：四个家族逐项列出（路径/大小/年龄），按时间新在前。
+    只读、不判断能不能删——删不删由 backup_prune 按保留策略算。"""
+    hub = db_path(root).parent
+    now = time.time()
+    fams: dict = {}
+    all_items: list = []
+    for key, (sub, pat, keep, label) in BACKUP_FAMILIES.items():
+        d = hub / sub
+        items = []
+        try:
+            for p in d.glob(pat):
+                if not p.is_file():
+                    continue
+                try:
+                    st = p.stat()
+                except OSError:
+                    continue
+                item = {"path": str(p), "size": st.st_size,
+                        "mtime": datetime.datetime.fromtimestamp(st.st_mtime).strftime("%Y-%m-%d %H:%M"),
+                        "mtime_ts": st.st_mtime,
+                        "age_days": max(0, int((now - st.st_mtime) // 86400))}
+                items.append(item)
+        except OSError:
+            items = []
+        items.sort(key=lambda x: (x["mtime_ts"], x["path"]), reverse=True)
+        fams[key] = {"label": label, "dir": str(d), "keep_default": keep,
+                     "count": len(items), "bytes": sum(i["size"] for i in items),
+                     "items": items}
+        all_items.extend(items)
+    newest = max(all_items, key=lambda x: x["mtime_ts"], default=None)
+    oldest = min(all_items, key=lambda x: x["mtime_ts"], default=None)
+    return {"hub": str(hub), "families": fams,
+            "total_count": len(all_items),
+            "total_bytes": sum(i["size"] for i in all_items),
+            "newest": newest, "oldest": oldest}
+
+
+def _backup_prune_safe(p: Path, hub: Path) -> bool:
+    """清理路径安全闸：必须落在 _hub 内、必须是文件、绝不碰主库与 WAL/SHM。"""
+    try:
+        rp = p.resolve()
+        rp.relative_to(hub)
+    except (OSError, ValueError):
+        return False
+    return rp.is_file() and rp.name not in ("brain.db", "brain.db-wal", "brain.db-shm")
+
+
+def backup_prune(root: str, keep_zip: int = 3, keep_snapshot: int = 10,
+                 keep_legacy: int = 1, keep_bak: int = 2, min_age_days: int = 7,
+                 apply: bool = False) -> dict:
+    """R7 按家族保留策略清理备份：默认**只预演**（apply=False），apply=True 才真删。
+    两道保护：① 每家族至少保留最新 N 份；② 未满 min_age_days 的一律不动（防刚备份完就被清）。
+    只删 BACKUP_FAMILIES 模式命中的文件，主库/WAL/SHM 无论如何不碰；删除写 journal 可追溯。"""
+    inv = backup_inventory(root)
+    hub = Path(inv["hub"]).resolve()
+    keeps = {"zip": keep_zip, "snapshot": keep_snapshot,
+             "legacy_db": keep_legacy, "manual_bak": keep_bak}
+    cands: list = []
+    for key, fam in inv["families"].items():
+        keep = max(0, int(keeps.get(key, fam["keep_default"])))
+        for i, item in enumerate(fam["items"]):
+            if i < keep or item["age_days"] < min_age_days:
+                continue
+            cands.append({**item, "family": key})
+    out = {"ok": True, "apply": bool(apply), "candidates": cands,
+           "candidate_bytes": sum(c["size"] for c in cands),
+           "deleted": [], "reclaimed_bytes": 0, "errors": [],
+           "inventory": inv}
+    if not apply:
+        return out
+    reclaimed = 0
+    for c in cands:
+        p = Path(c["path"])
+        if not _backup_prune_safe(p, hub):
+            out["errors"].append(f"跳过不安全路径：{p}")
+            continue
+        try:
+            size = p.stat().st_size
+            p.unlink()
+            out["deleted"].append(c)
+            reclaimed += size
+        except OSError as e:
+            out["errors"].append(f"{p.name}：{e}")
+    out["reclaimed_bytes"] = reclaimed
+    out["ok"] = not out["errors"]
+    if out["deleted"]:
+        journal_add(root, "mcp-server", "backup_prune", "backup",
+                    note=f"清理 {len(out['deleted'])} 份，释放 {reclaimed // 1024}KB"
+                     f"（keep zip={keep_zip} snapshot={keep_snapshot} "
+                     f"legacy={keep_legacy} bak={keep_bak}，min_age={min_age_days}d）")
+    out["inventory"] = backup_inventory(root)
+    return out
+
 
 def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:
     """在线备份 brain.db 到 _hub/brain-backups/（保留 keep 份轮转）。返回错误或备份路径。"""
@@ -5932,7 +7270,8 @@ def get_record(root: str, record_id: int, level: str = "full") -> dict:
         return {}
     with db_conn(root) as conn:
         row = conn.execute(
-            "SELECT id, project, agent, date, title, content, status FROM records WHERE id=?",
+            "SELECT id, project, agent, date, title, content, status, "
+            "superseded_by, valid_until FROM records WHERE id=?",
             (rid,)).fetchone()
     d = dict(row) if row else {}
     if d:
@@ -6178,11 +7517,14 @@ def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
     ⑤ **剥四段式模板头**（2026-10-18 实测后加）：【目的】【做了什么】【验证结果】【如何回滚】
        在每条 work_log 里都有，不剥掉等于给所有记录对发一份「基础相似度」——短记录光靠
        共享脚手架就能越过阈值。剥的是脚手架不是内容，与记忆版「只用 content」同精神。
-    ⑥ **排除两类机器模板记录**（实测后加）：`migrated:*` 源（历史迁移按小节拆 工作记录.md，
+    ⑥ **排除三类机器模板记录**（实测后加）：`migrated:*` 源（历史迁移按小节拆 工作记录.md，
        标题小节名，同标题对是语料 boilerplate）；标题含「（auto-hook）」的会话边界锚
        （Stop hook 每轮响应末记一条，同一 session 跨天anchors是设计使然、且整条都是
-       模板+少量变量）。auto 源的**流程结果**记录（如 playbook release 自动日志）保留——
-       「同一流程重复记几条」正是最典型的真 ghost（真实库实测抓到 3 组）。
+       模板+少量变量）；**source='auto' 的全部自动捕获记录**（2026-10-22 更正：此前把
+       playbook 流程运行日志保留在候选里，理由是「同一流程重复记几条像真 ghost」；真实库
+       实测 10 组候选 100% 来自 10-13 的 5 次 release 运行——备份文件名与 exe 时间各不相同，
+       是事件流不是知识版本。自动记录由机器按节奏产生，其重复性归生产方的幂等性管；
+       知识侧的 ghost 只该盯人工/agent 写的 hub 记录，否则每天的都是同一批正常日志）。
     返回 [{a, b, sim, project, verdict, agent_a, agent_b, date_a, date_b,
           title_a, title_b, content_a, content_b}]，按 sim 降序。
     """
@@ -6196,6 +7538,7 @@ def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
         rows = [dict(r) for r in conn.execute(
             "SELECT id, project, agent, date, title, content FROM records WHERE "
             + _live_sql() + " AND date >= date('now', ?) AND source NOT LIKE 'migrated:%' "
+            "AND source != 'auto' "
             "ORDER BY id", (f"-{int(days)} days",))]
     if project:
         rows = [r for r in rows if r["project"] == project]
@@ -6238,6 +7581,22 @@ def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
                     return out
     out.sort(key=lambda x: -x["sim"])
     return out
+
+
+def auto_record_count(root: str, days: int = 90) -> int:
+    """近 days 天自动捕获记录数（source='auto'：会话锚 + playbook 流程运行日志）。
+
+    幽灵检测已整体排除自动记录；这个计数只用于把「跳过了多少条机器事件流」如实报出来，
+    让排除有据可查，而不是静默少报。"""
+    try:
+        with db_conn(root) as conn:
+            row = conn.execute(
+                "SELECT COUNT(*) FROM records WHERE " + _live_sql()
+                + " AND date >= date('now', ?) AND source='auto'",
+                (f"-{int(days)} days",)).fetchone()
+        return int(row[0] if row else 0)
+    except Exception:  # noqa: BLE001
+        return 0
 
 
 def ghost_record_candidates(root: str, threshold: float = 0.55, limit: int = 10) -> list:
@@ -6285,6 +7644,9 @@ def ghost_record_candidates(root: str, threshold: float = 0.55, limit: int = 10)
 #   ③ key 按 agent 分命名空间（不同 agent 的同字符串 key 互不干扰）；
 #   ④ 保留期 7 天（典型重试窗口），存储时顺带清理过期键。
 IDEM_RETENTION_DAYS = 7
+# 占位保护期：持有占位的进程崩溃/超时后，超过这个时长才允许他人接管同键。
+# 写工具正常在秒级完成（最长含触发器预算 ~20s），120s 足够宽以免把慢请求判死。
+IDEM_PENDING_GRACE_SEC = 120
 
 
 def idem_digest(parts: dict) -> str:
@@ -6294,32 +7656,79 @@ def idem_digest(parts: dict) -> str:
     return hashlib.sha256(blob.encode("utf-8")).hexdigest()[:16]
 
 
-def idem_lookup(root: str, agent: str, key: str, digest: str):
-    """查幂等键。返回 None=未见/已过期（放行）/ str=首次结果（重放）/ 'conflict'=同键不同内容。
+def idem_begin(root: str, agent: str, key: str, digest: str, tool: str) -> tuple:
+    """原子占位：检查与插入在同一写事务里完成，并发同键只有一个请求能执行。
 
-    时间窗过滤是**查询侧的硬约束**（R2 回归抓到的自引入 bug）：只靠 store 时的 DELETE
-    清理不够——库安静一阵后过期键仍会被重放（实测：把 ts 改老后同键照样返回首次结果）。
-    语义上「保留期」就是「重放窗口」：超过 7 天的同键视为新操作。"""
+    此前 lookup 与 store 分属两个事务：两个并发重试都能读到「未见」再各写一次，
+    正是文件租约刚修过的同型竞态（R15）。返回 (状态, 载荷)：
+    go=抢到占位可以执行 / replay=已有首次结果 / conflict=同键不同内容 /
+    pending=另一请求正在执行 / busy=数据库写锁等待超时（可重试）。
+    """
+    now_dt = datetime.datetime.now()
+    now = now_dt.isoformat(timespec="seconds")
+    stale = (now_dt - datetime.timedelta(seconds=IDEM_PENDING_GRACE_SEC)).isoformat(
+        timespec="seconds")
     with db_conn(root) as conn:
-        r = conn.execute("SELECT digest, result FROM idem_keys "
+        busy = _begin_write(conn)
+        if busy:
+            return "busy", busy
+        conn.execute("DELETE FROM idem_keys WHERE ts < datetime('now', ?)",
+                     (f"-{IDEM_RETENTION_DAYS} days",))
+        cur = conn.execute(
+            "INSERT OR IGNORE INTO idem_keys(agent,key,tool,digest,result,ref,ts) "
+            "VALUES(?,?,?,?,'',NULL,?)", (agent, key, tool, digest, now))
+        if cur.rowcount == 1:
+            return "go", ""
+        row = conn.execute("SELECT digest,result,ts FROM idem_keys WHERE agent=? AND key=?",
+                           (agent, key)).fetchone()
+        if row is None:  # 插入与查询之间被清理：重占一次（写事务内实际不会发生）
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO idem_keys(agent,key,tool,digest,result,ref,ts) "
+                "VALUES(?,?,?,?,'',NULL,?)", (agent, key, tool, digest, now))
+            return ("go", "") if cur.rowcount == 1 else ("pending", "")
+        if row["digest"] != digest:
+            return "conflict", ""
+        if row["result"]:
+            return "replay", row["result"]
+        if row["ts"] < stale:
+            # 占位超过保护期：视为持有者已崩溃，允许接管（删除+重插在同一写事务内）。
+            conn.execute("DELETE FROM idem_keys WHERE agent=? AND key=? AND result='' AND ts<?",
+                         (agent, key, stale))
+            cur = conn.execute(
+                "INSERT OR IGNORE INTO idem_keys(agent,key,tool,digest,result,ref,ts) "
+                "VALUES(?,?,?,?,'',NULL,?)", (agent, key, tool, digest, now))
+            if cur.rowcount == 1:
+                return "go", ""
+        return "pending", ""
+
+
+def idem_lookup(root: str, agent: str, key: str, digest: str):
+    """查幂等键。返回 None=未见/已过期（放行）/ str=首次结果（重放）/ 'conflict'=同键不同内容 /
+    'pending'=另一请求已占位、尚未产出结果。"""
+    stale = (datetime.datetime.now()
+             - datetime.timedelta(seconds=IDEM_PENDING_GRACE_SEC)).isoformat(timespec="seconds")
+    with db_conn(root) as conn:
+        r = conn.execute("SELECT digest, result, ts FROM idem_keys "
                          "WHERE agent=? AND key=? AND ts >= datetime('now', ?)",
                          (agent, key, f"-{IDEM_RETENTION_DAYS} days")).fetchone()
     if not r:
         return None
     if r["digest"] != digest:
         return "conflict"
-    return r["result"]
+    if r["result"]:
+        return r["result"]
+    return "pending" if r["ts"] >= stale else None
 
 
 def idem_store(root: str, agent: str, key: str, digest: str, tool: str,
-               result: str, ref: int = 0) -> None:
-    """记 键→首次结果（INSERT OR REPLACE：并发下同键只留一条；顺带按保留期清理）。"""
+               result: str, ref: int = 0) -> bool:
+    """写成功后把占位行补成首次结果。返回是否补中自己的占位（False=占位已被接管/清理）。"""
     with db_conn(root) as conn:
-        conn.execute("DELETE FROM idem_keys WHERE ts < datetime('now', ?)",
-                     (f"-{IDEM_RETENTION_DAYS} days",))
-        conn.execute("INSERT OR REPLACE INTO idem_keys(agent,key,tool,digest,result,ref,ts) "
-                     "VALUES(?,?,?,?,?,?,?)",
-                     (agent, key, tool, digest, result, ref or None, _now()))
+        cur = conn.execute(
+            "UPDATE idem_keys SET result=?, ref=?, ts=? "
+            "WHERE agent=? AND key=? AND digest=? AND result=''",
+            (result, ref or None, _now(), agent, key, digest))
+        return cur.rowcount == 1
 
 
 def similar_lessons_for(root: str, content: str, threshold: float = 0.15, limit: int = 3) -> list:
@@ -6389,9 +7798,64 @@ def mark_intercept_hit(root: str, agent: str, rec_id: int, hits: list) -> None:
         pass
 
 
+def _idle_days(date_str: str, today: datetime.date = None) -> int | None:
+    """YYYY-MM-DD[时间] → 闲置天数；无法解析返回 None（不猜）。"""
+    try:
+        d = datetime.date.fromisoformat((date_str or "").strip()[:10])
+    except (ValueError, TypeError):
+        return None
+    return max(0, ((today or datetime.date.today()) - d).days)
+
+
+def project_activity(root: str, stall_days: int = STALL_DAYS) -> dict:
+    """项目活动快照（R20）：按最后一条工作记录/任务活动算真实闲置天数。
+
+    为什么单列出来：`status='stalled'` 是**显式决策**（历史批量标记/人工判定），
+    不等于「90 天无活动」——2026-10-22 实测 8 个停滞项目实际闲置只 6–47 天，
+    旧检查却一律宣称「90 天无活动」，把人引向错误的归档理由。这里把两类分开：
+    · labelled：状态已标停滞 → 决策队列（归档与否由用户拍板）；
+    · drift：状态仍是 active 但真实闲置 ≥ stall_days → 漏标，才是维护故障。
+
+    活动来源只认工作记录与任务：记忆可能是从旧项目蒸馏出的横向知识，写一条
+    不代表该项目复工（真实案例：WiFi蓝牙项目 10-21 的记忆来自 ADB蓝牙调研），
+    因此不用记忆刷新活跃，避免把已完结项目误判为在办。
+    """
+    today = datetime.date.today()
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT name, status, updated FROM projects "
+            "WHERE status IN ('active','stalled') ORDER BY name")]
+        rec_last = {r["project"]: r["last"] for r in conn.execute(
+            "SELECT project, MAX(date) AS last FROM records WHERE status='active' "
+            "AND project!='' GROUP BY project")}
+        task_last = {r["project"]: r["last"] for r in conn.execute(
+            "SELECT project, MAX(substr(COALESCE(NULLIF(updated,''),created),1,10)) AS last "
+            "FROM tasks WHERE project!='' GROUP BY project")}
+    labelled, drift, no_activity = [], [], []
+    for p in rows:
+        cands = [(rec_last.get(p["name"], ""), "record"),
+                 (task_last.get(p["name"], ""), "task")]
+        cands = [(d, src) for d, src in cands if d]
+        last, src = max(cands, key=lambda x: x[0]) if cands else ("", "")
+        idle = _idle_days(last, today)
+        item = {"name": p["name"], "status": p["status"], "updated": p["updated"],
+                "last_activity": last[:10], "idle_days": idle, "source": src}
+        if p["status"] == "stalled":
+            labelled.append(item)
+        elif idle is None:
+            no_activity.append(item)
+        elif idle >= stall_days:
+            drift.append(item)
+    labelled.sort(key=lambda x: (x["idle_days"] is None,
+                                 -(x["idle_days"] or 0), x["name"]))
+    drift.sort(key=lambda x: (-(x["idle_days"] or 0), x["name"]))
+    return {"today": today.isoformat(), "stall_days": stall_days,
+            "labelled": labelled, "drift": drift, "no_activity": no_activity}
+
+
 def archive_project(root: str, name: str, agent: str = "") -> str:
     """项目归档（清理决策的落地动作）：状态改 archived（不再计入活跃/stalled）；
-    目录存在则移入 <root>/99_Archive\\（可逆：移回 + 状态改回 active 即恢复）。
+    目录存在则移入 <root>/99_Archive\\（可逆：restore_project 一步恢复）。
     add_record 对 archived 项目有 status!='archived' 守卫——归档后新记录不会误复活它。"""
     import shutil
     name = (name or "").strip()
@@ -6415,6 +7879,48 @@ def archive_project(root: str, name: str, agent: str = "") -> str:
             shutil.move(str(src), str(dst))
         except OSError as e:
             return f"状态已归档，但目录移动失败（可手动移入 99_Archive）：{e}"
+    return ""
+
+
+def restore_project(root: str, name: str, agent: str = "") -> str:
+    """归档恢复（archive_project 的逆操作）：状态改回 active，目录从 99_Archive 移回根目录。
+    先校验再动：根目录已有同名目录时拒绝，绝不覆盖未归档内容；归档目录缺失不阻塞状态恢复
+    （归档时目录移动失败的项目也要能重新进入活跃视图）。updated 记为今天——恢复是「继续推进」
+    的决定，不应在下一次 init 的 90 天自动标记里被立刻打回 stalled。"""
+    name = (name or "").strip()
+    if not name:
+        return "project 必填"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT name, status FROM projects WHERE name=?", (name,)).fetchone()
+        if not row:
+            return f"未找到项目：{name}"
+        if row["status"] != "archived":
+            return f"项目未归档，无需恢复：{name}（当前状态 {row['status']}）"
+    src = Path(root) / core.DIR_ARCHIVE / name
+    dst = Path(root) / name
+    if dst.exists():
+        return f"未恢复：根目录已有同名 {name}\\（未改动状态与文件，请先处理冲突）"
+    dir_found = src.is_dir()
+    if dir_found:
+        try:
+            # 同卷原子改名：目标被并发创建时直接失败；shutil.move 会把源搬进目标目录里，
+            # 造成「恢复成功但文件埋了一层」的假象
+            os.rename(str(src), str(dst))
+        except OSError as e:
+            return f"未恢复：目录移回失败（状态仍为 archived）：{e}"
+    try:
+        with db_conn(root) as conn:
+            conn.execute("UPDATE projects SET status='active', updated=? WHERE name=?",
+                         (_now()[:10], name))
+    except sqlite3.Error as e:
+        if dir_found:
+            try:
+                os.rename(str(dst), str(src))
+            except OSError:
+                pass
+        return f"未恢复：状态写回失败（目录已回滚）：{e}"
+    if not dir_found:
+        return f"状态已恢复为 active，但 99_Archive\\{name} 下无目录（归档时可能未移动）"
     return ""
 
 
