@@ -1335,7 +1335,9 @@ def t_note_tool(tmp):
 
 
 def t_status_tool(tmp):
-    """hub_status 连续性层（3.1）：五问快照——正常/空库/脏数据/限条数/只读性/畸形参数。"""
+    """hub_status 连续性层（3.1）：五问快照——正常/空库/脏数据/限条数/只读性/畸形参数。
+    R69：hub_status 是开工对齐第一入口，必须挂运行版本告警——旧进程给出的「此刻
+    状态」是旧代码视角，不声明就会被当成现状（R66 同型问题在最重要读路径的漏网）。"""
     root = fresh_hub(tmp, "status")
     root_s = str(root)
     today = datetime.date.today().isoformat()
@@ -1404,6 +1406,24 @@ def t_status_tool(tmp):
     before = counts()
     m.call_tool("hub_status", {}, root_s)
     assert counts() == before, "hub_status 产生了写入（必须纯只读）"
+
+    # R69：now 视图挂运行版本告警（开工第一入口不给旧代码视角）；新鲜进程不出警告
+    import core
+    _fake_stale = {"known": True, "count": 2, "started": "2026-10-23T17:45:12",
+                   "basis": "content",
+                   "stale": [{"file": "agenthub_mcp.py", "mtime": "2026-10-23T18:01:00"}]}
+    _orig_rs = core.runtime_staleness
+    try:
+        core.runtime_staleness = lambda *a, **k: _fake_stale
+        out_stale = m.call_tool("hub_status", {}, root_s)
+        core.runtime_staleness = lambda *a, **k: {"known": False, "count": 0,
+                                                  "started": "", "stale": []}
+        out_fresh = m.call_tool("hub_status", {}, root_s)
+    finally:
+        core.runtime_staleness = _orig_rs
+    assert out_stale.splitlines()[0].startswith("⚠") and "旧代码" in out_stale.splitlines()[0], \
+        f"hub_status 缺运行版本告警：{out_stale[:200]}"
+    assert not out_fresh.splitlines()[0].startswith("⚠"), out_fresh[:120]
 
 
 def t_decision_record(tmp):
@@ -3890,6 +3910,24 @@ def t_team_digest_surface(hub):
                    "zcode", "风险："):
         assert needle in out, (needle, out[:800])
     assert "→" in out, out[:800]
+
+    # R69：digest 视图同样挂运行版本告警（与 now 视图、hub_heartbeat 同址同理）
+    import core
+    _fake_stale = {"known": True, "count": 2, "started": "2026-10-23T17:45:12",
+                   "basis": "content",
+                   "stale": [{"file": "agenthub_mcp.py", "mtime": "2026-10-23T18:01:00"}]}
+    _orig_rs = core.runtime_staleness
+    try:
+        core.runtime_staleness = lambda *a, **k: _fake_stale
+        out_stale = m.call_tool("hub_status", {"view": "digest", "days": 1}, rs)
+        core.runtime_staleness = lambda *a, **k: {"known": False, "count": 0,
+                                                  "started": "", "stale": []}
+        out_fresh = m.call_tool("hub_status", {"view": "digest", "days": 1}, rs)
+    finally:
+        core.runtime_staleness = _orig_rs
+    assert out_stale.splitlines()[0].startswith("⚠") and "旧代码" in out_stale.splitlines()[0], \
+        f"digest 缺运行版本告警：{out_stale[:200]}"
+    assert not out_fresh.splitlines()[0].startswith("⚠"), out_fresh[:120]
     bad = m.call_tool("hub_status", {"view": "nope"}, rs)
     assert "错误" in bad and "now/digest" in bad, bad
     bid = m.call_tool("hub_status", {"view": "digest", "days": 0}, rs)
