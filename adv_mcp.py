@@ -104,7 +104,7 @@ def t_help_topics(root):
                    "hub_status(view=\"digest\"", "复制回滚方式",
                    "### 3.5 库损坏的识别与降级", "db_corrupt", "db_integrity",
                    "backup-drill", "恢复演练",
-                   "### 5.1 规模与内存", "AGENTHUB_TOK_CACHE_MAX",
+                   "### 5.1 规模与内存", "AGENTHUB_TOK_CACHE_MAX", "cli.py --root <root> approve",
                    "## 11. 规则闸门：证据通道与探针", "gate_probe.py",
                    "auto_records", "evidence", "sid=probe-", "ASU_SKIP_BRAINLOG"):
         assert needle in text, f"运维手册缺关键步骤：{needle}"
@@ -4115,6 +4115,18 @@ def t_task_defer_approve_surface(hub):
     assert set(schema.get("required") or []) == {"task_id"}, schema
     upd = next(t for t in m.TOOLS if t["name"] == "hub_task_update")["inputSchema"]
     assert upd["properties"]["defer_until"]["type"] == "string", upd
+
+    # ---- R72：审批指引必须锁定感知——三处面向用户的文案（工具描述/参数描述/help 主题）
+    # 都不能再写「空传 agent=管理面」：进程锁定的会话里空传会被顶成锁定身份，是死路
+    # （R70 dogfood 实测、R71 修了错误路径，R72 走查发现帮助与手册原样复读误导指引）。
+    appr = next(t for t in m.TOOLS if t["name"] == "hub_task_approve")
+    assert "cli.py approve" in appr["description"], appr["description"]
+    assert "空 agent=管理面" not in appr["description"], appr["description"]
+    assert "cli.py approve" in appr["inputSchema"]["properties"]["agent"]["description"], \
+        appr["inputSchema"]["properties"]["agent"]
+    help_tasks = m.call_tool("hub_help", {"topic": "tasks"}, rs)
+    assert "cli.py approve" in help_tasks, help_tasks[-400:]
+    assert "管理面空传 agent" not in help_tasks, help_tasks[-400:]
     assert upd["properties"]["approval_required"]["type"] == "boolean", upd
     add_schema = next(t for t in m.TOOLS if t["name"] == "hub_task_add")["inputSchema"]
     assert add_schema["properties"]["approval_required"]["type"] == "boolean", add_schema
