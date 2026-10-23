@@ -4088,6 +4088,28 @@ def t_task_defer_approve_surface(hub):
     notneeded = m.call_tool("hub_task_approve", {"task_id": tid3, "agent": "workbuddy"}, rs)
     assert "未开启" in notneeded, notneeded
 
+    # ---- R71：进程身份锁定时，拒绝文案必须说清「空传 agent 也走不通」+ 可行两条腿。
+    # R70 dogfood 实测：锁定会话空传 agent 照样被 apply_server_agent 顶成锁定身份而
+    # 被拒，旧文案（「或管理面空传 agent」）建议的是一条死路；锁定在场时补 CLI 管理面指引。
+    add4 = m.call_tool("hub_task_add", {"title": "锁定期审批面任务", "project": "测试-项目",
+                                        "approval_required": True}, rs)
+    tid4 = int(add4.split("#")[1].split("：")[0].split()[0])
+    assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid4, "agent": "zcode"}, rs)
+    _old_agent = m.SERVER_AGENT
+    try:
+        m.SERVER_AGENT = "zcode"   # 模拟进程锁定身份=owner（生产由启动参数 --agent 设定）
+        locked = m.handle_message(rpc("tools/call", {"name": "hub_task_approve",
+                                                     "arguments": {"task_id": tid4}}), rs)
+    finally:
+        m.SERVER_AGENT = _old_agent
+    locked_txt = locked["result"]["content"][0]["text"]
+    assert "不能给自己" in locked_txt, locked_txt
+    assert "锁定" in locked_txt and "cli.py" in locked_txt, \
+        f"锁定会话的拒绝文案缺可行路径指引：{locked_txt}"
+    # 解锁后同一任务可经 MCP 管理面（空 agent）批准——证明指引的那条腿真的通
+    mgr = m.call_tool("hub_task_approve", {"task_id": tid4}, rs)
+    assert "已批准完成" in mgr and "管理面" in mgr, mgr
+
     schema = next(t for t in m.TOOLS if t["name"] == "hub_task_approve")["inputSchema"]
     assert schema["properties"]["note"]["type"] == "string", schema
     assert set(schema.get("required") or []) == {"task_id"}, schema

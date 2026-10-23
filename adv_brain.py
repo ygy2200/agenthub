@@ -4782,10 +4782,15 @@ def t_task_deliverables(tmp):
     assert (row6.get("evidence") or {}).get("total") == 0, row6.get("evidence")
 
     # ⑦ 改声明后 done：以最终声明为准
+    # ⑦ 改声明后 done：以最终声明为准。文件必须是**本任务期间**产出的——复用早前
+    #    子用例的文件会被严格口径判 stale（跨秒时必挂，同秒时被微秒差蒙混，
+    #    2026-10-23 实测 8 跑 1 挂的根因），这是测试结构错误不是生产缺陷。
     err, tid7 = brain.task_add(root, "后补声明", project="AgentHub-交付证据",
                                agent="workbuddy")
     assert not err, err
-    err, _r = brain.task_update(root, tid7, deliverables="output/报告.md",
+    late = proj / "output" / "后补的交付.md"
+    late.write_text("后补\n", encoding="utf-8")
+    err, _r = brain.task_update(root, tid7, deliverables="output/后补的交付.md",
                                 agent="workbuddy")
     assert not err, err
     _err, row7 = brain.task_update(root, tid7, status="done", agent="workbuddy")
