@@ -2746,6 +2746,25 @@ def t_usage_trace_completeness(hub):
     except Exception as e:  # noqa: BLE001
         raise AssertionError(f"留痕路径对任意工具名失败：{e}") from e
 
+    # ⑤ R67：多路复用内层留痕——经 hub_call_tool 转发的调用，内层工具也必须留痕。
+    # qoder 全家走 hub_call_tool，其真实流量此前只记得到多路复用本身，内层工具在
+    # usage_report 里显示「零调用」——「待审查」清单被假象污染，按假象治理就会把
+    # 在用工具当僵尸下线（D6 留痕盲区换了张皮）。失败的内层调用不计（同口径）。
+    before_mux, before_inner = _traced("hub_call_tool"), _traced("hub_status")
+    r_mux = m.handle_message(rpc("tools/call", {"name": "hub_call_tool",
+                                "arguments": {"name": "hub_status", "arguments": {}}}), rs)
+    assert "error" not in r_mux, f"hub_call_tool 出错：{r_mux}"
+    assert _traced("hub_call_tool") > before_mux, "多路复用本身未留痕"
+    assert _traced("hub_status") > before_inner, "内层工具未留痕（R67 盲区回来了）"
+    before_bad_mux, before_bad_inner = _traced("hub_call_tool"), _traced("hub_get_record")
+    r_bad = m.handle_message(rpc("tools/call", {"name": "hub_call_tool",
+                                "arguments": {"name": "hub_get_record",
+                                              "arguments": {"id": "abc"}}}), rs)
+    assert r_bad["result"].get("isError") or "错误" in r_bad["result"]["content"][0]["text"], \
+        f"本探针应失败：{r_bad}"
+    assert _traced("hub_get_record") == before_bad_inner, "失败的内层调用不该计入使用"
+    assert _traced("hub_call_tool") == before_bad_mux, "外层随内层失败一同不计（同口径）"
+
 
 def t_call_attribution(hub):
     """R28 控制面归因：tool_calls.agent 必须记「谁在调用」，而不是「在查谁」或空。
