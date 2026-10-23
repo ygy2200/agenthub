@@ -9,6 +9,12 @@ MRR / Hit@1/3/5（强断言）与 weak 达成、逐查询耗时 p50/max。
 
 运行：python tools/eval_search.py
       python tools/eval_search.py --root D:\tmp\hub-snapshot   # 指定语料根（同库复测）
+
+**持久冻结语料（R76）**：output/eval-corpus-20261023/_hub/brain.db（16MB，manifest.json
+记语料规模与首次指标 MRR 0.874 / Hit@5 27/28 / p50 105ms，2026-10-23 复现一致）。
+改检索后先跑它——**实时语料会漂移，拿今天的实时库跟去年的冻结基线比，指标变化分不清
+是算法改的还是语料长了的**（R6 时代语料是临时快照、没留下，教训已入库）。
+同口径确认后，再跑一次实时库看真实生产表现。
 """
 from __future__ import annotations
 
