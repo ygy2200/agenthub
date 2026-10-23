@@ -108,6 +108,29 @@ CHECK_FIXES = {
 }
 
 
+def patrol_freshness_note() -> str:
+    """R66：巡检结论的进程新鲜度标注——本进程代码旧于磁盘时返回一句警告，否则空串。
+
+    为什么需要：巡检（hub_sentry/doctor）跑在**调用方进程**里。部署后不重启的
+    会话加载的是旧代码，旧检查逻辑会产出**自信的错误结论**——2026-10-23 实测：
+    17:45 启动的旧进程把 zcode 的 auto_records 证据通道（R63 新增）当成零触发，
+    报出「闸门失效 zcode」假阳性；而按那条修复建议去重新注入 zcode 的闸门，
+    反而会动坏一个本来正常的配置。代价不对称：漏报可以复查，假阳性会被照办。
+    判定复用 core.runtime_staleness（R22/R24 的运行版本视野），不另起炉灶。
+    """
+    try:
+        core = _import_core()
+        info = core.runtime_staleness()
+        if info.get("known") and info.get("count"):
+            started = info.get("started") or "?"
+            when = started[5:16].replace("T", " ") if len(started) >= 16 else started
+            return (f"⚠ 本进程加载的代码旧于磁盘（{when} 启动，落后 {info['count']} 个文件）"
+                    "——本次巡检结论可能过期（旧逻辑可能误报），重启会话/客户端后复查")
+    except Exception:  # noqa: BLE001  标注失败不影响巡检本身
+        pass
+    return ""
+
+
 def run_patrol(root: str, checks=None) -> dict:
     """R8 一键自检：串行跑 PATROL_CHECKS，聚合成「通过/问题+修复建议」。
     单项炸了只记该为问题（检查实现故障不等于大脑故障），不拖垮整轮。"""

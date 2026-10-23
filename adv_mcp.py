@@ -181,7 +181,10 @@ def t_backup_drill_surface(tmp):
 
 
 def t_sentry_report(root):
-    """R8：hub_sentry action=report 只出自检报告（每条问题附修复建议），不广播信号。"""
+    """R8：hub_sentry action=report 只出自检报告（每条问题附修复建议），不广播信号。
+    R66：进程旧于磁盘时报告首行必须是新鲜度警告——旧检查逻辑会误报（实测旧进程把
+    zcode 的 auto_records 通道误判成「闸门失效」假阳性），照办那条修复建议反而会
+    动坏正常配置。双向 monkeypatch，不依赖测试机当时的真实新旧状态。"""
     hub = fresh_hub(Path(root), "mcp_doctor")
     out = m.call_tool("hub_sentry", {"action": "report"}, str(hub))
     assert "一键自检" in out and "修复：" in out, out[:400]
@@ -189,6 +192,20 @@ def t_sentry_report(root):
     with brain.db_conn(str(hub)) as conn:
         n = conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
     assert n == 0, f"report 不应写 signals：{n}"
+    import core
+    _orig = core.runtime_staleness
+    try:
+        core.runtime_staleness = lambda *a, **k: {"known": True, "count": 2,
+                                                  "started": "2026-10-23T17:45:12"}
+        out_stale = m.call_tool("hub_sentry", {"action": "report"}, str(hub))
+        core.runtime_staleness = lambda *a, **k: {"known": False, "count": 0, "started": ""}
+        out_fresh = m.call_tool("hub_sentry", {"action": "report"}, str(hub))
+    finally:
+        core.runtime_staleness = _orig
+    assert out_stale.splitlines()[0].startswith("⚠") and "可能过期" in out_stale.splitlines()[0], \
+        f"旧进程报告缺新鲜度警告：{out_stale[:200]}"
+    assert not out_fresh.splitlines()[0].startswith("⚠"), \
+        f"新鲜进程不应带警告：{out_fresh[:120]}"
 
 
 def t_protocol(root):

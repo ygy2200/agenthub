@@ -334,6 +334,21 @@ def main():
           and not ops._is_probe_line("2026-10-23T09:37:28Z  agent=hermes  BLOCK@stop sid=real-1"),
           "probe 过滤逻辑异常")
 
+    # ---- R66·巡检新鲜度标注：旧进程 → 警告；新鲜/未知 → 空串（不吓唬也不漏报）
+    import core as _core66
+    _orig_rs = _core66.runtime_staleness
+    try:
+        _core66.runtime_staleness = lambda *a, **k: {"known": True, "count": 2,
+                                                     "started": "2026-10-23T17:45:12"}
+        _note = ops.patrol_freshness_note()
+        check("R66 旧进程给新鲜度警告（点名落后文件数与照办风险）",
+              "可能过期" in _note and "2" in _note, _note)
+        _core66.runtime_staleness = lambda *a, **k: {"known": False, "count": 0, "started": ""}
+        check("R66 新鲜/未知进程不出警告", ops.patrol_freshness_note() == "",
+              ops.patrol_freshness_note())
+    finally:
+        _core66.runtime_staleness = _orig_rs
+
     # ---- R6·接入状态机（七项齐全 / 未注册也出清单 / 缺口带下一步 / 快照可复查）
     _ob = ops.agent_onboard_status(str(tmp), "Qoder-未接入样例")
     _keys = [s["key"] for s in _ob["steps"]]
