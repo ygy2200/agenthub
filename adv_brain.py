@@ -2360,6 +2360,24 @@ def t_signals(tmp):
         assert conn.execute("SELECT COUNT(*) FROM signal_reads").fetchone()[0] == 3
         row = conn.execute("SELECT status, read_by FROM signals WHERE id=1").fetchone()
         assert row["status"] == "read" and row["read_by"] == "dsh"
+    # 9) R77 陈旧治理：新信号计入开工推送；把 ts 拨到 SIGNAL_STALE_DAYS+1 天前——
+    #    不再计入（旧信号不该永远占着推送名额），但收件箱仍可见并标「陈旧」，
+    #    总账用 include_stale=True 仍可查；**不自动标已读**（伪造送达回执）
+    _tip9, sid9 = brain.signal_send(root, "zcode", "陈旧治理测试", to_agent="dsh")
+    assert brain.signal_unread_count(root, "dsh") == 1
+    old = (datetime.datetime.now()
+           - datetime.timedelta(days=brain.SIGNAL_STALE_DAYS + 1)).isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE signals SET ts=? WHERE id=?", (old, sid9))
+    assert brain.signal_unread_count(root, "dsh") == 0, "陈旧未读不应计入开工推送"
+    assert brain.signal_unread_count(root, "dsh", include_stale=True) == 1, "总账仍应可见"
+    brk = brain.signal_unread_breakdown(root, "dsh")
+    assert brk == {"fresh": 0, "stale": 1, "total": 1}, brk
+    box = brain.signal_inbox(root, "dsh", unread_only=True)
+    assert [r["id"] for r in box] == [sid9] and box[0]["_stale"] is True, box
+    assert brain.signal_inbox(root, "dsh", unread_only=True, exclude_stale=True) == []
+    # 自发广播仍不计（口径不变）
+    assert brain.signal_unread_count(root, "zcode") == 0
 
 
 def t_checkpoints(tmp):

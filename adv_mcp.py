@@ -105,6 +105,7 @@ def t_help_topics(root):
                    "### 3.5 库损坏的识别与降级", "db_corrupt", "db_integrity",
                    "backup-drill", "恢复演练",
                    "### 5.1 规模与内存", "AGENTHUB_TOK_CACHE_MAX", "cli.py --root <root> approve",
+                   "SIGNAL_STALE_DAYS", "未读信号·陈旧",
                    "## 11. 规则闸门：证据通道与探针", "gate_probe.py",
                    "auto_records", "evidence", "sid=probe-", "ASU_SKIP_BRAINLOG"):
         assert needle in text, f"运维手册缺关键步骤：{needle}"
@@ -669,6 +670,36 @@ def t_heartbeat_conflict(root):
     # agent 必填
     out = m.call_tool("hub_heartbeat", {"agent": "  "}, root)
     assert "必填" in out
+
+
+def t_signal_stale_push(tmp):
+    """R77：未读信号陈旧治理——新的逐条推内容，超 SIGNAL_STALE_DAYS 天的只给汇总句，
+    收件箱仍可见并标「陈旧」，且绝不自动标已读（伪造送达回执）。"""
+    import datetime as _dt
+    hub = fresh_hub(Path(tmp), "sig_stale")
+    rs = str(hub)
+    # 基线：无信号时心跳不提信号
+    out0 = m.call_tool("hub_heartbeat", {"agent": "workbuddy", "project": "甲-问题"}, rs)
+    assert "未读信号" not in out0, out0
+    # 1) 新信号 → 逐条推内容
+    _err, sid = brain.signal_send(rs, "zcode", "发布管线已修好，来验", to_agent="workbuddy")
+    out1 = m.call_tool("hub_heartbeat", {"agent": "workbuddy", "project": "甲-问题"}, rs)
+    assert "[未读信号] 1 条" in out1 and "发布管线已修好" in out1, out1
+    assert "陈旧" not in out1, out1
+    # 2) 拨成陈旧 → 不再推内容，改一句汇总；收件箱仍可见
+    old = (_dt.datetime.now()
+           - _dt.timedelta(days=brain.SIGNAL_STALE_DAYS + 1)).isoformat(timespec="seconds")
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE signals SET ts=? WHERE id=?", (old, sid))
+    out2 = m.call_tool("hub_heartbeat", {"agent": "workbuddy", "project": "甲-问题"}, rs)
+    assert "发布管线已修好" not in out2, "陈旧信号仍被逐条推送"
+    assert "[未读信号·陈旧] 1 条" in out2 and "hub_signal_read" in out2, out2
+    # 3) 不自动标已读：signal_reads 仍为空（送达回执只由对方显式动作产生）
+    with brain.db_conn(rs) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM signal_reads").fetchone()[0] == 0
+    # 4) hub_signals 里仍可见且标「陈旧」
+    box = m.call_tool("hub_signals", {"agent": "workbuddy"}, rs)
+    assert "陈旧" in box and "发布管线已修好" in box, box
 
 
 def t_heartbeat_today(root):
@@ -4407,6 +4438,8 @@ def main():
     case("8线程并发log_work（不丢行/journal完整）", lambda: t_concurrent_log_work(tmp, fresh_hub(tmp, "conc")))
     case("心跳撞车预警/陈旧清理/坏json自愈", lambda: t_heartbeat_conflict(fresh_hub(tmp, "hb")))
     case("M10 心跳开工推送今日任务（空库不刷/项目过滤/回退全局/P排序）", lambda: t_heartbeat_today(fresh_hub(tmp, "hbt")))
+    case("R77 未读信号陈旧治理（新信号逐条推/陈旧只汇总/不自动标已读/收件箱仍可见）",
+         lambda: t_signal_stale_push(tmp))
     case("R11 文件租约工具面（查占/获取/冲突/续租/释放/list/dry_run/心跳预警与续租/看板锁计数）",
          lambda: t_file_lease_surface(fresh_hub(tmp, "hublock")))
     case("错误登记（上报/查询/流转/坏行）", lambda: t_errors_flow(fresh_hub(tmp, "err")))

@@ -7768,6 +7768,12 @@ def claim_handoff(root: str, handoff_id, agent: str) -> str:
 # ---------------------------------------------------------------- 信号（M3）
 
 SIGNAL_KINDS = ("msg", "ack_request", "alert")
+# R77：未读信号的陈旧阈值（天）。信号是「开工推送」的燃料——一条没人读的信号会
+# 在每次心跳里原样再推一遍，永远占着未读名额（真实库实测：#2 三天前、#1 七天前
+# 仍 unread，signal_reads 全表 0 行），越积越多最后「N 条未读」本身就变成噪音，
+# 新信号反而被挤出 limit=2 的推送窗口。超阈值的不再计入开工推送，但**不静默丢弃**：
+# 收件箱仍显示并标「陈旧」，心跳给一句汇总。不自动标已读——那会伪造送达回执。
+SIGNAL_STALE_DAYS = 7
 
 
 def signal_send(root: str, from_agent: str, content: str, to_agent: str = "",
@@ -7804,10 +7810,21 @@ def signal_send(root: str, from_agent: str, content: str, to_agent: str = "",
     return tip, sid
 
 
+def _signal_age_days(ts) -> float:
+    """信号年龄（天）。时间不可解析时返回 -1——**不猜**：调用方按「年龄未知=不算陈旧」
+    处理，宁可多推一条也不静默吞掉一条没人读的信号。"""
+    dt = _parse_ts(ts)
+    if dt is None:
+        return -1.0
+    return (datetime.datetime.now() - dt).total_seconds() / 86400.0
+
+
 def signal_inbox(root: str, agent: str, unread_only: bool = False,
-                 limit: int = 30) -> list:
-    """收件箱：发给我的 + 广播（to 空），新的在前；每行附 _read（我是否已读）。
-    unread_only=True 只要未读。自己发的广播也在（群里自己发的也显示）。"""
+                 limit: int = 30, exclude_stale: bool = False) -> list:
+    """收件箱：发给我的 + 广播（to 空），新的在前；每行附 _read（我是否已读）与
+    _stale（是否超过 SIGNAL_STALE_DAYS 天未读）。unread_only=True 只要未读；
+    exclude_stale=True 再滤掉陈旧未读（开工推送用，避免旧信号永远占着推送名额）。
+    自己发的广播也在（群里自己发的也显示）。"""
     who = _norm_agent(agent)
     if not who:
         return []
@@ -7819,8 +7836,11 @@ def signal_inbox(root: str, agent: str, unread_only: bool = False,
             r["_read"] = bool(conn.execute(
                 "SELECT 1 FROM signal_reads WHERE signal_id=? AND agent=?",
                 (r["id"], who)).fetchone())
+            r["_stale"] = (not r["_read"]) and _signal_age_days(r.get("ts")) > SIGNAL_STALE_DAYS
         if unread_only:
             rows = [r for r in rows if not r["_read"]]
+        if exclude_stale:
+            rows = [r for r in rows if not r.get("_stale")]
     return rows
 
 
@@ -7863,18 +7883,30 @@ def signal_sent(root: str, agent: str, limit: int = 30) -> list:
             (who, max(1, min(int(limit or 30), 200))))]
 
 
-def signal_unread_count(root: str, agent: str) -> int:
+def signal_unread_count(root: str, agent: str, include_stale: bool = False) -> int:
     """未读数（心跳开工推送用）：发给我的 + 广播里我没读的。
-    排除自己发的广播——提醒自己去读自己发的消息没有意义（收件箱仍显示，留痕用）。"""
+    排除自己发的广播——提醒自己去读自己发的消息没有意义（收件箱仍显示，留痕用）。
+
+    include_stale 默认 False：超过 SIGNAL_STALE_DAYS 天仍未读的不计入（R77）——
+    它们长期没人理，继续按「新消息」推只会把开工推送变成噪音，还会挤掉 limit=2
+    里真正新的信号。要总账用 include_stale=True，或在 hub_signals 里看带「陈旧」
+    标记的行。**不自动标已读**：那等于伪造送达回执，宁可留在收件箱里可见。"""
+    return signal_unread_breakdown(root, agent)["total" if include_stale else "fresh"]
+
+
+def signal_unread_breakdown(root: str, agent: str) -> dict:
+    """未读数拆成 fresh / stale / total（R77）：开工推送只推 fresh，stale 给一句
+    汇总而不是整条内容，total 用于「我到底积了多少」的总账。"""
     who = _norm_agent(agent)
+    empty = {"fresh": 0, "stale": 0, "total": 0}
     if not who:
-        return 0
-    with db_conn(root) as conn:
-        return conn.execute(
-            "SELECT COUNT(*) FROM signals s WHERE s.from_agent!=? "
-            "AND (s.to_agent=? OR s.to_agent='') "
-            "AND NOT EXISTS (SELECT 1 FROM signal_reads r "
-            "WHERE r.signal_id=s.id AND r.agent=?)", (who, who, who)).fetchone()[0]
+        return dict(empty)
+    rows = signal_inbox(root, who, unread_only=True, limit=200)
+    # 沿用旧口径：自己发的广播不计（提醒自己去读自己发的没意义）
+    rows = [r for r in rows if r.get("from_agent") != who]
+    fresh = sum(1 for r in rows if not r.get("_stale"))
+    stale = sum(1 for r in rows if r.get("_stale"))
+    return {"fresh": fresh, "stale": stale, "total": fresh + stale}
 
 
 # ---------------------------------------------------------------- 检查点（M4）
