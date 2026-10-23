@@ -206,7 +206,7 @@ def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: 
 
 
 def cmd_backup_drill(root: str, path: str) -> int:
-    """R61 恢复演练：只读，不写现场库。"""
+    """R61 恢复演练：不写现场数据（R75 起仅审计流水留痕）。"""
     import brain  # noqa: PLC0415
     err, summary = brain.backup_drill(root, path)
     print(f"错误：{err}" if err else summary)
@@ -711,7 +711,7 @@ def main(argv=None) -> int:
     sub.add_parser("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
     sub.add_parser("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
     p_bp = sub.add_parser("backup-prune", help="R7 备份盘点与清理（默认预演，--apply 才删）")
-    p_bd = sub.add_parser("backup-drill", help="R61 恢复演练（只读：校验+试恢复，不写现场库）")
+    p_bd = sub.add_parser("backup-drill", help="R61 恢复演练（校验+试恢复，不写现场数据（仅审计流水留痕））")
     p_bd.add_argument("path", nargs="?", default="", help="备份文件路径，留空=最新整包")
     sub.add_parser("doctor", help="R8 一键自检：巡检聚合 + 可执行修复建议")
     p_bp.add_argument("--keep-zip", type=int, default=3)

@@ -142,8 +142,9 @@ def t_backup_prune_surface(root):
 
 
 def t_backup_drill_surface(tmp):
-    """R61：恢复演练只读——默认最新整包；报完整性/数据量/时效/§3.4；坏包与缺库包拒绝；
-    演练后现场 db/-wal/-shm 字节不变；空白空 path 给可执行提示。"""
+    """R61：恢复演练不写现场数据——默认最新整包；报完整性/数据量/时效/§3.4；坏包与缺库包拒绝；
+    演练后现场数据表零改动（R75 起允许的唯一写入是 journal 里的「备份演练」审计痕，
+    「全程只读不写现场库」的旧承诺因此修正为「不写现场数据，仅审计流水留痕」）。"""
     hub = fresh_hub(Path(tmp), "mcp_drill")
     m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
                                  "content": "演练用记录"}, str(hub))
@@ -151,16 +152,29 @@ def t_backup_drill_surface(tmp):
     assert not err, err
     meta = hub / core.DIR_META
 
-    def snapshot():
-        return {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
-                for p in meta.glob("brain.db*")}
+    def data_fingerprint():
+        """现场数据表的指纹（不含 journal——审计痕是 R75 起允许的唯一写入）。"""
+        with brain.db_conn(str(hub)) as conn:
+            out = {}
+            for t in ("records", "memories", "tasks", "projects", "signals", "checkpoints"):
+                try:
+                    out[t] = conn.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+                except Exception:  # noqa: BLE001  表可能不存在
+                    out[t] = -1
+            return out
 
-    before = snapshot()
+    before = data_fingerprint()
+    j_before = brain.journal_list(str(hub), 500)
     out = m.call_tool("hub_export", {"action": "drill"}, str(hub))
     for needle in ("恢复演练：可用", "quick_check ok", "未指定 path，取最新整包",
-                   "数据：records", "§3.4", "未写现场库"):
+                   "数据：records", "§3.4", "不写现场数据"):
         assert needle in out, (needle, out[:500])
-    assert snapshot() == before, "演练改动了现场库文件"
+    # 现场数据零改动；唯一允许的写入是那条审计痕
+    assert data_fingerprint() == before, "演练改动了现场数据表"
+    j_after = brain.journal_list(str(hub), 500)
+    new_rows = [j for j in j_after if j not in j_before]
+    assert len(new_rows) == 1 and new_rows[0].get("action") == "备份演练", \
+        f"演练应恰好留一条备份演练痕：{new_rows}"
     # 备份后又写一条：演练必须点名现场与备份的差异（恢复会回到备份时刻）
     m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
                                  "content": "备份之后的写入"}, str(hub))
@@ -4486,7 +4500,7 @@ def main():
          lambda: t_task_board_surface(fresh_hub(tmp, "hub_board_surface")))
     case("R7·备份清理工具面（backups 盘点/预演不删/apply 才删并留 journal）",
          lambda: t_backup_prune_surface(tmp))
-    case("R61·恢复演练工具面（默认最新整包/现场零改动/差异告警/坏包拒绝/无备份提示）",
+    case("R61·恢复演练工具面（默认最新整包/现场数据零改动+审计痕/差异告警/坏包拒绝/无备份提示）",
          lambda: t_backup_drill_surface(tmp))
     case("R8·一键自检工具面（action=report 出报告+修复建议/不广播信号）",
          lambda: t_sentry_report(tmp))

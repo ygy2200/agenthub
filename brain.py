@@ -8802,9 +8802,11 @@ def _ts_age_note(ts: str) -> str:
 
 
 def backup_drill(root: str, path: str = "") -> tuple:
-    """R61 恢复演练（全程只读）：把备份里的 brain.db 复制到临时目录、按恢复流程打开，
+    """R61 恢复演练（R75 起留审计痕）：把备份里的 brain.db 复制到临时目录、按恢复流程打开，
     校验 quick_check / 核心表 / schema 版本 / 数据量与时效，并与现场库只读对比。
-    不写现场库、不碰 -wal/-shm、不自动恢复——恢复仍是人的手工动作。
+    不写现场数据、不碰 -wal/-shm、不自动恢复——恢复仍是人的手工动作。R75 起成功后
+    在 journal 留一条「备份演练」痕（旁路写，失败不影响结论；「可恢复性上次被证明
+    是什么时候」从此可审计）。
     path 留空取最新整包（zip）；没有整包才回退到最新备份。"""
     import shutil
     import tempfile
@@ -8946,12 +8948,48 @@ def backup_drill(root: str, path: str = "") -> tuple:
         except OSError:
             space = f"约需 {need_mb:.1f}MB（磁盘可用空间未取到）"
         lines.append(f"空间：{space}")
-        lines.append("结论：可用于恢复（演练全程只读，未写现场库）。恢复：停写 → 现场 "
+        lines.append("结论：可用于恢复（演练不写现场数据（仅审计流水留痕））。恢复：停写 → 现场 "
                      "db/-wal/-shm 留证移走 → 解压 brain.db 放回 _hub → doctor 与 "
                      "db_integrity 复核（详见运维手册 §3.4）。")
+        # R75：演练留痕——「可恢复性上次被证明是什么时候」是审计要回答的问题，
+        # 没痕迹就等于没练过（备份不验恢复等于没备份）。旁路写，失败不影响结论。
+        journal_add(root, "system", "备份演练", str(p),
+                    note="结论=可用于恢复（未写现场数据）")
         return "", "\n".join(lines)
     finally:
         shutil.rmtree(drill_dir, ignore_errors=True)
+
+
+# R75：恢复演练的提醒周期（天）。本地单人系统，演练一次约十几秒+1GB 临时空间，
+# 30 天既不打断节奏也不至于「装了 drill 却一年想不起跑」。
+DRILL_REMIND_DAYS = 30
+
+
+def backup_drill_due(root: str, max_days: int = DRILL_REMIND_DAYS) -> dict:
+    """R75：距上次成功演练是否已超期（只读）。返回 {due, age_days, last_ts, reason}。
+
+    备份不验恢复等于没备份（生产共识）——R61 建了 drill 能力，但没有任何东西会
+    主动说「该跑一次了」；本函数给心跳推送做**条件式**提醒：从未演练过（有备份）
+    或上次演练超 max_days 天 → due=True。无备份/读失败/时间不可解析 → 不猜（due=False）。
+    """
+    try:
+        inv = backup_inventory(root)
+        if not inv.get("total_count"):
+            return {"due": False, "age_days": None, "last_ts": "", "reason": "无备份"}
+        with db_conn(root) as conn:
+            row = conn.execute(
+                "SELECT ts FROM journal WHERE action=? ORDER BY id DESC LIMIT 1",
+                ("备份演练",)).fetchone()
+        if not row:
+            return {"due": True, "age_days": None, "last_ts": "", "reason": "从未演练"}
+        last = str(row["ts"] or "")
+        try:
+            age = (datetime.datetime.now() - datetime.datetime.fromisoformat(last)).days
+        except (TypeError, ValueError):
+            return {"due": False, "age_days": None, "last_ts": last, "reason": "时间不可解析"}
+        return {"due": age >= max_days, "age_days": age, "last_ts": last, "reason": ""}
+    except Exception as e:  # noqa: BLE001  提醒是旁路，失败不出声
+        return {"due": False, "age_days": None, "last_ts": "", "reason": type(e).__name__}
 
 
 # ---------------------------------------------------------------- 时间机器（X4）

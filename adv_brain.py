@@ -327,6 +327,57 @@ def t_backup_brain(tmp):
     assert "不存在" in brain.backup_brain(str(Path(tmp) / "无2"))
 
 
+def t_backup_drill_due(tmp):
+    """R75：演练提醒条件式判定 + drill 成功留 journal 痕（可审计）。
+
+    备份不验恢复等于没备份——R61 建了 drill，但没有任何东西主动说「该跑一次了」。
+    提醒必须条件式：无备份/周期内不出声（不制造噪音），从未演练/超期才出声。
+    """
+    import datetime
+    import time
+    root = str(Path(tmp) / "hub_drill")
+    hub = Path(root) / core.DIR_META
+    (hub / "backup").mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+
+    # ① 无备份 → 不出声（没什么可演练，提醒等于骂空气）
+    d0 = brain.backup_drill_due(root)
+    assert not d0["due"] and d0["reason"] == "无备份", d0
+
+    # ② 有备份、从未演练 → 提醒
+    now = time.time()
+    bp = hub / "backup" / "brain-20261001.db"
+    bp.write_bytes(b"x" * 1024)
+    os.utime(bp, (now - 86400, now - 86400))
+    d1 = brain.backup_drill_due(root)
+    assert d1["due"] and d1["reason"] == "从未演练", d1
+
+    # ③ 刚演练过（journal 有痕）→ 不出声
+    brain.journal_add(root, "system", "备份演练", str(bp), note="test")
+    d2 = brain.backup_drill_due(root)
+    assert not d2["due"] and d2["age_days"] == 0, d2
+
+    # ④ 演练痕回拨 31 天（相对时间，不写死日期）→ 超 30 天周期，提醒
+    old = (datetime.datetime.now() - datetime.timedelta(days=31)).isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE journal SET ts=? WHERE action=?", (old, "备份演练"))
+    d3 = brain.backup_drill_due(root)
+    assert d3["due"] and (d3["age_days"] or 0) >= 30, d3
+
+    # ⑤ drill 真跑一次成功 → journal 落下「备份演练」痕（审计可查「何时证明过可恢复」）
+    err, real_bp = brain.backup_db(root)
+    assert not err, err
+    derr, dsum = brain.backup_drill(root, real_bp)
+    assert not derr, derr
+    assert "可用于恢复" in dsum, dsum[-200:]
+    with brain.db_conn(root) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='备份演练' "
+                         "AND target=?", (str(real_bp),)).fetchone()[0]
+    assert n >= 1, "drill 成功后未留 journal 痕"
+    # 留痕后周期内不再提醒
+    assert not brain.backup_drill_due(root)["due"], "刚演练过又提醒（条件式失效）"
+
+
 def t_backup_inventory_prune(tmp):
     """R7：备份盘点四家族 + 清理默认预演；apply 只删超保留份数且过最小年龄者。
     安全不变量：主库/非备份文件不动、最新 N 份永不清、未满 min_age 不动、删后 journal 可查。"""
@@ -5003,6 +5054,8 @@ def main():
          lambda: t_file_leases(tmp))
     case("R7 运行版本检测（顶层py/非py与子目录不算/容差/缺启动标记不猜/非 MCP 身份不冒充/坏时间不崩）", lambda: t_runtime_staleness(tmp))
     case("R7 备份盘点与清理（四家族/预演不删/保留最新/年龄闸/主库不动/留痕）", lambda: t_backup_inventory_prune(tmp))
+    case("R75 演练提醒条件式（无备份静默/从未演练提醒/周期内静默/超期提醒/drill 留痕）",
+         lambda: t_backup_drill_due(tmp))
     case("R29 部署原子化（全量暂存+校验/中段失败旧部署不变/无残留/故障后重试成功）",
          lambda: t_deploy_atomic(tmp))
     case("R33 部署状态只读探测（missing/ready/stale/no-python 四态/全程不写盘）",
