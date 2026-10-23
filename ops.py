@@ -1634,13 +1634,25 @@ def _agents(root: str) -> dict:
     return {"ok": not (miss_boot or stale or miss_mcp), "summary": summary, "detail": detail[:8]}
 
 
-def rules_components(root: str) -> dict:
+def _is_probe_line(ln: str) -> bool:
+    """R63：守卫日志里的探针会话行（tools/gate_probe.py 契约实测，sid=probe-*）。
+
+    探针证明的是「钩子接了线」，不是「闸门在跑」——不排除的话刚探活过就会被
+    当成有触发证据，rules_health 的 dead/idle 分级被污染。纯函数便于单测。
+    """
+    return "sid=probe-" in (ln or "")
+
+
+def rules_components(root: str, targets_file: str = "") -> dict:
     """逐家闸门状态的结构化版本（rules_health 与 hub_agent 共用，避免两套口径）。
 
-    返回 {"agents": [{agent,state,last,block,deny,mark,last_work,work_recent}],
+    返回 {"agents": [{agent,state,last,block,deny,mark,last_work,work_recent,channel}],
           "scripts_missing": [...], "untracked": [...]}；state ∈ inplace/missing/unwired。
     last_work/work_recent（R32）= 该 agent 近 GATE_SILENT_ACTIVITY_DAYS 天最后一条工作记录/是否有记录，
     供 rules_health 把零触发分级成「未验证」与「钩子失效」；只增字段。
+    channel（R63）= 触发证据通道：guard（守卫日志，缺省）/ auto_records（auto_log 写的
+    source='auto' 记录——zcode 的闸门是另一套机制，拿守卫日志衡量它永远零触发）。
+    targets_file 仅供回归注入，生产读 ~/.agenthub/hooks/targets.json。
     """
     guard_script = Path.home() / ".agenthub" / "hooks" / "agent_guard.mjs"
     brainlog_script = Path.home() / ".workbuddy" / "bin" / "guard-brainlog.mjs"
@@ -1657,30 +1669,34 @@ def rules_components(root: str) -> dict:
 
     targets, scripts = [], [guard_script, brainlog_script]
     try:
-        _mfd = json.loads((Path.home() / ".agenthub" / "hooks" / "targets.json").read_text(encoding="utf-8"))
+        _mfd = json.loads((Path(targets_file) if targets_file
+                           else Path.home() / ".agenthub" / "hooks" / "targets.json")
+                          .read_text(encoding="utf-8"))
         for _t in (_mfd.get("targets") or []):
-            targets.append((str(_t.get("agent") or "?"), _expand(_t.get("cfg")), str(_t.get("keyword") or "")))
+            targets.append((str(_t.get("agent") or "?"), _expand(_t.get("cfg")),
+                            str(_t.get("keyword") or ""),
+                            str(_t.get("evidence") or "guard")))
         if _mfd.get("scripts"):
             scripts = [_expand(s) for s in _mfd["scripts"]]
     except (OSError, ValueError):
         pass
     if not targets:   # 回退内置清单（清单缺失也不瞎）
         targets = [
-            ("workbuddy", Path.home() / ".workbuddy" / "settings.json", "guard-brainlog.mjs"),
-            ("claude", Path.home() / ".claude" / "settings.json", "agent_guard.mjs"),
-            ("codex", Path.home() / ".codex" / "hooks.json", "agent_guard.mjs"),
-            ("hermes", Path.home() / "AppData" / "Local" / "hermes" / "config.yaml", "agent_guard.mjs"),
-            ("hermes-cn", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"), "agent_guard.mjs"),
-            ("zcode", Path.home() / ".zcode" / "cli" / "config.json", "auto_log.py"),
-            ("dsh", Path.home() / ".dsh" / "hooks.json", "agent_guard.mjs"),
-            ("qoder", Path.home() / ".qoder-cn" / "settings.json", "agent_guard.mjs"),
+            ("workbuddy", Path.home() / ".workbuddy" / "settings.json", "guard-brainlog.mjs", "guard"),
+            ("claude", Path.home() / ".claude" / "settings.json", "agent_guard.mjs", "guard"),
+            ("codex", Path.home() / ".codex" / "hooks.json", "agent_guard.mjs", "guard"),
+            ("hermes", Path.home() / "AppData" / "Local" / "hermes" / "config.yaml", "agent_guard.mjs", "guard"),
+            ("hermes-cn", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"), "agent_guard.mjs", "guard"),
+            ("zcode", Path.home() / ".zcode" / "cli" / "config.json", "auto_log.py", "auto_records"),
+            ("dsh", Path.home() / ".dsh" / "hooks.json", "agent_guard.mjs", "guard"),
+            ("qoder", Path.home() / ".qoder-cn" / "settings.json", "agent_guard.mjs", "guard"),
         ]
 
     # 动态核对注册表：新增 agent 只登记 config.agents.json 而忘了补 targets.json 时，
     # 过去是静默漏掉（Qoder 接入即如此）。这里按注册表逐家点名，而不是等人去发现。
     try:
         _core = _import_core()
-        covered = {_core.agent_key(a) for a, _c, _k in targets}
+        covered = {_core.agent_key(a) for a, _c, _k, _e in targets}
         untracked = [str(a.get("agent") or "?")
                      for a in _core.AGENT_ADAPTERS + _core.load_agent_adapters(root)
                      if _core.agent_key(str(a.get("agent") or "")) not in covered]
@@ -1695,6 +1711,10 @@ def rules_components(root: str) -> dict:
         except OSError:
             continue
         for ln in lines:
+            # R63：探针会话不是真实使用——tools/gate_probe.py 的契约实测会写归因行，
+            # 不排除的话「刚探活过」会被当成「闸门在跑」，触发证据被污染。
+            if _is_probe_line(ln):
+                continue
             m = re.search(r"agent=(\S+)", ln)
             ag = m.group(1) if m else default_agent
             if not ag:
@@ -1710,17 +1730,38 @@ def rules_components(root: str) -> dict:
             elif "marked logged" in ln:
                 d["mark"] += 1
 
+    # R63：auto_records 证据通道——zcode 的闸门是 auto_log.py（会话轨迹自动捕获，
+    # 写 source='auto' 的大脑记录 + journal），触发证据不在守卫日志里。拿 guard
+    # 日志衡量它永远零触发，R32 会把它误判成 dead。按通道取各自的证据。
+    auto_stat: dict = {}
+    if any(t[3] == "auto_records" for t in targets):
+        try:
+            import brain as _brain  # noqa: PLC0415
+            with _brain.db_conn(root) as _conn:
+                for _r in _conn.execute(
+                        "SELECT agent, MAX(date) AS last, COUNT(*) AS n FROM records "
+                        "WHERE source='auto' GROUP BY agent"):
+                    auto_stat[str(_r["agent"] or "")] = (str(_r["last"] or ""), int(_r["n"] or 0))
+        except Exception:  # noqa: BLE001  读不到大脑时该通道按无证据处理（不猜）
+            auto_stat = {}
+
     agents = []
-    for agent, cfg, keyword in targets:
+    for agent, cfg, keyword, evidence in targets:
         try:
             txt = cfg.read_text(encoding="utf-8", errors="replace") if cfg.is_file() else ""
         except OSError:
             txt = ""
         state = "missing" if not txt else ("unwired" if keyword not in txt else "inplace")
-        s = stat.get(agent) or {}
-        agents.append({"agent": agent, "state": state,
-                       "last": s.get("last", ""), "block": s.get("block", 0),
-                       "deny": s.get("deny", 0), "mark": s.get("mark", 0)})
+        if evidence == "auto_records":
+            _last, _n = auto_stat.get(agent, ("", 0))
+            row = {"agent": agent, "state": state, "last": _last,
+                   "block": 0, "deny": 0, "mark": _n, "channel": evidence}
+        else:
+            s = stat.get(agent) or {}
+            row = {"agent": agent, "state": state,
+                   "last": s.get("last", ""), "block": s.get("block", 0),
+                   "deny": s.get("deny", 0), "mark": s.get("mark", 0), "channel": evidence}
+        agents.append(row)
     # R32：闸门生效性分级的数据面——零触发单看不分善恶，配上「agent 近期有没有在干活」
     # 才能把「没活动所以没触发」（未验证）与「在干活却零触发」（钩子没生效）分开。
     # 只增字段，不改既有口径；大脑读不到时留空，由消费侧按未验证处理（不猜）。
@@ -1794,20 +1835,23 @@ def _rules_health(root: str) -> dict:
         elif r["last"]:
             detail.append(f"{agent}: ✓ 最近触发 {r['last'][5:16]} 拦截{r['block']}/拒绝{r['deny']}/记账{r['mark']}")
         elif agent in silent_dead:
+            _ch = "守卫日志" if r.get("channel", "guard") == "guard" else "auto_log 记录"
             detail.append(f"{agent}: ✗ 闸门零触发但该 agent 近期在工作（最后记录 "
-                          f"{r.get('last_work') or '?'}）——钩子可能没生效，去其会话实测一次写工具调用")
+                          f"{r.get('last_work') or '?'}）——钩子可能没生效，去其会话实测一次写工具调用"
+                          f"（契约探针：python tools/gate_probe.py；证据通道：{_ch}）")
         else:
+            _ch = "守卫日志" if r.get("channel", "guard") == "guard" else "auto_log 记录"
             detail.append(f"{agent}: ⚠ 配置在位但零触发（agent 近期无活动"
                           + (f"，最后记录 {r.get('last_work')}" if r.get("last_work")
                              else f"，近 {GATE_SILENT_ACTIVITY_DAYS} 天无工作记录")
-                          + "，闸门未获验证）")
+                          + f"，闸门未获验证；证据通道：{_ch}）")
 
     gaps = len(missing) + len(unwired) + len(scripts_ok) + len(untracked) + len(silent_dead)
     if untracked:
         detail.append("注册表有但闸门清单未覆盖：" + "、".join(untracked) + "（补 ~/.agenthub/hooks/targets.json）")
     if silent_dead:
         detail.append(f"闸门失效判定依据：这些 agent 近 {GATE_SILENT_ACTIVITY_DAYS} 天有工作记录、"
-                      "守卫日志却零触发——配置在位 ≠ 钩子生效")
+                      "各自证据通道却零触发——配置在位 ≠ 钩子生效")
     if gaps == 0:
         tail = "且均有触发记录"
         if silent:

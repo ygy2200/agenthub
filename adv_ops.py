@@ -303,6 +303,37 @@ def main():
     finally:
         ops.rules_components = _orig_rc
 
+    # ---- R63·证据通道分型：auto_records 通道（zcode 的 auto_log 闸门）取
+    # source='auto' 的大脑记录，不再拿守卫日志衡量它；探针会话行不算证据。
+    import datetime as _dt
+    _today = _dt.date.today().isoformat()
+    _ch_root = tmp / "hub_channel"
+    _ch_root.mkdir()
+    import brain as _b_ch
+    _b_ch.ensure_schema(str(_ch_root))
+    _b_ch.add_record(str(_ch_root), "P-chan", "zz-auto", _today, "auto 捕获", "自动记录", source="auto")
+    _b_ch.add_record(str(_ch_root), "P-chan", "zz-auto", _today, "手工记录", "在干活的证据")
+    (_ch_root / "cfg.yaml").write_text("hooks:\n  - auto_log.py\n", encoding="utf-8")
+    (_ch_root / "cfg2.json").write_text('{"agent_guard.mjs": true}', encoding="utf-8")
+    _tgt = tmp / "targets_inject.json"
+    _tgt.write_text(json.dumps({"targets": [
+        {"agent": "zz-auto", "cfg": str(_ch_root / "cfg.yaml"), "keyword": "auto_log.py",
+         "evidence": "auto_records"},
+        {"agent": "zz-guard", "cfg": str(_ch_root / "cfg2.json"), "keyword": "agent_guard.mjs",
+         "evidence": "guard"}]}, ensure_ascii=False), encoding="utf-8")
+    _comp = ops.rules_components(str(_ch_root), targets_file=str(_tgt))
+    _rows = {r["agent"]: r for r in _comp["agents"]}
+    check("R63 auto_records 通道取到 source='auto' 证据（last=今天）",
+          _rows["zz-auto"]["channel"] == "auto_records" and _rows["zz-auto"]["last"] == _today,
+          str(_rows.get("zz-auto")))
+    check("R63 guard 通道不被 auto 记录污染（无守卫日志→空，不串用）",
+          _rows["zz-guard"]["channel"] == "guard" and _rows["zz-guard"]["last"] == "",
+          str(_rows.get("zz-guard")))
+    check("R63 探针会话行不算触发证据（纯函数）",
+          ops._is_probe_line("2026-10-23T09:37:28Z  agent=hermes  BLOCK@stop sid=probe-123-hermes")
+          and not ops._is_probe_line("2026-10-23T09:37:28Z  agent=hermes  BLOCK@stop sid=real-1"),
+          "probe 过滤逻辑异常")
+
     # ---- R6·接入状态机（七项齐全 / 未注册也出清单 / 缺口带下一步 / 快照可复查）
     _ob = ops.agent_onboard_status(str(tmp), "Qoder-未接入样例")
     _keys = [s["key"] for s in _ob["steps"]]
