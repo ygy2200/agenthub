@@ -104,7 +104,9 @@ def t_help_topics(root):
                    "hub_status(view=\"digest\"", "复制回滚方式",
                    "### 3.5 库损坏的识别与降级", "db_corrupt", "db_integrity",
                    "backup-drill", "恢复演练",
-                   "### 5.1 规模与内存", "AGENTHUB_TOK_CACHE_MAX"):
+                   "### 5.1 规模与内存", "AGENTHUB_TOK_CACHE_MAX",
+                   "## 11. 规则闸门：证据通道与探针", "gate_probe.py",
+                   "auto_records", "evidence", "sid=probe-", "ASU_SKIP_BRAINLOG"):
         assert needle in text, f"运维手册缺关键步骤：{needle}"
 
 
