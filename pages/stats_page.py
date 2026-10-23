@@ -53,6 +53,11 @@ class StatsPage(QWidget):
         lay.addSpacing(16)
         lay.addWidget(section_head("大脑体检（智能摘要）", "HEART"))
         lay.addWidget(self.healthLine)
+        lay.addSpacing(16)
+        lay.addWidget(section_head("任务过程（近 7 天，hub_tasks view=stats 同口径）", "HISTORY"))
+        self.taskLine = CaptionLabel("")
+        self.taskLine.setWordWrap(True)
+        lay.addWidget(self.taskLine)
         lay.addStretch(1)
 
     def set_db(self, s: dict):
@@ -85,6 +90,30 @@ class StatsPage(QWidget):
                 + "（agent 可调 hub_health / hub_distill 看完整报告）")
         except Exception:
             self.healthLine.setText("体检暂不可用")
+        try:
+            m = brain.task_metrics(self.win.root, days=7)
+            f, w, r = m["flow"], m["wip"], m["retry"]
+            dc = f["done_cycle_hours"]
+
+            def h(x):
+                return "—" if x is None else f"{x:g}h"
+
+            tip = [f"近 7 天：新建 {f['created']} · 完成 {f['done']}"
+                   f" · 取消/死信 {f['cancelled_or_dead']}"
+                   f"（完成周期中位 {h(dc['p50'])} / P90 {h(dc['p90'])}）",
+                   f"在办 {w['in_progress']}：租约超时 {w['stale_leases']} · 无主 {w['unowned']}"
+                   f" · 等审批 {w['approval_waiting']} · 逾期 {w['overdue']}",
+                   f"重试存量 {r['tasks_with_attempts']} 单 / 累计 {r['attempts_total']} 次"]
+            if m.get("risks"):
+                labels = {"lease_stale": "租约超时", "unowned": "无主", "approval_waiting": "等审批",
+                          "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2"}
+                tip.append("风险：" + "、".join(
+                    f"{labels.get(x['kind'], x['kind'])} {x['count']}" for x in m["risks"]))
+            else:
+                tip.append("风险信号：无")
+            self.taskLine.setText("；".join(tip) + "（CLI：tasks --stats）")
+        except Exception:
+            self.taskLine.setText("任务统计暂不可用")
 
         def clear(box):
             while box.count():

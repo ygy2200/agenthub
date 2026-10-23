@@ -134,7 +134,8 @@ class BrainPage(QWidget):
             leases = brain.file_lease_list(root, include_released=False, limit=200)
         except Exception:
             leases = []
-        chip_key = {"in_progress": "accent", "blocked": "warning", "done": "success"}
+        chip_key = {"in_progress": "accent", "blocked": "warning", "done": "success",
+                    "dead": "warning", "cancelled": "text_secondary"}
         lease_label = {"expired": "租约过期", "ownerless": "无主", "unleased": "缺租约"}
         lease_tip = {
             "expired": lambda t: (f"认领于 {t['claimed_at'][:16]}，超过 "
@@ -174,6 +175,34 @@ class BrainPage(QWidget):
                 chip.setToolTip(
                     f"任务创建后 {t['_starve_days']:g} 天一直可直接开工，却无人认领；"
                     "还该做就 hub_claim，不做就 hub_task_update 调整优先级或关单")
+                r.addWidget(chip)
+            # R42-R45 过程控制：死信/退避/延后/审批四类状态桌面直接可见
+            if t.get("status") == "dead":
+                chip = status_chip(f"死信（{t.get('_attempts') or 0} 次失败）", "warning")
+                chip.setToolTip("重试耗尽已退出队列；排查后 hub_task_retry 复活（次数重置），"
+                                "或确认放弃后新建任务")
+                r.addWidget(chip)
+            elif t.get("_retry_wait_min"):
+                chip = status_chip(f"退避 {t['_retry_wait_min']} 分钟", "warning")
+                chip.setToolTip(
+                    f"第 {t.get('_attempts') or 0} 次失败后指数退避；"
+                    f"原因：{(t.get('last_error') or '-')[:60]}；"
+                    "确认修复后 hub_task_retry(delay=0) 提前放行")
+                r.addWidget(chip)
+            if t.get("_defer_wait_h"):
+                until = (t.get("defer_until") or "")[:16].replace("T", " ")
+                chip = status_chip(f"延后至 {until[5:]}", "text_secondary")
+                chip.setToolTip(
+                    f"原因：{(t.get('defer_reason') or '-')[:80]}；到点自动回到前沿，"
+                    "提前唤醒 hub_task_update(defer_until='-')")
+                r.addWidget(chip)
+            if t.get("_approval_required"):
+                if (t.get("approved_by") or "").strip():
+                    chip = status_chip(f"已审批 {t['approved_by']}", "success")
+                    chip.setToolTip("已由他人复核批准；持有者可标 done")
+                else:
+                    chip = status_chip("待审批", "warning")
+                    chip.setToolTip("done 前需他人/管理面 hub_task_approve 批准（owner 不能自批）")
                 r.addWidget(chip)
             # R14 文件租约可见性：挂在本任务上的活跃锁（与 hub_tasks 行尾「锁 N」同口径）
             locks = t.get("_locks") or 0

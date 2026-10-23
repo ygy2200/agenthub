@@ -12,6 +12,7 @@ from PySide6.QtWidgets import QListWidgetItem, QInputDialog  # noqa: F401
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401
 import brain
+import ops
 
 
 class _SubPage(QWidget):
@@ -304,8 +305,121 @@ class _SkillStatsSub(_SubPage):
             self.listw.addItem(f"  {s['name']} [{s['agent']}] {s['path']}")
 
 
+
+class _SecuritySub(_SubPage):
+    """R54 安全与闸门：桌面端看审计链/冻结状态/安全体检，并能冻结、解冻、导出取证。
+
+    审计链断裂时不给「重新封存」按钮——取证场景先导出留证，掩盖链比链断更糟。"""
+
+    TITLE = "安全与闸门"
+    EMPTY_TITLE = "安全面正常"
+    EMPTY_DESC = "审计链完整、未冻结、凭据扫描干净；有异常时这里逐条列出"
+
+    def _build_buttons(self):
+        self.freezeBtn = PushButton("冻结写入")
+        self.freezeBtn.setToolTip("全局写闸门：所有写工具被拒，读工具照常；定时或手动解冻")
+        self.freezeBtn.clicked.connect(self.freeze)
+        self.thawBtn = PushButton("解除冻结")
+        self.thawBtn.clicked.connect(self.thaw)
+        self.exportBtn = PushButton("导出审计")
+        self.exportBtn.setToolTip("journal 链字段 + 写审计导出 JSONL 到 _hub/exports（取证用）")
+        self.exportBtn.clicked.connect(self.export)
+        self.refreshBtn = PushButton("刷新")
+        self.refreshBtn.clicked.connect(self.reload)
+        for b in (self.freezeBtn, self.thawBtn, self.exportBtn, self.refreshBtn):
+            self.btnRow.addWidget(b)
+        self.btnRow.addStretch(1)
+
+    def _fill(self):
+        super()._fill()
+        if not self.win.root:
+            return
+        root = self.win.root
+        chain_ok = health_ok = False
+        try:
+            chain = brain.journal_verify(root)
+            chain_ok = chain["ok"]
+            self.listw.addItem(f"审计链：{chain['summary']}")
+            if chain.get("chain_at"):
+                self.listw.addItem(f"  封存起点 {chain['chain_at'][:19]}"
+                                   f"（此前历史只能证明封存后未改）")
+            for b in chain.get("broken", [])[:5]:
+                self.listw.addItem(f"  ⚠ #{b['id']}：{b['why']}")
+        except Exception as e:  # noqa: BLE001 单块失败不拖垮整页
+            self.listw.addItem(f"审计链：校验失败（{type(e).__name__}: {str(e)[:80]}）")
+        try:
+            fr = brain.freeze_get(root)
+            if fr["active"]:
+                span = fr["until"][:19].replace("T", " ") if fr["until"] else "手动解冻"
+                self.listw.addItem(f"写入闸门：冻结中（{fr['by'] or '-'}｜至 {span}｜"
+                                   f"{fr['reason'][:60]}）")
+            elif fr.get("expired"):
+                self.listw.addItem("写入闸门：已过期（残留状态，点「解除冻结」清理）")
+            else:
+                self.listw.addItem("写入闸门：未冻结")
+        except Exception as e:  # noqa: BLE001
+            self.listw.addItem(f"写入闸门：读取失败（{type(e).__name__}: {str(e)[:80]}）")
+        try:
+            h = ops.run_check("security_health", "", root)
+            health_ok = h["ok"]
+            self.listw.addItem(("✓ " if h["ok"] else "✗ ") + "安全体检：" + h["summary"])
+            for d in h.get("detail", [])[:8]:
+                self.listw.addItem("  " + d)
+        except Exception as e:  # noqa: BLE001
+            self.listw.addItem(f"安全体检：执行失败（{type(e).__name__}: {str(e)[:80]}）")
+        self.sumLabel.setText(
+            ("✓ 安全面正常" if (chain_ok and health_ok) else "⚠ 安全面有异常，见下方逐条")
+            + "——审计链只读校验，冻结/解冻动作会记入审计链")
+
+    def freeze(self):
+        minutes, ok = QInputDialog.getInt(
+            self, "冻结全局写入", "分钟数（0=手动解冻，1..1440=定时自动解冻）：", 30, 0, 1440)
+        if not ok:
+            return
+        reason, ok = QInputDialog.getText(self, "冻结原因", "写清为什么冻结（必填，解冻时按它对账）：")
+        if not ok:
+            return
+        reason = (reason or "").strip()
+        if not reason:
+            InfoBar.warning("冻结原因必填", "没有原因的冻结无法在解冻时对账", parent=self)
+            return
+        err, fr = brain.freeze_set(self.win.root, minutes, reason, "gui")
+        if err:
+            op_failed("冻结写入", Exception(err), parent=self)
+            return
+        span = f"{minutes} 分钟" if minutes else "手动解冻"
+        InfoBar.success("已冻结全局写入", f"{span}｜{reason[:60]}", parent=self)
+        self.reload()
+
+    def thaw(self):
+        err, fr = brain.freeze_clear(self.win.root, "gui", "桌面解除")
+        if err:
+            op_failed("解除冻结", Exception(err), parent=self)
+            return
+        if fr.get("_was_active"):
+            InfoBar.success("已解除冻结", "写工具恢复可用；动作已记入审计链", parent=self)
+        elif fr.get("_was_expired"):
+            InfoBar.success("已清理过期冻结", "此前已自动过期，无需再解冻", parent=self)
+        else:
+            InfoBar.info("当前未冻结", "无需解冻", parent=self)
+        self.reload()
+
+    def export(self):
+        err, meta = brain.audit_export(self.win.root, "jsonl", 30, 20000)
+        if err:
+            op_failed("导出审计", Exception(err), parent=self)
+            return
+        chain = (meta.get("chain") or {}).get("summary", "")
+        note = f"{meta['path']}（{meta['bytes']} 字节）"
+        if meta.get("truncated"):
+            note += "；已触达上限被截断，缩小 days 或调大 limit 再导"
+        if chain and not (meta.get("chain") or {}).get("ok", True):
+            note += f"；⚠ 链异常：{chain}"
+        InfoBar.success("审计已导出", note, parent=self)
+
+
 class GovernancePage(QWidget):
-    """治理中心：隔离区/整合提案/待验证决策/关注管理/技能统计 五段。"""
+    """治理中心：隔离区/整合提案/待验证决策/关注管理/技能统计/安全与闸门 六段。"""
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -314,20 +428,20 @@ class GovernancePage(QWidget):
         set_page_margins(lay)
         lay.addWidget(_page_head(
             "治理中心", "大脑的日常治理面：可疑内容隔离、重复记忆整合、决策到期回顾、"
-                        "关注项目管理、技能使用统计——桌面直接操作"))
+                        "关注项目管理、技能使用统计、审计链与写闸门——桌面直接操作"))
 
         self.seg = SegmentedWidget(self)
         self.stack = QStackedWidget(self)
         self.subs = (_QuarantineSub(win), _ConsolidateSub(win), _DecisionSub(win),
-                     _ViewSub(win), _SkillStatsSub(win))
-        for key, sub in zip(("quarantine", "consolidate", "decision", "view", "skill"),
-                            self.subs):
+                     _ViewSub(win), _SkillStatsSub(win), _SecuritySub(win))
+        for key, sub in zip(("quarantine", "consolidate", "decision", "view", "skill",
+                             "security"), self.subs):
             self.seg.addItem(key, sub.TITLE)
             self.stack.addWidget(sub)
         self.seg.currentItemChanged.connect(
             lambda key: self.stack.setCurrentIndex(
                 {"quarantine": 0, "consolidate": 1, "decision": 2, "view": 3,
-                 "skill": 4}.get(key, 0)))
+                 "skill": 4, "security": 5}.get(key, 0)))
         lay.addWidget(self.seg)
         lay.addWidget(self.stack, 1)
         self.seg.setCurrentItem("quarantine")

@@ -3,7 +3,11 @@
     "props": {
       "action": "string",
       "agent": "string",
-      "note": "string"
+      "confirm": "boolean",
+      "note": "string",
+      "skills": "string",
+      "state": "string",
+      "target": "string"
     },
     "required": []
   },
@@ -220,7 +224,9 @@
   "hub_export": {
     "props": {
       "action": "string",
+      "audit_format": "string",
       "confirm": "boolean",
+      "days": "integer",
       "dest": "string",
       "dry_run": "boolean",
       "fmt": "string",
@@ -236,6 +242,18 @@
       "dry_run": "boolean",
       "force": "boolean",
       "max_chars": "integer"
+    },
+    "required": []
+  },
+  "hub_freeze": {
+    "props": {
+      "action": "string",
+      "agent": "string",
+      "confirm": "boolean",
+      "dry_run": "boolean",
+      "max_chars": "integer",
+      "minutes": "integer",
+      "reason": "string"
     },
     "required": []
   },
@@ -407,6 +425,7 @@
       "project": "string",
       "record_type": "string",
       "review_date": "string",
+      "task": "integer",
       "tradeoffs": "string",
       "waive": "string"
     },
@@ -690,7 +709,9 @@
   },
   "hub_status": {
     "props": {
-      "max_chars": "integer"
+      "days": "integer",
+      "max_chars": "integer",
+      "view": "string"
     },
     "required": []
   },
@@ -699,6 +720,7 @@
       "agent": "string",
       "blocked_by": "string",
       "confirm": "boolean",
+      "deliverables": "string",
       "deps": "string",
       "detail": "string",
       "dry_run": "boolean",
@@ -706,23 +728,60 @@
       "max_chars": "integer",
       "priority": "integer",
       "project": "string",
+      "skills": "string",
       "title": "string"
     },
     "required": [
       "title"
     ]
   },
+  "hub_task_approve": {
+    "props": {
+      "agent": "string",
+      "note": "string",
+      "task_id": "integer"
+    },
+    "required": [
+      "task_id"
+    ]
+  },
+  "hub_task_quality": {
+    "props": {
+      "days": "integer",
+      "limit": "integer",
+      "project": "string",
+      "task_id": "integer"
+    },
+    "required": []
+  },
+  "hub_task_retry": {
+    "props": {
+      "agent": "string",
+      "delay": "integer",
+      "reason": "string",
+      "task_id": "integer"
+    },
+    "required": [
+      "task_id",
+      "reason"
+    ]
+  },
   "hub_task_update": {
     "props": {
       "agent": "string",
       "blocked_by": "string",
+      "cancel_reason": "string",
       "confirm": "boolean",
+      "deliverables": "string",
       "deps": "string",
       "detail": "string",
       "dry_run": "boolean",
       "due": "string",
+      "handoff_note": "string",
+      "handoff_to": "string",
       "max_chars": "integer",
       "priority": "integer",
+      "skills": "string",
       "status": "string",
       "task_id": "integer"
     },
@@ -732,11 +791,13 @@
   },
   "hub_tasks": {
     "props": {
+      "days": "integer",
       "limit": "integer",
       "max_chars": "integer",
       "owner": "string",
       "project": "string",
-      "status": "string"
+      "status": "string",
+      "view": "string"
     },
     "required": []
   },

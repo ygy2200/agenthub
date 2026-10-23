@@ -7,6 +7,7 @@
 """
 from __future__ import annotations
 
+import datetime
 import json
 import os
 import sqlite3
@@ -262,11 +263,23 @@ def t_search_all_and_stats(tmp):
     _today = datetime.date.today().isoformat()
     brain.add_record(rs, "测试-项目", "zcode", _today, f"{_today}（zcode）", "修了FlClash的规则")
     brain.update_files_index(rs, [("测试-项目", str(root / "测试-项目" / "a.png"), "a.png", "根目录", 1, 0.0)])
+    err, tid = brain.task_add(rs, "修复 FlClash 规则丢失", project="测试-项目",
+                              detail="订阅更新后 profile_id 被覆盖", agent="zcode")
+    assert not err, err
+    assert not brain.error_add(rs, "zcode", "FlClash 规则被订阅覆盖",
+                               detail="更新订阅后自定义规则消失", project="测试-项目",
+                               undo="重新导入规则并核对 profile_id")
     res = brain.search_all(rs, "flclash")
     assert res["records"] and res["memories"] and not res["files"]
+    assert [t["id"] for t in res["tasks"]] == [tid], res["tasks"]
+    assert res["errors"] and res["errors"][0]["undo"].startswith("重新导入"), res["errors"]
+    # 任务/错误多词 AND：全中才收，拆开时任一字段命中即可
+    assert brain.search_tasks(rs, "flclash 规则") and not brain.search_tasks(rs, "flclash 不存在")
+    assert brain.search_errors(rs, "订阅 自定义规则")
     res = brain.search_all(rs, "a.png")
     assert res["files"] and not res["records"], "文件名命中不应混入记录"
-    assert brain.search_all(rs, "  ") == {"records": [], "memories": [], "notes": [], "files": []}
+    assert brain.search_all(rs, "  ") == {"records": [], "memories": [], "notes": [],
+                                          "tasks": [], "errors": [], "files": []}
     s = brain.stats(rs)
     assert s["records"] >= 4 and s["memories"] >= 3 and "agent_counts" in s and "monthly_counts" in s
     assert s["today"] >= 1
@@ -4696,6 +4709,169 @@ def t_deploy_status(tmp):
     assert not list(dst.parent.glob(f".{dst.name}.old-*")), "探测留下旧目录"
 
 
+def t_task_deliverables(tmp):
+    """R34 交付物证据：声明→done 核验（ok/missing/stale/unverifiable/坏路径 fail-open）。"""
+    import datetime
+    import os as _os
+    proj = Path(tmp) / "AgentHub-交付证据"
+    (proj / "output").mkdir(parents=True)
+    root = str(tmp)
+
+    # ① 新建即声明；done 时核验：存在的本轮文件 → ok、complete
+    #    先建任务再落文件：本用例要验「本轮产物」，文件写在任务创建之前会被严格
+    #    判 stale（Enjambre 口径），两者顺序写反会让用例随毫秒差间歇性失败。
+    err, tid = brain.task_add(root, "写周报", project="AgentHub-交付证据",
+                              deliverables="output/报告.md", agent="workbuddy")
+    assert not err, err
+    fresh = proj / "output" / "报告.md"
+    fresh.write_text("# 交付物\n", encoding="utf-8")
+    err, row = brain.task_update(root, tid, status="done", agent="workbuddy")
+    assert not err, err
+    ev = row.get("evidence") or {}
+    assert ev.get("total") == 1 and ev["counts"]["ok"] == 1 and ev["complete"], ev
+    assert ev["items"][0]["state"] == "ok", ev
+
+    # ② 缺失 → missing、complete=False（不阻断：状态已是 done）
+    err, tid2 = brain.task_add(root, "补截图", project="AgentHub-交付证据",
+                               deliverables="output/不存在的.png", agent="workbuddy")
+    assert not err, err
+    err, row2 = brain.task_update(root, tid2, status="done", agent="workbuddy")
+    ev2 = row2.get("evidence") or {}
+    assert ev2["counts"]["missing"] == 1 and not ev2["complete"], ev2
+    assert row2["status"] == "done", "证据不全不得阻断完成"
+
+    # ③ 旧于任务创建 → stale（os.utime 回拨一天）
+    old = proj / "output" / "旧稿.md"
+    old.write_text("旧\n", encoding="utf-8")
+    past = datetime.datetime.now() - datetime.timedelta(days=1)
+    _os.utime(old, (past.timestamp(), past.timestamp()))
+    err, tid3 = brain.task_add(root, "改旧稿", project="AgentHub-交付证据",
+                               deliverables="output/旧稿.md", agent="workbuddy")
+    assert not err, err
+    _err, row3 = brain.task_update(root, tid3, status="done", agent="workbuddy")
+    ev3 = row3.get("evidence") or {}
+    assert ev3["counts"]["stale"] == 1 and not ev3["complete"], ev3
+    assert "早于任务创建" in ev3["items"][0]["note"], ev3
+
+    # ④ URL → unverifiable（诚实标注，不假装验证过）
+    err, tid4 = brain.task_add(root, "发文章", project="AgentHub-交付证据",
+                               deliverables="https://example.com/post", agent="workbuddy")
+    assert not err, err
+    _err, row4 = brain.task_update(root, tid4, status="done", agent="workbuddy")
+    ev4 = row4.get("evidence") or {}
+    assert ev4["counts"]["unverifiable"] == 1, ev4
+
+    # ⑤ 多条混合 + 坏路径 fail-open：坏路径不抛错、按缺失处理（Path.exists 自吞
+    #    ValueError，observable 行为=不崩+判 missing）；新文件在任务前一刻落盘才 ok。
+    fresh2 = proj / "output" / "刚写的.md"
+    fresh2.write_text("新\n", encoding="utf-8")
+    err, tid5 = brain.task_add(root, "混合声明", project="AgentHub-交付证据",
+                               deliverables=f"output/刚写的.md\noutput/缺的.txt\x00坏",
+                               agent="workbuddy")
+    assert not err, err
+    _err, row5 = brain.task_update(root, tid5, status="done", agent="workbuddy")
+    ev5 = row5.get("evidence") or {}
+    assert ev5["total"] == 2 and ev5["counts"]["ok"] == 1, ev5
+    assert ev5["items"][1]["state"] == "missing", ev5
+
+    # ⑥ 未声明 → total=0（不制造噪音）
+    err, tid6 = brain.task_add(root, "无声明任务", project="AgentHub-交付证据",
+                               agent="workbuddy")
+    assert not err, err
+    _err, row6 = brain.task_update(root, tid6, status="done", agent="workbuddy")
+    assert (row6.get("evidence") or {}).get("total") == 0, row6.get("evidence")
+
+    # ⑦ 改声明后 done：以最终声明为准
+    err, tid7 = brain.task_add(root, "后补声明", project="AgentHub-交付证据",
+                               agent="workbuddy")
+    assert not err, err
+    err, _r = brain.task_update(root, tid7, deliverables="output/报告.md",
+                                agent="workbuddy")
+    assert not err, err
+    _err, row7 = brain.task_update(root, tid7, status="done", agent="workbuddy")
+    assert (row7.get("evidence") or {}).get("complete"), row7.get("evidence")
+
+
+def t_task_record_binding(tmp):
+    """R35 记录↔任务闭环：老库补列/绑定落库/持有者写入续租/完成声明漂移（含负向与
+    历史任务号）/结晶优先收编绑定记录且不混入他任务。"""
+    root = str(Path(tmp) / "AgentHub-闭环")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    # ⓪ 老库迁移：模拟没有 task_id 的 records 表 → 补列 + 补索引（索引必须补列后建）
+    with brain.db_conn(root) as conn:
+        conn.execute("DROP INDEX IF EXISTS idx_records_task")
+        conn.execute("ALTER TABLE records DROP COLUMN task_id")
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
+        idxs = {r["name"] for r in conn.execute("PRAGMA index_list(records)")}
+    assert "task_id" in cols, "老库未补 task_id"
+    assert "idx_records_task" in idxs, "老库未补 task_id 索引"
+
+    err, tid = brain.task_add(root, "闭环任务", project="AgentHub-闭环", agent="workbuddy")
+    assert not err, err
+    rid = brain.add_record(root, "AgentHub-闭环", "workbuddy", "2026-10-23", "冒烟",
+                           "目的：验证绑定。已完成并交付。", task_id=tid)
+    with brain.db_conn(root) as conn:
+        assert conn.execute("SELECT task_id FROM records WHERE id=?",
+                            (rid,)).fetchone()[0] == tid
+
+    # ① 持有者写入 → 续租并推进 progress_at；非持有者只读不改
+    err, _row = brain.task_claim(root, tid, "workbuddy")
+    assert not err, err
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00', "
+                     "progress_at='2020-01-01T00:00:00' WHERE id=?", (tid,))
+    err, row = brain.task_touch(root, tid, "workbuddy")
+    assert not err and row["status"] == "in_progress", row
+    assert row["claimed_at"] > "2020-01-01" and row["progress_at"] > "2020-01-01", row
+    err, row2 = brain.task_touch(root, tid, "zcode")
+    assert not err and row2["owner"] == "workbuddy", row2
+    assert row2["claimed_at"] == row["claimed_at"], "非持有者不应续租"
+
+    # ② 完成声明漂移：绑定记录算；负向表述不算；任务 done 后清零
+    drift = brain.task_closure_drift(root)
+    assert drift["counts"]["linked"] == 1 and drift["items"][0]["task_id"] == tid, drift
+    brain.add_record(root, "AgentHub-闭环", "workbuddy", "2026-10-23", "还没好",
+                     "当前尚未完成，未交付。", task_id=tid)
+    neg = brain.task_closure_drift(root)
+    assert neg["counts"]["linked"] == 1 and neg["counts"]["total"] == 1, neg
+    err, _row = brain.task_update(root, tid, status="done", agent="workbuddy")
+    assert not err, err
+    assert brain.task_closure_drift(root)["counts"]["total"] == 0, \
+        brain.task_closure_drift(root)
+
+    # ③ 历史未绑定记录：正文点名「任务 #N」也能发现
+    err, tid2 = brain.task_add(root, "历史口径任务", project="AgentHub-闭环")
+    assert not err, err
+    brain.add_record(root, "AgentHub-闭环", "zcode", "2026-10-23", "收尾",
+                     f"任务 #{tid2} 已完成，产物在 output。")
+    d2 = brain.task_closure_drift(root)
+    assert d2["counts"]["unlinked"] == 1 and d2["items"][0]["task_id"] == tid2, d2
+    assert d2["items"][0]["linked"] is False, d2
+
+    # ④ 结晶收编：绑定记录不受时间窗限制；他任务记录不混入
+    rid_early = brain.add_record(root, "AgentHub-闭环", "workbuddy", "2026-10-22", "提前写的",
+                                 "开工前记录。", task_id=tid2)
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET created='2020-01-01T00:00:00' WHERE id=?",
+                     (rid_early,))
+    err, tid3 = brain.task_add(root, "他任务", project="AgentHub-闭环")
+    assert not err, err
+    brain.add_record(root, "AgentHub-闭环", "zcode", "2026-10-23", "他任务记录",
+                     "同项目同期但属于别的任务。", task_id=tid3)
+    err, _row = brain.task_update(root, tid2, status="done", agent="")
+    assert not err, err
+    with brain.db_conn(root) as conn:
+        c = conn.execute("SELECT id,content,task_id FROM records WHERE "
+                         "record_type='crystal' ORDER BY id DESC LIMIT 1").fetchone()
+    assert c is not None and c["task_id"] == tid2, dict(c) if c else None
+    assert "任务绑定 1 条" in c["content"], c["content"][:400]
+    assert "他任务记录" not in c["content"], "他任务记录混入结晶"
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_brain_")
     print(f"临时目录：{tmp}\n")
@@ -4826,12 +5002,1118 @@ def main():
          lambda: t_deploy_atomic(tmp))
     case("R33 部署状态只读探测（missing/ready/stale/no-python 四态/全程不写盘）",
          lambda: t_deploy_status(tmp))
+    case("R34 交付物证据（ok/missing/stale/unverifiable/坏路径 fail-open/未声明静默/后补声明）",
+         lambda: t_task_deliverables(tmp))
+    case("R35 记录↔任务闭环（老库补列索引/绑定落库/持有者续租/完成声明漂移/结晶收编）",
+         lambda: t_task_record_binding(tmp))
+    case("R36 agent 管控（老库补列/状态读写/心跳不复活/认领闸门/收尾可续租/前沿停止推荐/journal）",
+         lambda: t_agent_control(tmp))
+    case("R37 能力路由（技能归一/老库补列/未声明放行/匹配认领/不匹配拒收/前沿过滤/续租不受影响）",
+         lambda: t_skill_routing(tmp))
+    case("R38 WIP 上限（到顶拦新认领/续租不拦/完成释放/他人不受影响/0=不限）",
+         lambda: t_wip_limit(tmp))
+    case("R39 任务交办（非持有者/未知/技能/暂停/WIP 拦截/检查点/租约释放/信号/journal）",
+         lambda: t_task_handoff(tmp))
+    case("R40 完成质量（自动锚点不算痕迹/交付物缺失提示/扎实满分/未完成不体检/巡检排序）",
+         lambda: t_closure_quality(tmp))
+    case("R41 任务取消（原因必填/持有者约束/终态不可逆/释放租约/退出队列WIP/漂移豁免）",
+         lambda: t_task_cancel(tmp))
+    case("R42/R43 失败重试与死信（原因必填/指数退避/提前放行/死信终态/复活/终态拒收）",
+         lambda: t_task_retry(tmp))
+    case("R44/R45 延后与完成审批（老库补列/原因与未来/退出前沿/唤醒/清退避/释放租约/四眼审批/关审批清批准）",
+         lambda: t_task_defer_approve(tmp))
+    case("R47 审计链（写入接链/头锚/改字段点名/删行断层/截断头锚/历史未封存不误伤/老库补列自动封存）",
+         lambda: t_journal_chain(tmp))
+    case("R48 冻结状态机（必填与范围/定时与手动/到期失效/幂等解冻/坏状态fail-closed/动作入审计链）",
+         lambda: t_freeze_state(tmp))
+    case("R51 项目名护栏（穿越/分隔符/盘符/保留目录/控制字符拒收，任务与归档同护栏，合法名不误伤）",
+         lambda: t_project_ref_guard(tmp))
+    case("R53 任务过程统计（窗口流量/周期分位/在办卡点/重试存量/质量抽检/项目与 owner 过滤）",
+         lambda: t_task_metrics(tmp))
+    case("R55 团队日结（窗口流动/当前卡点/风险归因/agent 记分卡/长窗口/空库）",
+         lambda: t_team_digest(tmp))
+    case("R59 库损坏识别与恢复指引（只认结构损坏/锁与缺表不误判/路径与步骤齐全）",
+         lambda: t_db_corruption_guidance(tmp))
+    case("R60 覆盖度闸门 df 复用（乱码仍被闸/全表 COUNT 只扫一次）",
+         lambda: t_coverage_gate_reuses_df(tmp))
+    case("R60 BM25 分词缓存有上限（FIFO 淘汰/两个命名空间各自受限）",
+         lambda: t_tok_cache_bounded(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
         sys.exit(1)
     print("BRAIN ALL PASS")
+
+
+def t_agent_control(tmp):
+    """R36 agent 管控：老库补列/状态读写/心跳不复活/认领闸门（draining/paused/offline）
+    /收尾可续租在办/前沿停止推荐/切换留 journal。"""
+    root = str(Path(tmp) / "AgentHub-管控")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    # 老库迁移：模拟没有管控列的 agents 表 → init_db 补列
+    with brain.db_conn(root) as conn:
+        for c in ("control_state", "control_note", "control_at"):
+            conn.execute(f"ALTER TABLE agents DROP COLUMN {c}")
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+    assert {"control_state", "control_note", "control_at"} <= cols, cols
+
+    assert brain.agent_control_get(root, "zcode")["state"] == "active"
+    # 先在 active 下开一单在办任务，再切收尾——收尾的语义是「干完现有活」
+    err, tid = brain.task_add(root, "管控任务", project="项目-甲", agent="qoder")
+    assert not err, err
+    err, tid2 = brain.task_add(root, "已在办", project="项目-甲", agent="qoder")
+    assert not err
+    assert brain.task_update(root, tid2, status="in_progress", agent="zcode")[0] == ""
+    err, info = brain.agent_control_set(root, "ZCode", "draining", "收尾旧任务", "qoder")
+    assert not err and info["state"] == "draining", (err, info)
+    # 心跳只刷新活跃，不得把管控状态悄悄改回 active
+    brain.heartbeat_touch(root, "zcode", "项目-甲")
+    assert brain.agent_control_get(root, "zcode")["state"] == "draining"
+    assert brain.agent_control_get(root, "zcode")["note"] == "收尾旧任务"
+
+    err, _row = brain.task_claim(root, tid, "zcode")
+    assert "收尾" in err and "不接新任务" in err, err
+    nx = brain.task_next(root, owner="zcode")
+    assert nx["counts"]["ready"] == 0 and nx["control"]["state"] == "draining", nx
+
+    err, row = brain.task_claim(root, tid2, "zcode")
+    assert not err and row.get("_renewed"), (err, row)
+
+    # paused / offline 同样拦新认领；非法状态拒收
+    for st in ("paused", "offline"):
+        brain.agent_control_set(root, "zcode", st)
+        err, _ = brain.task_claim(root, tid, "zcode")
+        assert "不接新任务" in err, (st, err)
+    err, _ = brain.agent_control_set(root, "zcode", "dead")
+    assert "只能是" in err, err
+
+    # 恢复 active：认领放行，前沿恢复推荐
+    brain.agent_control_set(root, "zcode", "active")
+    err, row = brain.task_claim(root, tid, "zcode")
+    assert not err and row["status"] == "in_progress", (err, row)
+    nx = brain.task_next(root, owner="zcode")
+    assert nx["control"]["state"] == "active", nx
+
+    with brain.db_conn(root) as conn:
+        n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='agent 管控'").fetchone()[0]
+    assert n >= 4, n
+
+
+def t_skill_routing(tmp):
+    """R37 能力路由：技能归一/老库补列/未声明放行/声明后匹配认领/不匹配拒收/
+    前沿按技能过滤/续租不受影响/更新与清除。"""
+    root = str(Path(tmp) / "AgentHub-能力")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        conn.execute("ALTER TABLE agents DROP COLUMN skills")
+        conn.execute("ALTER TABLE tasks DROP COLUMN skills")
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        acols = {r["name"] for r in conn.execute("PRAGMA table_info(agents)")}
+        tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    assert "skills" in acols and "skills" in tcols, (acols, tcols)
+
+    err, sk = brain.agent_skills_set(root, "ZCode", "Python，写文档 python ; test")
+    assert not err and sk == ["python", "写文档", "test"], (err, sk)
+    assert brain.agent_skills_get(root, "zcode") == sk
+
+    # 双方都没声明：不过滤（存量兼容）
+    err, t_plain = brain.task_add(root, "无技能任务", project="项目-乙")
+    assert not err
+    assert brain.task_claim(root, t_plain, "qoder")[0] == ""
+
+    # 任务要求技能，agent 未声明 → 放行；agent 声明了但不匹配 → 拒收
+    err, t_free = brain.task_add(root, "未声明也可接", project="项目-乙", skills="python")
+    assert not err
+    assert brain.task_claim(root, t_free, "qoder")[0] == ""  # qoder 未声明，fail-open
+    brain.agent_skills_set(root, "buddy", "design")
+    err, t_py = brain.task_add(root, "Python 任务", project="项目-乙", skills="python,数据库")
+    assert not err
+    err2, _ = brain.task_claim(root, t_py, "buddy")
+    assert "不匹配" in err2 and "python" in err2, err2
+    # 已声明且命中 → 认领成功
+    assert brain.task_claim(root, t_py, "zcode")[0] == ""
+    err, t_design = brain.task_add(root, "设计任务", project="项目-乙", skills="design")
+    assert not err
+
+    # 前沿按技能过滤：zcode 只看得到 python 任务；buddy 只看 design；无声明者全看
+    nx_z = brain.task_next(root, owner="zcode")
+    assert all("design" not in (t.get("skills") or "") for t in nx_z["ready"]), nx_z
+    nx_b = brain.task_next(root, owner="buddy")
+    assert [t["id"] for t in nx_b["ready"]] == [t_design], nx_b["ready"]
+    nx_free = brain.task_next(root, owner="nobody")
+    assert {t["id"] for t in nx_free["ready"]} >= {t_design}, nx_free
+
+    # task_update 归一与清除；认领后续租不受技能变化影响
+    err, t_upd = brain.task_add(root, "可改技能", project="项目-乙", skills="python，a")
+    assert not err
+    err, row = brain.task_update(root, t_upd, status="in_progress", agent="zcode",
+                                 skills="Python;C")
+    assert not err and row["skills"] == "python,c", row
+    brain.agent_skills_set(root, "zcode", "design")
+    err, row = brain.task_claim(root, t_upd, "zcode")
+    assert not err and row.get("_renewed"), (err, row)
+    err, row = brain.task_update(root, t_upd, skills="-", agent="zcode")
+    assert not err and row["skills"] == "", row
+
+
+def t_wip_limit(tmp):
+    """R38 WIP 上限：到顶拦新认领/续租不拦/完成后释放/他人不受影响/0=不限。"""
+    root = str(Path(tmp) / "AgentHub-WIP")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    old = brain.MAX_WIP_PER_AGENT
+    brain.MAX_WIP_PER_AGENT = 2
+    try:
+        ids = []
+        for i in range(4):
+            err, tid = brain.task_add(root, f"WIP任务{i}", project="项目-丙", agent="qoder")
+            assert not err, err
+            ids.append(tid)
+        assert brain.task_claim(root, ids[0], "zcode")[0] == ""
+        assert brain.task_claim(root, ids[1], "zcode")[0] == ""
+        err, _ = brain.task_claim(root, ids[2], "zcode")
+        assert "WIP 上限 2" in err and "先完成" in err, err
+        wip = brain.task_wip(root, "zcode")
+        assert wip["open"] == 2 and wip["at_limit"] is True, wip
+        # 续租不受限
+        err, row = brain.task_claim(root, ids[0], "zcode")
+        assert not err and row.get("_renewed"), (err, row)
+        # 完成后释放名额
+        assert brain.task_update(root, ids[0], status="done", agent="zcode")[0] == ""
+        assert brain.task_claim(root, ids[2], "zcode")[0] == ""
+        # 其他 agent 不受影响
+        assert brain.task_claim(root, ids[3], "buddy")[0] == ""
+        # 0=不限
+        brain.MAX_WIP_PER_AGENT = 0
+        assert brain.task_claim(root, ids[1] + 0, "zcode")[0] == ""  # 续租
+        err, tid5 = brain.task_add(root, "不限任务", project="项目-丙")
+        assert not err
+        assert brain.task_claim(root, tid5, "zcode")[0] == ""
+        assert brain.task_wip(root, "zcode")["limit"] == 0
+    finally:
+        brain.MAX_WIP_PER_AGENT = old
+
+
+def t_task_handoff(tmp):
+    """R39 任务交办：非持有者/未知目标/技能不匹配/目标暂停/WIP 到顶均拒收；
+    成功交办换主、先留检查点、释放任务文件租约、发信号、写 journal。"""
+    root = str(Path(tmp) / "AgentHub-交办")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.agent_skills_set(root, "zcode", "python")
+    brain.agent_skills_set(root, "workbuddy", "python")
+    brain.agent_skills_set(root, "dsh", "design")
+    err, tid = brain.task_add(root, "交办任务", project="项目-丁", skills="python")
+    assert not err
+    assert brain.task_claim(root, tid, "zcode")[0] == ""
+    err, _ = brain.file_lease_acquire(root, "src/x.py", "zcode", task_id=tid, reason="交办测试")
+    assert not err, err
+
+    err, _ = brain.task_handoff(root, tid, "qoder", "workbuddy")
+    assert "只有持有者" in err, err
+    err, _ = brain.task_handoff(root, tid, "zcode", "ghost_agent")
+    assert "不在注册表" in err, err
+    err, _ = brain.task_handoff(root, tid, "zcode", "dsh")
+    assert "不匹配" in err, err
+    brain.agent_control_set(root, "workbuddy", "paused")
+    err, _ = brain.task_handoff(root, tid, "zcode", "workbuddy")
+    assert "暂停" in err, err
+    brain.agent_control_set(root, "workbuddy", "active")
+
+    # WIP：buddy 先领满 1 单，交办被拒；完成后再交办成功
+    old = brain.MAX_WIP_PER_AGENT
+    brain.MAX_WIP_PER_AGENT = 1
+    try:
+        err, t2 = brain.task_add(root, "占位", project="项目-丁")
+        assert not err
+        assert brain.task_claim(root, t2, "workbuddy")[0] == ""
+        err, _ = brain.task_handoff(root, tid, "zcode", "workbuddy")
+        assert "WIP 上限" in err, err
+        assert brain.task_update(root, t2, status="done", agent="workbuddy")[0] == ""
+        err, row = brain.task_handoff(root, tid, "zcode", "workbuddy", note="接口已改完，剩测试")
+        assert not err, err
+    finally:
+        brain.MAX_WIP_PER_AGENT = old
+    assert row["owner"] == "workbuddy" and row["status"] == "in_progress", row
+    assert row.get("_handoff") == "zcode→workbuddy", row
+    assert row.get("_leases_released") == 1, row
+    cps = brain.checkpoint_list(root, tid)
+    assert any("交办给 workbuddy" in (c["content"] or "") for c in cps), cps
+    inbox = brain.signal_inbox(root, "workbuddy")
+    assert any("【交办】" in (s.get("content") or "") for s in inbox), inbox
+    with brain.db_conn(root) as conn:
+        j = conn.execute("SELECT COUNT(*) FROM journal WHERE action='交办任务' "
+                         "AND target=?", (f"tasks#{tid}",)).fetchone()[0]
+        lease = conn.execute("SELECT released_at FROM file_leases WHERE task_id=?",
+                             (tid,)).fetchone()
+    assert j == 1, j
+    assert lease and lease["released_at"], dict(lease or {})
+
+    # 管理面（from 空）也可交办
+    err, row = brain.task_handoff(root, tid, "", "dsh")
+    assert "不匹配" in err  # 技能闸门对管理面同样生效
+    err, row = brain.task_handoff(root, tid, "", "hermes")
+    assert not err and row["owner"] == "hermes", (err, row)
+
+
+def t_closure_quality(tmp):
+    """R40 完成质量：只有自动锚点/交付物缺失/极速关单均提示；扎实关闭满分；
+    未完成任务不体检；结晶记录不算过程痕迹；巡检按分数升序。"""
+    root = str(Path(tmp) / "AgentHub-质量")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    proj = "项目-质"
+    err, t1 = brain.task_add(root, "空手关单", project=proj)
+    assert not err
+    assert brain.task_claim(root, t1, "zcode")[0] == ""
+    err, row = brain.task_update(root, t1, status="done", agent="zcode")
+    assert not err
+    q1 = row["quality"]
+    codes = {c["code"] for c in q1["checks"]}
+    assert q1["done"] and not q1["ok"], q1
+    assert "anchor_only" in codes, codes  # 自动锚点不算过程痕迹
+    assert "instant_close" in codes and "no_detail" in codes, codes
+    assert q1["score"] == 35, q1["score"]
+    with brain.db_conn(root) as conn:
+        n_crystal = conn.execute("SELECT COUNT(*) FROM records WHERE task_id=? "
+                                 "AND record_type='crystal'", (t1,)).fetchone()[0]
+    assert n_crystal == 1, n_crystal
+    assert q1["stats"]["records"] == 0, q1["stats"]
+
+    # 扎实关闭：人工检查点 + 绑定记录 + 真实交付物 + 关闭说明
+    err, t2 = brain.task_add(root, "扎实关闭", project=proj, detail="实现并验证",
+                             deliverables="out.txt")
+    assert not err
+    assert brain.task_claim(root, t2, "zcode")[0] == ""
+    assert not brain.checkpoint_save(root, t2, "zcode", "实现完成，自测通过")[0]
+    (Path(root) / proj).mkdir(parents=True, exist_ok=True)
+    (Path(root) / proj / "out.txt").write_text("ok", encoding="utf-8")
+    rid = brain.add_record(root, proj, "zcode", "2026-10-23", "实现记录",
+                           "改了什么、怎么验证", task_id=t2)
+    assert rid > 0
+    err, row = brain.task_update(root, t2, status="done", agent="zcode")
+    assert not err
+    q2 = row["quality"]
+    assert q2["done"] and q2["ok"] and q2["score"] == 100, q2
+    assert q2["stats"]["records"] == 1 and q2["stats"]["deliverables_ok"] == 1, q2
+
+    # 交付物缺失：只提示，不阻断
+    err, t3 = brain.task_add(root, "缺交付", project=proj, detail="要交报告",
+                             deliverables="missing.md")
+    assert not err
+    assert brain.task_claim(root, t3, "zcode")[0] == ""
+    assert not brain.checkpoint_save(root, t3, "zcode", "写完了")[0]
+    err, row = brain.task_update(root, t3, status="done", agent="zcode")
+    assert not err and row["status"] == "done", row
+    q3 = row["quality"]
+    assert not q3["ok"] and any("交付物" in w for w in q3["warnings"]), q3
+    assert q3["score"] == 70, q3["score"]
+    assert q3["stats"]["deliverables"] == 1 and q3["stats"]["deliverables_ok"] == 0, q3
+
+    # 未完成任务不体检；未知任务报错
+    err, t4 = brain.task_add(root, "未完成", project=proj)
+    assert not err
+    err, rep = brain.task_closure_quality(root, t4)
+    assert not err and rep["done"] is False and "只针对 done" in rep["note"], rep
+    err, _ = brain.task_closure_quality(root, 99999)
+    assert "不存在" in err
+
+    # 巡检：窗口内 3 单完成，按分数升序；项目过滤生效
+    rep = brain.task_closure_quality_report(root, days=1)
+    assert rep["counts"]["total"] == 3, rep["counts"]
+    assert rep["counts"]["ok"] == 1 and rep["counts"]["warned"] == 2, rep["counts"]
+    scores = [it["score"] for it in rep["items"]]
+    assert scores == sorted(scores), scores
+    assert brain.task_closure_quality_report(root, project="不存在")["counts"]["total"] == 0
+
+
+def t_task_cancel(tmp):
+    """R41 任务取消：必须写原因；持有者约束；终态不可逆；释放租约；退出队列/WIP；
+    管理面可取消；完成声明漂移不再追已取消任务。"""
+    root = str(Path(tmp) / "AgentHub-取消")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    err, t1 = brain.task_add(root, "需求取消", project="项目-戊")
+    assert not err
+    err, _ = brain.task_update(root, t1, status="cancelled", agent="qoder")
+    assert "cancel_reason" in err, err
+    err, row = brain.task_update(root, t1, status="cancelled", agent="qoder",
+                                 cancel_reason="需求方砍掉了这个功能")
+    assert not err and row["status"] == "cancelled", row
+    assert row["cancel_reason"] == "需求方砍掉了这个功能", row
+    assert row["cancelled_by"] == "qoder" and row["cancelled_at"], row
+    err, _ = brain.task_update(root, t1, status="pending", agent="qoder")
+    assert "终态" in err and "新建任务" in err, err
+
+    err, t2 = brain.task_add(root, "在办取消", project="项目-戊")
+    assert not err
+    assert brain.task_claim(root, t2, "zcode")[0] == ""
+    err, _ = brain.file_lease_acquire(root, "src/c.py", "zcode", task_id=t2, reason="取消测试")
+    assert not err, err
+    err, _ = brain.task_update(root, t2, status="cancelled", agent="workbuddy",
+                               cancel_reason="别人来取消")
+    assert "只有持有者" in err, err
+    err, row = brain.task_update(root, t2, status="cancelled", agent="zcode",
+                                 cancel_reason="上游接口废弃")
+    assert not err and row["status"] == "cancelled", row
+    with brain.db_conn(root) as conn:
+        lease = conn.execute("SELECT released_at FROM file_leases WHERE task_id=?",
+                             (t2,)).fetchone()
+        j = conn.execute("SELECT COUNT(*) FROM journal WHERE action='任务流转' "
+                         "AND target=? AND note LIKE '%取消原因%'", (f"tasks#{t2}",)).fetchone()[0]
+    assert lease and lease["released_at"], dict(lease or {})
+    assert j == 1, j
+    assert brain.task_wip(root, "zcode")["open"] == 0
+    nxt = brain.task_next(root, owner="zcode")
+    assert all(x["id"] != t2 for k in ("ready", "doing", "takeover", "waiting")
+               for x in nxt[k]), nxt
+    listed = brain.task_list(root, status="cancelled")
+    assert {t2}.issubset({t["id"] for t in listed}), listed
+
+    err, t3 = brain.task_add(root, "管理面取消", project="项目-戊")
+    assert not err
+    err, row = brain.task_update(root, t3, status="cancelled", agent="",
+                                 cancel_reason="计划调整")
+    assert not err and row["cancelled_by"] == "管理面", row
+
+    # 取消任务的「完成声明」不再进入未关单漂移（它已经明确关了，只是没做完）
+    rid = brain.add_record(root, "项目-戊", "qoder", "2026-10-23", "误报完成",
+                           "功能已完成并交付", task_id=t1)
+    assert rid > 0
+    drift = brain.task_closure_drift(root, days=1)
+    assert all(it["task_id"] != t1 for it in drift["items"]), drift["items"]
+
+
+def t_task_retry(tmp):
+    """R42/R43 失败重试与死信：原因必填；退避期间不可认领/不可直接转在办；
+    delay=0 提前放行；失败达上限自动死信（退出队列/释放租约/通知持有者）；
+    死信不可认领/不可手改，retry 复活且次数清零；终态不可重试；退避不算待办饥饿。"""
+    root = str(Path(tmp) / "AgentHub-重试")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    old_max, old_base = brain.MAX_TASK_ATTEMPTS, brain.RETRY_BASE_SECONDS
+    brain.MAX_TASK_ATTEMPTS, brain.RETRY_BASE_SECONDS = 3, 60
+    try:
+        # 老库补列：attempts/next_retry_at/last_error
+        with brain.db_conn(root) as conn:
+            for c in ("attempts", "next_retry_at", "last_error"):
+                conn.execute(f"ALTER TABLE tasks DROP COLUMN {c}")
+        brain.init_db(root)
+        with brain.db_conn(root) as conn:
+            cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+        assert {"attempts", "next_retry_at", "last_error"} <= cols, cols
+
+        err, t1 = brain.task_add(root, "失败重试主链", project="项目-己")
+        assert not err
+        err, _ = brain.task_retry(root, t1, agent="zcode")
+        assert "reason" in err, err
+        assert brain.task_claim(root, t1, "zcode")[0] == ""
+        err, _ = brain.file_lease_acquire(root, "src/retry.py", "zcode", task_id=t1,
+                                          reason="重试测试")
+        assert not err, err
+        err, _ = brain.task_retry(root, t1, agent="workbuddy", reason="别人来重试")
+        assert "只有持有者" in err, err
+        err, row = brain.task_retry(root, t1, agent="zcode", reason="接口 502")
+        assert not err, err
+        assert row["status"] == "pending" and row["_attempts"] == 1 and not row["_dead"], row
+        assert row["owner"] == "" and row["claimed_at"] == "", row
+        assert row["last_error"] == "接口 502", row
+        assert row["next_retry_at"], row
+        assert 50 <= row["_backoff_seconds"] <= 60, row["_backoff_seconds"]
+        with brain.db_conn(root) as conn:
+            lease = conn.execute("SELECT released_at FROM file_leases WHERE task_id=?",
+                                 (t1,)).fetchone()
+            j = conn.execute("SELECT COUNT(*) FROM journal WHERE action='任务重试' "
+                             "AND target=?", (f"tasks#{t1}",)).fetchone()[0]
+        assert lease and lease["released_at"], dict(lease or {})
+        assert j == 1, j
+
+        # 看板/前沿/巡检口径：退避可见、不冒充可开工、不算饥饿
+        rows = brain.task_list(root, status="pending")
+        brain.task_annotate(root, rows)
+        shown = next(r for r in rows if r["id"] == t1)
+        assert shown["_retry_wait_min"] > 0 and shown["_attempts"] == 1, shown
+        assert shown["_last_error"] == "接口 502", shown
+        nxt = brain.task_next(root, owner="zcode")
+        assert nxt["counts"]["backoff"] == 1, nxt["counts"]
+        assert all(x["id"] != t1 for x in nxt["ready"]), nxt["ready"]
+        assert any(x["id"] == t1 for x in nxt["backoff"]), nxt["backoff"]
+        starve = brain.task_starvation(root, days=0)
+        assert all(x["id"] != t1 for x in starve["starving"]), starve["starving"]
+
+        err, _ = brain.task_claim(root, t1, "zcode")
+        assert "退避" in err, err
+        err, _ = brain.task_update(root, t1, status="in_progress", agent="zcode")
+        assert "退避" in err, err
+
+        # 第二次失败：指数退避 120s；模拟到点后再认领
+        with brain.db_conn(root) as conn:
+            conn.execute("UPDATE tasks SET next_retry_at='2000-01-01T00:00:00' WHERE id=?",
+                         (t1,))
+        assert brain.task_claim(root, t1, "zcode")[0] == ""
+        err, row = brain.task_retry(root, t1, agent="zcode", reason="又 502")
+        assert not err and row["_attempts"] == 2 and row["_backoff_seconds"] == 120, row
+        with brain.db_conn(root) as conn:
+            conn.execute("UPDATE tasks SET next_retry_at='2000-01-01T00:00:00' WHERE id=?",
+                         (t1,))
+        assert brain.task_claim(root, t1, "zcode")[0] == ""
+        err, row = brain.task_retry(root, t1, agent="zcode", reason="三次都 502")
+        assert not err and row["status"] == "dead" and row["_dead"], row
+        assert row["_attempts"] == 3 and row["next_retry_at"] == "", row
+        assert row["owner"] == "zcode", row  # 保留持有者供追溯
+        with brain.db_conn(root) as conn:
+            j2 = conn.execute("SELECT COUNT(*) FROM journal WHERE action='任务死信' "
+                              "AND target=?", (f"tasks#{t1}",)).fetchone()[0]
+        assert j2 == 1, j2
+
+        # 死信：不可认领、不可手改、不进前沿、按状态可列、终态不显示逾期徽章
+        err, _ = brain.task_claim(root, t1, "workbuddy")
+        assert "死信" in err, err
+        err, _ = brain.task_update(root, t1, status="pending", agent="")
+        assert "死信" in err and "hub_task_retry" in err, err
+        nxt = brain.task_next(root)
+        assert all(x["id"] != t1 for k in ("ready", "doing", "takeover", "waiting", "backoff")
+                   for x in nxt[k]), nxt
+        dead_rows = brain.task_list(root, status="dead")
+        assert {t1}.issubset({x["id"] for x in dead_rows}), dead_rows
+        brain.task_annotate(root, dead_rows)
+        assert dead_rows[0]["_attempts"] == 3 and dead_rows[0]["_due_state"] == "", dead_rows[0]
+
+        # 管理面触发死信：通知持有者（自触发不给自己发信号）
+        err, t6 = brain.task_add(root, "管理面触发死信", project="项目-己")
+        assert not err
+        assert brain.task_claim(root, t6, "zcode")[0] == ""
+        brain.MAX_TASK_ATTEMPTS = 1
+        err, row = brain.task_retry(root, t6, agent="", reason="外部依赖永久失效")
+        brain.MAX_TASK_ATTEMPTS = 3
+        assert not err and row["status"] == "dead" and row["_attempts"] == 1, row
+        with brain.db_conn(root) as conn:
+            sig = conn.execute("SELECT COUNT(*) FROM signals WHERE to_agent='zcode' "
+                               "AND content LIKE '%死信%'").fetchone()[0]
+        assert sig == 1, sig
+
+        # 复活：次数清零、重新排队（pending + 新退避）
+        err, row = brain.task_retry(root, t1, agent="workbuddy", reason="人工复活再试")
+        assert not err and row["status"] == "pending" and row["_attempts"] == 1, row
+        assert not row["_dead"] and row["owner"] == "" and row["next_retry_at"], row
+        err, row = brain.task_retry(root, t1, agent="workbuddy", reason="确认修好", delay=0)
+        assert not err and row["_attempts"] == 2 and row["next_retry_at"] == "", row
+        dead_rows = brain.task_list(root, status="dead")
+        assert all(x["id"] != t1 for x in dead_rows), dead_rows
+
+        # delay=0：确认修复后提前放行
+        err, t_d = brain.task_add(root, "提前放行", project="项目-己")
+        assert not err
+        assert brain.task_claim(root, t_d, "zcode")[0] == ""
+        err, row = brain.task_retry(root, t_d, agent="zcode", reason="等一下")
+        assert not err and row["_attempts"] == 1, row
+        err, row = brain.task_retry(root, t_d, agent="zcode", reason="已修复", delay=0)
+        assert not err and row["_attempts"] == 2 and row["next_retry_at"] == "", row
+        assert brain.task_claim(root, t_d, "zcode")[0] == ""
+
+        # 终态不可重试
+        err, t2 = brain.task_add(root, "已完成不能重试", project="项目-己")
+        assert not err
+        assert brain.task_update(root, t2, status="done")[0] == ""
+        err, _ = brain.task_retry(root, t2, reason="再试试")
+        assert "终态" in err and "新建任务" in err, err
+        err, t3 = brain.task_add(root, "取消不能重试", project="项目-己")
+        assert not err
+        assert brain.task_update(root, t3, status="cancelled",
+                                 cancel_reason="不做了")[0] == ""
+        err, _ = brain.task_retry(root, t3, reason="再试试")
+        assert "终态" in err, err
+    finally:
+        brain.MAX_TASK_ATTEMPTS, brain.RETRY_BASE_SECONDS = old_max, old_base
+
+
+def t_task_defer_approve(tmp):
+    """R44 延后（snooze）：原因必填、必须是未来、退出前沿但可列可追、到点/唤醒恢复；
+    in_progress 只有持有者可延后，延后会释放 owner 与任务文件租约并清掉退避；
+    R45 完成审批：approval_required 的任务 done 前必须他人批准（owner 不能自批），
+    批准通知持有者；关闭审批会清空旧批准；终态不可延后/审批。"""
+    root = str(Path(tmp) / "AgentHub-延后审批")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    # 老库补列（迁移幂等）
+    with brain.db_conn(root) as conn:
+        for c in ("defer_until", "defer_reason", "deferred_at",
+                  "approval_required", "approved_by", "approved_at"):
+            conn.execute(f"ALTER TABLE tasks DROP COLUMN {c}")
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    assert {"defer_until", "defer_reason", "deferred_at",
+            "approval_required", "approved_by", "approved_at"} <= cols, cols
+
+    # ---- R44：参数闸门 ----
+    err, t1 = brain.task_add(root, "等上游接口", project="项目-庚")
+    assert not err
+    err, _ = brain.task_defer(root, t1, "2000-01-01", reason="过去")
+    assert "未来" in err, err
+    err, _ = brain.task_defer(root, t1, "下周一", reason="坏日期")
+    assert "YYYY-MM-DD" in err, err
+    err, _ = brain.task_defer(root, t1, "2030-01-01", reason="")
+    assert "reason" in err, err
+    err, _ = brain.task_defer(root, 99999, "2030-01-01", reason="不存在")
+    assert "不存在" in err, err
+
+    # 延后成功：日期按当天 00:00 恢复；退出前沿但列表可见
+    err, row = brain.task_defer(root, t1, "2030-01-01", reason="等上游接口 v2", agent="zcode")
+    assert not err and row["status"] == "pending", row
+    assert row["defer_until"] == "2030-01-01T00:00:00", row
+    assert row["defer_reason"] == "等上游接口 v2" and row["deferred_at"], row
+    assert row["_defer_hours"] > 0, row
+    with brain.db_conn(root) as conn:
+        j = conn.execute("SELECT COUNT(*) FROM journal WHERE action='延后任务' "
+                         "AND target=?", (f"tasks#{t1}",)).fetchone()[0]
+    assert j == 1, j
+
+    rows = brain.task_list(root, status="pending")
+    brain.task_annotate(root, rows)
+    shown = next(r for r in rows if r["id"] == t1)
+    assert shown["_defer_wait_h"] > 0 and shown["_defer_reason"], shown
+    nxt = brain.task_next(root, owner="zcode")
+    assert nxt["counts"]["deferred"] == 1, nxt["counts"]
+    assert all(x["id"] != t1 for x in nxt["ready"]), nxt["ready"]
+    assert any(x["id"] == t1 for x in nxt["deferred"]), nxt["deferred"]
+    starve = brain.task_starvation(root, days=0)
+    assert all(x["id"] != t1 for x in starve["starving"]), starve["starving"]
+
+    err, _ = brain.task_claim(root, t1, "zcode")
+    assert "延后" in err and "唤醒" in err, err
+    err, _ = brain.task_update(root, t1, status="in_progress", agent="zcode")
+    assert "延后" in err, err
+
+    # 提前唤醒：清除标记 → 可认领；重复唤醒幂等
+    err, row = brain.task_undefer(root, t1, agent="zcode")
+    assert not err and row["defer_until"] == "" and row["defer_reason"] == "", row
+    err, row = brain.task_undefer(root, t1, agent="zcode")
+    assert not err and row["defer_until"] == "", row
+    assert brain.task_claim(root, t1, "zcode")[0] == ""
+
+    # in_progress：非持有者不能延后；持有者延后会释放 owner 与文件租约
+    err, t2 = brain.task_add(root, "在办延后", project="项目-庚")
+    assert not err and brain.task_claim(root, t2, "zcode")[0] == ""
+    err, _ = brain.file_lease_acquire(root, "src/defer.py", "zcode", task_id=t2,
+                                      reason="延后测试")
+    assert not err, err
+    err, _ = brain.task_defer(root, t2, "2030-02-01", reason="等评审", agent="workbuddy")
+    assert "持有者" in err, err
+    err, row = brain.task_defer(root, t2, "2030-02-01", reason="等评审", agent="zcode")
+    assert not err and row["status"] == "pending" and row["owner"] == "", row
+    assert row["claimed_at"] == "" and row["_leases_released"] == 1, row
+    with brain.db_conn(root) as conn:
+        lease = conn.execute("SELECT released_at FROM file_leases WHERE task_id=?",
+                             (t2,)).fetchone()
+    assert lease and lease["released_at"], dict(lease or {})
+
+    # 延后清掉退避：正在退避的任务改为「等外部条件」，不再按失败退避消失
+    err, t3 = brain.task_add(root, "退避转延后", project="项目-庚")
+    assert not err and brain.task_claim(root, t3, "zcode")[0] == ""
+    err, row = brain.task_retry(root, t3, agent="zcode", reason="偶发 502")
+    assert not err and row["next_retry_at"], row
+    err, row = brain.task_defer(root, t3, "2030-03-01", reason="先放一放", agent="zcode")
+    assert not err and row["next_retry_at"] == "" and row["attempts"] == 1, row
+    err, row = brain.task_undefer(root, t3, agent="zcode")
+    assert not err and row["defer_until"] == "" and row["next_retry_at"] == "", row
+    assert brain.task_claim(root, t3, "zcode")[0] == ""  # 唤醒后不再受退避阻挡
+
+    # 终态不可延后/唤醒
+    err, t4 = brain.task_add(root, "已完成", project="项目-庚")
+    assert not err and brain.task_update(root, t4, status="done")[0] == ""
+    err, _ = brain.task_defer(root, t4, "2030-01-01", reason="x")
+    assert "终态" in err, err
+    err, _ = brain.task_undefer(root, t4)
+    assert "终态" in err, err
+
+    # ---- R45：完成审批（four-eyes） ----
+    err, t5 = brain.task_add(root, "需复核交付", project="项目-庚", approval_required=True)
+    assert not err
+    assert brain.task_claim(root, t5, "zcode")[0] == ""
+    err, _ = brain.task_update(root, t5, status="done", agent="zcode")
+    assert "审批" in err and "hub_task_approve" in err, err
+    row = brain.task_get(root, t5)
+    assert row["status"] == "in_progress", row
+    err, _ = brain.task_approve(root, t5, agent="zcode", note="自己批自己")
+    assert "不能给自己" in err, err
+    err, row = brain.task_approve(root, t5, agent="workbuddy", note="验收通过")
+    assert not err and row["_approved_by"] == "workbuddy" and row["_approved"], row
+    with brain.db_conn(root) as conn:
+        j = conn.execute("SELECT COUNT(*) FROM journal WHERE action='任务审批' "
+                         "AND target=?", (f"tasks#{t5}",)).fetchone()[0]
+        sig = conn.execute("SELECT COUNT(*) FROM signals WHERE to_agent='zcode' "
+                           "AND content LIKE '%审批通过%'").fetchone()[0]
+    assert j == 1 and sig == 1, (j, sig)
+
+    rows = brain.task_list(root, status="in_progress")
+    brain.task_annotate(root, rows)
+    shown = next(r for r in rows if r["id"] == t5)
+    assert shown["_approval_required"] and shown["_approved_by"] == "workbuddy", shown
+
+    err, row = brain.task_update(root, t5, status="done", agent="zcode")
+    assert not err and row["status"] == "done", row
+    err, _ = brain.task_approve(root, t5, agent="beta")
+    assert "终态" in err, err
+
+    # 未开启审批的任务不需要批准
+    err, t6 = brain.task_add(root, "普通任务", project="项目-庚")
+    assert not err
+    err, row = brain.task_approve(root, t6, agent="workbuddy")
+    assert "未开启" in err, err
+    assert brain.task_update(root, t6, status="done")[0] == ""
+
+    # 关闭审批：清空旧批准，之后 done 不再需要复核
+    err, t7 = brain.task_add(root, "先审后关", project="项目-庚", approval_required=True)
+    assert not err
+    err, row = brain.task_approve(root, t7, agent="workbuddy")
+    assert not err and row["approved_by"] == "workbuddy", row
+    err, row = brain.task_update(root, t7, approval_required=False)
+    assert not err and int(row["approval_required"]) == 0 and row["approved_by"] == "", row
+    assert brain.task_update(root, t7, status="done")[0] == ""
+
+    # 默认不开启审批
+    err, t8 = brain.task_add(root, "默认不审", project="项目-庚")
+    assert not err
+    row = brain.task_get(root, t8)
+    assert int(row["approval_required"]) == 0, row
+
+
+def t_journal_chain(tmp):
+    """R47 审计链：新流水逐条接链并更新头锚；改字段/删行/截尾分别按内容、断层、头锚点名；
+    历史未封存行不算篡改（如实计数）；老库补列时按 id 顺序自动封存且不改内容。"""
+    root = str(Path(tmp) / "AgentHub-审计链")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    v = brain.journal_verify(root)
+    assert v["ok"] and v["total"] == 0 and "空" in v["summary"], v
+
+    brain.journal_add(root, "ZCode", "测试动作甲", "target#1", note="备注甲")
+    brain.journal_add(root, "qoder", "测试动作乙", "target#2", note="备注乙")
+    err, _ = brain.agent_control_set(root, "qoder", "draining", "审计链测试", "qoder")
+    assert not err
+
+    with brain.db_conn(root) as conn:
+        rows = list(conn.execute("SELECT id,agent,prev_hash,hash FROM journal ORDER BY id"))
+        head = conn.execute("SELECT value FROM meta WHERE key='journal_head'").fetchone()[0]
+    assert len(rows) == 3, rows
+    assert rows[0]["prev_hash"] == "" and rows[0]["hash"], rows
+    assert rows[1]["prev_hash"] == rows[0]["hash"], rows
+    assert rows[2]["prev_hash"] == rows[1]["hash"], rows
+    assert head == rows[2]["hash"], (head, rows[-1]["hash"])
+    assert rows[0]["agent"] == "zcode", rows  # 写入即归一，不留给历史清理去改已封存行
+
+    v = brain.journal_verify(root)
+    assert v["ok"] and v["sealed"] == 3 and v["legacy"] == 0 and v["head"] == head, v
+    assert v["chain_at"], v  # 首启封存起点
+
+    # 改字段：自身 hash 对不上
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE journal SET note='被改' WHERE id=?", (rows[0]["id"],))
+    v = brain.journal_verify(root)
+    assert not v["ok"] and v["breaks"] == 1, v
+    assert any(b["id"] == rows[0]["id"] and "内容" in b["why"] for b in v["broken"]), v
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE journal SET note='备注甲' WHERE id=?", (rows[0]["id"],))
+    assert brain.journal_verify(root)["ok"]
+
+    # 删中间行：后继 prev_hash 断层
+    with brain.db_conn(root) as conn:
+        conn.execute("DELETE FROM journal WHERE id=?", (rows[1]["id"],))
+    v = brain.journal_verify(root)
+    assert not v["ok"] and any(b["id"] == rows[2]["id"] and "断层" in b["why"] for b in v["broken"]), v
+
+    # 截尾：删最后一行 → 头锚抓（新库独立造，避免上面已脏）
+    root2 = str(Path(tmp) / "AgentHub-审计链-截断")
+    Path(root2).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root2)
+    for i in range(3):
+        brain.journal_add(root2, "qoder", f"动作{i}", f"t#{i}")
+    assert brain.journal_verify(root2)["ok"]
+    with brain.db_conn(root2) as conn:
+        last = conn.execute("SELECT MAX(id) FROM journal").fetchone()[0]
+        conn.execute("DELETE FROM journal WHERE id=?", (last,))
+    v = brain.journal_verify(root2)
+    assert not v["ok"] and any("头锚" in b["why"] for b in v["broken"]), v
+
+    # 历史未封存：全库无封存要红；有封存行时按 legacy 如实计数且不误报
+    root3 = str(Path(tmp) / "AgentHub-审计链-历史")
+    Path(root3).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root3)
+    with brain.db_conn(root3) as conn:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note) "
+                     "VALUES('2026-01-01T00:00:00','qoder','旧动作','t','','')")
+    v = brain.journal_verify(root3)
+    assert not v["ok"] and v["sealed"] == 0 and "未封存" in v["summary"], v
+    brain.journal_add(root3, "qoder", "新动作")
+    v = brain.journal_verify(root3)
+    assert v["ok"] and v["sealed"] == 1 and v["legacy"] == 1, v
+    with brain.db_conn(root3) as conn:  # 链后追加的历史行也不破坏后续验证
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note) "
+                     "VALUES('2026-01-02T00:00:00','qoder','旧动作2','t','','')")
+    v = brain.journal_verify(root3)
+    assert v["ok"] and v["legacy"] == 2, v
+
+    # 老库补列：存量流水自动封存、内容不变、链可验证
+    root4 = str(Path(tmp) / "AgentHub-审计链-升级")
+    Path(root4).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root4)
+    for i in range(3):
+        brain.journal_add(root4, "qoder", f"历史{i}")
+    with brain.db_conn(root4) as conn:
+        conn.execute("ALTER TABLE journal DROP COLUMN prev_hash")
+        conn.execute("ALTER TABLE journal DROP COLUMN hash")
+        conn.execute("DELETE FROM meta WHERE key IN ('journal_head','journal_chain_at')")
+    brain.init_db(root4)
+    v = brain.journal_verify(root4)
+    assert v["ok"] and v["sealed"] == 3 and v["legacy"] == 0 and v["chain_at"], v
+    assert {r["action"] for r in brain.journal_list(root4)} == {"历史0", "历史1", "历史2"}
+
+
+def t_freeze_state(tmp):
+    """R48 冻结状态机：reason/分钟校验；定时冻结、改为手动解冻、到期自动失效；
+    解冻幂等；meta 损坏按冻结处理（fail-closed）；冻结与解冻动作进审计链。"""
+    root = str(Path(tmp) / "AgentHub-冻结")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    fr = brain.freeze_get(root)
+    assert not fr["active"] and fr["minutes"] == 0 and not fr["expired"], fr
+
+    err, _ = brain.freeze_set(root, 30, "", "qoder")
+    assert "reason" in err, err
+    err, _ = brain.freeze_set(root, -1, "坏分钟", "qoder")
+    assert "minutes" in err, err
+    err, _ = brain.freeze_set(root, 1441, "太长", "qoder")
+    assert "minutes" in err, err
+
+    err, fr = brain.freeze_set(root, 30, "迁移窗口", "Qoder")
+    assert not err and fr["active"] and fr["minutes"] == 30, fr
+    assert fr["by"] == "qoder" and fr["until"] and not fr["expired"], fr
+    assert fr["remaining_min"] > 29, fr
+
+    err, fr = brain.freeze_set(root, 0, "改为手动解冻", "qoder")
+    assert not err and fr["active"] and not fr["until"] and fr["_was_active"], fr
+    assert fr["minutes"] == 0 and fr["reason"] == "改为手动解冻", fr
+
+    # 到期自动失效：把 until 拨到过去（定时冻结的真实路径）
+    with brain.db_conn(root) as conn:
+        d = json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key=?",
+            (brain.FREEZE_KEY,)).fetchone()[0])
+        d["until"] = "2000-01-01T00:00:00"
+        conn.execute("UPDATE meta SET value=? WHERE key=?",
+                     (json.dumps(d, ensure_ascii=False), brain.FREEZE_KEY))
+    fr = brain.freeze_get(root)
+    assert not fr["active"] and fr["expired"] and not fr["remaining_min"], fr
+
+    # 解冻幂等：过期残留清一次，再清返回「没有生效」
+    _, fr = brain.freeze_clear(root, "qoder")
+    assert fr["_was_expired"] and not fr["active"], fr
+    _, fr = brain.freeze_clear(root, "qoder")
+    assert not fr["_was_active"] and not fr["_was_expired"], fr
+    assert not brain.freeze_get(root)["active"]
+
+    # 状态损坏 fail-closed：坏 JSON 不能等于自动解冻；仍可强制解冻
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                     (brain.FREEZE_KEY, "{broken"))
+    fr = brain.freeze_get(root)
+    assert fr["active"] and "损坏" in fr["reason"], fr
+    _, fr = brain.freeze_clear(root, "qoder")
+    assert fr["_was_active"] and not brain.freeze_get(root)["active"], fr
+
+    v = brain.journal_verify(root)
+    assert v["ok"], v
+    acts = [r["action"] for r in brain.journal_list(root)]
+    assert "写入冻结" in acts and "延长写入冻结" in acts and "解除写入冻结" in acts, acts
+
+
+def t_project_ref_guard(tmp):
+    """R51 项目名护栏：路径穿越/分隔符/盘符/保留目录/控制字符一律拒；
+    合法中文与空格仍可用；任务/归档/恢复都走同一护栏。"""
+    root = str(Path(tmp) / "AgentHub-项目名护栏")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    for n in ("测试-项目", "安全", "AgentHub-多agent文件统一管理", "项目 A"):
+        assert core.validate_project_ref(n) == "", (n, core.validate_project_ref(n))
+    for n in ("", " ", "../逃逸", "..\\逃逸", "a/b", "a\\b", "C:\\x", "\\\\srv\\share",
+              "_hub", "00_Inbox", "99_Archive", "projects", "name.", "带\x01控制",
+              "x" * 101, ".", ".."):
+        assert core.validate_project_ref(n), f"应拒收：{n!r}"
+
+    err, tid = brain.task_add(root, "穿越任务", project="../x")
+    assert err and tid == 0 and "project" in err, (err, tid)
+    err, tid = brain.task_add(root, "保留目录任务", project="_hub")
+    assert err and tid == 0 and "保留" in err, (err, tid)
+    err, tid = brain.task_add(root, "正常任务", project="测试-项目")
+    assert not err and tid > 0, (err, tid)
+
+    assert "project" in brain.archive_project(root, "../x")
+    assert "project" in brain.restore_project(root, "../x")
+
+    # 建项目目录：穿越与保留名都不落盘
+    assert core.create_project(root, "../逃逸")
+    assert core.create_project(root, "_hub")
+    assert not (Path(root).parent / "逃逸").exists()
+    assert not (Path(root) / "_hub" / "input").exists()
+
+
+
+def t_task_metrics(tmp):
+    """R53 任务过程统计：窗口流量/完成周期分位/在办卡点/重试存量/质量抽检/scope 过滤。"""
+    root = str(Path(tmp) / "AgentHub-任务统计")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    now = datetime.datetime.now()
+
+    def iso(h):
+        return (now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated,"
+                     "done_at,attempts) VALUES('P','done ok','done','zcode',?,?,?,?,0)",
+                     (iso(9), iso(10), iso(2), iso(2)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated,"
+                     "approval_required,approved_by) VALUES('P','stale waiting','in_progress',"
+                     "'qoder',?,?,?,1,'')", (iso(3), iso(5), iso(3)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated) "
+                     "VALUES('P','unowned','in_progress','',?,?)", (iso(2), iso(2)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated,attempts,last_error) "
+                     "VALUES('P','dead one','dead','zcode',?,?,3,'boom')", (iso(6), iso(1)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated,attempts) "
+                     "VALUES('P','retrying','pending','zcode',?,?,2)", (iso(4), iso(1)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated,done_at) "
+                     "VALUES('P','old done','done','zcode',?,?,?)", (iso(800), iso(700), iso(700)))
+
+    m = brain.task_metrics(root, days=7)
+    f, w, r = m["flow"], m["wip"], m["retry"]
+    assert f["created"] == 5 and f["done"] == 1 and f["cancelled_or_dead"] == 1, f
+    assert f["done_cycle_hours"]["n"] == 1 and f["done_cycle_hours"]["p50"] == 8.0, f["done_cycle_hours"]
+    assert m["by_status"]["done"] == 2 and m["by_status"]["in_progress"] == 2, m["by_status"]
+    assert w["in_progress"] == 2 and w["unowned"] == 1, w
+    assert w["stale_leases"] == 1, w          # 无主单没有 claimed_at，不算租约超时
+    assert w["approval_waiting"] == 1 and w["overdue"] == 0, w
+    assert r == {"tasks_with_attempts": 2, "attempts_total": 5, "max_attempts": 3}, r
+    ag = {a["ag"]: a for a in m["agents"]}
+    assert ag["zcode"]["done"] == 1 and ag["zcode"]["dead"] == 1 and ag["zcode"]["attempts"] == 5, ag
+    assert ag["qoder"]["doing"] == 1, ag
+    kinds = {x["kind"] for x in m["risks"]}
+    assert {"lease_stale", "unowned", "approval_waiting", "dead_letter"} <= kinds, kinds
+    assert m["quality"]["total"] == 1 and m["quality"]["warned"] == 1, m["quality"]
+
+    # 窗口：365 天把 800h 前的完成单也算进来；项目/owner 过滤不串
+    assert brain.task_metrics(root, days=365)["flow"]["done"] == 2, "长窗口未纳入旧完成单"
+    assert brain.task_metrics(root, project="P")["flow"]["created"] == 5
+    q = brain.task_metrics(root, project="Q")
+    assert q["flow"]["created"] == 0 and q["risks"] == [], q
+    z = brain.task_metrics(root, agent="zcode")
+    assert z["flow"]["done"] == 1 and z["wip"]["in_progress"] == 0, z
+    assert z["quality"].get("skipped"), z["quality"]
+
+    empty = str(Path(tmp) / "AgentHub-任务统计空")
+    Path(empty).mkdir(parents=True, exist_ok=True)
+    brain.init_db(empty)
+    e = brain.task_metrics(empty, days=7)
+    assert e["flow"]["done"] == 0 and e["wip"]["in_progress"] == 0 and e["risks"] == [], e
+    assert e["flow"]["done_cycle_hours"] == {"n": 0, "p50": None, "p90": None,
+                                             "avg": None, "max": None}, e["flow"]["done_cycle_hours"]
+
+
+def t_team_digest(tmp):
+    """R55 团队日结：窗口流动/当前卡点/风险归因/按 agent 记分卡/窗口与空库。"""
+    root = str(Path(tmp) / "AgentHub-团队日结")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    now = datetime.datetime.now()
+
+    def iso(h):
+        return (now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+
+    def day(offset):
+        return (now.date() + datetime.timedelta(days=offset)).isoformat()
+
+    brain.heartbeat_touch(root, "qoder", "P", "日结测试")
+    with brain.db_conn(root) as conn:
+        for proj, ag, date, title in (
+                ("P", "qoder", day(0), "今日 lowercase"),
+                ("P", "Qoder", day(0), "今日 uppercase"),
+                ("P", "qoder", day(-40), "旧记录")):
+            conn.execute("INSERT INTO records(project,agent,date,title,content,status,created)"
+                         " VALUES(?,?,?,?,?,'active',?)",
+                         (proj, ag, date, title, "正文", date + "T10:00:00"))
+        for content, hours in (("今天记忆", 2), ("旧记忆", 800)):
+            conn.execute("INSERT INTO memories(kind,content,tags,project,agent,status,created,updated)"
+                         " VALUES('fact',?,'','P','qoder','active',?,?)",
+                         (content, iso(hours), iso(hours)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated,"
+                     "done_at,attempts) VALUES('P','日结完成','done','qoder',?,?,?,?,0)",
+                     (iso(10), iso(10), iso(2), iso(2)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated,"
+                     "due,attempts,approval_required,approved_by) "
+                     "VALUES('P','卡住的单','in_progress','qoder',?,?,?,?,2,1,'')",
+                     (iso(3), iso(5), iso(3), day(-1)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated) "
+                     "VALUES('P','无主单','in_progress','',?,?)", (iso(2), iso(2)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated,attempts) "
+                     "VALUES('P','死信单','dead','qoder',?,?,3)", (iso(6), iso(1)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated) "
+                     "VALUES('P','待办单','pending','qoder',?,?)", (iso(4), iso(1)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated,done_at) "
+                     "VALUES('P','旧完成单','done','qoder',?,?,?)", (iso(800), iso(750), iso(750)))
+        conn.execute("INSERT INTO errors(ts,agent,project,title,detail,status) "
+                     "VALUES(?, 'qoder','P','未闭错误','d','open')", (iso(1),))
+        conn.execute("INSERT INTO errors(ts,agent,project,title,detail,status) "
+                     "VALUES(?, 'qoder','P','已修错误','d','fixed')", (iso(2),))
+        for tool in ("hub_status", "hub_tasks"):
+            conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?, 'qoder', ?)",
+                         (iso(1), tool))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits)"
+                     " VALUES(?, 'qoder','hub_search','不存在',0)", (iso(1),))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits)"
+                     " VALUES(?, 'qoder','hub_search','找到',1)", (iso(1),))
+
+    d = brain.team_digest(root, days=1)
+    f, c = d["flow"], d["current"]
+    assert f["records"] == 2 and f["memories"] == 1, f
+    assert f["tasks_created"] == 5 and f["tasks_done"] == 1, f
+    assert f["tasks_cancelled_or_dead"] == 1, f
+    assert f["errors_opened"] == 2 and f["errors_open"] == 1, f
+    assert f["tool_calls"] == 2 and f["searches"] == 2 and f["zero_hit_searches"] == 1, f
+    assert f["done_cycle_p50_h"] == 8.0, f
+    assert c["online_agents"] == 1 and c["open_total"] == 3, c
+    assert c["wip"]["in_progress"] == 2 and c["wip"]["stale_leases"] == 1, c["wip"]
+    assert c["wip"]["unowned"] == 1 and c["wip"]["approval_waiting"] == 1, c["wip"]
+    assert c["wip"]["overdue"] == 1 and c["freeze"]["active"] is False, c
+    kinds = {x["kind"] for x in d["risks"]}
+    assert {"lease_stale", "unowned", "approval_waiting", "overdue",
+            "dead_letter", "retry_storm", "errors_open", "zero_hit_search"} <= kinds, kinds
+    stale = next(x for x in d["risks"] if x["kind"] == "lease_stale")
+    assert stale["agents"] == ["qoder"] and "#2" in stale["sample"][0], stale
+    unowned = next(x for x in d["risks"] if x["kind"] == "unowned")
+    assert unowned["agents"] == [] and "无主" in unowned["sample"][0], unowned
+    assert len(d["suggestions"]) >= len(d["risks"]), d["suggestions"]
+    ag = {a["agent"]: a for a in d["agents"]}
+    q = ag["qoder"]
+    assert q["online"] and q["records"] == 2 and q["record_days"] == 1, q
+    assert q["memories"] == 1 and q["last_record"] == day(0), q
+    assert q["tasks"] == {"created": 4, "done": 1, "open": 2, "doing": 1, "blocked": 0,
+                          "dead": 1, "stale": 1, "waiting": 1, "overdue": 1,
+                          "attempts": 5}, q["tasks"]
+    assert q["errors"] == {"open": 1, "opened": 2}, q["errors"]
+    assert q["usage"] == {"calls": 2, "searches": 2, "zero_hit": 1}, q["usage"]
+    assert any("租约逾期" in r for r in q["risks"]), q["risks"]
+
+    long = brain.team_digest(root, days=365)
+    assert long["flow"]["records"] == 3 and long["flow"]["memories"] == 2, long["flow"]
+    assert long["flow"]["tasks_done"] == 2, long["flow"]
+
+    empty = str(Path(tmp) / "AgentHub-团队日结空")
+    Path(empty).mkdir(parents=True, exist_ok=True)
+    brain.init_db(empty)
+    e = brain.team_digest(empty, days=7)
+    assert e["flow"]["records"] == 0 and e["risks"] == [] and e["agents"] == [], e
+    assert e["suggestions"] and "无风险信号" in e["suggestions"][0], e["suggestions"]
+
+
+def t_db_corruption_guidance(tmp):
+    """R59：库文件损坏的识别与统一恢复文案。
+
+    is_db_corruption 只认「文件结构坏了」——锁冲突 / 缺表 / 打不开文件各有处置路径，
+    误判成损坏会诱导用户去恢复备份，反而制造数据丢失。
+    """
+    root = Path(tmp) / "hub_corrupt"
+    (root / core.DIR_META).mkdir(parents=True)
+    (root / core.DIR_META / brain.DB_NAME).write_bytes(b"not a sqlite database" * 64)
+    try:
+        brain.search_all(str(root), "任意")
+        raise AssertionError("坏库查询竟然成功")
+    except sqlite3.DatabaseError as e:
+        assert brain.is_db_corruption(e), e
+        rep = brain.db_corruption_report(str(root), e)
+        for needle in ("数据库文件已损坏", "brain.db", "-wal", "§3.4", "doctor"):
+            assert needle in rep, (needle, rep)
+    assert brain.is_db_corruption("database disk image is malformed")
+    assert not brain.is_db_corruption("database is locked")
+    assert not brain.is_db_corruption("no such table: records")
+    assert not brain.is_db_corruption(ValueError("boom"))
+
+
+def t_coverage_gate_reuses_df(tmp):
+    """R60：覆盖度闸门复用已算好的 df——弱候选路径不再为「拉丁乱码判定」重扫两表。
+
+    3 万记录库实测：每个 token 两条全表 COUNT，重复一遍约占单次检索 15%。
+    行为不变（乱码查询仍被闸掉），只断言扫描次数。
+    """
+    root = str(Path(tmp) / "hub_gate_reuse")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    calls = {"n": 0}
+    orig = brain._token_df
+
+    def counting(r, tokens):
+        calls["n"] += 1
+        return orig(r, tokens)
+
+    brain._token_df = counting
+    try:
+        rows = [{"id": 1, "title": "无关", "content": "内容", "project": "p"}]
+        out = brain._coverage_gate(root, rows, "zzz qqq wwww", min_match=2)
+    finally:
+        brain._token_df = orig
+    assert out == [], out                      # 乱码查询仍被闸掉（行为不变）
+    assert calls["n"] == 1, f"df 被重复扫描 {calls['n']} 次"
+
+
+def t_tok_cache_bounded(tmp):
+    """R60：BM25 分词缓存有 FIFO 上限。
+
+    常驻 MCP 进程的缓存没有生命周期：3 万记录实测 ~57MB（每条 Counter 约 2KB）。
+    无上限时库越大进程越胖；超限丢最早条目 = 退回按需分词，只慢不炸。
+    """
+    old = brain._TOK_CACHE_MAX
+    brain._TOK_CACHE_MAX = 3
+    try:
+        brain._TOK_CACHE.clear()
+        for i in range(10):
+            brain._TOK_CACHE.put_records_bm25("r", i, (Counter({"x": 1}), 1))
+        assert brain._TOK_CACHE.sizes()[1] == 3, brain._TOK_CACHE.sizes()
+        assert brain._TOK_CACHE.get_records_bm25("r", 0) is None
+        assert brain._TOK_CACHE.get_records_bm25("r", 9) is not None
+        for i in range(10):
+            brain._TOK_CACHE.put_mem_bm25("r", i, (Counter({"x": 1}), 1))
+        assert brain._TOK_CACHE.sizes()[0] == 3, brain._TOK_CACHE.sizes()
+        assert brain._TOK_CACHE.get_mem_bm25("r", 9) is not None
+    finally:
+        brain._TOK_CACHE_MAX = old
+        brain._TOK_CACHE.clear()
+
+    # 语料 > 上限时干脆不缓存（否则逐条淘汰会把 0.3s 检索拖成 5.7s）
+    root = str(Path(tmp) / "hub_cache_skip")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        for i in range(3):
+            conn.execute(
+                "INSERT INTO records(project,agent,date,title,content,record_type,source,status)"
+                " VALUES('p','zcode','2026-10-23',?,?,'work_log','hub','active')",
+                (f"记录{i}", "备份与恢复"))
+    brain._TOK_CACHE_MAX = 1
+    try:
+        brain._TOK_CACHE.clear()
+        ranked = brain._records_bm25_rank(root, "备份", limit=5)
+        assert len(ranked) == 3, ranked
+        assert brain._TOK_CACHE.sizes()[1] == 0, brain._TOK_CACHE.sizes()
+    finally:
+        brain._TOK_CACHE_MAX = old
+        brain._TOK_CACHE.clear()
 
 
 def shutil_rmtree(tmp):

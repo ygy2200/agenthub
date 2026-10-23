@@ -23,6 +23,7 @@ class JournalPage(QWidget):
         self.win = win
         self.errors: list = []
         self.journal: list = []
+        self._sel_err_id = 0
         # 2026-10-16：整页套滚动保护（#2055 修复模式）。此前无滚动，920×600 下
         # 最小需求高 588 > 可用 551（errList 150 + 两个 section_head + 两行按钮 +
         # 说明文字），layout_stress 从第一轮报"压扁风险"报到现在。
@@ -56,15 +57,29 @@ class JournalPage(QWidget):
         # 列表区不包卡：ListWidget 自带边界，卡套列表=框中框
         g1 = QVBoxLayout()
         g1.setSpacing(tokens.SPACE_S)
-        g1.addWidget(section_head("错误登记（open=待处理 · fixed=已处理）", "FLAG"))
+        g1.addWidget(section_head("错误登记（未关闭=待处理 · 已修复=已处理）", "FLAG"))
+        errTop = QHBoxLayout()
+        self.errFilter = ComboBox()
+        self.errFilter.addItems(["全部", "未关闭", "已修复"])
+        self.errFilter.setFixedWidth(110)
+        errTop.addWidget(self.errFilter)
+        self.errCount = CaptionLabel("")
+        errTop.addWidget(self.errCount)
+        errTop.addStretch(1)
+        g1.addLayout(errTop)
         self.errList = ListWidget()
-        self.errList.setMinimumHeight(150)
+        self.errList.setMinimumHeight(130)
         g1.addWidget(self.errList, 1)
+        # 详情预览：回滚方式是错误登记最有价值的字段，此前只能看到列表里截断的 60 字
+        self.errPreview = TextBrowser()
+        self.errPreview.setMinimumHeight(110)
+        g1.addWidget(self.errPreview)
         errRow = QHBoxLayout()
         self.fixBtn = PushButton("标记已修")
         self.reopenBtn = PushButton("重新打开")
         self.openProjBtn = PushButton(ic("FOLDER", "INFO"), "打开相关项目")
-        for b in (self.fixBtn, self.reopenBtn, self.openProjBtn):
+        self.copyUndoBtn = PushButton(ic("COPY", "INFO"), "复制回滚方式")
+        for b in (self.fixBtn, self.reopenBtn, self.openProjBtn, self.copyUndoBtn):
             errRow.addWidget(b)
         errRow.addStretch(1)
         g1.addLayout(errRow)
@@ -86,20 +101,28 @@ class JournalPage(QWidget):
         self.fixBtn.clicked.connect(lambda: self.set_status("fixed"))
         self.reopenBtn.clicked.connect(lambda: self.set_status("open"))
         self.openProjBtn.clicked.connect(self.open_project)
+        self.copyUndoBtn.clicked.connect(self.copy_undo)
         self.undoBtn.clicked.connect(self.undo_selected)
+        self.errFilter.currentIndexChanged.connect(self.reload)
+        self.errList.currentRowChanged.connect(self._on_err_selected)
+        self.errList.itemDoubleClicked.connect(lambda _: self.open_project())
 
     def reload(self):
         if not self.win.root:
             return
-        self.errors = brain.error_list(self.win.root)
+        key = {1: "open", 2: "fixed"}.get(self.errFilter.currentIndex(), "")
+        self.errors = brain.error_list(self.win.root, key)
         self.errList.clear()
         for e in self.errors:
+            st = "未关闭" if e["status"] == "open" else "已修复"
             self.errList.addItem(
-                f"#{e['id']} [{e['status']}] {e['ts']}  {e['agent']}"
+                f"#{e['id']} [{st}] {e['ts']}  {e['agent']}"
                 f" · {e['project'] or '无项目'}：{e['title']}"
                 + (f"  ｜回滚：{e['undo'][:60]}" if e["undo"] else ""))
         if not self.errors:
             self.errList.addItem("（无错误登记）")
+        self.errCount.setText(f"当前 {len(self.errors)} 条 · 未关闭 "
+                              f"{sum(1 for e in self.errors if e['status'] == 'open')}")
         self.journal = brain.journal_list(self.win.root, 200)
         self.jList.clear()
         for e in self.journal:
@@ -112,13 +135,54 @@ class JournalPage(QWidget):
             self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
         tight_rows(self.errList)
         tight_rows(self.jList)
+        if self.errors:
+            self.errList.setCurrentRow(self._row_of_err(self._sel_err_id))
+        else:
+            self._on_err_selected(-1)
+
+    def _selected_error(self):
+        row = self.errList.currentRow()
+        if 0 <= row < len(self.errors):
+            return self.errors[row]
+        return None
+
+    def _row_of_err(self, eid):
+        for i, e in enumerate(self.errors):
+            if e["id"] == eid:
+                return i
+        return 0
+
+    def _on_err_selected(self, row):
+        e = self._selected_error()
+        self._sel_err_id = e["id"] if e else 0
+        self._sync_err_actions(e)
+        if not e:
+            self.errPreview.setHtml(
+                f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选上方错误查看详情与回滚方式</p>")
+            return
+        st = "未关闭" if e["status"] == "open" else "已修复"
+        body = f"## {e['title']}\n\n**状态** {st} · **登记** {e['agent']} {e['ts']}"
+        if e["project"]:
+            body += f" · **项目** {e['project']}"
+        if e["detail"]:
+            body += f"\n\n{e['detail']}"
+        if e["undo"]:
+            body += f"\n\n**回滚方式**\n\n`{e['undo']}`"
+        self.errPreview.setHtml(md_to_html(body))
+
+    def _sync_err_actions(self, e=None):
+        if e is None:
+            e = self._selected_error()
+        self.fixBtn.setEnabled(bool(e) and e["status"] == "open")
+        self.reopenBtn.setEnabled(bool(e) and e["status"] == "fixed")
+        self.openProjBtn.setEnabled(bool(e and e.get("project")))
+        self.copyUndoBtn.setEnabled(bool(e and e.get("undo")))
 
     def set_status(self, status):
-        row = self.errList.currentRow()
-        if row < 0 or row >= len(self.errors):
+        e = self._selected_error()
+        if not e:
             InfoBar.warning("先选中一条错误登记", "在「错误登记」列表里选中一条，再标记状态", duration=2000, parent=self.win)
             return
-        e = self.errors[row]
         err = brain.error_set_status(self.win.root, e["id"], status)
         if err:
             op_failed("标记错误状态", err, parent=self.win)
@@ -127,13 +191,28 @@ class JournalPage(QWidget):
         self.reload()
 
     def open_project(self):
-        row = self.errList.currentRow()
-        if row < 0 or row >= len(self.errors):
+        e = self._selected_error()
+        if not e:
             return
-        p = self.errors[row].get("project", "")
+        p = e.get("project", "")
         d = Path(self.win.root) / p if p else None
         if d and d.is_dir():
             os.startfile(str(d))  # noqa: S606
+
+    def copy_undo(self):
+        e = self._selected_error()
+        if not e:
+            InfoBar.warning("先选中一条错误登记", "在「错误登记」列表里选中一条，再复制回滚方式",
+                            duration=2000, parent=self.win)
+            return
+        if not e.get("undo"):
+            InfoBar.warning("这条错误没有回滚方式",
+                            "让上报者用 hub_report_error(undo=…) 补齐，或按详情手动处理",
+                            duration=3000, parent=self.win)
+            return
+        QApplication.clipboard().setText(e["undo"])
+        InfoBar.success("已复制回滚方式", f"#{e['id']} · {e['title'][:40]}",
+                        duration=2000, parent=self.win)
 
     def undo_selected(self):
         row = self.jList.currentRow()

@@ -14,6 +14,7 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import sqlite3
 import sys
 from pathlib import Path
 
@@ -204,6 +205,14 @@ def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: 
     return 0 if r["ok"] else 1
 
 
+def cmd_backup_drill(root: str, path: str) -> int:
+    """R61 恢复演练：只读，不写现场库。"""
+    import brain  # noqa: PLC0415
+    err, summary = brain.backup_drill(root, path)
+    print(f"错误：{err}" if err else summary)
+    return 1 if err else 0
+
+
 def cmd_build_manifest(src: Path, phase: str) -> int:
     """构建清单两阶段（build.bat 调用）：start 快照源码哈希，finish 记录 exe sha256。"""
     import ops  # 同目录
@@ -237,13 +246,20 @@ def cmd_call(root: str, tool: str, kv: list) -> int:
            "params": {"name": tool, "arguments": args}}
     try:
         r = agenthub_mcp.handle_message(rpc, root)
+    except sqlite3.DatabaseError as e:
+        import brain  # noqa: PLC0415
+        if brain.is_db_corruption(e):
+            print(brain.db_corruption_report(root, e))
+            return 2
+        print(f"调用失败：{type(e).__name__}: {e}")
+        return 1
     except Exception as e:  # noqa: BLE001
         print(f"调用失败：{e}")
         return 1
     res = r.get("result") or {}
     if "content" in res:
         print(res["content"][0]["text"])
-        return 0
+        return 1 if res.get("isError") else 0
     err = r.get("error") or {}
     print(err.get("message") or str(r))
     return 1
@@ -276,15 +292,56 @@ def _task_line(t: dict) -> str:
 
 
 def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
-              limit: int = 50) -> int:
-    """任务看板（headless）：状态/负责人/截止/前置/租约/阻塞原因。"""
+              limit: int = 50, stats: bool = False, days: int = 7) -> int:
+    """任务看板（headless）：状态/负责人/截止/前置/租约/阻塞原因；--stats 看过程统计。"""
     import brain  # noqa: PLC0415
+    if stats:
+        if not 1 <= int(days) <= 365:
+            print("days 范围 1..365")
+            return 2
+        m = brain.task_metrics(root, days=int(days), project=project, agent=owner)
+        f, w, r = m["flow"], m["wip"], m["retry"]
+        dc = f["done_cycle_hours"]
+
+        def h(x):
+            return "-" if x is None else f"{x:g}h"
+
+        print(f"任务过程统计（窗口 {m['window_days']} 天"
+              + (f"｜{project}" if project else "") + (f"｜owner={owner}" if owner else "") + "）：")
+        print(f"  流量：新建 {f['created']} · 完成 {f['done']} · 取消/死信 {f['cancelled_or_dead']}"
+              f" · 审批通过 {f['approved']}")
+        print(f"  完成周期：{dc['n']} 单，中位 {h(dc['p50'])} / P90 {h(dc['p90'])}"
+              f" / 最长 {h(dc['max'])}")
+        print(f"  当前在办 {w['in_progress']}：租约超时 {w['stale_leases']} · 无主 {w['unowned']}"
+              f" · 等审批 {w['approval_waiting']} · 逾期 {w['overdue']}")
+        print(f"  重试存量：{r['tasks_with_attempts']} 单 · 累计 {r['attempts_total']} 次"
+              f" · 最高 {r['max_attempts']} 次")
+        q = m.get("quality") or {}
+        if q.get("total"):
+            print(f"  完成质量（抽检）：{q['total']} 单 · 达标 {q.get('ok', 0)}"
+                  f" · 告警 {q.get('warned', 0)} · 均分 {q.get('avg_score', 0)}")
+        elif q.get("error") or q.get("skipped"):
+            print(f"  完成质量：{q.get('error') or q.get('skipped')}")
+        if m.get("agents"):
+            print("  按 agent：" + "，".join(
+                f"{a['ag']} 在办{a['doing']}/完成{a['done']}/死信{a['dead']}"
+                for a in m["agents"][:8]))
+        labels = {"lease_stale": "租约超时", "unowned": "无主在办", "approval_waiting": "等审批",
+                  "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2"}
+        if m.get("risks"):
+            print("  风险信号：")
+            for x in m["risks"]:
+                print(f"    ! {labels.get(x['kind'], x['kind'])} {x['count']} 条（"
+                      + "；".join(x["sample"]) + "）")
+        else:
+            print("  风险信号：无")
+        return 0
     if status and status not in brain.TASK_STATUSES:
         print(f"status 只能是 {'/'.join(brain.TASK_STATUSES)}（收到「{status}」）")
         return 2
     rows = brain.task_list(root, status=status, owner=owner, project=project, limit=limit)
     if not rows:
-        print("暂无任务（hub_task_add 新建；状态 pending/in_progress/blocked/done）")
+        print("暂无任务（hub_task_add 新建；状态 pending/in_progress/blocked/done/cancelled/dead）")
         return 0
     brain.task_annotate(root, rows)
     print(f"任务 {len(rows)} 条（进行中→阻塞→待办→完成 排序）：")
@@ -293,11 +350,57 @@ def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
     return 0
 
 
+def cmd_digest(root: str, days: int = 1) -> int:
+    """R55 团队日结（headless）：窗口流动 + 当前风险 + 按 agent 记分卡。"""
+    import brain  # noqa: PLC0415
+    if not 1 <= int(days) <= 365:
+        print("days 范围 1..365")
+        return 2
+    d = brain.team_digest(root, days=int(days))
+    f, c = d["flow"], d["current"]
+    print(f"团队日结（近 {d['window_days']} 天）：")
+    cyc = f.get("done_cycle_p50_h")
+    print(f"  流动：记录 {f['records']} · 记忆 {f['memories']} · 任务 新建 {f['tasks_created']}"
+          f" / 完成 {f['tasks_done']}"
+          + ("" if cyc is None else f"（中位周期 {cyc:g}h）")
+          + f" / 取消或死信 {f['tasks_cancelled_or_dead']}"
+          f" · 错误新开 {f['errors_opened']}（未闭 {f['errors_open']}）"
+          f" · 调用 {f['tool_calls']} · 检索 {f['searches']}（零命中 {f['zero_hit_searches']}）")
+    w, fr = c["wip"], c["freeze"]
+    print(f"  当前：在线 {c['online_agents']}/{c['known_agents']} · 在办 {c['open_total']}"
+          f"（租约逾期 {w['stale_leases']} / 无主 {w['unowned']} / 等审批 {w['approval_waiting']}"
+          f" / 逾期 {w['overdue']}）· " + ("写入冻结中" if fr["active"] else "写入未冻结"))
+    labels = {"lease_stale": "租约逾期", "unowned": "无主在办", "approval_waiting": "等审批",
+              "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2",
+              "offline_with_open": "无心跳但有在办", "errors_open": "未闭错误",
+              "zero_hit_search": "零命中检索"}
+    if d["risks"]:
+        print("  风险：")
+        for r in d["risks"]:
+            print(f"    ! {labels.get(r['kind'], r['kind'])} {r['count']}："
+                  + "；".join(r["sample"]))
+    else:
+        print("  风险：无")
+    print("  建议：")
+    for s in d["suggestions"]:
+        print(f"    - {s}")
+    if d["agents"]:
+        print("  按 agent：")
+        for a in d["agents"][:8]:
+            t = a["tasks"]
+            warn = f" ⚠ {' · '.join(a['risks'])}" if a["risks"] else ""
+            print(f"    {a['agent']} {'[在线]' if a['online'] else '[离线]'}"
+                  f"｜记录 {a['records']} · 任务 在办{t['open']}/完成{t['done']}"
+                  f" · 错误未闭{a['errors']['open']} · 调用{a['usage']['calls']}{warn}")
+    return 0
+
+
 def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5) -> int:
     """前沿队列（headless）：可认领/进行中/可接管/等待依赖。"""
     import brain  # noqa: PLC0415
     res = brain.task_next(root, project=project, owner=agent, limit=limit)
-    brain.task_annotate(root, res["ready"] + res["doing"] + res["takeover"] + res["waiting"])
+    brain.task_annotate(root, res["ready"] + res["doing"] + res["takeover"] + res["waiting"]
+                        + res.get("backoff", []) + res.get("deferred", []))
     c = res["counts"]
     if not any(c.values()):
         print("前沿队列为空（没有待办/在办任务）。")
@@ -320,6 +423,17 @@ def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5) -> i
                 elif (t.get("blocked_by") or "").strip():
                     reason = f" —— 阻塞：{t['blocked_by'][:30]}"
             print(f"  - {_task_line(t)}{reason}")
+    if res.get("backoff"):
+        print(f"退避中 {c.get('backoff', 0)} 条（失败重试，到点自动回到待办）：")
+        for t in res["backoff"][:5]:
+            print(f"  - {_task_line(t)} —— 还剩 {t.get('_retry_wait_min') or 0} 分钟，"
+                  f"第 {t.get('_attempts') or 0} 次失败：{(t.get('last_error') or '-')[:40]}")
+    if res.get("deferred"):
+        print(f"延后中 {c.get('deferred', 0)} 条（不占前沿，到点自动恢复）：")
+        for t in res["deferred"][:5]:
+            print(f"  - {_task_line(t)} —— 恢复于 {(t.get('defer_until') or '')[:16]}，"
+                  f"原因：{(t.get('defer_reason') or '-')[:40]}"
+                  f"（提前唤醒：cli.py update {t['id']} --defer-until -）")
     return 0
 
 
@@ -338,12 +452,44 @@ def cmd_claim(root: str, task_id, agent: str) -> int:
 
 def cmd_update(root: str, task_id, status: str = "", agent: str = "",
                blocked_by: str = "", detail: str = "", priority=None,
-               deps: str = "", due: str = "") -> int:
-    """任务流转（headless）：与 hub_task_update 同一状态机与依赖校验。"""
+               deps: str = "", due: str = "", cancel_reason: str = "",
+               defer_until: str = "", defer_reason: str = "",
+               approval_required=None) -> int:
+    """任务流转（headless）：与 hub_task_update 同一状态机与依赖校验。
+    R44 延后（--defer-until/--defer-reason，传 - 唤醒）与 R45 完成审批开关
+    （--approval on/off）也走这里，避免 CLI 与 MCP 出现两套行为。"""
     import brain  # noqa: PLC0415
+    defer_until = (defer_until or "").strip()
+    if defer_until:
+        if defer_until == "-":
+            err, row = brain.task_undefer(root, task_id, agent=agent)
+            if err:
+                print(f"唤醒失败：{err}")
+                return 1
+            if not row.get("_was_deferred"):
+                print(f"任务 #{row['id']} 当前没有延后标记（无需恢复）")
+                return 0
+            print(f"任务 #{row['id']} 已恢复：{row['title'][:50]}（回到前沿可认领）")
+            return 0
+        err, row = brain.task_defer(root, task_id, defer_until, reason=defer_reason, agent=agent)
+        if err:
+            print(f"延后失败：{err}")
+            return 1
+        print(f"任务 #{row['id']} 已延后至 {row['_defer_until']}"
+              f"（约 {row['_defer_hours']:g} 小时）：{row['title'][:50]}")
+        print(f"原因：{(row.get('defer_reason') or '')[:80]}")
+        if row.get("_leases_released"):
+            print(f"已释放文件租约 {row['_leases_released']} 个")
+        print("到点自动回到可认领；提前唤醒：cli.py update %s --defer-until -" % row["id"])
+        return 0
+    approval = None
+    if approval_required in ("on", "off", True, False):
+        approval = approval_required in ("on", True)
     err, row = brain.task_update(root, task_id, status=status, agent=agent,
                                  blocked_by=blocked_by, detail=detail,
-                                 priority=priority, deps=deps, due=due)
+                                 priority=priority, deps=deps, due=due,
+                                 cancel_reason=cancel_reason,
+                                 approval_required=approval)
     if err:
         print(f"更新失败：{err}")
         return 1
@@ -352,6 +498,98 @@ def cmd_update(root: str, task_id, status: str = "", agent: str = "",
           f"{brain.TASK_CN.get(row['status'], row['status'])}{who}｜{row['title'][:50]}")
     if row.get("crystal"):
         print(row["crystal"])
+    return 0
+
+
+def cmd_retry(root: str, task_id, reason: str, agent: str = "",
+              delay=None) -> int:
+    """失败重试（headless）：记录原因、指数退避排队；耗尽进死信，再调一次即复活。"""
+    import brain  # noqa: PLC0415
+    err, row = brain.task_retry(root, task_id, agent=agent, reason=reason, delay=delay)
+    if err:
+        print(f"重试失败：{err}")
+        return 1
+    if row.get("_dead"):
+        print(f"任务 #{row['id']} 已进入死信（第 {row['_attempts']} 次失败）："
+              f"{row['title'][:50]}")
+        print(f"原因：{(row.get('last_error') or '')[:100]}")
+        print("已退出队列并通知持有者；排查后 cli.py retry 复活（次数重置），"
+              "或 update --status cancelled --cancel-reason ... 放弃")
+        return 0
+    when = (f"{int(row.get('_backoff_seconds') or 0)} 秒后（{row.get('_retry_at')}）"
+            if row.get("_backoff_seconds") else "立即可认领")
+    print(f"任务 #{row['id']} 已重试排队（第 {row['_attempts']} 次失败）："
+          f"{row['title'][:50]}")
+    print(f"原因：{(row.get('last_error') or '')[:100]}")
+    print(f"退避：{when}；到点后 cli.py next 查看、cli.py claim 认领")
+    return 0
+
+
+def cmd_approve(root: str, task_id, agent: str = "", note: str = "") -> int:
+    """完成审批（headless）：four-eyes——owner 不能自批；批准后持有者才能标 done。"""
+    import brain  # noqa: PLC0415
+    err, row = brain.task_approve(root, task_id, agent=agent, note=note)
+    if err:
+        print(f"审批失败：{err}")
+        return 1
+    print(f"任务 #{row['id']} 已批准完成（复核人 {row['_approved_by']}）：{row['title'][:50]}")
+    print("持有者现在可以 cli.py update %s --status done --agent ..." % row["id"])
+    return 0
+
+
+def cmd_freeze(root: str, minutes=None, reason: str = "", off: bool = False,
+               agent: str = "") -> int:
+    """R48 全局写入冻结（headless）：--off 解除；缺 minutes 只查看状态。"""
+    import brain  # noqa: PLC0415
+    if off:
+        _, fr = brain.freeze_clear(root, agent or "cli", reason)
+        if fr.get("_was_active"):
+            print("全局写入冻结已解除，写工具恢复可用。")
+        elif fr.get("_was_expired"):
+            print("写入冻结此前已过期，已清理残留状态。")
+        else:
+            print("当前没有生效的写入冻结。")
+        return 0
+    if minutes is None:
+        fr = brain.freeze_get(root)
+        if not fr["active"]:
+            print(f"写入未冻结{'（上次冻结已过期）' if fr['expired'] else ''}。"
+                  "冻结：cli.py freeze --minutes 30 --reason \"...\"（0=手动解冻）")
+            return 0
+        until = fr["until"][:19].replace("T", " ") if fr["until"] else "手动解冻"
+        rem = f"，约剩 {fr['remaining_min']:g} 分钟" if fr["until"] else ""
+        print(f"⛔ 全局写入已冻结：{until}{rem}｜由 {fr['by'] or '-'} 开启")
+        print(f"原因：{fr['reason'] or '-'}")
+        print("写工具全部拒收（hub_freeze/hub_undo 例外）；解除：cli.py freeze --off")
+        return 0
+    err, fr = brain.freeze_set(root, minutes, reason, agent or "cli")
+    if err:
+        print(f"冻结失败：{err}")
+        return 1
+    until = fr["until"][:19].replace("T", " ") if fr["until"] else "手动解冻"
+    print(f"⛔ 全局写入已{'延长至' if fr.get('_was_active') else '冻结至'} {until}："
+          f"{fr['reason'][:80]}")
+    print("写工具全部拒收（读工具照常）；解除：cli.py freeze --off")
+    return 0
+
+
+def cmd_audit_export(root: str, fmt: str = "jsonl", days: int = 30,
+                     limit: int = 20000) -> int:
+    """R50 审计导出（headless）：journal+op_audit → JSONL/CSV（含链校验快照）。"""
+    import brain  # noqa: PLC0415
+    err, r = brain.audit_export(root, fmt, days, limit)
+    if err:
+        print(f"导出失败：{err}")
+        return 1
+    ch = r["chain"]
+    scope = "全部历史" if not r["days"] else f"近 {r['days']} 天"
+    print(f"已导出审计流水：{r['path']}（{r['bytes'] / 1024:.1f}KB，{r['format'].upper()}）")
+    print(f"journal {r['journal']} 条 + op_audit {r['op_audit']} 条"
+          + ("（已达上限，可能截断）" if r["truncated"] else ""))
+    print(f"审计链：{ch['summary']}")
+    if not ch["ok"]:
+        print("⚠ 审计链异常：导出保留现场，先追查 broken 明细，勿重算链。")
+    print(f"范围：{scope}；只读导出，不改库。")
     return 0
 
 
@@ -473,6 +711,8 @@ def main(argv=None) -> int:
     sub.add_parser("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
     sub.add_parser("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
     p_bp = sub.add_parser("backup-prune", help="R7 备份盘点与清理（默认预演，--apply 才删）")
+    p_bd = sub.add_parser("backup-drill", help="R61 恢复演练（只读：校验+试恢复，不写现场库）")
+    p_bd.add_argument("path", nargs="?", default="", help="备份文件路径，留空=最新整包")
     sub.add_parser("doctor", help="R8 一键自检：巡检聚合 + 可执行修复建议")
     p_bp.add_argument("--keep-zip", type=int, default=3)
     p_bp.add_argument("--keep-snapshot", type=int, default=10)
@@ -491,11 +731,15 @@ def main(argv=None) -> int:
     p_srv.add_argument("--allow-write", action="store_true",
                        help="开放写工具（会生成 token，调用时带 token=）")
     p_srv.add_argument("--open", action="store_true", help="启动后自动开浏览器")
-    p_tasks = sub.add_parser("tasks", help="R9 任务看板（截止/前置/租约/阻塞）")
+    p_tasks = sub.add_parser("tasks", help="R9 任务看板（截止/前置/租约/阻塞）；--stats 过程统计")
     p_tasks.add_argument("--status", default="", help="pending/in_progress/blocked/done")
     p_tasks.add_argument("--project", default="")
     p_tasks.add_argument("--owner", default="")
     p_tasks.add_argument("--limit", type=int, default=50)
+    p_tasks.add_argument("--stats", action="store_true", help="R53 任务过程统计（流量/周期/卡点/重试/质量）")
+    p_tasks.add_argument("--days", type=int, default=7, help="--stats 窗口天数，默认 7")
+    p_digest = sub.add_parser("digest", help="R55 团队日结（流动/风险/按 agent 记分卡）")
+    p_digest.add_argument("--days", type=int, default=1, help="窗口天数 1..365，默认 1")
     p_next = sub.add_parser("next", help="R9 前沿队列（可认领/进行中/可接管/等待）")
     p_next.add_argument("--project", default="")
     p_next.add_argument("--agent", default="", help="该 agent 名下的在办任务归入「进行中」")
@@ -513,6 +757,35 @@ def main(argv=None) -> int:
     p_update.add_argument("--priority", type=int, default=None, choices=[0, 1, 2, 3])
     p_update.add_argument("--deps", default="", help="前置任务 id，逗号分隔；传 - 清除")
     p_update.add_argument("--due", default="", help="截止日 YYYY-MM-DD；传 - 清除")
+    p_update.add_argument("--cancel-reason", dest="cancel_reason", default="",
+                          help="取消原因（--status cancelled 时必填）")
+    p_update.add_argument("--defer-until", dest="defer_until", default="",
+                          help="R44 延后到何时（YYYY-MM-DD/ISO，须未来）；传 - 提前唤醒")
+    p_update.add_argument("--defer-reason", dest="defer_reason", default="",
+                          help="R44 延后原因（--defer-until 非 - 时必填）")
+    p_update.add_argument("--approval", choices=["on", "off"], default=None,
+                          help="R45 完成审批开关：on=done 前须他人批准；off=关闭并清空批准")
+    p_retry = sub.add_parser("retry", help="R42 失败重试（退避排队；耗尽进死信，再调复活）")
+    p_retry.add_argument("task_id", type=int)
+    p_retry.add_argument("reason", help="失败原因/下次怎么改（必填）")
+    p_retry.add_argument("--agent", default="", help="你的 agent 名（管理面可空）")
+    p_retry.add_argument("--delay", type=int, default=None,
+                         help="可选退避秒数（0=立即可认领），缺省按失败次数指数退避")
+    p_approve = sub.add_parser("approve", help="R45 完成审批（four-eyes，owner 不能自批）")
+    p_approve.add_argument("task_id", type=int)
+    p_approve.add_argument("--agent", default="", help="复核人 agent 名（管理面可空）")
+    p_approve.add_argument("--note", default="", help="复核意见/验收依据")
+    p_freeze = sub.add_parser("freeze", help="R48 全局写入冻结（应急闸门；--off 解除）")
+    p_freeze.add_argument("--minutes", type=int, default=None,
+                          help="冻结分钟数：0=手动解冻；缺省=只查看状态")
+    p_freeze.add_argument("--reason", default="", help="冻结原因（冻结时必填）")
+    p_freeze.add_argument("--off", action="store_true", help="解除冻结（幂等）")
+    p_freeze.add_argument("--agent", default="", help="操作人（缺省 cli）")
+    p_audit = sub.add_parser("audit-export", help="R50 审计导出（journal+op_audit → JSONL/CSV）")
+    p_audit.add_argument("--format", default="jsonl", choices=["jsonl", "csv"],
+                         help="导出格式，缺省 jsonl（首行 meta 含链校验快照）")
+    p_audit.add_argument("--days", type=int, default=30, help="近 N 天，缺省 30；0=全部历史")
+    p_audit.add_argument("--limit", type=int, default=20000, help="每类行上限，缺省 20000")
     p_ck = sub.add_parser("checkpoint", help="R9 任务检查点（断点续跑）")
     p_ck.add_argument("task_id", type=int)
     p_ck.add_argument("content")
@@ -543,57 +816,81 @@ def main(argv=None) -> int:
     p_unlock.add_argument("--reason", default="")
     args = ap.parse_args(argv)
 
-    if args.cmd == "release":
-        return cmd_release(_root(args.root))
-    if args.cmd == "build-manifest":
-        return cmd_build_manifest(Path(__file__).resolve().parent, args.phase)
-    if args.cmd == "backup-prune":
-        return cmd_backup_prune(_root(args.root), args.keep_zip, args.keep_snapshot,
-                                args.keep_legacy, args.keep_bak, args.min_age_days,
-                                args.apply)
-    if args.cmd == "doctor":
-        return cmd_doctor(_root(args.root))
-    root = _root(args.root)
-    if not root or not Path(root).is_dir():
-        print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")
+    try:
+        if args.cmd == "release":
+            return cmd_release(_root(args.root))
+        if args.cmd == "build-manifest":
+            return cmd_build_manifest(Path(__file__).resolve().parent, args.phase)
+        if args.cmd == "backup-prune":
+            return cmd_backup_prune(_root(args.root), args.keep_zip, args.keep_snapshot,
+                                    args.keep_legacy, args.keep_bak, args.min_age_days,
+                                    args.apply)
+        if args.cmd == "backup-drill":
+            return cmd_backup_drill(_root(args.root), args.path)
+        if args.cmd == "doctor":
+            return cmd_doctor(_root(args.root))
+        root = _root(args.root)
+        if not root or not Path(root).is_dir():
+            print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")
+            return 2
+        if args.cmd == "status":
+            return cmd_status(root, args.agent)
+        if args.cmd == "onboard":
+            return cmd_onboard(root, args.agent)
+        if args.cmd == "refresh":
+            return cmd_refresh(root)
+        if args.cmd == "discover":
+            return cmd_discover(root)
+        if args.cmd == "deploy":
+            return cmd_deploy(root)
+        if args.cmd == "tools":
+            return cmd_list_tools(root)
+        if args.cmd == "call":
+            return cmd_call(root, args.tool, args.kv)
+        if args.cmd == "serve":
+            return cmd_serve(root, args.port, args.allow_write, args.open)
+        if args.cmd == "tasks":
+            return cmd_tasks(root, args.status, args.project, args.owner, args.limit,
+                             stats=args.stats, days=args.days)
+        if args.cmd == "digest":
+            return cmd_digest(root, args.days)
+        if args.cmd == "next":
+            return cmd_next(root, args.project, args.agent, args.limit)
+        if args.cmd == "claim":
+            return cmd_claim(root, args.task_id, args.agent)
+        if args.cmd == "update":
+            return cmd_update(root, args.task_id, args.status, args.agent, args.blocked_by,
+                              args.detail, args.priority, args.deps, args.due,
+                              args.cancel_reason, args.defer_until, args.defer_reason,
+                              args.approval)
+        if args.cmd == "retry":
+            return cmd_retry(root, args.task_id, args.reason, args.agent, args.delay)
+        if args.cmd == "approve":
+            return cmd_approve(root, args.task_id, args.agent, args.note)
+        if args.cmd == "freeze":
+            return cmd_freeze(root, args.minutes, args.reason, args.off, args.agent)
+        if args.cmd == "audit-export":
+            return cmd_audit_export(root, args.format, args.days, args.limit)
+        if args.cmd == "checkpoint":
+            return cmd_checkpoint(root, args.task_id, args.content, args.agent, args.kind)
+        if args.cmd == "locks":
+            return cmd_locks(root, args.project, args.owner, args.path,
+                             args.include_released, args.limit, args.prune, args.agent)
+        if args.cmd == "lock":
+            return cmd_lock(root, args.path, args.agent, args.task_id, args.ttl_min,
+                            args.reason, args.project)
+        if args.cmd == "unlock":
+            return cmd_unlock(root, args.lease_id, args.path, args.agent, args.reason)
+        ap.print_help()
+        return 0
+    except sqlite3.DatabaseError as e:
+        # R59：库文件损坏时不再把 sqlite 堆栈抛给用户——给恢复路径并退 2。
+        import brain  # noqa: PLC0415
+        if brain.is_db_corruption(e):
+            print(brain.db_corruption_report(_root(args.root), e))
+            return 2
+        print(f"数据库操作失败（{type(e).__name__}）：{e}")
         return 2
-    if args.cmd == "status":
-        return cmd_status(root, args.agent)
-    if args.cmd == "onboard":
-        return cmd_onboard(root, args.agent)
-    if args.cmd == "refresh":
-        return cmd_refresh(root)
-    if args.cmd == "discover":
-        return cmd_discover(root)
-    if args.cmd == "deploy":
-        return cmd_deploy(root)
-    if args.cmd == "tools":
-        return cmd_list_tools(root)
-    if args.cmd == "call":
-        return cmd_call(root, args.tool, args.kv)
-    if args.cmd == "serve":
-        return cmd_serve(root, args.port, args.allow_write, args.open)
-    if args.cmd == "tasks":
-        return cmd_tasks(root, args.status, args.project, args.owner, args.limit)
-    if args.cmd == "next":
-        return cmd_next(root, args.project, args.agent, args.limit)
-    if args.cmd == "claim":
-        return cmd_claim(root, args.task_id, args.agent)
-    if args.cmd == "update":
-        return cmd_update(root, args.task_id, args.status, args.agent, args.blocked_by,
-                          args.detail, args.priority, args.deps, args.due)
-    if args.cmd == "checkpoint":
-        return cmd_checkpoint(root, args.task_id, args.content, args.agent, args.kind)
-    if args.cmd == "locks":
-        return cmd_locks(root, args.project, args.owner, args.path,
-                         args.include_released, args.limit, args.prune, args.agent)
-    if args.cmd == "lock":
-        return cmd_lock(root, args.path, args.agent, args.task_id, args.ttl_min,
-                        args.reason, args.project)
-    if args.cmd == "unlock":
-        return cmd_unlock(root, args.lease_id, args.path, args.agent, args.reason)
-    ap.print_help()
-    return 0
 
 
 if __name__ == "__main__":

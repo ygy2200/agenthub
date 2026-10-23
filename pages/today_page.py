@@ -40,6 +40,10 @@ class TodayPage(QWidget):
         top.addWidget(refreshBtn)
         lay.addLayout(top)
 
+        self.digestLine = CaptionLabel("")
+        self.digestLine.setWordWrap(True)
+        lay.addWidget(self.digestLine)
+
         self.listw = ListWidget()
         self.listw.setMinimumHeight(320)
         lay.addWidget(section_head("待办清单", "DATE_TIME"))
@@ -68,12 +72,26 @@ class TodayPage(QWidget):
         self._item2task.clear()
         if not self.win.root:
             self.sumLabel.setText("未配置数据根目录")
+            self.digestLine.setText("")
             return
         try:
             nxt = brain.task_next(self.win.root, limit=20)
         except Exception as e:  # noqa: BLE001  看板读失败不该拖垮窗口刷新
             self.sumLabel.setText(f"读取失败：{e}")
             return
+        try:
+            dg = brain.team_digest(self.win.root, days=1)
+            f, cur = dg["flow"], dg["current"]
+            w = cur["wip"]
+            tip = dg["suggestions"][0] if dg["risks"] and dg["suggestions"] else ""
+            self.digestLine.setText(
+                f"近 24h：记录 {f['records']} · 任务完成 {f['tasks_done']}"
+                f" · 在办 {cur['open_total']}"
+                f"（租约逾期 {w['stale_leases']} / 等审批 {w['approval_waiting']}）"
+                f" · 风险 {len(dg['risks'])} 类" + (f"；{tip}" if tip else ""))
+            self.digestLine.setToolTip("\n".join(f"- {s}" for s in dg["suggestions"]))
+        except Exception as e:  # noqa: BLE001  日结失败不该拖垮工作台
+            self.digestLine.setText(f"近 24h 日结读取失败：{e}")
         c = nxt["counts"]
         self.sumLabel.setText(" · ".join(f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER))
         for key in _GROUP_ORDER:

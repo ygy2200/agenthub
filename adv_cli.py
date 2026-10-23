@@ -226,6 +226,43 @@ def t_task_cli(tmp):
     rc, out = _capture(cli.main, ["--root", root, "update", str(c), "--status", "pending"])
     assert rc == 0 and "已更新" in out, (rc, out)
 
+    # R44/R45 过程控制：延后/唤醒、审批闸门与审批、retry/approve 子命令接线
+    d = brain.task_add(root, "CLI 延后", project="CLI")[1]
+    rc, out = _capture(cli.cmd_update, root, d, defer_until="2030-01-01",
+                       defer_reason="等上游")
+    assert rc == 0 and "已延后至" in out and "等上游" in out, (rc, out)
+    rc, out = _capture(cli.cmd_next, root, "CLI", "", 5)
+    assert "延后中 1 条" in out and f"#{d}" in out, out
+    rc, out = _capture(cli.cmd_claim, root, d, "cliagent")
+    assert rc == 1 and "延后" in out, (rc, out)
+    rc, out = _capture(cli.cmd_update, root, d, defer_until="-")
+    assert rc == 0 and "已恢复" in out, (rc, out)
+
+    e = brain.task_add(root, "CLI 审批", project="CLI", approval_required=True)[1]
+    assert brain.task_claim(root, e, "cliagent")[0] == ""
+    rc, out = _capture(cli.cmd_update, root, e, status="done", agent="cliagent")
+    assert rc == 1 and "审批" in out, (rc, out)
+    rc, out = _capture(cli.cmd_approve, root, e, "reviewer", "验收通过")
+    assert rc == 0 and "已批准完成" in out and "reviewer" in out, (rc, out)
+    rc, out = _capture(cli.cmd_update, root, e, status="done", agent="cliagent")
+    assert rc == 0 and "完成" in out, (rc, out)
+
+    f = brain.task_add(root, "CLI 重试", project="CLI")[1]
+    assert brain.task_claim(root, f, "cliagent")[0] == ""
+    rc, out = _capture(cli.cmd_retry, root, f, "接口 502", "cliagent")
+    assert rc == 0 and "已重试排队" in out and "退避" in out, (rc, out)
+
+    rc, out = _capture(cli.main, ["--root", root, "approve", str(e),
+                                  "--agent", "reviewer", "--note", "验收"])
+    assert rc == 1 and "终态" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "retry", str(f), "再试",
+                                  "--delay", "0"])
+    assert rc == 0 and "已重试排队" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "update", str(d),
+                                  "--defer-until", "2030-02-01",
+                                  "--defer-reason", "等评审"])
+    assert rc == 0 and "已延后至" in out, (rc, out)
+
 
 def t_lock_cli(tmp):
     """R12 文件租约 CLI：台账/查占/获取/冲突拒绝/释放归属/任务完成自动释放。
@@ -550,6 +587,169 @@ def t_serve_graceful_stop(tmp):
             p.wait(timeout=10)
 
 
+def t_freeze_cli(tmp):
+    """R48 CLI 冻结闸门：缺 reason/坏分钟拒收；定时/手动/延长/解冻幂等；
+    状态与真实状态机同源；argparse 子命令真的接上了。"""
+    import brain
+    root = str(Path(tmp) / "hub_freeze_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+
+    rc, out = _capture(cli.cmd_freeze, root)
+    assert rc == 0 and "未冻结" in out, (rc, out)
+    rc, out = _capture(cli.cmd_freeze, root, 30, "")
+    assert rc == 1 and "reason" in out, (rc, out)
+    rc, out = _capture(cli.cmd_freeze, root, -1, "坏分钟")
+    assert rc == 1 and "minutes" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_freeze, root, 30, "迁移中", False, "qoder")
+    assert rc == 0 and "已冻结至" in out and "迁移中" in out, (rc, out)
+    assert brain.freeze_get(root)["active"]
+    rc, out = _capture(cli.cmd_freeze, root)
+    assert rc == 0 and "全局写入已冻结" in out and "迁移中" in out, (rc, out)
+
+    rc, out = _capture(cli.cmd_freeze, root, 0, "改手动", False, "qoder")
+    assert rc == 0 and "已延长至" in out and "手动解冻" in out, (rc, out)
+    rc, out = _capture(cli.cmd_freeze, root, None, "", True, "qoder")
+    assert rc == 0 and "已解除" in out, (rc, out)
+    rc, out = _capture(cli.cmd_freeze, root, None, "", True, "qoder")
+    assert rc == 0 and "没有生效" in out, (rc, out)
+    assert not brain.freeze_get(root)["active"]
+
+    # argparse 接线（--off 与 --minutes 走同一条状态机）
+    rc, out = _capture(cli.main, ["--root", root, "freeze", "--minutes", "15",
+                                  "--reason", "接线", "--agent", "qoder"])
+    assert rc == 0 and "已冻结至" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "freeze", "--off", "--agent", "qoder"])
+    assert rc == 0 and "已解除" in out, (rc, out)
+    assert brain.freeze_get(root)["active"] is False
+
+
+def t_audit_export_cli(tmp):
+    """R50 CLI 审计导出：JSONL/CSV 落盘、坏参拒收、子命令接线。"""
+    import brain
+    root = str(Path(tmp) / "hub_audit_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.ensure_schema(root)
+    brain.journal_add(root, "cli", "审计导出测试", note="x")
+
+    rc, out = _capture(cli.cmd_audit_export, root)
+    assert rc == 0 and "已导出审计流水" in out and "JSONL" in out, (rc, out)
+    files = sorted((Path(root) / "_hub" / "exports").glob("audit-*.jsonl"))
+    assert files and files[-1].stat().st_size > 0, out
+    rc, out = _capture(cli.cmd_audit_export, root, "csv", 0, 100)
+    assert rc == 0 and "CSV" in out and "全部历史" in out, (rc, out)
+    rc, out = _capture(cli.cmd_audit_export, root, "xml")
+    assert rc == 1 and "jsonl/csv" in out, (rc, out)
+    rc, out = _capture(cli.cmd_audit_export, root, "jsonl", 5000)
+    assert rc == 1 and "days" in out, (rc, out)
+
+    rc, out = _capture(cli.main, ["--root", root, "audit-export",
+                                  "--format", "csv", "--days", "0"])
+    assert rc == 0 and "CSV" in out, (rc, out)
+
+
+
+def t_task_stats_cli(tmp):
+    """R53 CLI 任务过程统计：--stats 输出流量/卡点/风险，坏天数拒收，子命令接线。"""
+    import brain, datetime
+    root = str(Path(tmp) / "hub_stats")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    now = datetime.datetime.now()
+    iso = lambda h: (now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated,"
+                     "done_at) VALUES('P','done','done','zcode',?,?,?,?)",
+                     (iso(9), iso(10), iso(2), iso(2)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated) "
+                     "VALUES('P','stale','in_progress','zcode',?,?,?)", (iso(3), iso(4), iso(3)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated,attempts) "
+                     "VALUES('P','retry','pending','zcode',?,?,2)", (iso(2), iso(1)))
+    rc, out = _capture(cli.cmd_tasks, root, "", "P", "", 50, True, 7)
+    assert rc == 0, (rc, out)
+    for needle in ("任务过程统计", "完成周期", "当前在办", "租约超时 1", "重试存量", "风险信号"):
+        assert needle in out, (needle, out)
+    rc, out = _capture(cli.cmd_tasks, root, "", "", "", 50, True, 0)
+    assert rc == 2 and "1..365" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "tasks", "--stats", "--days", "7"])
+    assert rc == 0 and "任务过程统计" in out, (rc, out)
+
+
+def t_team_digest_cli(tmp):
+    """R55 CLI 团队日结：流动/风险/建议/记分卡，坏天数拒收，子命令接线。"""
+    import brain, datetime
+    root = str(Path(tmp) / "hub_digest")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    now = datetime.datetime.now()
+    iso = lambda h: (now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+    day = lambda d: (now.date() + datetime.timedelta(days=d)).isoformat()
+    brain.heartbeat_touch(root, "zcode", "P", "")
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO records(project,agent,date,title,content,status,created)"
+                     " VALUES('P','zcode',?,'今日记录','正文','active',?)",
+                     (day(0), day(0) + "T10:00:00"))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,claimed_at,created,updated,"
+                     "due) VALUES('P','卡住的单','in_progress','zcode',?,?,?,?)",
+                     (iso(3), iso(4), iso(3), day(-1)))
+        conn.execute("INSERT INTO tasks(project,title,status,owner,created,updated) "
+                     "VALUES('P','无主单','in_progress','',?,?)", (iso(2), iso(2)))
+        conn.execute("INSERT INTO errors(ts,agent,project,title,detail,status)"
+                     " VALUES(?, 'zcode','P','未闭错误','d','open')", (iso(1),))
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?, 'zcode','hub_status')",
+                     (iso(1),))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits)"
+                     " VALUES(?, 'zcode','hub_search','不存在',0)", (iso(1),))
+    rc, out = _capture(cli.cmd_digest, root, 1)
+    assert rc == 0, (rc, out)
+    for needle in ("团队日结", "流动：", "当前：在线", "租约逾期", "无主在办",
+                   "未闭错误", "零命中检索", "建议：", "按 agent", "zcode"):
+        assert needle in out, (needle, out)
+    rc, out = _capture(cli.cmd_digest, root, 0)
+    assert rc == 2 and "1..365" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "digest", "--days", "7"])
+    assert rc == 0 and "团队日结" in out, (rc, out)
+
+
+def t_corrupt_db_cli(tmp):
+    """R59：库文件损坏时 CLI 不吐 sqlite 堆栈。
+
+    digest 退 2 并给恢复步骤；call 走 isError 返回非零——此前无论 isError 都退 0，
+    脚本会把「失败」当成功（这次顺带修正）。
+    """
+    root = Path(tmp) / "hub_corrupt"
+    (root / "_hub").mkdir(parents=True)
+    (root / "_hub" / "brain.db").write_bytes(b"garbage" * 4096)
+    rc, out = _capture(cli.main, ["--root", str(root), "digest"])
+    assert rc == 2, (rc, out)
+    for needle in ("数据库文件已损坏", "brain.db", "-wal", "§3.4"):
+        assert needle in out, (needle, out)
+    rc, out = _capture(cli.main, ["--root", str(root), "call", "hub_status"])
+    assert rc == 1, (rc, out)
+    assert "数据库文件已损坏" in out, out
+
+
+def t_backup_drill_cli(tmp):
+    """R61：backup-drill 子命令——默认最新整包、显式 path、坏路径退 1。"""
+    import brain
+    root = str(Path(tmp) / "hub_drill_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    brain.add_record(root, project="P", agent="zcode",
+                     date=time.strftime("%Y-%m-%d"), title="演练", content="cli drill")
+    err, zip_path = brain.backup_db(root)
+    assert not err, err
+    rc, out = _capture(cli.main, ["--root", root, "backup-drill"])
+    assert rc == 0, (rc, out)
+    for needle in ("恢复演练：可用", "quick_check ok", "§3.4"):
+        assert needle in out, (needle, out)
+    rc, out = _capture(cli.main, ["--root", root, "backup-drill", zip_path])
+    assert rc == 0 and "恢复演练：可用" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "backup-drill", str(Path(tmp) / "nope.zip")])
+    assert rc == 1 and "不存在" in out, (rc, out)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_cli_")
     print(f"临时目录：{tmp}\n")
@@ -573,6 +773,18 @@ def main():
          lambda: t_serve_subprocess(tmp))
     case("C8 遗留·serve 优雅停止（SIGBREAK=Ctrl+Break 同优雅路径：退出码0/已停止/端口可重用）",
          lambda: t_serve_graceful_stop(tmp))
+    case("R48·CLI 冻结闸门（reason/分钟拒收/定时与手动/解冻幂等/子命令接线）",
+         lambda: t_freeze_cli(tmp))
+    case("R50·CLI 审计导出（JSONL/CSV 落盘/坏参拒收/子命令接线）",
+         lambda: t_audit_export_cli(tmp))
+    case("R53·CLI 任务过程统计（--stats 流量/卡点/重试/风险，坏天数拒收，子命令接线）",
+         lambda: t_task_stats_cli(tmp))
+    case("R55·CLI 团队日结（流动/风险/建议/记分卡，坏天数拒收，子命令接线）",
+         lambda: t_team_digest_cli(tmp))
+    case("R59·库损坏降级（digest 退 2 给恢复步骤不吐堆栈；call 按 isError 退非零）",
+         lambda: t_corrupt_db_cli(tmp))
+    case("R61·恢复演练子命令（默认最新整包/显式 path/坏路径退 1）",
+         lambda: t_backup_drill_cli(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

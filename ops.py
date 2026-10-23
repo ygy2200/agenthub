@@ -60,6 +60,9 @@ CHECKS = {
     "ponytail_gate": ("Ponytail 粗筛：疑似未引用依赖 / 裸 except 吞异常（提示级，不做硬阻断——包名≠导入名会误报）", True),
     "coverage_gate": ("分片对账（移植 study-abroad-planner v1.4.0 硬门禁）：output/ 下最近两份同构 json 比对，任一分片下降 >20% 或清零即命中；无基线则跳过不妄判", True),
     "db_health": ("数据库健康（2026-10-13）：journal_mode/busy_timeout/synchronous 是否达标 + -wal/-shm 残留与体积 + 库体积与表规模——并发与持久化问题日常可见，不必等回归脚本", False),
+    "db_integrity": ("库完整性体检（R59）：PRAGMA quick_check 实际读一遍库结构；损坏时直接点名「哪条恢复路径」，巡检会短路后续检查——坏库上跑其它检查只会产出一屏无用的次生失败", False),
+    "audit_chain": ("审计链体检（R47）：journal 流水带 sha256 前向链（prev_hash/hash + meta 头锚），单行改字段/删行/调序/尾部截断都会点名；全库无流水视为健康空态，通过时给出封存条数与封存起点——审计能力要看得见，不能等出事才发现没开", False),
+    "security_health": ("安全面体检（R49）：审计链完整性 + 写入冻结状态 + agent 管控状态合法性 + 在办任务归属是否可解析 + 记录/记忆/随记/错误里的明文凭据扫描（OpenAI/GitHub/AWS 密钥、私钥块、口令赋值；只报位置不回显密钥）——多 agent 共用大脑，安全面要一张单子看完", False),
     "backup_health": ("备份健康（R7/R18）：四类备份（整包 zip/旧库/在线快照/手工 bak）的份数与体积、最新备份年龄、清理候选——无整包=只备库不备源文件，还原会丢项目文件；最新超 7 天、可清理超 512MB 或总量达整包 4 倍（堆积）会点名，单份整包的大小只作信息（不按总量绝对值误报）；只报不动手", False),
     "graph_health": ("知识图谱健康（2026-10-13）：结构边数/已连条目/孤岛数/最大簇——孤岛变多=该补标签的信号，边归零=图谱接线坏了", False),
     "ghost_memory": ("幽灵候选检测（2026-10-18，C4；同日晚扩展 records）：内容高度相似却互无 supersedes 取代关系的**记忆对+记录对**——多版本事实共存、没人裁决，检索时会被一起捞出来让模型从混合物里综合（业界称 ghost memory）。记录口径：近90天/同项目/剥四段式模板头/排除 migrated 拆分、auto-hook 会话锚与全部 source=auto 自动捕获记录（流程运行日志是事件流，同标题多次运行属正常节奏）。只报不裁，交给 agent/用户决定谁取代谁", False),
@@ -70,19 +73,23 @@ CHECKS = {
     "record_quality": ("记录模板遵守率（R7/R19）：近 90 天 work_log 四段式（目的/做了什么/验证结果/如何回滚）俱全率+缺段分布——以 2026-10-17 标准上线后的记录判失败（实测当前 89%），上线前历史存量只作参考（全期 27% 不据此误报）。只测不拦，软提示在 hub_log_work 回显", False),
     "profile_surface": ("被动上下文预算（2026-10-18 R8，C7）：tools/list 每会话推一次，是被动 token 成本——外部研究（wavespeed：模型过 ~40 工具开始退化；上下文爆炸 5 server×12 tool×800 token≈48k）。实测三档 profile 工具数与序列化体积，admin 超预算即 warn，防工具描述无声膨胀。R8 评估结论：默认保持 admin（切 worker 只省 3.8K tok 却藏起 5 个在用工具，不划算）", False),
     "stale_health": ("陈旧健康（2026-10-18 R3，D3）：① 硬不变量——已标 superseded_by 的旧事实不得被检索返回（泄漏=检索管线回归）；② 陈旧 fact 清单（写入 >45 天且零唤起 → 该复核候选）。由来：外部研究一致把 staleness rate 列为记忆系统第一指标（persistence≠truth）。不发明真相预言机，只让泄漏可抓、陈旧可见", False),
-    "tasks_health": ("任务治理巡检（R5 2026-10-21）：在办任务的过期租约/无主/持有者心跳已停/截止日已过——认领了没人续、人走了任务还挂着，都会让「谁在干什么」失真；只报不动手（接管 hub_claim，改派 hub_task_update）", False),
+    "tasks_health": ("任务治理巡检（R5 2026-10-21，R30/R34/R35/R43 扩展）：在办任务的过期租约/无主/持有者心跳已停/截止日已过/待办饥饿，近 7 天 done 任务的交付物证据核对，「记录称已完成、任务却没关」的闭环漂移，以及重试耗尽的死信任务——认领了没人续、人走了任务还挂着、声明过的产物缺失、完成只停在记录里、失败多次后无声退出队列，都会让「谁在干什么」失真；只报不动手（接管 hub_claim，关单/改派 hub_task_update，死信 hub_task_retry）", False),
     "lease_health": ("文件租约巡检（R12 2026-10-21）：活跃租约互相冲突/任务绑定漂移/持有者未登记一次点名；过期未释放只报数供清理，不算失败——租约不拦写盘，但冲突看不见就会让两个 agent 同时改同一文件；只报不动手（list 看台账、release 释放、先 signal 协调）", False),
 }
 
 # R8 一键自检：巡哪些项 + 每项失败时「下一步怎么做」（修复建议必须可执行，
 # 不是「请检查」这类把活推回人的废话）。巡检项刻意不含需要 target 的（回归/部署比对）。
-PATROL_CHECKS = ("env", "runtime_health", "db_health", "backup_health", "rules_health",
+PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_chain", "security_health",
+                 "backup_health", "rules_health",
                  "stale_health", "ghost_memory", "dup_mem", "record_quality",
                  "date_health", "tasks_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
+    "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
     "env": "按 detail 点名项修环境（Python/代理/磁盘/库路径）；装依赖用 pip install -e .",
     "runtime_health": "重启各 agent 的 agenthub MCP 进程（旧进程仍跑旧代码）；部署先 cli.py deploy",
     "db_health": "重启连接清理 -wal/-shm；journal_mode 非 WAL 时检查连接参数；必要时 sqlite VACUUM",
+    "audit_chain": "内容被改：按 broken 的 id 对照 journal/op_audit 原始流水，追查写权限；链断层：恢复被删行或从最近备份回滚；头锚不一致：尾部被截断，先导出审计留存再排查谁有库写权限（整库重算级篡改超出本链威胁模型）",
+    "security_health": "审计链/N 类问题按各自点名项处理；明文凭据：把密钥改放环境变量或凭据文件，清掉大脑里的明文（记录用 hub_undo/新记录更正，记忆用 hub_memory_supersede，随记/错误用对应工具更新或删除），再轮换已泄露的密钥——删掉文本不等于密钥没泄露过",
     "backup_health": "hub_export action=backup 生成整包；清理用 action=prune（确认后 apply=true）",
     "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门；零触发且有记录的 agent 去其会话实测一次写工具调用，确认钩子加载",
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
@@ -90,7 +97,7 @@ CHECK_FIXES = {
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
     "record_quality": "hub_log_work 的 content 按四段式写：目的/做了什么/验证结果/如何回滚",
     "date_health": "把 date/valid_until/截止日改成 YYYY-MM-DD（格式歪了到期提醒会静默失效）",
-    "tasks_health": "过期/失联持有者：确认后 hub_claim 接管；不再做则 hub_task_update 改派或释放；逾期任务重排截止日；待办饥饿：hub_next 认领，或改优先级/关单",
+    "tasks_health": "过期/失联持有者：确认后 hub_claim 接管；不再做则 hub_task_update 改派或释放；逾期任务重排截止日；待办饥饿：hub_next 认领，或改优先级/关单；交付物证据不全：补交付，或用 hub_task_update(deliverables=...) 修正声明；完成声明未关单：核对记录后 hub_task_update(status=\"done\") 关单，或用 hub_log_work(task=id) 绑定后续报；死信：看 last_error 后 hub_task_retry 复活，或 hub_task_update(status=\"cancelled\") 放弃",
     "lease_health": "冲突：先 hub_signal_send 协调，再由一方 hub_lock action=release；任务绑定漂移：brain 会在任务完成/换主时自动释放，出现漂移先 release 再查 journal；过期未释放：hub_lock action=prune 一键回收（只标记释放，活跃不受影响）",
     "inbox": "把 00_Inbox 文件分拣进对应项目目录（或 hub_search_files 找回）",
     "stalled": "显式标记项：归档 hub_archive_project（需拍板）或 hub_task_add 写下下一步（任务写入会自动恢复 active）；[漏标] 项核实最后活动后归档或补记",
@@ -107,7 +114,7 @@ def run_patrol(root: str, checks=None) -> dict:
     names = tuple(checks or PATROL_CHECKS)
     issues, passed, skipped = [], [], []
     t0 = time.time()
-    for name in names:
+    for idx, name in enumerate(names):
         if name not in CHECKS:
             skipped.append({"name": name, "why": "未注册的检查项"})
             continue
@@ -128,6 +135,13 @@ def run_patrol(root: str, checks=None) -> dict:
             issues.append({"name": name, "summary": r.get("summary") or "未通过",
                            "fix": CHECK_FIXES.get(name, "看 hub_ops_run 的 detail 逐项处理"),
                            "detail": (r.get("detail") or [])[:5]})
+            # R59：坏库上继续跑只会产出一屏次生失败（每项都「查询失败」），
+            # 把后续项标成跳过并说明原因，让根因保持在第一条。
+            if name == "db_integrity" and r.get("fatal"):
+                for rest in names[idx + 1:]:
+                    skipped.append({"name": rest,
+                                    "why": "数据库损坏，跳过（先按 db_integrity 修复建议恢复）"})
+                break
     return {"ok": not issues, "checked": len(names) - len(skipped),
             "issues": issues, "passed": passed, "skipped": skipped,
             "elapsed_ms": round((time.time() - t0) * 1000)}
@@ -137,7 +151,14 @@ def run_patrol(root: str, checks=None) -> dict:
 # 基线（2026-10-18 实测）：reader 7 工具 ~1.4K / worker 51 ~15.5K / admin 69 ~19.3K。
 # 取基线 +25% 余量：正常的功能增补（新工具/描述微调）不会误伤，
 # 但描述膨胀（动辄半个屏幕的 description）或工具数失控会立刻可见。
+# R42：工具数已到 76，静态总额会把「新增真工具」与「单工具描述膨胀」混为一谈；
+# 改为「工具数 × 单人预算」——新增工具按同等篇幅放行，单个描述膨胀仍推高总额被抓。
 PROFILE_SURFACE_BUDGET = 24000
+PROFILE_TOK_PER_TOOL = 340  # 19.3K/69≈280，+25% 余量取整
+
+
+def _profile_budget(tool_count: int) -> int:
+    return max(PROFILE_SURFACE_BUDGET, tool_count * PROFILE_TOK_PER_TOOL)
 
 
 def run_check(name: str, target: str = "", root: str = "") -> dict:
@@ -178,6 +199,12 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _coverage_gate(t)
     elif name == "db_health":
         r = _db_health(root)
+    elif name == "db_integrity":
+        r = _db_integrity(root)
+    elif name == "audit_chain":
+        r = _audit_chain(root)
+    elif name == "security_health":
+        r = _security_health(root)
     elif name == "backup_health":
         r = _backup_health(root)
     elif name == "graph_health":
@@ -464,6 +491,39 @@ def _regression(target: Path) -> dict:
             "detail": detail}
 
 
+def _db_integrity(root: str) -> dict:
+    """库完整性体检（R59，只读）：PRAGMA quick_check 实际读库结构，坏库当场点名。
+
+    为什么单列：db_health 看的是配置（WAL/timeout）与体积，文件损坏时它只会抛
+    「检查失败」；完整性检查要给出的是「哪条恢复路径」，并让巡检短路后续项。
+    """
+    import brain  # noqa: PLC0415
+    p = Path(root) / brain.core.DIR_META / brain.DB_NAME if root else None
+    if not root or p is None or not p.is_file():
+        return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+    try:
+        with brain.db_conn(root) as conn:
+            bad = brain._db_quick_check(conn)
+            n_tab = conn.execute(
+                "SELECT COUNT(*) c FROM sqlite_master WHERE type='table'").fetchone()["c"]
+    except Exception as e:  # noqa: BLE001
+        if brain.is_db_corruption(e):
+            return {"ok": False, "fatal": True,
+                    "summary": f"库文件已损坏：{type(e).__name__}: {e}"[:120],
+                    "detail": [f"库：{p}",
+                               "先停写，把 db/-wal/-shm 一起复制留证（只留 db 会丢 WAL 数据）",
+                               "再用 hub_export action=backups + verify 选可用整包，按手册 §3.4 恢复"]}
+        return {"ok": False,
+                "summary": f"完整性检查失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    if bad:
+        head = ("库文件已损坏（quick_check 无法执行）" if "执行失败" in bad
+                else "quick_check 未通过（库结构可能已损坏）")
+        return {"ok": False, "fatal": True, "summary": f"{head}：{bad}"[:120],
+                "detail": [f"库：{p}", "坏库别再写；留证后用最近可用备份恢复（手册 §3.4）"]}
+    mb = p.stat().st_size / 1048576
+    return {"ok": True, "summary": f"quick_check ok · {n_tab} 张表 · {mb:.1f}MB", "detail": []}
+
+
 def _db_health(root: str) -> dict:
     """大脑库健康体检（只读）。
 
@@ -488,6 +548,9 @@ def _db_health(root: str) -> dict:
             n_rec = conn.execute("SELECT COUNT(*) c FROM records WHERE " + brain._rec_live_sql()).fetchone()["c"]
             n_mem = conn.execute("SELECT COUNT(*) c FROM memories WHERE " + brain._live_sql()).fetchone()["c"]
     except Exception as e:  # noqa: BLE001
+        if brain.is_db_corruption(e):
+            return {"ok": False, "summary": f"库文件已损坏：{type(e).__name__}: {e}"[:120],
+                    "detail": ["改用 hub_ops_run(name=\"db_integrity\") 看可执行的恢复路径"]}
         return {"ok": False, "summary": f"库健康检查失败：{type(e).__name__}: {e}"[:120], "detail": []}
     if mode != "wal":
         ok = False
@@ -515,7 +578,175 @@ def _db_health(root: str) -> dict:
     return {"ok": ok, "summary": summary, "detail": lines[:8]}
 
 
-# MCP server 进程会加载的模块（stdio 协议下这些文件里的裸 print 都是致命污染源）。
+def _audit_chain(root: str) -> dict:
+    """审计链体检（R47，只读）：流水是否可证未被改。
+
+    通过时也报封存条数/封存起点——「审计开着但没人知道开没开」和没开一样。
+    失败按 broken 点名 id 与原因，修复建议必须落到「回滚/追权限」而非「请检查」。
+    """
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
+            return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+        v = brain.journal_verify(root)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False,
+                "summary": f"审计链检查失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    detail = [f"已封存 {v['sealed']} 条 / 历史未封存 {v['legacy']} 条 / 共 {v['total']} 条"]
+    if v.get("chain_at"):
+        detail.append(f"封存起点：{v['chain_at']}（此前历史只能证明封存后未改）")
+    if v.get("head"):
+        detail.append(f"链头：{v['head'][:16]}…")
+    for b in v.get("broken", [])[:4]:
+        detail.append(f"异常 #{b['id']}：{b['why']}")
+    if v.get("breaks", 0) > len(v.get("broken", [])):
+        detail.append(f"……另有 {v['breaks'] - len(v['broken'])} 处未展开")
+    return {"ok": v["ok"], "summary": v["summary"], "detail": detail[:8]}
+
+
+_SECRET_PATTERNS = (
+    ("OpenAI/Anthropic 风格密钥", re.compile(r"\b(?:sk|sk-ant)-[A-Za-z0-9_\-]{16,}")),
+    ("GitHub token", re.compile(r"\b(?:ghp|gho|ghu|ghs|ghr)_[A-Za-z0-9]{20,}")),
+    ("AWS AccessKey", re.compile(r"\bAKIA[0-9A-Z]{16}\b")),
+    ("私钥块", re.compile(r"-----BEGIN (?:RSA |EC |OPENSSH )?PRIVATE KEY-----")),
+    ("明文口令赋值", re.compile(
+        r"(?i)\b(?:password|passwd|passphrase|secret|api[_-]?key|access[_-]?token)"
+        r"\s*[:=]\s*['\"]?([^\s'\"]{8,})")),
+)
+
+
+_PLACEHOLDER_MARKERS = ("your", "example", "placeholder", "redacted", "changeme",
+                        "xxxx", "here", "dummy", "sample")
+
+
+def _looks_placeholder(tok: str) -> bool:
+    low = (tok or "").lower()
+    return any(mark in low for mark in _PLACEHOLDER_MARKERS)
+
+
+def _secret_label(text: str) -> str:
+    """返回命中的凭据类型（空=干净）。只判类型，不返回密钥内容。"""
+    for label, pat in _SECRET_PATTERNS:
+        m = pat.search(text or "")
+        if not m:
+            continue
+        # 文档/教程里的占位符（sk-ant-your-key-here、AKIAxxxxxxxx…）不是泄露；
+        # 真实事故是裸密钥，别让示例把信号淹没。
+        tok = m.group(1) if label == "明文口令赋值" else m.group(0)
+        if _looks_placeholder(tok):
+            continue
+        if label == "明文口令赋值":
+            v = (m.group(1) or "").strip()
+            low = v.lower()
+            # 环境变量引用/掩码不是泄露，别把文档里的示例当事故
+            if (low.startswith(("os.environ", "getenv"))
+                    or v[0] in "$%{<" or set(v) <= set("*x.-_")):
+                continue
+        return label
+    return ""
+
+
+def _scan_plaintext_secrets(root: str, brain) -> tuple:
+    """扫描共用大脑里的明文凭据。返回 (命中位置列表, 扫描条数)；命中不含密钥原文。"""
+    hits, scanned = [], 0
+    queries = (
+        ("记录", "SELECT id, project, content FROM records "
+                 "WHERE COALESCE(status,'active')!='deleted' ORDER BY id DESC LIMIT ?", 3000),
+        ("记忆", "SELECT id, project, content FROM memories "
+                 "WHERE COALESCE(status,'active')!='deleted' ORDER BY id DESC LIMIT ?", 1500),
+        ("随记", "SELECT id, '' AS project, content FROM notes ORDER BY id DESC LIMIT ?", 500),
+        ("错误", "SELECT id, project, title || char(10) || detail || char(10) || undo AS content "
+                 "FROM errors ORDER BY id DESC LIMIT ?", 500),
+    )
+    with brain.db_conn(root) as conn:
+        for kind, sql, cap in queries:
+            try:
+                rows = list(conn.execute(sql, (cap,)))
+            except Exception:  # noqa: BLE001 老库缺表不影响其余面
+                continue
+            for r in rows:
+                scanned += 1
+                label = _secret_label(r["content"] or "")
+                if label:
+                    hits.append({"kind": kind, "id": r["id"],
+                                 "project": (r["project"] or "").strip(), "label": label})
+    return hits, scanned
+
+
+def _security_health(root: str) -> dict:
+    """安全面体检（R49，只读）：一张单子看完审计/冻结/管控/归属/明文凭据。
+
+    凭据命中只报「哪张表哪条 + 类型」，绝不回显密钥本身——体检输出会被记进
+    流水、发给多个 agent，回显等于二次泄露。
+    """
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
+            return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+        v = brain.journal_verify(root)
+        fr = brain.freeze_get(root)
+        ctrl = brain.agent_control_map(root)
+        hits, scanned = _scan_plaintext_secrets(root, brain)
+        with brain.db_conn(root) as conn:
+            task_rows = [dict(r) for r in conn.execute(
+                "SELECT id, owner FROM tasks WHERE status='in_progress'")]
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False,
+                "summary": f"安全体检失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+
+    problems, detail = [], []
+    if v["ok"]:
+        detail.append(f"审计链完整：{v['sealed']} 条已封存"
+                      + (f"，起点 {v['chain_at'][:19]}" if v.get("chain_at") else ""))
+    else:
+        problems.append("审计链异常")
+        detail.append(f"审计链：{v['summary']}")
+        for b in v.get("broken", [])[:2]:
+            detail.append(f"  异常 #{b['id']}：{b['why']}")
+
+    if fr["active"]:
+        until = fr["until"][:19].replace("T", " ") if fr["until"] else "手动解冻"
+        detail.append(f"⛔ 写入冻结中（至 {until}）：{fr['reason'][:40] or '-'}")
+    else:
+        detail.append("写入闸门：未冻结")
+
+    bad_ctrl = {k: s for k, s in ctrl.items() if s not in brain.AGENT_CONTROL_STATES}
+    if bad_ctrl:
+        problems.append(f"{len(bad_ctrl)} 个 agent 管控状态非法")
+        detail.append("管控异常：" + "、".join(
+            f"{k}={s!r}" for k, s in list(bad_ctrl.items())[:3]))
+    else:
+        detail.append(f"agent 管控状态：{len(ctrl)} 个注册项均合法")
+
+    names = {k.lower() for k in ctrl}
+    orphan = [t for t in task_rows
+              if (t.get("owner") or "").strip()
+              and (t["owner"] or "").strip().lower() not in names]
+    if orphan:
+        problems.append(f"{len(orphan)} 个在办任务持有者不在注册表")
+        detail.append("归属异常：" + "、".join(
+            f"#{t['id']}@{t['owner']}" for t in orphan[:3]))
+    else:
+        detail.append(f"在办任务归属：{len(task_rows)} 条均可解析")
+
+    if hits:
+        problems.append(f"疑似明文凭据 {len(hits)} 处")
+        for h in hits[:3]:
+            detail.append(f"{h['kind']}#{h['id']}（{h['project'] or '-'}）：{h['label']}")
+    else:
+        detail.append(f"明文凭据扫描：{scanned} 条未发现密钥/口令模式")
+
+    if problems:
+        summary = f"安全面发现 {len(problems)} 类问题：" + "；".join(problems)
+    else:
+        summary = (f"安全面健康：审计链 {v['sealed']} 条已封存｜"
+                   f"写入{'冻结中' if fr['active'] else '未冻结'}｜"
+                   f"凭据扫描 {scanned} 条干净｜管控/归属正常")
+    return {"ok": not problems, "summary": summary, "detail": detail[:8]}
 # 与 core.SERVER_FILES 同源：CLI/api 是独立进程（print 到 stdout 是正确输出），
 # 真正致命的是被 MCP server import 的模块。
 _STDOUT_MODULES = ("agenthub_mcp.py", "core.py", "brain.py", "agentscore.py", "ops.py",
@@ -857,10 +1088,11 @@ def _profile_surface() -> dict:
     finally:
         m.SERVER_PROFILE = orig
     admin_name, admin_n, admin_chars, admin_tok = rows[-1]
-    ok = admin_tok <= PROFILE_SURFACE_BUDGET
+    budget = _profile_budget(admin_n)
+    ok = admin_tok <= budget
     detail = [f"{n}: {c} 工具 / {ch:,} 字符 / ~{tk:,} tok" for n, c, ch, tk in rows]
-    detail.append(f"预算 {PROFILE_SURFACE_BUDGET:,} tok（R8 基线 19.3K +25% 余量；"
-                  "reader 7/worker 51/admin 69 工具）")
+    detail.append(f"预算 {budget:,} tok（{admin_n} 工具×{PROFILE_TOK_PER_TOOL}；"
+                  "R8 基线 69 工具 19.3K +25% 余量）")
     verdict = "✓ 预算内" if ok else "⚠ 超预算——工具描述可能在膨胀，检查新增工具的描述篇幅"
     return {"ok": ok,
             "summary": f"被动上下文预算：admin ~{admin_tok:,} tok（{admin_n} 工具）{verdict}",
@@ -2068,7 +2300,12 @@ def _tasks_health(root: str) -> dict:
     更新时点名。租约与心跳只证明持有者在，不证明任务在走；两类问题分开计数不重叠。
     推进口径是 progress_at（心跳不刷）+ 手工检查点，认领自动锚点不计入。
     R30：新增「待办饥饿」——能开工（无阻塞/前置全完成）却 ≥ TASK_STARVE_DAYS 没人认领
-    的 pending。在办任务出问题有人可找，没人认领的活连「找谁」都没有，此前完全不可见。"""
+    的 pending。在办任务出问题有人可找，没人认领的活连「找谁」都没有，此前完全不可见。
+    R34：新增「交付物证据」——近 7 天 done 且声明过 deliverables 的任务，逐条核对
+    产物存在性与时效（旧于任务创建的不算），缺失/陈旧点名（只报不裁，完成权在持有者）。
+    R35：新增「完成声明未关单」——记录（绑定或正文点名任务号）称已完成、任务却还没
+    done 的闭环漂移；与租约类问题分开计数，只点名不自动关单。
+    R43：死信任务单列——重试耗尽后退出队列，没人处理就永远没人干；只报不自动复活。"""
     if err := _need_root(root):
         return err
     try:
@@ -2081,20 +2318,32 @@ def _tasks_health(root: str) -> dict:
         with brain.db_conn(root) as conn:
             rows = [dict(r) for r in conn.execute(
                 "SELECT id,project,title,owner,claimed_at,due,status,updated,progress_at,"
+                "attempts,next_retry_at,last_error,"
                 "(SELECT MAX(ts) FROM checkpoints c WHERE c.task_id=tasks.id "
                 " AND c.kind<>'auto_claim') AS last_cp "
-                "FROM tasks WHERE status!='done' ORDER BY priority, id")]
+                "FROM tasks WHERE status NOT IN ('done','cancelled','dead') "
+                "ORDER BY priority, id")]
+            dead_rows = [dict(r) for r in conn.execute(
+                "SELECT id,project,title,owner,attempts,last_error,updated "
+                "FROM tasks WHERE status='dead' ORDER BY updated DESC, id DESC LIMIT 20")]
             sessions = {r["agent"]: r["ts"] for r in conn.execute(
                 "SELECT agent, ts FROM sessions")}
             registered = {r["name"] for r in conn.execute("SELECT name FROM agents")}
+            # R34：近 7 天 done 且声明过交付物的任务（只读核对，失败静默跳过）
+            done_rows = [dict(r) for r in conn.execute(
+                "SELECT id,project,title,owner,deliverables,created FROM tasks "
+                "WHERE status='done' AND deliverables!='' AND done_at>=? "
+                "ORDER BY done_at DESC LIMIT 20",
+                ((now - datetime.timedelta(days=7)).isoformat(timespec="seconds"),))]
         audit = brain.task_graph_audit(root)
         starve = brain.task_starvation(root, limit=1000)
+        drift = brain.task_closure_drift(root, days=30, limit=100)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}",
                 "detail": []}
     counts = {"stale": 0, "unleased": 0, "ownerless": 0, "idle": 0, "stalled": 0,
               "starving": 0, "overdue": 0, "unregistered": 0, "dangling": 0, "cycles": 0,
-              "residual": 0}
+              "residual": 0, "drift": 0, "dead": len(dead_rows)}
     starve_map = {r["id"]: r["_age_days"] for r in starve["starving"]}
     # 结构缺陷挂到具体任务上（与租约/归属原因合并展示），看板/巡检口径同源
     struct: dict = {}
@@ -2151,24 +2400,59 @@ def _tasks_health(root: str) -> dict:
         if reasons:
             problems.append((r, reasons))
     in_prog = sum(1 for r in rows if r["status"] == "in_progress")
-    if not problems:
+    # R34 交付物证据：声明过的产物缺/旧 → 点名（done 任务不在主查询里，单独汇总）
+    ev_bad: list = []
+    for r in done_rows:
+        try:
+            v = brain._verify_deliverables(root, r["project"], r["deliverables"], r["created"])
+        except Exception:  # noqa: BLE001  单条核对失败不拖垮整轮巡检
+            continue
+        if v["total"] and not v["complete"]:
+            c = v["counts"]
+            ev_bad.append(f"#{r['id']} [{(r['owner'] or '无主')}@{r['project'] or '无项目'}] "
+                          f"{r['title'][:24]}（交付物证据不全：缺 {c['missing']} / "
+                          f"旧于任务 {c['stale']} / 未验证 {c['unverifiable']}）")
+    counts["evidence"] = len(ev_bad)
+    # R35 闭环漂移：记录称已完成、任务却没关——记录是「声称」，任务是「事实」，
+    # 两者矛盾时点名让持有者裁决；不自动关单，避免把「记录写错」当成完成。
+    drift_bad = [
+        f"记录#{d['record_id']} → 任务#{d['task_id']}"
+        f"（{brain.TASK_CN.get(d['task_status'], d['task_status'])}）"
+        f"「{d['task_title'][:24]}」（记录称已完成未关单：{d['snippet'][:40]}）"
+        for d in drift["items"]]
+    counts["drift"] = drift["counts"]["total"]
+    # R43 死信：重试耗尽已退出队列——比「在办失败」更隐蔽，没人复活就永远没人干。
+    dead_bad = [
+        f"#{r['id']} [{(r['owner'] or '无主')}@{r['project'] or '无项目'}] "
+        f"{r['title'][:24]}（死信：重试 {r.get('attempts') or 0} 次仍失败"
+        + (f"，最后错误 {r['last_error'][:40]}" if r.get("last_error") else "") + "）"
+        for r in dead_rows]
+    if not problems and not ev_bad and not drift_bad and not dead_bad:
         return {"ok": True,
                 "summary": f"任务治理：在办 {in_prog} 项 / 未完成 {len(rows)} 项，"
-                           "租约·归属·进展·待办·截止·依赖图均正常",
+                           "租约·归属·进展·待办·截止·依赖图·交付物证据·闭环一致性均正常",
                 "detail": []}
     detail = [f"#{r['id']} [{(r['owner'] or '无主')}@{r['project'] or '无项目'}] "
               f"{r['title'][:30]}（{'、'.join(reasons)}）" for r, reasons in problems[:8]]
+    detail.extend(ev_bad[:3])
+    detail.extend(drift_bad[:3])
+    detail.extend(dead_bad[:3])
     return {"ok": False,
-            "summary": (f"任务治理：{len(problems)} 项需关注（过期租约 {counts['stale']} / "
+            "summary": (f"任务治理：{len(problems) + len(ev_bad) + len(drift_bad) + len(dead_bad)} 项需关注（过期租约 {counts['stale']} / "
                         f"租约缺失 {counts['unleased']} / "
                         f"无主 {counts['ownerless']} / 持有者失联 {counts['idle']} / "
                         f"进展停滞 {counts['stalled']} / "
                         f"待办饥饿 {counts['starving']} / "
+                        f"交付物证据不全 {counts['evidence']} / "
+                        f"完成声明未关单 {counts['drift']} / "
+                        f"死信 {counts['dead']} / "
                         f"未登记 {counts['unregistered']} / "
                         f"前置缺失 {counts['dangling']} / 依赖成环 {counts['cycles']} / "
                         f"残留阻塞 {counts['residual']} / "
                         f"逾期 {counts['overdue']}）——接管 hub_claim，改派 hub_task_update，"
-                        "长期没人做的待办用 hub_next 认领或关单"),
+                        "长期没人做的待办用 hub_next 认领或关单；交付物证据不全：补交付或用 hub_task_update(deliverables=...) 修正声明；"
+                        "完成声明未关单：核对后 hub_task_update(status=\"done\") 关单；"
+                        "死信：查 last_error 后 hub_task_retry 复活或 hub_task_update(status=\"cancelled\") 放弃"),
             "detail": detail}
 
 
@@ -2205,7 +2489,7 @@ def _lease_health(root: str) -> dict:
         if not t:
             reasons = ["绑定任务不存在"]
         elif t["status"] != "in_progress":
-            reasons = [f"任务已{brain.TASK_CN.get(t['status'], t['status'])}"]
+            reasons = [f"任务状态为{brain.TASK_CN.get(t['status'], t['status'])}"]
         elif (t.get("owner") or "") != (r.get("owner") or ""):
             reasons = [f"任务持有者已变为 {t.get('owner') or '无主'}"]
         else:

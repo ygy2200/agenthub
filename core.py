@@ -695,6 +695,8 @@ def validate_project_name(name: str) -> str:
         return "项目名不能包含 .."
     if name.endswith(".") or name.endswith(" "):
         return "项目名不能以点或空格结尾"
+    if name in RESERVED or name.lower() in {x.lower() for x in RESERVED}:
+        return f"「{name}」是保留目录名，不能用作项目名"
     if any(ord(ch) < 32 for ch in name):
         return "项目名含控制字符"
     stem = name.split(".")[0].upper()
@@ -704,6 +706,32 @@ def validate_project_name(name: str) -> str:
         return "项目名不能带 agent 前缀（deepseek - / hermes - / claude - 等），同一项目只允许一份目录"
     if "-" not in name:
         return "命名须为「对象-问题」结构，需包含连字符 -"
+    return ""
+
+
+def validate_project_ref(name: str) -> str:
+    """宽松校验用于记录/任务/归档等既有数据的 project 字段：只拦路径穿越、
+    分隔符、盘符与保留目录，不强制「对象-问题」命名（历史项目/临时标签仍可用）。
+    返回 "" 合法，否则错误原因。"""
+    n = name or ""
+    if not n.strip():
+        return "project 不能为空"
+    if n != n.strip():
+        return "project 首尾不能有空格"
+    if len(n) > 100:
+        return "project 过长（>100 字符）"
+    if n in (".", ".."):
+        return "project 不能是 . 或 .."
+    if ".." in n:
+        return "project 不能包含 .."
+    if any(ch in INVALID_NAME_CHARS for ch in n):
+        return "project 含非法字符 \\ / : * ? \" < > |"
+    if any(ord(ch) < 32 for ch in n):
+        return "project 含控制字符"
+    if n.endswith(".") or n.endswith(" "):
+        return "project 不能以点或空格结尾"
+    if n in RESERVED or n.lower() in {x.lower() for x in RESERVED}:
+        return f"project 名「{n}」是保留目录名，不能使用"
     return ""
 
 
@@ -751,6 +779,9 @@ def move_to_project(root: str, filename: str, project_name: str) -> str:
     """把 00_Inbox 下的文件移到项目 input/。重名自动加序号。返回错误或 ""。"""
     if not root or not os.path.isdir(root):
         return "根目录不存在"
+    perr = validate_project_ref(project_name)
+    if perr:
+        return perr
     inbox = Path(root) / DIR_INBOX
     src = (inbox / filename).resolve()
     try:

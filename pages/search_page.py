@@ -5,7 +5,8 @@ from __future__ import annotations
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
 class SearchPage(QWidget):
-    KIND_CN = {"record": "记录", "memory": "记忆", "file": "文件", "evfile": "全盘文件"}
+    KIND_CN = {"record": "记录", "memory": "记忆", "note": "随记", "task": "任务",
+               "error": "错误", "file": "文件", "evfile": "全盘文件"}
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -15,12 +16,12 @@ class SearchPage(QWidget):
         lay.addWidget(_page_head("搜索", "全脑检索 + 全盘文件——回车执行，双击打开"))
         top = QHBoxLayout()
         self.edit = SearchLineEdit()
-        self.edit.setPlaceholderText("全脑检索：工作记录 / 记忆 / 文件名，回车执行…")
+        self.edit.setPlaceholderText("全脑检索：记录 / 记忆 / 随记 / 任务 / 错误 / 文件名，回车执行…")
         self.edit.setClearButtonEnabled(True)
         top.addWidget(self.edit, 1)
         self.kindFilter = ComboBox()
-        self.kindFilter.addItems(["全部", "记录", "记忆", "文件", "全盘文件"])
-        self.kindFilter.setFixedWidth(110)
+        self.kindFilter.addItems(["全部", "记录", "记忆", "随记", "任务", "错误", "文件", "全盘文件"])
+        self.kindFilter.setFixedWidth(120)
         self.kindFilter.currentIndexChanged.connect(self.refill)
         top.addWidget(self.kindFilter)
         lay.addLayout(top)
@@ -72,7 +73,7 @@ class SearchPage(QWidget):
         # Round 5：run() 只在用户回车时才跑，启动时也要有引导（助手幂等，run() 再调只会显隐）
         list_empty_guard(self.result, lay,
                          "输入关键词开始检索",
-                         "回车执行：全脑检索（记录 + 记忆）+ 全盘文件；"
+                         "回车执行：全脑检索（记录 + 记忆 + 随记 + 任务 + 错误）+ 全盘文件；"
                          "支持分类筛选与「全部」视图",
                          index=lay.indexOf(split))
 
@@ -81,7 +82,7 @@ class SearchPage(QWidget):
         kw = self.edit.text().strip()
         if not kw or not self.win.root:
             return
-        # 本地三查询是毫秒级 SQLite（实测 8/2/1ms），同步跑比 QThread 启动+信号往返更快——
+        # 本地六类查询都是毫秒级 SQLite，同步跑比 QThread 启动+信号往返更快——
         # 回车立即出结果，不再有"搜索中…"的顿挫
         try:
             res = brain.search_all(self.win.root, kw)
@@ -101,6 +102,12 @@ class SearchPage(QWidget):
                 hits.append(("record", r))
             for m in res.get("memories", []):
                 hits.append(("memory", m))
+            for n in res.get("notes", []):
+                hits.append(("note", n))
+            for t in res.get("tasks", []):
+                hits.append(("task", t))
+            for e in res.get("errors", []):
+                hits.append(("error", e))
             for f in res.get("files", []):
                 hits.append(("file", f))
             self.hits = hits or [("info", "无结果")]
@@ -121,8 +128,9 @@ class SearchPage(QWidget):
 
     def refill(self):
         """按类型过滤重建列表。本地在 self.hits，Everything 在 self.ev，显示子集在 self.view_hits。"""
-        kind = self.kindFilter.currentIndex()  # 0全部 1记录 2记忆 3文件 4全盘
-        key = {1: "record", 2: "memory", 3: "file", 4: "evfile"}.get(kind)
+        kind = self.kindFilter.currentIndex()  # 0全部 1记录 2记忆 3随记 4任务 5错误 6文件 7全盘
+        key = {1: "record", 2: "memory", 3: "note", 4: "task", 5: "error",
+               6: "file", 7: "evfile"}.get(kind)
         self.result.clear()
         self.view_hits = []
         if key in (None, "evfile"):
@@ -154,6 +162,22 @@ class SearchPage(QWidget):
                 conf = f" ⚠️疑似互斥#{'/#'.join(str(i) for i in h['_conflict_with'])}" if h.get("_conflict_with") else ""
                 self.result.addItem(f"[记忆#{h['id']}] {brain.KIND_CN.get(h['kind'], h['kind'])}：{h['content'][:100]}{src}{conf}")
                 self.view_hits.append((k, h))
+            elif k == "note":
+                mood = f"（{h['mood']}）" if h.get("mood") else ""
+                self.result.addItem(f"[随记#{h['id']}] {h['ts'][:10]}{mood}：{h['content'][:100]}")
+                self.view_hits.append((k, h))
+            elif k == "task":
+                st = brain.TASK_CN.get(h["status"], h["status"])
+                who = h.get("owner") or "无主"
+                due = f" ⏰{h['due'][:10]}" if h.get("due") else ""
+                self.result.addItem(f"[任务#{h['id']}] [{st}] {h.get('project') or '—'}："
+                                    f"{h['title'][:80]}（{who}）{due}")
+                self.view_hits.append((k, h))
+            elif k == "error":
+                st = "未关闭" if h["status"] == "open" else "已修复"
+                self.result.addItem(f"[错误#{h['id']}] [{st}] {h.get('project') or '—'}"
+                                    f"（{h['agent']}）：{h['title'][:80]}")
+                self.view_hits.append((k, h))
             elif k == "file":
                 self.result.addItem(f"[文件] {h['project']}\\{h['name']}")
                 self.view_hits.append((k, h))
@@ -164,7 +188,7 @@ class SearchPage(QWidget):
         # 结果列表在 QSplitter 里（不是 layout 子项），故显式指定插到分栏之前。
         list_empty_guard(self.result, self.lay,
                          "输入关键词开始检索",
-                         "回车执行：全脑检索（记录 + 记忆）+ 全盘文件；"
+                         "回车执行：全脑检索（记录 + 记忆 + 随记 + 任务 + 错误）+ 全盘文件；"
                          "支持分类筛选与「全部」视图",
                          index=self.lay.indexOf(self.split))
 
@@ -191,14 +215,38 @@ class SearchPage(QWidget):
         if kind == "memory":
             return md_to_html(f"**{brain.KIND_CN.get(h['kind'], h['kind'])}**"
                               f"{(' #' + h['tags']) if h['tags'] else ''}\n\n{h['content']}")
+        if kind == "note":
+            mood = f"（{h['mood']}）" if h.get("mood") else ""
+            tags = f" #{h['tags']}" if h.get("tags") else ""
+            return md_to_html(f"**随记 #{h['id']}** {h['ts'][:10]}{mood}{tags}\n\n{h['content']}")
+        if kind == "task":
+            st = brain.TASK_CN.get(h["status"], h["status"])
+            body = (f"## {h['title']}\n\n**状态** {st} · **负责人** {h.get('owner') or '无主'}"
+                    f" · **项目** {h.get('project') or '—'}")
+            if h.get("due"):
+                body += f" · **截止** {h['due']}"
+            if h.get("detail"):
+                body += f"\n\n{h['detail']}"
+            if h.get("last_error"):
+                body += f"\n\n**最近错误** {h['last_error']}"
+            return md_to_html(body)
+        if kind == "error":
+            st = "未关闭" if h["status"] == "open" else "已修复"
+            body = (f"## {h['title']}\n\n**状态** {st} · **项目** {h.get('project') or '—'}"
+                    f" · **登记** {h['agent']} {h['ts'][:10]}")
+            if h.get("detail"):
+                body += f"\n\n{h['detail']}"
+            if h.get("undo"):
+                body += f"\n\n**回滚方式** {h['undo']}"
+            return md_to_html(body)
         return md_to_html(f"**文件**（{h['project']}）\n\n`{h['path']}`")
 
     def _sync_actions(self, kind):
         """操作按钮按结果类型显隐：能打开的才出现打开按钮，不让按钮灰着占地方。"""
         self.btnOpen.setVisible(kind in ("file", "evfile"))
         self.btnLoc.setVisible(kind in ("file", "evfile"))
-        self.btnJump.setVisible(kind == "record")
-        self.btnCopy.setVisible(kind in ("record", "memory"))
+        self.btnJump.setVisible(kind in ("record", "task"))
+        self.btnCopy.setVisible(kind in ("record", "memory", "note", "task", "error"))
 
     def _highlight(self):
         """预览正文里高亮关键词（ExtraSelection 运行时叠加，不改 HTML 结构）。"""
@@ -248,7 +296,7 @@ class SearchPage(QWidget):
 
     def jump_project(self):
         kind, h = self._current()
-        if kind == "record" and hasattr(self.win, "project_page"):
+        if kind in ("record", "task") and h.get("project") and hasattr(self.win, "project_page"):
             self.win.project_page.select_project(h["project"])
             self.win.switchTo(self.win.project_page)
 
@@ -260,4 +308,16 @@ class SearchPage(QWidget):
         elif kind == "record":
             QApplication.clipboard().setText(h["content"])
             InfoBar.success("已复制记录正文", h["title"][:60], duration=2000, parent=self.win)
+        elif kind == "note":
+            QApplication.clipboard().setText(h["content"])
+            InfoBar.success("已复制随记内容", f"#{h['id']}", duration=2000, parent=self.win)
+        elif kind == "task":
+            QApplication.clipboard().setText(f"{h['title']}\n\n{h.get('detail') or ''}".strip())
+            InfoBar.success("已复制任务内容", f"#{h['id']}", duration=2000, parent=self.win)
+        elif kind == "error":
+            txt = f"{h['title']}\n\n{h.get('detail') or ''}"
+            if h.get("undo"):
+                txt += f"\n\n回滚：{h['undo']}"
+            QApplication.clipboard().setText(txt.strip())
+            InfoBar.success("已复制错误记录", f"#{h['id']}", duration=2000, parent=self.win)
 

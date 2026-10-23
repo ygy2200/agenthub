@@ -193,10 +193,13 @@ class ConnectPage(QWidget):
         self.refresh_status()
 
     def _snippet_text(self):
-        py, server, _ = self._rows_data()
-        entry = {"agenthub": {"command": py or "D:/python311/python.exe",
-                              "args": [server or r"C:\\Users\\y\\.agenthub\\mcp_server\\agenthub_mcp.py",
-                                       self.win.root or "D:/AgentHub"]}}
+        # R57：R33 把 _rows_data 改成 (deploy_status, rows) 后这里仍按旧的
+        # (python, server, rows) 三元组解包——「复制配置片段」一点就崩。
+        st = core.deploy_status()
+        py = st.get("python") or "D:/python311/python.exe"
+        server = st.get("server") or r"C:\Users\y\.agenthub\mcp_server\agenthub_mcp.py"
+        entry = {"agenthub": {"command": py,
+                              "args": [server, self.win.root or "D:/AgentHub"]}}
         return json.dumps({"mcpServers": entry}, ensure_ascii=False, indent=2)
 
     def copy_snippet(self):

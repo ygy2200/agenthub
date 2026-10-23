@@ -13,7 +13,7 @@ PAGES = (
     ("project_page", "项目", "FOLDER", "work", "project 项目列表 工作记录", 2),
     ("today_page", "工作台", "DATE_TIME", "work", "today 工作台 今日 任务 前沿 待办 干活 该干什么", 0),
     ("signal_page", "信号中心", "CHAT", "work", "signal 信号 消息 广播 未读 收件箱 agent 通信", 0),
-    ("governance_page", "治理中心", "SETTING", "work", "governance 治理 隔离 整合 决策 回顾 关注 技能统计", 0),
+    ("governance_page", "治理中心", "SETTING", "work", "governance 治理 隔离 整合 决策 回顾 关注 技能统计 安全 审计 冻结 闸门", 0),
     ("playbook_page", "编排中心", "PLAY", "work", "playbook 编排 流程 自动化 触发器 图谱 跑一次 续跑 断点", 0),
     ("timeline_page", "时间线", "HISTORY", "work", "timeline 动态 记录 历史", 3),
     ("hub_page", "Agent 中心", "PEOPLE", "work", "hub agent 技能 mcp 记忆 配置", 4),

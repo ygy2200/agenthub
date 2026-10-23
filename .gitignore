@@ -12,3 +12,4 @@ publish.py
 drag_probe.py
 *.bak-*
 output/
+..output*

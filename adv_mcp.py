@@ -13,6 +13,7 @@ import subprocess
 import sys
 import tempfile
 import time
+import zipfile
 from collections import deque
 from pathlib import Path
 
@@ -71,6 +72,10 @@ def t_help_topics(root):
                           ("recover", "runtime_health"), ("release", "build.bat")):
         out = m.call_tool("hub_help", {"topic": topic}, str(root))
         assert needle in out, (topic, out[:200])
+    recover_help = m.call_tool("hub_help", {"topic": "recover"}, str(root))
+    assert "db_integrity" in recover_help and "§3.4" in recover_help, recover_help[:400]
+    backup_help = m.call_tool("hub_help", {"topic": "backup"}, str(root))
+    assert "drill" in backup_help and "backup-drill" in backup_help, backup_help[:600]
     # 客户端按 schema 先校验：主题只加进 HELP_TOPICS、没进 enum，就会在 handler 之前被挡成
     # 「must be equal to one of the allowed values」（R9 的 tasks 主题正是这样漏了）
     schema = next(t for t in m.TOOLS if t["name"] == "hub_help")["inputSchema"]
@@ -80,6 +85,9 @@ def t_help_topics(root):
     assert "hub_lock" in tasks_help and "续租" in tasks_help, tasks_help[:400]
     assert "lease_health" in tasks_help and "cli.py" in tasks_help, tasks_help[:500]
     assert "prune" in tasks_help, tasks_help[:500]
+    assert "digest" in tasks_help and "stats" in tasks_help, tasks_help[:500]
+    search_help = m.call_tool("hub_help", {"topic": "search"}, str(root))
+    assert "任务" in search_help and "错误" in search_help, search_help[:400]
     bad = m.call_tool("hub_help", {"topic": "nope"}, str(root))
     assert "未知主题" in bad and "recover" in bad, bad
     base = m.call_tool("hub_help", {}, str(root))
@@ -89,9 +97,14 @@ def t_help_topics(root):
     text = doc.read_text(encoding="utf-8")
     for needle in ("备份、校验与恢复", "backup-prune", "cli.py release", "runtime_health",
                    "任务管控：看板、租约、依赖与追溯", "quick_check", "写入围栏",
-                   "### 4.5 文件租约", "hub_lock action=acquire", "fence",
+                   "### 4.6 文件租约", "hub_lock action=acquire", "fence",
                    "cli.py locks", "lease_health", "hub_lock action=prune", "locks --prune",
-                   "hub_history(kind=\"task\"", "python cli.py --root <root> tasks"):
+                   "hub_history(kind=\"task\"", "python cli.py --root <root> tasks",
+                   "### 4.11 全脑检索的覆盖范围", "### 4.12 流水页错误处置",
+                   "hub_status(view=\"digest\"", "复制回滚方式",
+                   "### 3.5 库损坏的识别与降级", "db_corrupt", "db_integrity",
+                   "backup-drill", "恢复演练",
+                   "### 5.1 规模与内存", "AGENTHUB_TOK_CACHE_MAX"):
         assert needle in text, f"运维手册缺关键步骤：{needle}"
 
 
@@ -126,6 +139,45 @@ def t_backup_prune_surface(root):
     assert n == 1, f"清理未留 journal：{n}"
 
 
+def t_backup_drill_surface(tmp):
+    """R61：恢复演练只读——默认最新整包；报完整性/数据量/时效/§3.4；坏包与缺库包拒绝；
+    演练后现场 db/-wal/-shm 字节不变；空白空 path 给可执行提示。"""
+    hub = fresh_hub(Path(tmp), "mcp_drill")
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "演练用记录"}, str(hub))
+    err, zip_path = brain.backup_db(str(hub))
+    assert not err, err
+    meta = hub / core.DIR_META
+
+    def snapshot():
+        return {p.name: (p.stat().st_size, p.stat().st_mtime_ns)
+                for p in meta.glob("brain.db*")}
+
+    before = snapshot()
+    out = m.call_tool("hub_export", {"action": "drill"}, str(hub))
+    for needle in ("恢复演练：可用", "quick_check ok", "未指定 path，取最新整包",
+                   "数据：records", "§3.4", "未写现场库"):
+        assert needle in out, (needle, out[:500])
+    assert snapshot() == before, "演练改动了现场库文件"
+    # 备份后又写一条：演练必须点名现场与备份的差异（恢复会回到备份时刻）
+    m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": "备份之后的写入"}, str(hub))
+    out2 = m.call_tool("hub_export", {"action": "drill", "path": zip_path}, str(hub))
+    assert ("现场比备份新" in out2) or ("现场与备份数据量不同" in out2), out2
+    bad = Path(tmp) / "bad.zip"
+    bad.write_bytes(b"PK\x03\x04garbage")
+    out3 = m.call_tool("hub_export", {"action": "drill", "path": str(bad)}, str(hub))
+    assert out3.startswith("错误：") and ("损坏" in out3 or "读取失败" in out3), out3
+    nod = Path(tmp) / "nod.zip"
+    with zipfile.ZipFile(nod, "w") as zf:
+        zf.writestr("x.txt", "x")
+    out4 = m.call_tool("hub_export", {"action": "drill", "path": str(nod)}, str(hub))
+    assert "缺少 brain.db" in out4, out4
+    empty = fresh_hub(Path(tmp), "mcp_drill_empty")
+    out5 = m.call_tool("hub_export", {"action": "drill"}, str(empty))
+    assert "还没有备份" in out5 and "action=backup" in out5, out5
+
+
 def t_sentry_report(root):
     """R8：hub_sentry action=report 只出自检报告（每条问题附修复建议），不广播信号。"""
     hub = fresh_hub(Path(root), "mcp_doctor")
@@ -155,13 +207,13 @@ def t_protocol(root):
             "hub_handoff", "hub_status", "hub_user_profile", "hub_note", "hub_note_read",
             "hub_ask", "hub_metacognition",
             "hub_help", "hub_search_tools", "hub_call_tool", "hub_audit", "hub_flush_index",
-            "hub_task_add", "hub_task_update", "hub_claim", "hub_tasks",
+            "hub_task_add", "hub_task_update", "hub_task_retry", "hub_claim", "hub_tasks",
             "hub_next", "hub_crystallize",
             "hub_event_write", "hub_events",
             "hub_skill_match", "hub_skill_sync"} <= names, names
     # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
     # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
-    assert len(names) == 74  # ...；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
+    assert len(names) == 78  # ...；78=+hub_freeze（R48：全局写入冻结——事故止损先停写，读面照常）；77=+hub_task_approve（R45：完成审批 four-eyes）；76=+hub_task_retry（R42/R43：失败重试指数退避 + 死信复活——失败不是静默消失）；75=+hub_task_quality（R40：完成质量体检——done 不只是状态，还要看关得扎不扎实）；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -456,9 +508,9 @@ def t_tools(root):
     assert "MCP" in out
     out = m.call_tool("hub_log_work", {"project": "", "agent": "zcode", "content": " "}, root_s)
     assert "必填" in out
-    # project 只作为 DB 文本行落库，无文件系统操作（穿越由 create_project 校验拦截）
+    # R51：project 会参与目录定位（coverage_gate 等），穿越名一律拒收
     out = m.call_tool("hub_log_work", {"project": "..\\逃逸", "agent": "zcode", "content": "y"}, root_s)
-    assert "已记入大脑" in out
+    assert "错误" in out and "project" in out, out
 
 
 def t_memory_overwrite(tmp):
@@ -1091,7 +1143,7 @@ def t_search_output(tmp):
     m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
                                  "content": "【目的】修好 Everything 索引延迟问题，验证通过"}, root_s)
     out = m.call_tool("hub_search", {"keyword": "Everything 索引"}, root_s)
-    assert "全脑检索" in out and "命中 记录1 · 记忆0 · 随记0 · 文件0" in out, out
+    assert "全脑检索" in out and "命中 记录1 · 记忆0 · 随记0 · 任务0 · 错误0 · 文件0" in out, out
     assert "[记录#" in out, f"记录行缺 #id（精读链路断）：{out}"
     assert "↳" in out, f"缺命中片段行：{out}"
     assert "放宽召回" not in out, "正常命中误标注重试提示"
@@ -1104,6 +1156,19 @@ def t_search_output(tmp):
     # 通配符按字面匹配：hub 内无字面 %，裸 % 零命中（旧版全库命中返回一串）
     outw = m.call_tool("hub_search", {"keyword": "%"}, root_s)
     assert "无结果" in outw, f"裸 % 仍全库命中：{outw[:200]}"
+    # R56：任务/错误进全脑检索——「这个活/这个坑之前怎么处理」能直接搜到
+    m.call_tool("hub_task_add", {"title": "排查 Everything 索引延迟", "project": "测试-项目",
+                                 "detail": "索引延迟 3 秒", "agent": "zcode"}, root_s)
+    m.call_tool("hub_report_error", {"title": "Everything 索引延迟", "agent": "zcode",
+                                     "project": "测试-项目", "detail": "索引未及时刷新",
+                                     "undo": "重建索引"}, root_s)
+    out2 = m.call_tool("hub_search", {"keyword": "Everything 索引"}, root_s)
+    assert "[任务#" in out2 and "[错误#" in out2, f"任务/错误未进检索：{out2}"
+    assert "任务1" in out2 and "错误1" in out2, out2
+    assert "回滚：重建索引" in out2, f"错误条目缺回滚方案：{out2}"
+    assert "已修复" not in out2 and "[未关闭]" in out2, out2
+    # 零命中也提示任务/错误查询入口
+    assert "hub_list_errors" in m.call_tool("hub_search", {"keyword": "不存在的词zzq"}, root_s)
     # hub_memory_read 头部总数与实际条数一致（COUNT 而非全捞）
     m.call_tool("hub_memory_write", {"content": "计数测试记忆A", "kind": "fact"}, root_s)
     outm = m.call_tool("hub_memory_read", {"query": "计数测试"}, root_s)
@@ -1742,6 +1807,15 @@ def t_p3_contract(tmp):
 
 def t_p3_tasks_events(tmp):
     """P3-2 状态机：并发认领只胜一家 / 持有者约束 / 超时自动接管 / 阻塞不可领 / 事件流增量。"""
+    old = brain.MAX_WIP_PER_AGENT
+    brain.MAX_WIP_PER_AGENT = 0
+    try:
+        _t_p3_tasks_events_impl(tmp)
+    finally:
+        brain.MAX_WIP_PER_AGENT = old
+
+
+def _t_p3_tasks_events_impl(tmp):
     import threading as _th
     root = fresh_hub(tmp, "p3t")
     rs = str(root)
@@ -3131,7 +3205,7 @@ def t_agent_holdings_surface(hub):
     assert "在办 1 项" in line and f"#{tid}" in line and "租约剩" in line, listing
     assert "推进" in line and "检查点" not in line, listing  # R27 默认单行只带推进
     idle = next((ln for ln in listing.splitlines() if ln.startswith("- idleprobe")), "")
-    assert idle and "在办" not in idle, listing
+    assert idle and "在办 0/" in idle and "#" not in idle, listing
 
     out = m.handle_message(rpc("tools/call", {"name": "hub_agent",
                                               "arguments": {"action": "status", "agent": ag}}),
@@ -3554,16 +3628,632 @@ def t_new_project_hint(hub):
     assert "首次出现" not in again, again
 
 
+def t_log_work_task_binding(hub):
+    """R35：hub_log_work 的 task 绑定——落库/项目一致/完成声明告警/持有者续租/状态页
+    漂移可见/schema 可选参数/不绑定时零回归。"""
+    rs = str(hub)
+    err, tid = m.brain.task_add(rs, "MCP闭环任务", project="测试-项目", agent="zcode")
+    assert not err, err
+    out = m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode", "task": tid,
+        "content": "目的：验证绑定\n做了什么：写实现\n验证结果：已完成并交付\n如何回滚：revert"},
+        rs)
+    assert f"任务 #{tid}" in out and "records#" in out, out
+    assert "本条记录含完成声明" in out and "仍未关单" in out, out
+    assert m.brain.task_get(rs, tid)["status"] == "pending", "绑定不得替代认领"
+    with m.brain.db_conn(rs) as conn:
+        row = conn.execute("SELECT task_id FROM records ORDER BY id DESC LIMIT 1").fetchone()
+    assert row[0] == tid, row[0]
+
+    # 状态页点名闭环漂移
+    st = m.call_tool("hub_status", {}, rs)
+    assert "完成声明未关单" in st and f"任务#{tid}" in st, st
+
+    # 持有者写入 = 续租 + 推进 progress_at（不改成 done）
+    assert m.brain.task_claim(rs, tid, "zcode")[0] == ""
+    with m.brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at='2020-01-01T00:00:00', "
+                     "progress_at='2020-01-01T00:00:00' WHERE id=?", (tid,))
+    out2 = m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode", "task": tid,
+        "content": "目的：续租\n做了什么：继续实现\n验证结果：单测通过\n如何回滚：revert"}, rs)
+    assert "租约与进展已续" in out2, out2
+    trow = m.brain.task_get(rs, tid)
+    assert trow["status"] == "in_progress" and trow["claimed_at"] > "2020-01-01", trow
+    assert trow["progress_at"] > "2020-01-01", trow
+
+    # 项目不一致 / 不存在 / 坏类型：写前拒收（不落库）
+    err2, tid_other = m.brain.task_add(rs, "别项目任务", project="另一个-项目", agent="zcode")
+    assert not err2, err2
+    bad_proj = m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode", "task": tid_other,
+        "content": "目的：x\n做了什么：y\n验证结果：z\n如何回滚：w"}, rs)
+    assert "不一致" in bad_proj, bad_proj
+    miss = m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode", "task": 999999,
+        "content": "目的：x\n做了什么：y\n验证结果：z\n如何回滚：w"}, rs)
+    assert "不存在" in miss, miss
+    bad_type = m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode", "task": "abc",
+        "content": "目的：x\n做了什么：y\n验证结果：z\n如何回滚：w"}, rs)
+    assert "整数" in bad_type and "省略" in bad_type, bad_type
+
+    # 不绑定：零回归（输出不出现任务绑定文案）
+    plain = m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode",
+        "content": "目的：无绑定\n做了什么：普通记录\n验证结果：ok\n如何回滚：revert"}, rs)
+    assert "已记入大脑" in plain and "任务 #" not in plain, plain
+
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_log_work")["inputSchema"]
+    assert schema["properties"]["task"]["type"] == "integer", schema
+    assert "task" not in (schema.get("required") or []), "task 必须是可选参数"
+
+
+def t_agent_control_surface(hub):
+    """R36：hub_agent(control) 读/切状态、替他人需 confirm、认领闸门、前沿告警、
+    列表状态徽标与 schema 可选参数。"""
+    rs = str(hub)
+    out = m.call_tool("hub_agent", {"action": "control", "agent": "zcode"}, rs)
+    assert "正常" in out and "active" in out, out
+    denied = m.call_tool("hub_agent", {"action": "control", "agent": "zcode",
+                                       "state": "draining"}, rs)
+    assert "confirm=true" in denied, denied
+    ok = m.call_tool("hub_agent", {"action": "control", "agent": "zcode",
+                                   "state": "draining", "note": "收尾", "confirm": True}, rs)
+    assert "收尾" in ok and "不接新任务" in ok, ok
+    listed = m.call_tool("hub_list_agents", {}, rs)
+    assert "控制:收尾" in listed, listed
+
+    err, tid = m.brain.task_add(rs, "管控任务", project="测试-项目", agent="qoder")
+    assert not err, err
+    claim = m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    assert "收尾" in claim and "错误" in claim, claim
+    nxt = m.call_tool("hub_next", {"agent": "zcode"}, rs)
+    assert "已停止推荐新任务" in nxt, nxt
+
+    back = m.call_tool("hub_agent", {"action": "control", "agent": "zcode",
+                                     "state": "active", "confirm": True}, rs)
+    assert "正常" in back, back
+    claim2 = m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    assert "认领成功" in claim2, claim2
+
+    bad = m.call_tool("hub_agent", {"action": "control", "agent": "zcode",
+                                    "state": "dead", "confirm": True}, rs)
+    assert "只能是" in bad, bad
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_agent")["inputSchema"]
+    assert "control" in schema["properties"]["action"]["enum"], schema
+    assert schema["properties"]["state"]["type"] == "string", schema
+    assert "state" not in (schema.get("required") or []), schema
+
+
+def t_skill_routing_surface(hub):
+    """R37：hub_agent(skills) 读/设/清、hub_task_add skills、认领匹配与拒收、前沿过滤。"""
+    rs = str(hub)
+    setz = m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                                     "skills": "python,文档", "confirm": True}, rs)
+    assert "python" in setz and "文档" in setz, setz
+    read = m.call_tool("hub_agent", {"action": "skills", "agent": "zcode"}, rs)
+    assert "python" in read, read
+    setb = m.call_tool("hub_agent", {"action": "skills", "agent": "buddy",
+                                     "skills": "design", "confirm": True}, rs)
+    assert "design" in setb, setb
+
+    add = m.call_tool("hub_task_add", {"title": "Python 任务", "project": "测试-项目",
+                                       "skills": "python"}, rs)
+    tid = int(add.split("#")[1].split("：")[0].split()[0])
+    denied = m.call_tool("hub_claim", {"task_id": tid, "agent": "buddy"}, rs)
+    assert "不匹配" in denied, denied
+    ok = m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    assert "认领成功" in ok, ok
+    add2 = m.call_tool("hub_task_add", {"title": "设计任务", "project": "测试-项目",
+                                        "skills": "design"}, rs)
+    tid2 = int(add2.split("#")[1].split("：")[0].split()[0])
+    nxt = m.call_tool("hub_next", {"agent": "zcode"}, rs)
+    assert f"#{tid2}" not in nxt, nxt
+    listed = m.call_tool("hub_tasks", {"project": "测试-项目"}, rs)
+    assert "技能:python" in listed, listed
+
+    clear = m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                                      "skills": "-", "confirm": True}, rs)
+    assert "已清除" in clear, clear
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_add")["inputSchema"]
+    assert schema["properties"]["skills"]["type"] == "string", schema
+    schema2 = next(t for t in m.TOOLS if t["name"] == "hub_agent")["inputSchema"]
+    assert "skills" in schema2["properties"]["action"]["enum"], schema2
+
+
+
+def t_task_stats_surface(hub):
+    """R53 hub_tasks view=stats：流量/周期/在办卡点/重试/风险一张单，坏参与 schema 受控。"""
+    rs = str(hub)
+    now = datetime.datetime.now()
+    iso = lambda h: (now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+    a = m.call_tool("hub_task_add", {"title": "统计完成单", "project": "测试-项目"}, rs)
+    tid = int(a.split("#")[1].split("：")[0].split()[0])
+    m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET created=?, claimed_at=? WHERE id=?",
+                     (iso(10), iso(9), tid))
+    done = m.call_tool("hub_task_update", {"task_id": tid, "status": "done", "agent": "zcode"}, rs)
+    assert "完成" in done, done
+    b = m.call_tool("hub_task_add", {"title": "等审批单", "project": "测试-项目",
+                                     "approval_required": True}, rs)
+    tid2 = int(b.split("#")[1].split("：")[0].split()[0])
+    m.call_tool("hub_claim", {"task_id": tid2, "agent": "zcode"}, rs)
+    c = m.call_tool("hub_task_add", {"title": "无主单", "project": "测试-项目"}, rs)
+    tid3 = int(c.split("#")[1].split("：")[0].split()[0])
+    d = m.call_tool("hub_task_add", {"title": "死信单", "project": "测试-项目"}, rs)
+    tid4 = int(d.split("#")[1].split("：")[0].split()[0])
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (iso(3), tid2))
+        conn.execute("UPDATE tasks SET status='in_progress', owner='', claimed_at='', "
+                     "updated=? WHERE id=?", (iso(1), tid3))
+        conn.execute("UPDATE tasks SET status='dead', owner='zcode', attempts=2, "
+                     "last_error='boom', updated=? WHERE id=?", (iso(1), tid4))
+    out = m.call_tool("hub_tasks", {"view": "stats", "days": 7, "project": "测试-项目"}, rs)
+    for needle in ("任务过程统计", "完成周期", "当前在办", "租约超时 1", "无主 1",
+                   "等审批 1", "重试存量", "按 agent", "风险信号", "死信 1"):
+        assert needle in out, (needle, out[:500])
+    assert "完成质量" in out, out[:500]
+    empty = m.call_tool("hub_tasks", {"view": "stats", "project": "不存在的项目"}, rs)
+    assert "风险信号：无" in empty and "完成质量" in empty, empty
+    bad = m.call_tool("hub_tasks", {"view": "nope"}, rs)
+    assert "错误" in bad and "board/stats" in bad, bad
+    bid = m.call_tool("hub_tasks", {"view": "stats", "days": 0}, rs)
+    assert "1..365" in bid, bid
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_tasks")["inputSchema"]
+    assert schema["properties"]["view"]["enum"] == ["board", "stats"], schema
+    assert schema["properties"]["days"]["type"] == "integer", schema
+
+
+def t_team_digest_surface(hub):
+    """R55 hub_status view=digest：流动/风险/建议/记分卡一张单，坏参与默认视图受控。"""
+    rs = str(hub)
+    empty = m.call_tool("hub_status", {"view": "digest"}, rs)
+    assert "团队日结" in empty and "风险：无" in empty and "建议：" in empty, empty[:500]
+
+    now = datetime.datetime.now()
+    iso = lambda h: (now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+    day = lambda d: (now.date() + datetime.timedelta(days=d)).isoformat()
+    m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "测试-项目"}, rs)
+
+    a = m.call_tool("hub_task_add", {"title": "日结完成单", "project": "测试-项目"}, rs)
+    tid = int(a.split("#")[1].split("：")[0].split()[0])
+    m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET created=?, claimed_at=? WHERE id=?",
+                     (iso(10), iso(9), tid))
+    assert "完成" in m.call_tool("hub_task_update", {
+        "task_id": tid, "status": "done", "agent": "zcode"}, rs)
+
+    b = m.call_tool("hub_task_add", {"title": "日结在办单", "project": "测试-项目"}, rs)
+    tid2 = int(b.split("#")[1].split("：")[0].split()[0])
+    m.call_tool("hub_claim", {"task_id": tid2, "agent": "zcode"}, rs)
+    c = m.call_tool("hub_task_add", {"title": "日结无主单", "project": "测试-项目"}, rs)
+    tid3 = int(c.split("#")[1].split("：")[0].split()[0])
+    d = m.call_tool("hub_task_add", {"title": "日结死信单", "project": "测试-项目"}, rs)
+    tid4 = int(d.split("#")[1].split("：")[0].split()[0])
+    with brain.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=?, due=?, approval_required=1, approved_by='' "
+                     "WHERE id=?", (iso(3), day(-1), tid2))
+        conn.execute("UPDATE tasks SET status='in_progress', owner='', claimed_at='', "
+                     "updated=? WHERE id=?", (iso(1), tid3))
+        conn.execute("UPDATE tasks SET status='dead', owner='zcode', attempts=2, "
+                     "last_error='boom', updated=? WHERE id=?", (iso(1), tid4))
+        conn.execute("INSERT INTO tool_calls(ts,agent,tool) VALUES(?, 'zcode', 'hub_status')",
+                     (iso(1),))
+        conn.execute("INSERT INTO searches(ts,agent,tool,query,hits)"
+                     " VALUES(?, 'zcode','hub_search','不存在',0)", (iso(1),))
+    brain.error_add(rs, "zcode", "未闭错误", "detail", "")
+
+    out = m.call_tool("hub_status", {"view": "digest", "days": 1}, rs)
+    for needle in ("团队日结", "流动：", "当前：在线", "租约逾期", "无主在办", "等审批",
+                   "逾期", "死信", "未闭错误", "零命中检索", "建议：", "按 agent",
+                   "zcode", "风险："):
+        assert needle in out, (needle, out[:800])
+    assert "→" in out, out[:800]
+    bad = m.call_tool("hub_status", {"view": "nope"}, rs)
+    assert "错误" in bad and "now/digest" in bad, bad
+    bid = m.call_tool("hub_status", {"view": "digest", "days": 0}, rs)
+    assert "1..365" in bid, bid
+    bint = m.call_tool("hub_status", {"view": "digest", "days": "abc"}, rs)
+    assert "整数" in bint, bint
+    assert "大脑此刻状态" in m.call_tool("hub_status", {}, rs)
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_status")["inputSchema"]
+    assert schema["properties"]["view"]["enum"] == ["now", "digest"], schema
+    assert schema["properties"]["days"]["type"] == "integer", schema
+
+
+def t_wip_limit_surface(hub):
+    """R38：WIP 到顶时 hub_claim 拒收、列表显示在办/上限、完成后可再领。"""
+    rs = str(hub)
+    old = m.brain.MAX_WIP_PER_AGENT
+    m.brain.MAX_WIP_PER_AGENT = 1
+    try:
+        m.call_tool("hub_heartbeat", {"agent": "zcode", "project": "测试-项目"}, rs)
+        add1 = m.call_tool("hub_task_add", {"title": "WIP一", "project": "测试-项目"}, rs)
+        tid1 = int(add1.split("#")[1].split("：")[0].split()[0])
+        add2 = m.call_tool("hub_task_add", {"title": "WIP二", "project": "测试-项目"}, rs)
+        tid2 = int(add2.split("#")[1].split("：")[0].split()[0])
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid1, "agent": "zcode"}, rs)
+        denied = m.call_tool("hub_claim", {"task_id": tid2, "agent": "zcode"}, rs)
+        assert "WIP 上限 1" in denied, denied
+        listed = m.call_tool("hub_list_agents", {}, rs)
+        assert "在办 1/1" in listed, listed
+        assert "已更新" in m.call_tool("hub_task_update", {
+            "task_id": tid1, "status": "done", "agent": "zcode"}, rs)
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid2, "agent": "zcode"}, rs)
+    finally:
+        m.brain.MAX_WIP_PER_AGENT = old
+
+
+def t_task_cancel_surface(hub):
+    """R41：取消必须带原因；回执含终态说明；看板可按已取消过滤；前沿不再出现。"""
+    rs = str(hub)
+    add = m.call_tool("hub_task_add", {"title": "取消面任务", "project": "测试-项目"}, rs)
+    tid = int(add.split("#")[1].split("：")[0].split()[0])
+    assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    bad = m.call_tool("hub_task_update", {
+        "task_id": tid, "status": "cancelled", "agent": "zcode"}, rs)
+    assert "cancel_reason" in bad, bad
+    ok = m.call_tool("hub_task_update", {
+        "task_id": tid, "status": "cancelled", "agent": "zcode",
+        "cancel_reason": "需求取消"}, rs)
+    assert "已取消" in ok and "取消原因：需求取消" in ok and "终态" in ok, ok
+    listed = m.call_tool("hub_tasks", {"status": "cancelled"}, rs)
+    assert "取消面任务" in listed and "取消：需求取消" in listed, listed
+    nxt = m.call_tool("hub_next", {"project": "测试-项目", "agent": "zcode"}, rs)
+    assert "取消面任务" not in nxt, nxt
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_update")["inputSchema"]
+    assert schema["properties"]["cancel_reason"]["type"] == "string", schema
+    assert "cancel_reason" not in (schema.get("required") or []), schema
+
+
+def t_task_retry_surface(hub):
+    """R42/R43：退避期认领被拒、看板/前沿标注、delay=0 提前放行、
+    死信退出队列且需 retry 复活；schema 必填 reason。"""
+    rs = str(hub)
+    old_base, old_max = m.brain.RETRY_BASE_SECONDS, m.brain.MAX_TASK_ATTEMPTS
+    m.brain.RETRY_BASE_SECONDS, m.brain.MAX_TASK_ATTEMPTS = 60, 3
+    try:
+        add = m.call_tool("hub_task_add", {"title": "重试面任务", "project": "测试-项目"}, rs)
+        tid = int(add.split("#")[1].split("：")[0].split()[0])
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+        bad = m.call_tool("hub_task_retry", {"task_id": tid, "agent": "zcode"}, rs)
+        assert "reason" in bad, bad
+        first = m.call_tool("hub_task_retry", {"task_id": tid, "agent": "zcode",
+                                               "reason": "接口 502"}, rs)
+        assert "已重试排队" in first and "退避" in first and "第 1 次失败" in first, first
+        denied = m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+        assert "退避" in denied, denied
+        listed = m.call_tool("hub_tasks", {"status": "pending"}, rs)
+        assert "↻退避" in listed and "重试面任务" in listed, listed
+        nxt = m.call_tool("hub_next", {"project": "测试-项目", "agent": "zcode"}, rs)
+        assert "退避中 1 条" in nxt and "重试面任务" in nxt, nxt
+        early = m.call_tool("hub_task_retry", {"task_id": tid, "agent": "zcode",
+                                               "reason": "已修复", "delay": 0}, rs)
+        assert "立即可认领" in early and "第 2 次失败" in early, early
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+        dead = m.call_tool("hub_task_retry", {"task_id": tid, "agent": "zcode",
+                                              "reason": "第三次失败"}, rs)
+        assert "死信" in dead and "hub_task_retry" in dead, dead
+        denied2 = m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+        assert "死信" in denied2, denied2
+        listed2 = m.call_tool("hub_tasks", {"status": "dead"}, rs)
+        assert "重试面任务" in listed2 and "☠死信" in listed2, listed2
+        revived = m.call_tool("hub_task_retry", {"task_id": tid, "agent": "qoder",
+                                                 "reason": "人工复活", "delay": 0}, rs)
+        assert "已重试排队" in revived and "第 1 次失败" in revived, revived
+    finally:
+        m.brain.RETRY_BASE_SECONDS, m.brain.MAX_TASK_ATTEMPTS = old_base, old_max
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_retry")["inputSchema"]
+    assert schema["properties"]["delay"]["type"] == "integer", schema
+    assert set(schema.get("required") or []) == {"task_id", "reason"}, schema
+
+
+def t_task_defer_approve_surface(hub):
+    """R44/R45：hub_task_update(defer_until) 延后回执/看板标注/退出前沿/唤醒；
+    approval_required 任务 done 前被拦，hub_task_approve 四眼批准后放行；schema 可选。"""
+    rs = str(hub)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                              "skills": "python", "confirm": True}, rs)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "workbuddy",
+                              "skills": "python", "confirm": True}, rs)
+
+    # ---- R44 ----
+    add = m.call_tool("hub_task_add", {"title": "延后面任务", "project": "测试-项目"}, rs)
+    tid = int(add.split("#")[1].split("：")[0].split()[0])
+    bad = m.call_tool("hub_task_update", {"task_id": tid, "defer_until": "2000-01-01",
+                                          "defer_reason": "过去"}, rs)
+    assert "未来" in bad, bad
+    bad2 = m.call_tool("hub_task_update", {"task_id": tid, "defer_until": "2030-01-01"}, rs)
+    assert "reason" in bad2, bad2
+    ok = m.call_tool("hub_task_update", {"task_id": tid, "agent": "zcode",
+                                         "defer_until": "2030-01-01",
+                                         "defer_reason": "等上游"}, rs)
+    assert "已延后至" in ok and "唤醒" in ok, ok
+    listed = m.call_tool("hub_tasks", {"status": "pending"}, rs)
+    assert "⏸延后" in listed and "延后面任务" in listed, listed
+    nxt = m.call_tool("hub_next", {"project": "测试-项目", "agent": "zcode"}, rs)
+    assert "延后中 1 条" in nxt and "延后面任务" in nxt, nxt
+    denied = m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    assert "延后" in denied, denied
+    wake = m.call_tool("hub_task_update", {"task_id": tid, "agent": "zcode",
+                                           "defer_until": "-"}, rs)
+    assert "已恢复" in wake, wake
+    wake2 = m.call_tool("hub_task_update", {"task_id": tid, "agent": "zcode",
+                                            "defer_until": "-"}, rs)
+    assert "没有延后标记" in wake2, wake2
+    assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+
+    # ---- R45 ----
+    add2 = m.call_tool("hub_task_add", {"title": "审批面任务", "project": "测试-项目",
+                                        "approval_required": True}, rs)
+    tid2 = int(add2.split("#")[1].split("：")[0].split()[0])
+    assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid2, "agent": "zcode"}, rs)
+    blocked = m.call_tool("hub_task_update", {
+        "task_id": tid2, "status": "done", "agent": "zcode"}, rs)
+    assert "要求完成审批" in blocked and "hub_task_approve" in blocked, blocked
+    selfapprove = m.call_tool("hub_task_approve", {"task_id": tid2, "agent": "zcode"}, rs)
+    assert "不能给自己" in selfapprove, selfapprove
+    approved = m.call_tool("hub_task_approve", {"task_id": tid2, "agent": "workbuddy",
+                                                "note": "验收通过"}, rs)
+    assert "已批准完成" in approved and "workbuddy" in approved, approved
+    listed2 = m.call_tool("hub_tasks", {"status": "in_progress"}, rs)
+    assert "✓已审批（workbuddy）" in listed2, listed2
+    done = m.call_tool("hub_task_update", {
+        "task_id": tid2, "status": "done", "agent": "zcode"}, rs)
+    assert "已完成" in done or "已更新" in done, done
+    done2 = m.call_tool("hub_task_approve", {"task_id": tid2, "agent": "workbuddy"}, rs)
+    assert "终态" in done2, done2
+
+    add3 = m.call_tool("hub_task_add", {"title": "普通面任务", "project": "测试-项目"}, rs)
+    tid3 = int(add3.split("#")[1].split("：")[0].split()[0])
+    notneeded = m.call_tool("hub_task_approve", {"task_id": tid3, "agent": "workbuddy"}, rs)
+    assert "未开启" in notneeded, notneeded
+
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_approve")["inputSchema"]
+    assert schema["properties"]["note"]["type"] == "string", schema
+    assert set(schema.get("required") or []) == {"task_id"}, schema
+    upd = next(t for t in m.TOOLS if t["name"] == "hub_task_update")["inputSchema"]
+    assert upd["properties"]["defer_until"]["type"] == "string", upd
+    assert upd["properties"]["approval_required"]["type"] == "boolean", upd
+    add_schema = next(t for t in m.TOOLS if t["name"] == "hub_task_add")["inputSchema"]
+    assert add_schema["properties"]["approval_required"]["type"] == "boolean", add_schema
+
+
+def t_freeze_surface(hub):
+    """R48 全局写入冻结：reason/分钟范围校验；冻结后写工具全拒、读工具与状态查询照常；
+    hub_freeze/hub_undo 免冻结；延长/过期自动失效/解冻幂等；冻结动作进审计链。"""
+    rs = str(hub)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                              "skills": "python", "confirm": True}, rs)
+    st = m.call_tool("hub_freeze", {"action": "status"}, rs)
+    assert "未冻结" in st, st
+    bad = m.call_tool("hub_freeze", {"action": "freeze", "minutes": 30}, rs)
+    assert "reason" in bad, bad
+    bad = m.call_tool("hub_freeze", {"action": "freeze", "minutes": 1441, "reason": "太长"}, rs)
+    assert "minutes" in bad, bad
+    bad = m.call_tool("hub_freeze", {"action": "nope"}, rs)
+    assert "action" in bad, bad
+
+    # 冻结前留一条可撤销记录，供 hub_undo 免冻结验证
+    assert "已记入大脑" in m.call_tool("hub_log_work", {
+        "project": "测试-项目", "agent": "zcode",
+        "content": "【目的】冻结测试\n【做了什么】写一条待撤销记录\n【验证结果】待验证\n【如何回滚】hub_undo"},
+        rs)
+
+    out = m.call_tool("hub_freeze", {"action": "freeze", "minutes": 30,
+                                     "reason": "迁移中避免并发写", "agent": "zcode"}, rs)
+    assert "已冻结至" in out and "30" in out and "zcode" in out, out
+
+    blocked = m.call_tool("hub_task_add", {"title": "冻结期间不该写入"}, rs)
+    assert "冻结" in blocked and "unfreeze" in blocked, blocked
+    read = m.call_tool("hub_tasks", {}, rs)
+    assert "冻结" not in read, read[:200]  # 读工具不受影响
+    status = m.call_tool("hub_status", {}, rs)
+    assert "全局写入已冻结" in status and "迁移中" in status, status[:400]
+    assert "读工具照常" in m.call_tool("hub_freeze", {"action": "status"}, rs)
+
+    # hub_undo 免冻结：解冻/修复不能自锁
+    undo = m.call_tool("hub_undo", {"agent": "zcode"}, rs)
+    assert "已撤销" in undo and "已全局冻结" not in undo, undo
+
+    ext = m.call_tool("hub_freeze", {"action": "freeze", "minutes": 0,
+                                     "reason": "延长为手动解冻", "agent": "zcode"}, rs)
+    assert "已延长" in ext and "手动解冻" in ext and "已延长至" in ext, ext
+
+    # 到期自动失效：改 until 到过去，状态报过期且写入恢复
+    import json as _json
+    with brain.db_conn(rs) as conn:
+        d = _json.loads(conn.execute(
+            "SELECT value FROM meta WHERE key='write_freeze'").fetchone()[0])
+        d["until"] = "2000-01-01T00:00:00"
+        conn.execute("UPDATE meta SET value=? WHERE key='write_freeze'",
+                     (_json.dumps(d, ensure_ascii=False),))
+    assert "已过期" in m.call_tool("hub_freeze", {"action": "status"}, rs)
+    add = m.call_tool("hub_task_add", {"title": "过期后恢复写入"}, rs)
+    assert "冻结" not in add and "#" in add, add
+
+    # 解冻幂等 + 审计链完整
+    m.call_tool("hub_freeze", {"action": "freeze", "minutes": 0, "reason": "再冻一次"}, rs)
+    off = m.call_tool("hub_freeze", {"action": "unfreeze", "agent": "zcode"}, rs)
+    assert "已解除" in off, off
+    off2 = m.call_tool("hub_freeze", {"action": "unfreeze", "agent": "zcode"}, rs)
+    assert "没有生效" in off2, off2
+
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_freeze")["inputSchema"]
+    assert set(schema["properties"]["action"]["enum"]) == {"status", "freeze", "unfreeze"}, schema
+    assert schema["properties"]["minutes"]["type"] == "integer", schema
+    assert "hub_freeze" in m.WRITE_TOOLS and m.FREEZE_EXEMPT == {"hub_freeze", "hub_undo"}
+    assert brain.journal_verify(rs)["ok"], brain.journal_verify(rs)
+    audit = m.call_tool("hub_audit", {"limit": 5}, rs)
+    assert "审计链" in audit, audit
+
+
+def t_audit_export_surface(hub):
+    """R50 审计导出：JSONL 首行 meta 带链快照；journal+op_audit 均在场；CSV 表头；
+    坏参拒收；链异常照导但明确告警；空库导出可读。"""
+    rs = str(hub)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                              "skills": "python", "confirm": True}, rs)
+    m.call_tool("hub_log_work", {"project": "审计导出", "agent": "zcode",
+                                 "content": "【目的】导出\n【做了什么】写一条\n"
+                                            "【验证结果】ok\n【如何回滚】undo"}, rs)
+    # 直接调 call_tool 不走 handle_message 的写审计钩子，这里补一条 op_audit 覆盖两类流水
+    brain.audit_add(rs, "zcode", "hub_log_work", "审计导出", "测试审计行", "record", "1")
+
+    out = m.call_tool("hub_export", {"action": "audit"}, rs)
+    assert "已导出审计流水" in out and "JSONL" in out and "审计链" in out, out
+    files = sorted((Path(rs) / "_hub" / "exports").glob("audit-*.jsonl"))
+    assert files, out
+    lines = files[-1].read_text(encoding="utf-8").splitlines()
+    meta = json.loads(lines[0])
+    assert meta["type"] == "meta" and meta["chain"]["ok"] is True, meta
+    assert meta["journal"] == len(lines) - 1 - meta["op_audit"], meta
+    rows = [json.loads(ln) for ln in lines[1:]]
+    types = {r["type"] for r in rows}
+    assert "journal" in types and "op_audit" in types, types
+    assert any(r.get("hash") for r in rows if r["type"] == "journal"), rows[:3]
+
+    csv_out = m.call_tool("hub_export", {"action": "audit", "audit_format": "csv",
+                                         "days": 0}, rs)
+    assert "CSV" in csv_out and "全部历史" in csv_out, csv_out
+    cfiles = sorted((Path(rs) / "_hub" / "exports").glob("audit-*.csv"))
+    assert cfiles, csv_out
+    text = cfiles[-1].read_text(encoding="utf-8-sig")
+    assert text.splitlines()[0].startswith("source,id,ts,agent,action,project"), text[:120]
+    assert "journal," in text and "op_audit," in text, text[:300]
+
+    bad = m.call_tool("hub_export", {"action": "audit", "audit_format": "xml"}, rs)
+    assert "jsonl/csv" in bad, bad
+    bad = m.call_tool("hub_export", {"action": "audit", "days": -1}, rs)
+    assert "days" in bad, bad
+    trunc = m.call_tool("hub_export", {"action": "audit", "limit": 1, "days": 0}, rs)
+    assert "截断" in trunc, trunc
+
+    # 链异常照导，但回执必须告警（出事时最需要现场）
+    with brain.db_conn(rs) as conn:
+        jid = conn.execute("SELECT id FROM journal WHERE hash!='' "
+                           "ORDER BY id DESC LIMIT 1").fetchone()[0]
+        conn.execute("UPDATE journal SET note='被改' WHERE id=?", (jid,))
+    broken = m.call_tool("hub_export", {"action": "audit", "days": 0}, rs)
+    assert "已导出" in broken and "审计链异常" in broken and "勿重算" in broken, broken
+
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_export")["inputSchema"]
+    assert "audit" in schema["properties"]["action"]["enum"], schema
+    assert set(schema["properties"]["audit_format"]["enum"]) == {"jsonl", "csv"}, schema
+    assert schema["properties"]["days"]["type"] == "integer", schema
+
+    # 空库：meta 只有一行，链为空态通过
+    empty = fresh_hub(Path(hub).parent, "hub_audit_empty")
+    m.call_tool("hub_export", {"action": "audit", "days": 0}, str(empty))
+    efiles = sorted((Path(empty) / "_hub" / "exports").glob("audit-*.jsonl"))
+    elines = efiles[-1].read_text(encoding="utf-8").splitlines()
+    emeta = json.loads(elines[0])
+    assert len(elines) == 1 and emeta["chain"]["ok"] and emeta["journal"] == 0, emeta
+
+
+def t_project_ref_surface(hub):
+    """R51 写入口项目名护栏：穿越/盘符/保留目录拒收且不落库；合法中文名照常。"""
+    rs = str(hub)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                              "skills": "python", "confirm": True}, rs)
+    with brain.db_conn(rs) as conn:
+        n0 = conn.execute("SELECT COUNT(*) FROM records").fetchone()[0]
+    content = ("【目的】护栏\n【做了什么】尝试写入\n【验证结果】待验证\n【如何回滚】undo")
+    for bad_name in ("../逃逸", "..\\逃逸", "C:\\temp", "a/b", "_hub"):
+        out = m.call_tool("hub_log_work", {"project": bad_name, "agent": "zcode",
+                                           "content": content}, rs)
+        assert "错误" in out and "project" in out, (bad_name, out)
+    with brain.db_conn(rs) as conn:
+        assert conn.execute("SELECT COUNT(*) FROM records").fetchone()[0] == n0
+    assert "错误" in m.call_tool("hub_task_add", {"title": "穿越", "project": "../x"}, rs)
+    assert "错误" in m.call_tool("hub_task_add", {"title": "保留", "project": "_hub"}, rs)
+    assert "错误" in m.call_tool("hub_create_project", {"project": "../逃逸"}, rs)
+    assert not (Path(rs).parent / "逃逸").exists()
+    assert "错误" in m.call_tool("hub_archive_project", {"project": "../x"}, rs)
+    assert "错误" in m.call_tool("hub_archive_project", {"project": "../x", "restore": True}, rs)
+
+    ok = m.call_tool("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                      "content": content}, rs)
+    assert "已记入大脑" in ok, ok
+    assert "#" in m.call_tool("hub_task_add", {"title": "正常", "project": "测试-项目"}, rs)
+
+
+def t_closure_quality_surface(hub):
+    """R40：done 回执带质量提示；hub_task_quality 单查/巡检可用；schema 为可选参数。"""
+    rs = str(hub)
+    add = m.call_tool("hub_task_add", {"title": "质量面任务", "project": "测试-项目"}, rs)
+    tid = int(add.split("#")[1].split("：")[0].split()[0])
+    assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    done = m.call_tool("hub_task_update", {
+        "task_id": tid, "status": "done", "agent": "zcode"}, rs)
+    assert "完成质量" in done and "条提示" in done, done
+    one = m.call_tool("hub_task_quality", {"task_id": tid}, rs)
+    assert "完成质量" in one and "警告：" in one and "统计：" in one, one
+    assert "只有认领自动锚点" in one, one
+    report = m.call_tool("hub_task_quality", {"days": 1}, rs)
+    assert "完成质量巡检" in report and f"#{tid}" in report, report
+    bad = m.call_tool("hub_task_quality", {"task_id": 99999}, rs)
+    assert "不存在" in bad, bad
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_quality")["inputSchema"]
+    assert schema["properties"]["task_id"]["type"] == "integer", schema
+    assert not (schema.get("required") or []), schema
+
+
+def t_task_handoff_surface(hub):
+    """R39：hub_task_update(handoff_to) 交办成功/非持有者拒收/schema 可选参数。"""
+    rs = str(hub)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "zcode",
+                              "skills": "python", "confirm": True}, rs)
+    m.call_tool("hub_agent", {"action": "skills", "agent": "workbuddy",
+                              "skills": "python", "confirm": True}, rs)
+    add = m.call_tool("hub_task_add", {"title": "交办任务", "project": "测试-项目",
+                                       "skills": "python"}, rs)
+    tid = int(add.split("#")[1].split("：")[0].split()[0])
+    assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+    denied = m.call_tool("hub_task_update", {"task_id": tid, "agent": "qoder",
+                                             "handoff_to": "workbuddy"}, rs)
+    assert "只有持有者" in denied, denied
+    ok = m.call_tool("hub_task_update", {"task_id": tid, "agent": "zcode",
+                                         "handoff_to": "workbuddy",
+                                         "handoff_note": "剩下联调"}, rs)
+    assert "已交办" in ok and "zcode→workbuddy" in ok, ok
+    assert m.brain.task_get(rs, tid)["owner"] == "workbuddy"
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_update")["inputSchema"]
+    assert schema["properties"]["handoff_to"]["type"] == "string", schema
+    assert "handoff_to" not in (schema.get("required") or []), schema
+
+
+def t_db_corrupt_protocol(tmp):
+    """R59：协议层遇库文件损坏——isError 给恢复路径，且不再谎称「已记入大脑错误」
+    （库都读不了，error_add 必然失败；假成功比报错更危险）。"""
+    hub = Path(tmp) / "hub_corrupt"
+    (hub / core.DIR_META).mkdir(parents=True)
+    (hub / core.DIR_META / brain.DB_NAME).write_bytes(b"garbage" * 4096)
+    r = resp_ok(m.handle_message(
+        rpc("tools/call", {"name": "hub_status", "arguments": {"agent": "zcode"}}), str(hub)))
+    assert r.get("isError") is True, r
+    text = r["content"][0]["text"]
+    for needle in ("数据库文件已损坏", "brain.db", "-wal", "§3.4"):
+        assert needle in text, (needle, text[:400])
+    assert "已记入大脑错误" not in text, text[:400]
+    assert (r.get("structuredContent") or {}).get("db_corrupt") is True, r
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_mcp_")
     root = Path(tmp) / "hub"
     build_hub(root)
     print(f"临时目录：{tmp}\n")
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
-    case("MCP协议（握手/73工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/78工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("R4·初始化说明渐进披露（instructions 非空/核心流程覆盖/无幽灵工具名/单段预算内）",
          lambda: t_initialize_instructions(root))
     case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
+    case("R59·库损坏协议降级（isError+恢复路径+db_corrupt，不谎称已登记）",
+         lambda: t_db_corrupt_protocol(tmp))
     case("响应体积双封顶（4000预算截断+full_text≤16K / max_chars=0失控>64K兜底）", lambda: t_response_size_guard())
     case("协议健壮性（畸形请求-32600 / 异常不外泄路径SQL）", lambda: t_handle_message_robustness(root))
     case("集中式必填校验（缺参拦截/agent豁免/checkpoint豁免/透传覆盖）", lambda: t_required_validation(root))
@@ -3669,12 +4359,42 @@ def main():
          lambda: t_task_board_surface(fresh_hub(tmp, "hub_board_surface")))
     case("R7·备份清理工具面（backups 盘点/预演不删/apply 才删并留 journal）",
          lambda: t_backup_prune_surface(tmp))
+    case("R61·恢复演练工具面（默认最新整包/现场零改动/差异告警/坏包拒绝/无备份提示）",
+         lambda: t_backup_drill_surface(tmp))
     case("R8·一键自检工具面（action=report 出报告+修复建议/不广播信号）",
          lambda: t_sentry_report(tmp))
     case("R9·场景帮助与运维手册（六主题/未知主题列可选/文档覆盖恢复·发布·任务治理）",
          lambda: t_help_topics(tmp))
     case("R28·新项目拼写提示（首次出现+相近项目/已登记静默）",
          lambda: t_new_project_hint(fresh_hub(tmp, "hub_new_project")))
+    case("R35·log_work 任务绑定（落库/项目一致/完成声明告警/续租/状态页漂移/schema可选）",
+         lambda: t_log_work_task_binding(fresh_hub(tmp, "hub_task_binding")))
+    case("R36·agent 管控面（读/切状态/替他人confirm/认领闸门/前沿告警/列表徽标/schema）",
+         lambda: t_agent_control_surface(fresh_hub(tmp, "hub_agent_control")))
+    case("R37·能力路由工具面（技能读设清/任务skills/匹配认领/不匹配拒/前沿过滤/schema）",
+         lambda: t_skill_routing_surface(fresh_hub(tmp, "hub_skill_routing")))
+    case("R38·WIP 上限工具面（到顶拒收/列表显示/完成释放）",
+         lambda: t_wip_limit_surface(fresh_hub(tmp, "hub_wip_limit")))
+    case("R39·任务交办工具面（handoff_to 成功/非持有者拒收/schema可选）",
+         lambda: t_task_handoff_surface(fresh_hub(tmp, "hub_task_handoff")))
+    case("R40·完成质量工具面（done 回执提示/单查/巡检/schema可选）",
+         lambda: t_closure_quality_surface(fresh_hub(tmp, "hub_task_quality")))
+    case("R41·任务取消工具面（原因必填/回执终态/看板过滤/前沿消失/schema可选）",
+         lambda: t_task_cancel_surface(fresh_hub(tmp, "hub_task_cancel")))
+    case("R42/R43·失败重试与死信工具面（退避拒认领/看板前沿/提前放行/死信复活/schema）",
+         lambda: t_task_retry_surface(fresh_hub(tmp, "hub_task_retry")))
+    case("R44/R45·延后与完成审批工具面（延后回执/看板前沿/唤醒/审批拦截/四眼批准/schema）",
+         lambda: t_task_defer_approve_surface(fresh_hub(tmp, "hub_task_defer_approve")))
+    case("R48·全局写入冻结工具面（原因/分钟校验/写拒读通/状态与解冻豁免/延长/过期恢复/审计链）",
+         lambda: t_freeze_surface(fresh_hub(tmp, "hub_freeze")))
+    case("R50·审计导出（JSONL meta 链快照/两类流水在场/CSV 表头/坏参/截断/链异常照导/空库）",
+         lambda: t_audit_export_surface(fresh_hub(tmp, "hub_audit_export")))
+    case("R51·项目名护栏（穿越/盘符/保留目录拒收不落库/归档恢复同护栏/合法名照常）",
+         lambda: t_project_ref_surface(fresh_hub(tmp, "hub_project_ref")))
+    case("R53·任务过程统计（流量/周期/在办卡点/重试/风险/空项目/坏参/schema）",
+         lambda: t_task_stats_surface(fresh_hub(tmp, "hub_task_stats")))
+    case("R55 hub_status view=digest 团队日结（流动/风险/建议/记分卡，坏参与默认视图）",
+         lambda: t_team_digest_surface(fresh_hub(tmp, "hub_team_digest")))
 
     print()
     if FAILED:

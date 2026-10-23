@@ -552,6 +552,11 @@ def main():
     # ---- inbox / stalled / dup_mem（真库造数）
     import brain
     brain.init_db(str(tmp))
+    empty_root = tmp / "空库-审计链"
+    empty_root.mkdir()
+    brain.init_db(str(empty_root))
+    rc = ops.run_check("audit_chain", "", str(empty_root))
+    check("audit_chain 空库不误报", rc["ok"] and "空" in rc["summary"], str(rc)[:160])
     r = ops.run_check("inbox", root=str(tmp))
     check("inbox 空态", r["ok"] and "已清空" in r["summary"], str(r["summary"]))
     (tmp / "00_Inbox").mkdir(exist_ok=True)
@@ -670,6 +675,93 @@ def main():
     check("compress 对抗内容不崩", cr3["ok"] is True, str(cr3)[:160])
     check("compress 伪路径 UNC 原样可识别（人取舍）", "srv" in str(cr3["detail"]), str(cr3)[:200])
     check("compress 代码块内容不炸正则", isinstance(cr3["detail"], list), "")
+
+    # ---- R47 审计链：ops 检查项在真库上通过，篡改后点名 id
+    rc = ops.run_check("audit_chain", "", str(tmp))
+    check("audit_chain 正常库通过并报告封存数", rc["ok"] and "已封存" in rc["summary"], str(rc)[:200])
+    check("audit_chain detail ≤ 8", len(rc["detail"]) <= 8)
+    with brain.db_conn(str(tmp)) as conn:
+        jid, old_action = conn.execute(
+            "SELECT id, action FROM journal WHERE hash!='' ORDER BY id DESC LIMIT 1").fetchone()
+        conn.execute("UPDATE journal SET action='被篡改' WHERE id=?", (jid,))
+    rc = ops.run_check("audit_chain", "", str(tmp))
+    check("audit_chain 抓到字段篡改并点名 id",
+          (not rc["ok"]) and str(jid) in "".join(rc["detail"]) and "内容" in "".join(rc["detail"]),
+          str(rc)[:300])
+    with brain.db_conn(str(tmp)) as conn:
+        conn.execute("UPDATE journal SET action=? WHERE id=?", (old_action, jid))
+    rc = ops.run_check("audit_chain", "", str(tmp))
+    check("audit_chain 恢复后重新通过", rc["ok"], str(rc)[:200])
+
+    # ---- R49 安全面体检：审计/冻结/管控/归属/明文凭据一张单子
+    sec = tmp / "安全体检"
+    sec.mkdir()
+    brain.init_db(str(sec))
+    rc = ops.run_check("security_health", "", str(sec))
+    check("security_health 空库不误报", rc["ok"] and "安全面健康" in rc["summary"], str(rc)[:240])
+    check("security_health 报扫描条数与未冻结",
+          "凭据扫描" in "".join(rc["detail"]) and "未冻结" in "".join(rc["detail"]),
+          str(rc)[:300])
+    check("security_health 在巡检清单且有修复建议",
+          "security_health" in ops.PATROL_CHECKS and "security_health" in ops.CHECK_FIXES, "")
+
+    rid = brain.add_record(str(sec), "安全", "qoder", "2026-10-23", "配置",
+                           "api_key = sk-abcdefghijklmnop1234567890")
+    rc = ops.run_check("security_health", "", str(sec))
+    check("security_health 抓到明文密钥并点名记录 id",
+          (not rc["ok"]) and f"记录#{rid}" in "".join(rc["detail"])
+          and "凭据" in rc["summary"], str(rc)[:300])
+    check("security_health 不回显密钥原文",
+          "sk-abcdef" not in "".join(rc["detail"]) and "sk-abcdef" not in rc["summary"], "")
+    check("security_health detail ≤ 8", len(rc["detail"]) <= 8)
+    with brain.db_conn(str(sec)) as conn:  # 软删后不再命中（扫描排除 deleted）
+        conn.execute("UPDATE records SET status='deleted' WHERE id=?", (rid,))
+    check("security_health 软删后干净", ops.run_check("security_health", "", str(sec))["ok"], "")
+
+    # 文档占位符不是事故（真机 dogfood 出的误报：ANTHROPIC_API_KEY=sk-ant-your-key-here）
+    brain.add_record(str(sec), "安全", "qoder", "2026-10-23", "文档",
+                     "ANTHROPIC_API_KEY=sk-ant-your-key-here\nAWS=AKIAXXXXXXXXXXXXXXXX")
+    repo = ops.run_check("security_health", "", str(sec))
+    check("security_health 占位符密钥不误报（your/here/xxxx）",
+          repo["ok"] and "疑似明文凭据" not in repo["summary"], str(repo)[:300])
+
+    # 冻结是运营状态不是故障：照常通过，但 detail 必须点名
+    brain.freeze_set(str(sec), 30, "测试冻结", "qoder")
+    rc = ops.run_check("security_health", "", str(sec))
+    check("security_health 冻结中不判失败但点名",
+          rc["ok"] and "冻结中" in "".join(rc["detail"]), str(rc)[:300])
+    brain.freeze_clear(str(sec), "qoder")
+
+    # 管控状态被手工改坏：注册项非法必须点名
+    brain.agent_control_set(str(sec), "qoder", "active", "测试", "qoder")
+    with brain.db_conn(str(sec)) as conn:
+        conn.execute("UPDATE agents SET control_state='zombie' WHERE name='qoder'")
+    rc = ops.run_check("security_health", "", str(sec))
+    check("security_health 抓到非法管控状态",
+          (not rc["ok"]) and "管控状态非法" in rc["summary"]
+          and "qoder" in "".join(rc["detail"]), str(rc)[:300])
+    with brain.db_conn(str(sec)) as conn:
+        conn.execute("UPDATE agents SET control_state='active' WHERE name='qoder'")
+
+    # 在办任务的持有者不在注册表：归属不可解析必须点名
+    with brain.db_conn(str(sec)) as conn:
+        conn.execute("INSERT INTO tasks(project,title,status,owner) "
+                     "VALUES('安全','幽灵任务','in_progress','ghost')")
+    rc = ops.run_check("security_health", "", str(sec))
+    check("security_health 抓到持有者失联",
+          (not rc["ok"]) and "注册表" in rc["summary"]
+          and "ghost" in "".join(rc["detail"]), str(rc)[:300])
+    with brain.db_conn(str(sec)) as conn:
+        conn.execute("DELETE FROM tasks WHERE title='幽灵任务'")
+
+    # 审计链篡改同样进入安全面结论
+    with brain.db_conn(str(sec)) as conn:
+        jid = conn.execute("SELECT id FROM journal WHERE hash!='' "
+                           "ORDER BY id DESC LIMIT 1").fetchone()[0]
+        conn.execute("UPDATE journal SET note='被改' WHERE id=?", (jid,))
+    rc = ops.run_check("security_health", "", str(sec))
+    check("security_health 也抓审计链篡改",
+          (not rc["ok"]) and "审计链" in rc["summary"], str(rc)[:300])
 
     # ---- R8 一键自检聚合：问题带修复建议、检查器自身异常不拖垮、需 target/未知项跳过
     check("PATROL_CHECKS 每项都有修复建议",
@@ -808,6 +900,28 @@ def main():
           "tasks_health" in ops.CHECK_FIXES and "hub_claim" in ops.CHECK_FIXES["tasks_health"],
           str(ops.CHECK_FIXES.get("tasks_health")))
 
+    # ---- R43 死信：重试耗尽退出队列的任务必须被巡检点名，且不混入未完成计数
+    dl_root = str(Path(tmp) / "hub_dead")
+    Path(dl_root).mkdir(parents=True, exist_ok=True)
+    _b.init_db(dl_root)
+    _, t_dead = _b.task_add(dl_root, "死信任务", project="壬")
+    _b.task_claim(dl_root, t_dead, "qoder")
+    old_max = _b.MAX_TASK_ATTEMPTS
+    _b.MAX_TASK_ATTEMPTS = 1
+    try:
+        _b.task_retry(dl_root, t_dead, agent="", reason="接口永久 502")
+    finally:
+        _b.MAX_TASK_ATTEMPTS = old_max
+    dres = ops.run_check("tasks_health", "", dl_root)
+    check("tasks_health 报死信", dres["ok"] is False and "死信 1" in dres["summary"],
+          str(dres)[:300])
+    check("tasks_health 死信明细",
+          any("死信任务" in d and "死信" in d for d in dres["detail"]),
+          str(dres["detail"])[:300])
+    check("tasks_health 死信修复建议含 retry",
+          "hub_task_retry" in ops.CHECK_FIXES["tasks_health"],
+          str(ops.CHECK_FIXES.get("tasks_health")))
+
     # ---- R26 进展停滞：心跳/租约只证明人还在，不能证明任务在走；与失联互斥计数
     st_root = str(Path(tmp) / "hub_stall")
     Path(st_root).mkdir(parents=True, exist_ok=True)
@@ -871,6 +985,26 @@ def main():
     check("tasks_health 修复建议含饥饿",
           "待办饥饿" in ops.CHECK_FIXES["tasks_health"], ops.CHECK_FIXES["tasks_health"])
 
+    # ---- R35 完成声明未关单：记录称已完成、任务还开着 → 巡检点名；关单后清零
+    cd_root = str(Path(tmp) / "hub_closure")
+    Path(cd_root).mkdir(parents=True, exist_ok=True)
+    _b.init_db(cd_root)
+    _, t_open = _b.task_add(cd_root, "做完了但没关", project="癸")
+    _b.add_record(cd_root, "癸", "qoder", "2026-10-23", "收尾",
+                  f"任务 #{t_open} 已完成并交付。")
+    cd = ops.run_check("tasks_health", "", cd_root)
+    check("tasks_health 报完成声明未关单",
+          cd["ok"] is False and "完成声明未关单 1" in cd["summary"], str(cd)[:400])
+    check("tasks_health 漂移明细点名",
+          any("记录称已完成未关单" in d and "做完了但没关" in d for d in cd["detail"]),
+          str(cd["detail"])[:400])
+    assert _b.task_update(cd_root, t_open, status="done", agent="")[0] == ""
+    cd2 = ops.run_check("tasks_health", "", cd_root)
+    check("tasks_health 关单后漂移清零", cd2["ok"] is True, str(cd2)[:300])
+    check("tasks_health 修复建议含关单",
+          "完成声明未关单" in ops.CHECK_FIXES["tasks_health"],
+          ops.CHECK_FIXES["tasks_health"])
+
     # ---- R12 文件租约巡检：冲突/任务绑定漂移/未登记持有者是真问题；过期未释放只报数
     import datetime as _dt
     lh_root = str(Path(tmp) / "hub_lh")
@@ -902,7 +1036,7 @@ def main():
     check("lease_health 报任务绑定漂移",
           lh3["ok"] is False and "任务绑定漂移 1" in lh3["summary"], str(lh3)[:400])
     check("lease_health 漂移明细点名任务状态",
-          any("任务已完成" in d for d in lh3["detail"]), str(lh3["detail"])[:300])
+          any("任务状态为完成" in d for d in lh3["detail"]), str(lh3["detail"])[:300])
     with _b.db_conn(lh_root) as conn:
         conn.execute("UPDATE tasks SET status='in_progress', owner='qoder' WHERE id=?", (t_lh,))
         _, key_dir, _, _ = _b._file_lock_path(lh_root, "lease-proj")
@@ -1012,6 +1146,20 @@ def main():
     rq = ops.run_check("record_quality", root=q_root)
     check("record_quality 接线（summary 标明标准上线后口径）",
           rq["ok"] and "标准上线后" in rq["summary"], str(rq["summary"]))
+
+    # ---- R59 库完整性体检：坏库点名 + 巡检短路，避免一屏次生失败
+    c_root = tmp / "hub_corrupt"
+    (c_root / "_hub").mkdir(parents=True)
+    (c_root / "_hub" / "brain.db").write_bytes(b"garbage" * 4096)
+    r = ops.run_check("db_integrity", root=str(c_root))
+    check("db_integrity 坏库点名损坏并给恢复路径",
+          (not r["ok"]) and bool(r.get("fatal")) and "损坏" in r["summary"]
+          and any("-wal" in d for d in r["detail"]), str(r))
+    rep = ops.run_patrol(str(c_root), checks=["db_integrity", "db_health", "inbox"])
+    check("db_integrity 坏库时巡检短路后续项并说明原因",
+          (not rep["ok"]) and [i["name"] for i in rep["issues"]] == ["db_integrity"]
+          and len(rep["skipped"]) == 2
+          and all("数据库损坏" in s["why"] for s in rep["skipped"]), str(rep))
 
     print()
     if FAILED:

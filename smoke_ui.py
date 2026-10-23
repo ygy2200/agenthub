@@ -91,6 +91,11 @@ def main():
         check("统计-记录数", w.stats_page.valRec.text() == "3", w.stats_page.valRec.text())
         check("对账问题>=3（前缀/野目录/缺记录）", len(w.audit_page.issues) >= 3)
         check("Inbox 读取", snap.inbox == ["待分拣.txt"])
+        # R56：任务/错误进全脑检索（GUI 分类过滤用）
+        brain.task_add(str(tmp), "存档备份路径核对", project="红色沙漠-存档备份",
+                       detail="核对备份目录", agent="smoke", blocked_by="等外部确认")
+        brain.error_add(str(tmp), "smoke", "存档恢复失败", detail="备份包校验不过",
+                        project="红色沙漠-存档备份", undo="重新下载备份")
         sw = SearchWorker(str(tmp), "存档", None)
         sw.done.connect(safe(step2))
         w._workers.append(sw)  # 持引用防 GC
@@ -110,6 +115,14 @@ def main():
         w.search_page.kindFilter.setCurrentIndex(1)  # 只看记录
         check("搜索页分类过滤", w.search_page.view_hits and
               all(k == "record" for k, _ in w.search_page.view_hits))
+        w.search_page.kindFilter.setCurrentIndex(4)  # 只看任务
+        check("搜索页任务分类过滤", w.search_page.view_hits and
+              all(k == "task" for k, _ in w.search_page.view_hits),
+              str(w.search_page.view_hits)[:120])
+        w.search_page.kindFilter.setCurrentIndex(5)  # 只看错误
+        check("搜索页错误分类过滤", w.search_page.view_hits and
+              all(k == "error" for k, _ in w.search_page.view_hits),
+              str(w.search_page.view_hits)[:120])
         w.search_page.kindFilter.setCurrentIndex(0)
         # 搜索页图关联/互斥标注（与 MCP 层同源逻辑）：此处只验渲染路径不崩，
         # 标注正确性由 adv_mcp 的 hub_search 断言覆盖（同一份 _cross/_conflict_with 口径）
@@ -150,7 +163,28 @@ def main():
         # 流水页冒烟（v2：journal/errors 读 brain.db）
         w.journal_page.reload()
         check("流水页填充不崩", w.journal_page.jList.count() >= 0 and w.journal_page.errList.count() >= 0)
+        # R57：错误筛选 + 详情预览 + 回滚复制 + 按钮随选中态启停
+        w.journal_page.errFilter.setCurrentIndex(1)  # 未关闭
+        check("流水页错误筛选（未关闭）", w.journal_page.errors
+              and all(e["status"] == "open" for e in w.journal_page.errors))
+        w.journal_page.errList.setCurrentRow(0)
+        check("流水页错误详情预览", "回滚方式" in w.journal_page.errPreview.toPlainText(),
+              w.journal_page.errPreview.toPlainText()[:80])
+        w.journal_page.copy_undo()
+        check("流水页复制回滚方式", QApplication.clipboard().text() == "重新下载备份",
+              QApplication.clipboard().text())
+        w.journal_page.set_status("fixed")
+        check("流水页标记已修后离开未关闭列表", not w.journal_page.errors
+              and not w.journal_page.fixBtn.isEnabled())
+        w.journal_page.errFilter.setCurrentIndex(2)  # 已修复
+        check("流水页错误筛选（已修复）", any(e["status"] == "fixed"
+                                              for e in w.journal_page.errors))
+        w.journal_page.errFilter.setCurrentIndex(0)
         w.journal_page.undo_selected()  # 无 log_work 时点击只弹提示，不崩
+        # R58：帮助页与检索/流水/工作台新能力同步
+        check("帮助页已同步新页面与新检索范围",
+              "工作台" in w.help_page.CONTENT and "随记/任务/错误/文件" in w.help_page.CONTENT
+              and "复制回滚方式" in w.help_page.CONTENT)
         # 大脑记忆视图冒烟（v2：memories 表 CRUD）
         w.hub_page.fill_memories()
         check("记忆视图可填充", hasattr(w.hub_page, "_mem_rows"))
@@ -189,6 +223,10 @@ def main():
               and "进行中 1" in w.today_page.sumLabel.text(), w.today_page.sumLabel.text())
         check("工作台列表有分组标题+任务行", w.today_page.listw.count() >= 5,
               str(w.today_page.listw.count()))
+        check("工作台显示近 24h 日结行（R55）",
+              "近 24h" in w.today_page.digestLine.text()
+              and "风险" in w.today_page.digestLine.text(),
+              w.today_page.digestLine.text())
         check("工作台任务行带优先级徽标",
               any("[P0]" in w.today_page.listw.item(i).text()
                   for i in range(w.today_page.listw.count())))
@@ -219,12 +257,37 @@ def main():
         check("信号中心已发送 tab 可切", w.signal_page.listw.count() >= 1,
               str(w.signal_page.listw.count()))
         w.signal_page.seg.setCurrentItem("inbox")
-        # 治理中心五段逐个 reload 不崩
-        for key in ("quarantine", "consolidate", "decision", "view", "skill"):
+        # 治理中心六段逐个 reload 不崩
+        for key in ("quarantine", "consolidate", "decision", "view", "skill", "security"):
             w.governance_page.seg.setCurrentItem(key)
         w.governance_page.reload()
-        check("治理中心五段可切且 reload 不崩", w.governance_page.stack.count() == 5)
+        check("治理中心六段可切且 reload 不崩", w.governance_page.stack.count() == 6)
         check("治理中心隔离区子页就位", w.governance_page.subs[0].listw.count() >= 0)
+        check("治理中心安全子页有审计/闸门/体检行", w.governance_page.subs[5].listw.count() >= 3,
+              str(w.governance_page.subs[5].listw.count()))
+        # 安全子页动作真跑：冻结→列表标注→导出→解冻（对话框打桩，不弹真窗）
+        from PySide6.QtWidgets import QInputDialog
+        sec = w.governance_page.subs[5]
+        _oi, _ot = QInputDialog.getInt, QInputDialog.getText
+        QInputDialog.getInt = staticmethod(lambda *a, **k: (30, True))
+        QInputDialog.getText = staticmethod(lambda *a, **k: ("冒烟测试冻结", True))
+        try:
+            sec.freeze()
+            app.processEvents()
+            fr = brain.freeze_get(str(tmp))
+            check("安全子页冻结生效", fr["active"] and fr["reason"] == "冒烟测试冻结", str(fr))
+            sec.reload()
+            check("安全子页冻结后列表点名", any("冻结中" in sec.listw.item(i).text()
+                                                 for i in range(sec.listw.count())))
+            sec.export()
+            app.processEvents()
+            files = list((tmp / "_hub" / "exports").glob("audit-*.jsonl"))
+            check("安全子页导出审计落盘", bool(files) and files[-1].stat().st_size > 0)
+            sec.thaw()
+            app.processEvents()
+            check("安全子页解冻生效", not brain.freeze_get(str(tmp))["active"])
+        finally:
+            QInputDialog.getInt, QInputDialog.getText = _oi, _ot
         # 编排中心（v2.40）：流程/步骤/执行历史/触发器/图谱 五段逐个 reload 不崩
         for key in ("flows", "steps", "runs", "trig", "graph"):
             w.playbook_page.seg.setCurrentItem(key)
