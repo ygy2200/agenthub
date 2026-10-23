@@ -3536,7 +3536,9 @@ def t_error_taxonomy(root):
     幂等键解决「能不能安全重试」，分类学解决「该不该重试」。
 
     验证六面：① 参数类错误 → permanent；② 限流 → transient；③ 未归类错误 → ambiguous
-    （兜底，不假装知道）；④ `structuredContent.error_kind` 带分类（机器可读，且不破坏
+    （兜底，不假装知道；R74 起校验类关键词——枚举/范围/类型/长度/缺参——也归 permanent，
+    实测 44 个失败站点里 22 个曾因此误落 ambiguous，白挨「可能已部分生效」的假提示）；
+    ④ `structuredContent.error_kind` 带分类（机器可读，且不破坏
     「错误：」开头的既有约定——59 个失败站点与全库断言都依赖它）；⑤ 成功调用无 error_kind；
     ⑥ **提示文案的差异化**：permanent 不追加任何「可重试」字样（多说一句就是噪音、
     还会诱导无意义重试），transient/ambiguous 追加且指向幂等键。
@@ -3576,6 +3578,21 @@ def t_error_taxonomy(root):
     assert m._error_kind("错误：触发速率限制（工具 hub_status，agent=zcode）") == "transient"
     assert m._error_kind("错误：数据库被锁定，请稍后再试") == "transient"
     assert m._error_kind("错误：某种全新的未知故障形态") == "ambiguous", "未命中任何关键词应兜底为 ambiguous"
+    # R74 实测补充：44 个失败站点里 22 个是纯参数校验（枚举/范围/类型/长度/缺参），
+    # 因不含老关键词全落进 ambiguous 兜底——「可能已部分生效」对执行前就被拒的请求
+    # 是假话，对面是「改参数再调」。新增校验类关键词后这些必须归 permanent。
+    for _v in ("错误：action 只支持 check/acquire/renew/release/prune/list",
+               "错误：view 只能是 board/stats（收到 timeline）",
+               "错误：days 范围 1..365",
+               "错误：arguments 需为对象（收到 list）",
+               "错误：idem_key 过长（≤64 字符）——它是去重标识不是载荷",
+               "错误：acquire 需要 path（文件或目录）",
+               "错误：ids 应为整数数组（收到 str）",
+               "错误：参数不足，必须给出 ids=[...] 指定条目，或 all_stale=true 批量复核陈旧条目"):
+        assert m._error_kind(_v) == "permanent", f"参数校验应归 permanent：{_v}"
+    # delay 的校验文案曾含「重试」二字被误判 transient（transient 优先检查的顺序是对的，
+    # 改文案不改顺序——R74 同轮把那个词从参数说明里去掉）
+    assert m._error_kind("错误：delay 必须是秒数（0=立即放回队列，上限 86400）") == "permanent"
     # permanent 无提示；另两类的提示对写工具会指向幂等键（R2 的配套）
     assert m._error_hint("permanent", "hub_log_work") == "", "permanent 不追加提示"
     assert "idem_key" in m._error_hint("transient", "hub_log_work")

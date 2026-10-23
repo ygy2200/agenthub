@@ -2956,7 +2956,7 @@ def task_retry(root: str, tid, agent: str = "", reason: str = "",
         try:
             backoff = max(0, min(int(delay), 86400))
         except (TypeError, ValueError):
-            return "delay 必须是秒数（0=立即重试，上限 86400）", {}
+            return "delay 必须是秒数（0=立即放回队列，上限 86400）", {}
     with db_conn(root) as conn:
         row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
         if row is None:
