@@ -291,10 +291,37 @@ def _task_line(t: dict) -> str:
             f"{proj}{t['title'][:60]}{agenthub_mcp._task_flags(t)}")
 
 
+def _age_span(hours) -> str:
+    if hours is None:
+        return "时间未知"
+    if hours >= 48:
+        return f"{hours / 24:.1f} 天"
+    if hours >= 1:
+        return f"{hours:g} 小时"
+    return f"{hours * 60:.0f} 分钟"
+
+
 def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
-              limit: int = 50, stats: bool = False, days: int = 7) -> int:
+              limit: int = 50, stats: bool = False, days: int = 7,
+              approvals: bool = False) -> int:
     """任务看板（headless）：状态/负责人/截止/前置/租约/阻塞原因；--stats 看过程统计。"""
     import brain  # noqa: PLC0415
+    if approvals:
+        rows = brain.task_approvals(root, project=project, limit=limit)
+        if not rows:
+            print("待审批任务：无（审批队列为空）")
+            return 0
+        brain.task_annotate(root, rows)
+        print(f"待审批任务 {len(rows)} 条（等最久的先看；等批从认领起算）：")
+        for t in rows:
+            who = f"@{t['owner']}" if (t.get("owner") or "").strip() else "@无主"
+            proj = f"[{t['project']}] " if t.get("project") else ""
+            flag = " ⚠待批过久" if t.get("_approval_aging") else ""
+            print(f"  #{t['id']} {proj}{t['title'][:50]} {who}"
+                  f" 等批 {_age_span(t.get('_approval_wait_h'))}{flag}")
+        print("退回返工：python cli.py --root <root> reject <id> --reason \"...\""
+              "（原因必填，任务回到待办并释放持有权）")
+        return 0
     if stats:
         if not 1 <= int(days) <= 365:
             print("days 范围 1..365")
@@ -313,7 +340,8 @@ def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
         print(f"  完成周期：{dc['n']} 单，中位 {h(dc['p50'])} / P90 {h(dc['p90'])}"
               f" / 最长 {h(dc['max'])}")
         print(f"  当前在办 {w['in_progress']}：租约超时 {w['stale_leases']} · 无主 {w['unowned']}"
-              f" · 等审批 {w['approval_waiting']} · 逾期 {w['overdue']}")
+              f" · 等审批 {w['approval_waiting']}（待批过久 {w['approval_aging']}）"
+              f" · 逾期 {w['overdue']}")
         print(f"  重试存量：{r['tasks_with_attempts']} 单 · 累计 {r['attempts_total']} 次"
               f" · 最高 {r['max_attempts']} 次")
         q = m.get("quality") or {}
@@ -327,7 +355,8 @@ def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
                 f"{a['ag']} 在办{a['doing']}/完成{a['done']}/死信{a['dead']}"
                 for a in m["agents"][:8]))
         labels = {"lease_stale": "租约超时", "unowned": "无主在办", "approval_waiting": "等审批",
-                  "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2"}
+                  "approval_aging": "待批过久", "overdue": "逾期", "dead_letter": "死信",
+                  "retry_storm": "重试≥2"}
         if m.get("risks"):
             print("  风险信号：")
             for x in m["risks"]:
@@ -367,13 +396,19 @@ def cmd_digest(root: str, days: int = 1) -> int:
           f" · 错误新开 {f['errors_opened']}（未闭 {f['errors_open']}）"
           f" · 调用 {f['tool_calls']} · 检索 {f['searches']}（零命中 {f['zero_hit_searches']}）")
     w, fr = c["wip"], c["freeze"]
+    hf = c.get("handoffs") or {"open": 0, "stale": 0}
+    sec = c.get("security") or {"denied": 0}
     print(f"  当前：在线 {c['online_agents']}/{c['known_agents']} · 在办 {c['open_total']}"
           f"（租约逾期 {w['stale_leases']} / 无主 {w['unowned']} / 等审批 {w['approval_waiting']}"
-          f" / 逾期 {w['overdue']}）· " + ("写入冻结中" if fr["active"] else "写入未冻结"))
+          f" / 待批过久 {w['approval_aging']} / 逾期 {w['overdue']}）"
+          f" · 交接 {hf['open']}（陈旧 {hf['stale']}）· "
+          + (f"拦截 {sec['denied']} · " if sec.get("denied") else "")
+          + ("写入冻结中" if fr["active"] else "写入未冻结"))
     labels = {"lease_stale": "租约逾期", "unowned": "无主在办", "approval_waiting": "等审批",
-              "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2",
-              "offline_with_open": "无心跳但有在办", "errors_open": "未闭错误",
-              "zero_hit_search": "零命中检索"}
+              "approval_aging": "待批过久", "overdue": "逾期", "dead_letter": "死信",
+              "retry_storm": "重试≥2", "offline_with_open": "无心跳但有在办",
+              "handoff_stale": "交接陈旧", "security_denied": "越权拦截",
+              "errors_open": "未闭错误", "zero_hit_search": "零命中检索"}
     if d["risks"]:
         print("  风险：")
         for r in d["risks"]:
@@ -392,6 +427,64 @@ def cmd_digest(root: str, days: int = 1) -> int:
             print(f"    {a['agent']} {'[在线]' if a['online'] else '[离线]'}"
                   f"｜记录 {a['records']} · 任务 在办{t['open']}/完成{t['done']}"
                   f" · 错误未闭{a['errors']['open']} · 调用{a['usage']['calls']}{warn}")
+    return 0
+
+
+def cmd_handoffs(root: str, project: str = "", include_all: bool = False,
+                 close_id: int = 0, reason: str = "", agent: str = "") -> int:
+    """R92 交接清单/作废（headless）；--close 走 brain.close_handoff 同一状态机。"""
+    import brain  # noqa: PLC0415
+    if close_id:
+        msg = brain.close_handoff(root, close_id, agent or "cli", reason)
+        print(msg)
+        return 0 if msg.startswith("已关闭") else 2
+    rows = brain.list_handoffs(root, project, include_claimed=include_all)
+    if not rows:
+        print("（无交接记录）" if include_all else "（无未认领交接）")
+        return 0
+    print(f"交接 {len(rows)} 条（{'全部' if include_all else 'open'}，新在前）：")
+    for r in rows:
+        if r["status"] == "open":
+            age_s = f"已等 {_age_span(r.get('_age_h'))}"
+            mark = f"待认领，{age_s}" + ("，⚠陈旧" if r.get("_stale") else "")
+        elif r["status"] == "closed":
+            mark = (f"已作废，{r.get('closed_by') or '他人'}"
+                    f"：{(r.get('close_note') or '无原因')[:40]}")
+        else:
+            mark = f"已被 {r.get('claimed_by') or '他人'} 认领"
+        print(f"  #{r['id']} [{r['project']}] 来自 {r['agent']}（{mark}）")
+        if r.get("next_step"):
+            print(f"      下一步：{r['next_step'][:60]}")
+    if not include_all:
+        print("（--all 看已认领/已作废；--close ID --reason 文本 作废未认领交接）")
+    return 0
+
+
+def cmd_security(root: str, days: int = 7) -> int:
+    """R92 越权拦截态势（headless）：与 hub_status(view=security) 同口径。"""
+    import brain  # noqa: PLC0415
+    if not 1 <= int(days) <= 365:
+        print("days 范围 1..365")
+        return 2
+    sec = brain.security_snapshot(root, days=int(days))
+    print(f"安全拦截（近 {days} 天）：{sec['total']} 次"
+          f"（未锁身份 {sec['identity']} / 角色越权 {sec['role']}）")
+    if not sec["total"]:
+        print("  无越权拦截记录。")
+        return 0
+    for x in sec["by_tool"]:
+        print(f"  {x['tool']} {x['count']} 次（未锁身份 {x['identity']} / "
+              f"角色越权 {x['role']}，最近 {x['last'] or '时间未知'}）")
+    if sec.get("by_agent"):
+        print("  按 agent：" + " · ".join(
+            f"@{a['agent']} {a['count']} 次（未锁身份 {a['identity']} / "
+            f"角色越权 {a['role']}）" for a in sec["by_agent"][:5]))
+    print("  最近拦截：")
+    for r in sec["recent"]:
+        print(f"    · {r['ts'] or '时间未知'} {r['agent']} → {r['target']}："
+              f"{r['note'] or '无说明'}")
+    print("  处置：MCP 接入加 --agent；worker 需管理动作由管理面授 manager；"
+          "管理操作走 CLI/GUI。")
     return 0
 
 
@@ -537,6 +630,19 @@ def cmd_approve(root: str, task_id, agent: str = "", note: str = "") -> int:
     return 0
 
 
+def cmd_reject(root: str, task_id, reason: str, agent: str = "") -> int:
+    """审批退回（headless）：原因必填；任务回到待办、释放持有权，修改后重新认领。"""
+    import brain  # noqa: PLC0415
+    err, row = brain.task_reject(root, task_id, agent=agent, reason=reason)
+    if err:
+        print(f"退回失败：{err}")
+        return 1
+    print(f"任务 #{row['id']} 已退回返工（退回人 {row['_rejected_by']}）：{row['title'][:50]}")
+    print(f"原因：{row['_reject_note'][:120]}")
+    print(f"任务已回到待办并释放持有权；重新认领：cli.py claim {row['id']} --agent <名>")
+    return 0
+
+
 def cmd_freeze(root: str, minutes=None, reason: str = "", off: bool = False,
                agent: str = "") -> int:
     """R48 全局写入冻结（headless）：--off 解除；缺 minutes 只查看状态。"""
@@ -570,6 +676,36 @@ def cmd_freeze(root: str, minutes=None, reason: str = "", off: bool = False,
     print(f"⛔ 全局写入已{'延长至' if fr.get('_was_active') else '冻结至'} {until}："
           f"{fr['reason'][:80]}")
     print("写工具全部拒收（读工具照常）；解除：cli.py freeze --off")
+    return 0
+
+
+def cmd_role(root: str, agent: str = "", role: str = "") -> int:
+    """R79：查看/授予 agent 角色（worker/manager）。管理通道专用。"""
+    import brain  # noqa: PLC0415
+    if agent and role:
+        err, info = brain.agent_role_set(root, agent, role, by="cli")
+        if err:
+            print(f"设置失败：{err}")
+            return 1
+        print(f"agent {info['agent']} 角色已切换为 {info['role']}"
+              f"（{brain.AGENT_ROLE_CN.get(info['role'], info['role'])}）")
+        print("manager 可执行冻结/归档/隔离/自动化/管控他人；worker 仅日常读写。")
+        return 0
+    if agent:
+        cur = brain.agent_role_get(root, agent)
+        print(f"agent {brain._norm_agent(agent)} 角色：{cur}"
+              f"（{brain.AGENT_ROLE_CN.get(cur, cur)}）")
+        print("设置：cli.py role <agent> --set manager|worker")
+        return 0
+    rows = brain.list_agents(root)
+    if not rows:
+        print("注册表为空（agent 首次心跳/写记录时自动登记）。")
+        return 0
+    role_map = brain.agent_role_map(root)
+    print("agent 角色（worker 执行 / manager 管理）：")
+    for r in rows:
+        role = role_map.get((r["name"] or "").strip().lower(), "worker")
+        print(f"- {r['name']}: {role}（{brain.AGENT_ROLE_CN.get(role, role)}）")
     return 0
 
 
@@ -704,6 +840,10 @@ def main(argv=None) -> int:
     sub = ap.add_subparsers(dest="cmd")
     p_status = sub.add_parser("status", help="各 agent 接入状态")
     p_status.add_argument("agent", nargs="?", default="")
+    p_role = sub.add_parser("role", help="R79：查看/授予 agent 角色（worker/manager）")
+    p_role.add_argument("agent", nargs="?", default="")
+    p_role.add_argument("--set", dest="role", choices=["worker", "manager"], default="",
+                        help="设置角色（缺省只读）")
     p_on = sub.add_parser("onboard", help="给某 agent 注入引导")
     p_on.add_argument("agent")
     sub.add_parser("refresh", help="刷新所有 agent 引导到当前版本")
@@ -738,8 +878,20 @@ def main(argv=None) -> int:
     p_tasks.add_argument("--limit", type=int, default=50)
     p_tasks.add_argument("--stats", action="store_true", help="R53 任务过程统计（流量/周期/卡点/重试/质量）")
     p_tasks.add_argument("--days", type=int, default=7, help="--stats 窗口天数，默认 7")
+    p_tasks.add_argument("--approvals", action="store_true",
+                         help="R92 待审批队列（等最久的先看，含待批时长）")
     p_digest = sub.add_parser("digest", help="R55 团队日结（流动/风险/按 agent 记分卡）")
     p_digest.add_argument("--days", type=int, default=1, help="窗口天数 1..365，默认 1")
+    p_handoffs = sub.add_parser("handoffs", help="R92 交接清单（open 默认；--all 含已认领/已作废）")
+    p_handoffs.add_argument("--project", default="")
+    p_handoffs.add_argument("--all", dest="include_all", action="store_true",
+                            help="含已认领/已作废")
+    p_handoffs.add_argument("--close", dest="close_id", type=int, default=0,
+                            help="作废交接 id（仅 open；需 --reason）")
+    p_handoffs.add_argument("--reason", default="", help="作废原因（--close 必填）")
+    p_handoffs.add_argument("--agent", default="", help="操作人（缺省 cli）")
+    p_security = sub.add_parser("security", help="R92 越权拦截态势（默认近 7 天）")
+    p_security.add_argument("--days", type=int, default=7, help="窗口天数 1..365，默认 7")
     p_next = sub.add_parser("next", help="R9 前沿队列（可认领/进行中/可接管/等待）")
     p_next.add_argument("--project", default="")
     p_next.add_argument("--agent", default="", help="该 agent 名下的在办任务归入「进行中」")
@@ -775,6 +927,10 @@ def main(argv=None) -> int:
     p_approve.add_argument("task_id", type=int)
     p_approve.add_argument("--agent", default="", help="复核人 agent 名（管理面可空）")
     p_approve.add_argument("--note", default="", help="复核意见/验收依据")
+    p_reject = sub.add_parser("reject", help="R100 审批退回（原因必填；任务回待办返工）")
+    p_reject.add_argument("task_id", type=int)
+    p_reject.add_argument("--reason", required=True, help="退回原因（必填）")
+    p_reject.add_argument("--agent", default="", help="复核人 agent 名（管理面可空）")
     p_freeze = sub.add_parser("freeze", help="R48 全局写入冻结（应急闸门；--off 解除）")
     p_freeze.add_argument("--minutes", type=int, default=None,
                           help="冻结分钟数：0=手动解冻；缺省=只查看状态")
@@ -835,6 +991,8 @@ def main(argv=None) -> int:
             return 2
         if args.cmd == "status":
             return cmd_status(root, args.agent)
+        if args.cmd == "role":
+            return cmd_role(root, args.agent, args.role)
         if args.cmd == "onboard":
             return cmd_onboard(root, args.agent)
         if args.cmd == "refresh":
@@ -851,7 +1009,12 @@ def main(argv=None) -> int:
             return cmd_serve(root, args.port, args.allow_write, args.open)
         if args.cmd == "tasks":
             return cmd_tasks(root, args.status, args.project, args.owner, args.limit,
-                             stats=args.stats, days=args.days)
+                             stats=args.stats, days=args.days, approvals=args.approvals)
+        if args.cmd == "handoffs":
+            return cmd_handoffs(root, args.project, args.include_all, args.close_id,
+                                args.reason, args.agent)
+        if args.cmd == "security":
+            return cmd_security(root, args.days)
         if args.cmd == "digest":
             return cmd_digest(root, args.days)
         if args.cmd == "next":
@@ -867,6 +1030,8 @@ def main(argv=None) -> int:
             return cmd_retry(root, args.task_id, args.reason, args.agent, args.delay)
         if args.cmd == "approve":
             return cmd_approve(root, args.task_id, args.agent, args.note)
+        if args.cmd == "reject":
+            return cmd_reject(root, args.task_id, args.reason, args.agent)
         if args.cmd == "freeze":
             return cmd_freeze(root, args.minutes, args.reason, args.off, args.agent)
         if args.cmd == "audit-export":

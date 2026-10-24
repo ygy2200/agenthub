@@ -434,7 +434,11 @@ def agent_known_names(root: str = "") -> dict:
     **单一事实来源**（2026-10-09）：过去core.AGENT_KNOWN 是硬编码集合，漏了 dsh/workbuddy，
     导致 parse_agent_from_header 认不出这两个主力 agent 的段头 → 迁移时 fallback 一律猜 zcode。
     现在注册表来自适配器配置，新增 agent 只改 config.agents.json、零改码。
-    历史别名（deepseek 等）保留在 AGENT_LEGACY 里一并纳入，避免老记录重判失败。"""
+    历史别名（deepseek 等）保留在 AGENT_LEGACY 里一并纳入，避免老记录重判失败。
+
+    **按 id 排序返回**（R104）：AGENT_LEGACY 是 set，遍历序随进程哈希种子变——
+    以本表为数据源的下拉（playbook/signal 的 agent 选择）默认选中项会跨进程随机跳，
+    结构快照基线跟着随机红（2026-10-24 实测四进程四序）。排序后顺序确定性成立。"""
     out: dict = {}
     for n in AGENT_LEGACY:
         out.setdefault(n, n)
@@ -443,7 +447,7 @@ def agent_known_names(root: str = "") -> dict:
         k = agent_key(name)
         if k:
             out[k] = name
-    return out
+    return dict(sorted(out.items()))
 
 
 def parse_agent_from_header(title: str, known: dict | None = None) -> tuple[str, str]:
@@ -1560,7 +1564,7 @@ def remove_mcp_entry(path: str, layout: str) -> str:
 
 
 def mcp_has_agenthub(path: str, layout: str = "") -> bool:
-    """该 agent 的 MCP 配置里是否已配 agenthub（格式无关：JSON/TOML/YAML/**bundle** 通吃）。"""
+    """该 agent 的 MCP 配置里是否已配 agenthub（格式无关：JSON/TOML/**bundle** 通吃）。"""
     fmt, key_path = _mcp_spec(layout, str(Path(os.path.expandvars(os.path.expanduser(path)))))
     if fmt == "bundle":                      # DSH：bundle 形式，不是配置文件
         return _dsh_bundle_has_agenthub(path)
@@ -1571,6 +1575,53 @@ def mcp_has_agenthub(path: str, layout: str = "") -> bool:
         return codec.contains(p, "agenthub", key_path, fmt)
     except OSError:
         return False
+
+
+def mcp_agenthub_entry(path: str, layout: str = "") -> dict | None:
+    """读出 agent MCP 配置里的 agenthub 条目 {name, command, args}（只读，R103 配置漂移检测用）。
+
+    返回 None = 没配 agenthub；{} = 布局无法自动解析（bundle 等需人工确认）。
+    条目判定：只认**叶子条目**（含 command/args 键的 dict）——容器键（如 zcode 配置
+    顶层 "mcp"）会误命中且 args 恒空，等于误报「未锁 --agent」。明确名（agenthub/hub）
+    优先，否则按内容含 agenthub_mcp 有限深度递归（zcode 的 mcpServers 嵌在更深层级）。
+    """
+    fmt, _kp = _mcp_spec(layout, str(Path(os.path.expandvars(os.path.expanduser(path)))))
+    if fmt == "bundle":
+        return {}
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    if not p.is_file():
+        return None
+    data = read_mcp_config(str(p))
+    if not isinstance(data, dict) or not data:
+        return {}
+
+    def _leaf(o, depth=0):
+        if depth > 6 or not isinstance(o, dict):
+            return None
+        if ("command" in o or "args" in o) \
+                and "agenthub_mcp" in json.dumps(o, ensure_ascii=False):
+            return o
+        for v in o.values():
+            hit = _leaf(v, depth + 1)
+            if hit is not None:
+                return hit
+        return None
+
+    servers = data.get("mcpServers") if isinstance(data.get("mcpServers"), dict) else data
+    named = None
+    for name, cfg in (servers or {}).items():
+        if isinstance(cfg, dict) and (name or "").strip().lower() in ("agenthub", "hub"):
+            named = (name, cfg)
+            break
+    if named is None:
+        leaf = _leaf(data)
+        named = ("agenthub", leaf) if leaf is not None else (None, None)
+    name, cfg = named
+    if not isinstance(cfg, dict):
+        return None
+    return {"name": str(name or "agenthub"),
+            "command": str(cfg.get("command") or ""),
+            "args": [str(x) for x in (cfg.get("args") or [])]}
 
 
 # ---------------------------------------------------------------- P9：发现层

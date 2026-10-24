@@ -317,6 +317,10 @@ CREATE TABLE IF NOT EXISTS journal (
     ts TEXT, agent TEXT, action TEXT, target TEXT, backup TEXT, note TEXT,
     prev_hash TEXT DEFAULT '', hash TEXT DEFAULT ''
 );
+-- R91 治理查询索引：安全态势/日结按 action+ts 过滤，审计导出按 ts 切片。
+-- 只加索引不改数据；init_db 每次幂等补建，存量库同样生效。
+CREATE INDEX IF NOT EXISTS idx_journal_action_ts ON journal(action, ts);
+CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(ts);
 CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, project TEXT, title TEXT, detail TEXT,
@@ -344,7 +348,8 @@ CREATE TABLE IF NOT EXISTS agents (
     control_state TEXT DEFAULT "active",
     control_note TEXT DEFAULT "",
     control_at TEXT DEFAULT "",
-    skills TEXT DEFAULT ""
+    skills TEXT DEFAULT "",
+    role TEXT DEFAULT "worker"
 );
 -- R6：接入验证快照（每 agent 一行，最新一次 verify 的结果）。
 -- 为什么落库：现场探测只能回答「现在配没配」，回答不了「上次验证过吗、当时哪项没过」。
@@ -515,8 +520,12 @@ CREATE TABLE IF NOT EXISTS handoffs (
     status TEXT DEFAULT "open",
     claimed_by TEXT DEFAULT "",
     claimed_at TEXT DEFAULT "",
+    closed_by TEXT DEFAULT "",
+    closed_at TEXT DEFAULT "",
+    close_note TEXT DEFAULT "",
     created TEXT DEFAULT ""
 );
+CREATE INDEX IF NOT EXISTS idx_handoffs_status ON handoffs(status);
 CREATE TABLE IF NOT EXISTS files (
     project TEXT, path TEXT, name TEXT, grp TEXT,
     size INTEGER DEFAULT 0, mtime REAL DEFAULT 0,
@@ -1268,7 +1277,11 @@ def _migrate_columns(root: str) -> None:
                          ("deferred_at", "TEXT DEFAULT ''"),
                          ("approval_required", "INTEGER DEFAULT 0"),
                          ("approved_by", "TEXT DEFAULT ''"),
-                         ("approved_at", "TEXT DEFAULT ''")):
+                         ("approved_at", "TEXT DEFAULT ''"),
+                         ("rejected_by", "TEXT DEFAULT ''"),
+                         ("rejected_at", "TEXT DEFAULT ''"),
+                         ("reject_note", "TEXT DEFAULT ''"),
+                         ("reject_count", "INTEGER DEFAULT 0")):
             if col not in tcols:
                 conn.execute(f"ALTER TABLE tasks ADD COLUMN {col} {ddl}")
         # R36（2026-10-23）agent 管控状态：active 正常 / draining 收尾不接新活 /
@@ -1278,7 +1291,8 @@ def _migrate_columns(root: str) -> None:
         for col, ddl in (("control_state", "TEXT DEFAULT 'active'"),
                          ("control_note", "TEXT DEFAULT ''"),
                          ("control_at", "TEXT DEFAULT ''"),
-                         ("skills", "TEXT DEFAULT ''")):
+                         ("skills", "TEXT DEFAULT ''"),
+                         ("role", "TEXT DEFAULT 'worker'")):
             if col not in acols:
                 conn.execute(f"ALTER TABLE agents ADD COLUMN {col} {ddl}")
         # R26（2026-10-22）进展时间戳：心跳续租同样刷新 updated，拿 updated 当「任务在走」
@@ -1296,6 +1310,14 @@ def _migrate_columns(root: str) -> None:
             conn.execute("ALTER TABLE agent_onboarding ADD COLUMN fingerprint TEXT DEFAULT ''")
         if acols and "base" not in acols:
             conn.execute("ALTER TABLE agent_onboarding ADD COLUMN base TEXT DEFAULT ''")
+        # R89（2026-10-24）交接作废出口：废弃的 open 交接可关闭，必须留作废人与原因；
+        # 只加列，历史行默认空，不影响既有 open/claimed 语义。
+        hcols = {r["name"] for r in conn.execute("PRAGMA table_info(handoffs)")}
+        for col, ddl in (("closed_by", "TEXT DEFAULT ''"),
+                         ("closed_at", "TEXT DEFAULT ''"),
+                         ("close_note", "TEXT DEFAULT ''")):
+            if col not in hcols:
+                conn.execute(f"ALTER TABLE handoffs ADD COLUMN {col} {ddl}")
         cols = {r["name"] for r in conn.execute("PRAGMA table_info(projects)")}
         if "status" not in cols:
             conn.execute("ALTER TABLE projects ADD COLUMN status TEXT DEFAULT 'active'")
@@ -2443,6 +2465,7 @@ TASK_CN = {"pending": "待办", "in_progress": "进行中", "blocked": "阻塞",
            "cancelled": "已取消", "dead": "死信"}
 TASK_TERMINAL = ("done", "cancelled", "dead")  # R41/R43：终态不可逆（重开请建新任务）
 CLAIM_TTL_HOURS = 2   # 认领超时自动释放（防死锁）：claimed_at 早于该时长的 in_progress 可被接管
+TASK_APPROVAL_AGING_H = 24  # R87 待批过久提示：认领后仍未批准超过该时长，只提示复核，不是硬 SLA
 # R38：WIP（在办任务）上限，防止一个 agent 囤一堆活却推进不了。0=不限；
 # 环境变量 AGENTHUB_MAX_WIP 可覆盖（测试/临时放宽）。
 try:
@@ -2477,6 +2500,11 @@ TASK_GROUP_CN = {"ready": "可认领", "doing": "进行中", "takeover": "可接
 # paused/offline 连认领也拦。控制状态由人决定，心跳不覆盖。
 AGENT_CONTROL_STATES = ("active", "draining", "paused", "offline")
 AGENT_CONTROL_CN = {"active": "正常", "draining": "收尾", "paused": "暂停", "offline": "离线"}
+# R79：agent 角色。worker=日常读写（默认）；manager=可执行全局冻结/归档/隔离/
+# 记忆整合/自动化开关等管理动作。管理通道（CLI/GUI/REST，非 MCP 会话）隐式 manager，
+# 不落成 agent，也不占注册表。角色由管理通道显式授予，agent 不能自我提权。
+AGENT_ROLES = ("worker", "manager")
+AGENT_ROLE_CN = {"worker": "执行", "manager": "管理"}
 
 EVENT_KINDS = ("progress", "note", "error", "handoff")
 
@@ -2631,6 +2659,21 @@ def task_list(root: str, status: str = "", owner: str = "", project: str = "",
         return [dict(r) for r in conn.execute(q, args)]
 
 
+def task_approvals(root: str, project: str = "", limit: int = 50) -> list:
+    """R86 待审批队列：在办、要求审批且尚未批准的任务，按认领时间升序（等最久的先看）。"""
+    q = ("SELECT * FROM tasks WHERE status='in_progress' AND approval_required=1 "
+         "AND COALESCE(approved_by,'')=''")
+    args: list = []
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    q += (" ORDER BY CASE WHEN COALESCE(claimed_at,'')='' THEN 1 ELSE 0 END, "
+          "claimed_at ASC, id ASC LIMIT ?")
+    args.append(max(1, min(int(limit or 50), 200)))
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(q, args)]
+
+
 def task_get(root: str, tid) -> dict:
     """按 id 取任务行（不存在返回 {}）。R35：记录绑定/漂移核对共用的只读入口。"""
     try:
@@ -2742,6 +2785,49 @@ def agent_control_map(root: str) -> dict:
                     for r in conn.execute("SELECT name, control_state FROM agents")}
     except sqlite3.OperationalError:
         return {}
+
+
+def agent_role_get(root: str, agent: str) -> str:
+    """R79：读 agent 角色。未登记/旧库缺列/非法值一律按 worker（最小权限）。"""
+    key = _norm_agent(agent)
+    if not key:
+        return "worker"
+    try:
+        with db_conn(root) as conn:
+            row = conn.execute("SELECT role FROM agents WHERE name=?", (key,)).fetchone()
+    except sqlite3.OperationalError:
+        return "worker"
+    role = ((row["role"] if row else "") or "worker").strip().lower()
+    return role if role in AGENT_ROLES else "worker"
+
+
+def agent_role_map(root: str) -> dict:
+    """R79：全量 agent → 角色（列表/巡检一次读）。缺列时全员 worker。"""
+    try:
+        with db_conn(root) as conn:
+            return {r["name"]: ((r["role"] or "worker").strip().lower()
+                                if (r["role"] or "").strip().lower() in AGENT_ROLES
+                                else "worker")
+                    for r in conn.execute("SELECT name, role FROM agents")}
+    except sqlite3.OperationalError:
+        return {}
+
+
+def agent_role_set(root: str, agent: str, role: str, by: str = "") -> tuple:
+    """R79：授予/收回角色。返回 (错误或 "", 角色行)。只有管理通道/manager 能调用。"""
+    key = _norm_agent(agent)
+    val = (role or "").strip().lower()
+    if not key:
+        return "agent 必填", {}
+    if val not in AGENT_ROLES:
+        return f"角色只能是 {'/'.join(AGENT_ROLES)}（收到 {role!r}）", {}
+    now = _now()
+    with db_conn(root) as conn:
+        _upsert_agent(conn, key)
+        conn.execute("UPDATE agents SET role=? WHERE name=?", (val, key))
+        _journal_row(conn, _norm_agent(by) or "管理面", "agent 角色", key,
+                     AGENT_ROLE_CN.get(val, val) + f"（{val}）")
+    return "", {"agent": key, "role": val, "at": now}
 
 
 def agent_control_set(root: str, agent: str, state: str, note: str = "",
@@ -3159,6 +3245,78 @@ def task_approve(root: str, tid, agent: str = "", note: str = "") -> tuple:
             pass
     out["_approved"] = True
     out["_approved_by"] = who or "管理面"
+    return "", out
+
+
+def task_reject(root: str, tid, agent: str = "", reason: str = "") -> tuple:
+    """R100 审批退回：复核不通过时把任务放回待办返工，而不是让 owner 无限空等。
+
+    与批准同属 four-eyes：署名 agent 不能是当前 owner；原因必填（owner 要知道怎么改）。
+    退回会释放 owner/租约/文件锁，任务回到 pending——修改后重新认领会再次进入审批队列；
+    rejected_by/at/note 保留最近一次退回，reject_count 累计，供看板与审计追溯。
+    已批准或非在办的任务不能退回（避免抹掉审批事实或凭空打回待办）。
+    返回 (错误或 "", 行；含 _rejected_by/_reject_note)。
+    """
+    who = _norm_agent(agent) or ""
+    reason = (reason or "").strip()
+    if not reason:
+        return "退回必须写明原因（owner 需要知道哪里不合格、怎么改）", {}
+    try:
+        tid = int(tid)
+    except (TypeError, ValueError):
+        return f"任务 id 非法：{tid!r}", {}
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone()
+        if row is None:
+            return f"任务 #{tid} 不存在", {}
+        row = dict(row)
+        if not int(row.get("approval_required") or 0):
+            return (f"任务 #{tid} 未开启完成审批，不存在退回；若要打回重做，"
+                    "用 hub_task_update(status=\"pending\", detail=...)"), row
+        if row["status"] in TASK_TERMINAL:
+            return (f"任务 #{tid} 已是「{TASK_CN.get(row['status'], row['status'])}」终态，"
+                    "不能退回"), row
+        if row["status"] != "in_progress":
+            return (f"任务 #{tid} 当前是「{TASK_CN.get(row['status'], row['status'])}」，"
+                    "不在审批队列（只有 in_progress 的待批任务可退回）"), row
+        owner = (row["owner"] or "").strip()
+        if who and owner and who == owner:
+            return ("退回需他人复核：owner 不能退回自己的任务——换一个 agent，"
+                    "或管理面空传 agent"), row
+        approved_by = (row.get("approved_by") or "").strip()
+        if approved_by:
+            return (f"任务 #{tid} 已由 {approved_by} 批准完成，不能再退回；"
+                    "如验收有误，请在 detail 记录问题并新建返工任务"), row
+        now = _now()
+        cur = conn.execute(
+            "UPDATE tasks SET status='pending', owner='', claimed_at='', blocked_by='', "
+            "approved_by='', approved_at='', rejected_by=?, rejected_at=?, reject_note=?, "
+            "reject_count=COALESCE(reject_count,0)+1, next_retry_at='', defer_until='', "
+            "defer_reason='', updated=?, progress_at=? "
+            "WHERE id=? AND status='in_progress' AND approval_required=1 "
+            "AND COALESCE(approved_by,'')=''",
+            (who or "管理面", now, reason[:500], now, now, tid))
+        if cur.rowcount != 1:
+            return (f"任务 #{tid} 状态已变化（可能刚被批准或流转），退回未执行；"
+                    "请刷新后重试"), row
+        out = dict(conn.execute("SELECT * FROM tasks WHERE id=?", (tid,)).fetchone())
+        released = _release_leases_for_task(conn, tid, who or "管理面", "任务退回")
+        _touch_project_activity(conn, out["project"], out["updated"])
+        _journal_row(conn, who or "管理面", "任务退回", f"tasks#{tid}",
+                     f"退回返工｜{reason[:400]}"
+                     + (f"｜释放文件租约 {released} 个" if released else ""))
+    if owner:
+        try:
+            signal_send(root, who or "管理面",
+                        f"【审批退回】任务 #{tid}「{out['title'][:40]}」已由 "
+                        f"{who or '管理面'} 退回返工：{reason[:200]}；"
+                        "修改后重新 hub_claim，完成时仍需复核",
+                        to_agent=owner, project=out.get("project") or "")
+        except Exception:  # noqa: BLE001 通知失败不影响退回
+            pass
+    out["_rejected"] = True
+    out["_rejected_by"] = who or "管理面"
+    out["_reject_note"] = reason
     return "", out
 
 
@@ -3875,6 +4033,7 @@ def task_annotate(root: str, rows: list) -> list:
     _block_note / _lease_state / _lease_left_h / _locks / _progress_age_h / _progress_stall /
     R27 时钟：_last_cp / _last_cp_age_h / _heartbeat_at / _heartbeat_age_h（心跳为 agent 级）。
     R30 饥饿：_age_days（可开工的 pending 建了几天）/ _starve_days（≥ TASK_STARVE_DAYS 时同上）。
+    R87 审批时效：_approval_wait_h（认领后等批小时数）/ _approval_aging（≥ 阈值）。
     """
     now = datetime.datetime.now()
     today = now.date()
@@ -3911,6 +4070,24 @@ def task_annotate(root: str, rows: list) -> list:
         t["_approval_required"] = bool(int(t.get("approval_required") or 0))
         t["_approved"] = bool((t.get("approved_by") or "").strip())
         t["_approved_by"] = (t.get("approved_by") or "").strip()
+        # R100 退回留痕：最近一次退回的人/原因/时间 + 累计次数，看板与复核据此解释
+        # 「为什么这单又回到待办」，不必翻 journal。
+        t["_rejected_by"] = (t.get("rejected_by") or "").strip()
+        t["_reject_note"] = (t.get("reject_note") or "").strip()
+        try:
+            t["_reject_count"] = int(t.get("reject_count") or 0)
+        except (TypeError, ValueError):
+            t["_reject_count"] = 0
+        t["_rejected"] = t["_reject_count"] > 0
+        t["_reject_age_h"] = _age_hours((t.get("rejected_at") or "").strip(), now)
+        t["_approval_wait_h"] = None
+        t["_approval_aging"] = False
+        if (t.get("status") == "in_progress" and t["_approval_required"]
+                and not t["_approved_by"]):
+            wait_h = _age_hours((t.get("claimed_at") or "").strip(), now)
+            if wait_h is not None:
+                t["_approval_wait_h"] = wait_h
+                t["_approval_aging"] = wait_h >= TASK_APPROVAL_AGING_H
         t["_deps_info"] = []
         for i in _parse_task_deps(t.get("deps") or ""):
             dep = ref.get(i)
@@ -4671,6 +4848,9 @@ def task_metrics(root: str, days: int = 7, project: str = "", agent: str = "") -
     unowned = [t for t in wip_rows if not (t.get("owner") or "").strip()]
     waiting = [t for t in wip_rows if int(t.get("approval_required") or 0)
                and not (t.get("approved_by") or "").strip()]
+    approval_aging = [t for t in waiting
+                      if (h := _age_hours((t.get("claimed_at") or "").strip(), now))
+                      is not None and h >= TASK_APPROVAL_AGING_H]
     overdue = [t for t in wip_rows if (t.get("due") or "").strip()
                and (t.get("due") or "")[:10] < today]
     high_retry = [t for t in wip_rows if int(t.get("attempts") or 0) >= 2]
@@ -4695,6 +4875,11 @@ def task_metrics(root: str, days: int = 7, project: str = "", agent: str = "") -
     if waiting:
         risks.append({"kind": "approval_waiting", "count": len(waiting),
                       "sample": [f"#{t['id']} {t['title'][:24]}" for t in waiting[:3]]})
+    if approval_aging:
+        risks.append({"kind": "approval_aging", "count": len(approval_aging),
+                      "sample": [f"#{t['id']} {t['title'][:24]}"
+                                 f"（等批 {_age_hours((t.get('claimed_at') or '').strip(), now):g}h）"
+                                 for t in approval_aging[:3]]})
     if overdue:
         risks.append({"kind": "overdue", "count": len(overdue),
                       "sample": [f"#{t['id']} {t['title'][:24]}（{t['due'][:10]}）" for t in overdue[:3]]})
@@ -4715,6 +4900,7 @@ def task_metrics(root: str, days: int = 7, project: str = "", agent: str = "") -
                  "approval_hours": _hours_stat(approved_rows, "created", "approved_at")},
         "by_status": by_status,
         "wip": {"in_progress": len(wip_rows), "approval_waiting": len(waiting),
+                "approval_aging": len(approval_aging),
                 "stale_leases": len(stale), "unowned": len(unowned), "overdue": len(overdue)},
         "retry": {"tasks_with_attempts": rr["n"] or 0,
                   "attempts_total": rr["s"] or 0, "max_attempts": rr["m"] or 0},
@@ -4741,6 +4927,7 @@ def team_digest(root: str, days: int = 1) -> dict:
     start_date = (now - datetime.timedelta(days=days)).date().isoformat()
     claim_cut = _claim_cutoff()
     today = now.date().isoformat()
+    sec = security_snapshot(root, days=days)
 
     def clean(name) -> str:
         k = _norm_agent(name)
@@ -4811,6 +4998,8 @@ def team_digest(root: str, days: int = 1) -> dict:
         dead_rows = [dict(r) for r in conn.execute(
             "SELECT id,title,owner FROM tasks WHERE status='dead'"
             " AND COALESCE(NULLIF(updated,''),'')>=?", (cutoff,))]
+        handoff_rows = [dict(r) for r in conn.execute(
+            "SELECT id, project, agent, status, created FROM handoffs WHERE status='open'")]
         by_status = {s: 0 for s in TASK_STATUSES}
         for r in conn.execute("SELECT status, COUNT(*) n FROM tasks GROUP BY status"):
             if r["status"] in by_status:
@@ -4845,6 +5034,8 @@ def team_digest(root: str, days: int = 1) -> dict:
             " AND COALESCE(NULLIF(cancelled_at,''), NULLIF(updated,''), '')>=?", (cutoff,))
         flow["done_cycle_p50_h"] = _hours_stat(done_rows, "created", "done_at")["p50"]
 
+    handoff_annotate(handoff_rows, now)
+    handoff_stale = [h for h in handoff_rows if h["_stale"]]
     online = {clean(s.get("agent")) for s in active_sessions(root)} - {""}
     names = set(reg) | set(rec) | set(mem) | set(task) | set(err) | set(calls) | set(search)
 
@@ -4915,6 +5106,9 @@ def team_digest(root: str, days: int = 1) -> dict:
     waiting = [t for t in open_rows if t["status"] == "in_progress"
                and int(t.get("approval_required") or 0)
                and not (t.get("approved_by") or "").strip()]
+    approval_aging = [t for t in waiting
+                      if (h := _age_hours((t.get("claimed_at") or "").strip(), now))
+                      is not None and h >= TASK_APPROVAL_AGING_H]
     overdue = [t for t in open_rows if t["status"] == "in_progress"
                and (t.get("due") or "").strip() and t["due"][:10] < today]
     high_retry = [t for t in open_rows if t["status"] == "in_progress"
@@ -4923,6 +5117,7 @@ def team_digest(root: str, days: int = 1) -> dict:
     wip = {
         "in_progress": sum(1 for t in open_rows if t["status"] == "in_progress"),
         "approval_waiting": len(waiting),
+        "approval_aging": len(approval_aging),
         "stale_leases": len(stale),
         "unowned": len(unowned),
         "overdue": len(overdue),
@@ -4947,6 +5142,12 @@ def team_digest(root: str, days: int = 1) -> dict:
     add("unowned", unowned, "hub_claim 认领；长期无人做就 hub_task_update 关单")
     add("approval_waiting", waiting,
         "管理面审批后 hub_task_update(approved_by=...)，别让任务空等")
+    add("approval_aging", approval_aging,
+        f"待批已 ≥{TASK_APPROVAL_AGING_H}h：先看进展——还在施工就催进度/改期，"
+        "真在等批就 hub_task_approve；只提示复核，不是硬 SLA")
+    add("handoff_stale", handoff_stale,
+        f"未认领交接已 ≥{HANDOFF_STALE_DAYS} 天：hub_handoff claim 接手；"
+        "已废弃的请在项目记录说明后重建，别让旧交接一直挂着")
     add("overdue", overdue, "核对截止日：改期、拆分，或明确取消")
     add("dead_letter", dead_rows, "看 last_error 复盘：重开任务或确认放弃")
     add("retry_storm", high_retry, "先看 last_error，别盲目重试；需要时 hub_handoff 交接")
@@ -4973,9 +5174,18 @@ def team_digest(root: str, days: int = 1) -> dict:
                        for r in zero_samples[:3]],
             "hint": "换关键词/补记录；同词反复零命中说明索引或描述要改",
         })
+    if sec["total"]:
+        risks.append({
+            "kind": "security_denied", "count": sec["total"], "agents": [],
+            "sample": [f"{x['tool']} {x['count']} 次" for x in sec["by_tool"][:3]],
+            "hint": f"近 {days} 天越权拦截 {sec['total']} 次（未锁身份 {sec['identity']} / "
+                    f"角色越权 {sec['role']}）——检查 MCP 是否用 --agent 启动、"
+                    'worker 是否该授 manager；hub_status(view="security") 看明细',
+        })
 
-    order = ["lease_stale", "unowned", "approval_waiting", "overdue", "offline_with_open",
-             "dead_letter", "retry_storm", "errors_open", "zero_hit_search"]
+    order = ["lease_stale", "unowned", "approval_waiting", "approval_aging", "overdue",
+             "offline_with_open", "dead_letter", "retry_storm", "handoff_stale",
+             "security_denied", "errors_open", "zero_hit_search"]
     risks.sort(key=lambda x: (order.index(x["kind"]) if x["kind"] in order else 99,
                               -x["count"]))
     suggestions = [r["hint"] for r in risks]
@@ -4995,6 +5205,9 @@ def team_digest(root: str, days: int = 1) -> dict:
         "open_total": sum(v for k, v in by_status.items()
                           if k not in ("done", "cancelled", "dead")),
         "wip": wip,
+        "handoffs": {"open": len(handoff_rows), "stale": len(handoff_stale)},
+        "security": {"denied": sec["total"], "identity": sec["identity"],
+                     "role": sec["role"]},
         "claim_ttl_hours": CLAIM_TTL_HOURS,
         "freeze": {"active": bool(fr.get("active")), "until": fr.get("until") or "",
                    "reason": fr.get("reason") or "", "by": fr.get("by") or ""},
@@ -7668,6 +7881,56 @@ def journal_list(root: str, limit: int = 200) -> list:
             "SELECT * FROM journal ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),))]
 
 
+SECURITY_WINDOW_DAYS = 7  # R90 安全态势默认窗口：拦截是低频事件，7 天足够发现配置漂移
+
+
+def security_snapshot(root: str, days: int = SECURITY_WINDOW_DAYS) -> dict:
+    """R90 越权拦截可观测（只读）：聚合近 N 天 journal 的「越权拦截」。
+
+    拒绝本身已在发生处留痕，但散在流水里没人看——管理者无法回答「谁在冒名、
+    哪个工具被反复尝试」。按工具归并，区分「未锁身份」与「角色越权」；
+    时间窗口按 ISO 字符串比较，坏时间不猜（ts 为空自然落在窗口外）。
+    """
+    try:
+        days = max(1, min(int(days), 365))
+    except (TypeError, ValueError):
+        days = SECURITY_WINDOW_DAYS
+    cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)).isoformat(timespec="seconds")
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id,ts,agent,action,target,note FROM journal "
+            "WHERE action='越权拦截' AND ts>=? ORDER BY id DESC", (cutoff,))]
+    by_tool: dict = {}
+    by_agent: dict = {}
+    for r in rows:
+        tool = (r.get("target") or "").split(":", 1)[0] or "-"
+        slot = by_tool.setdefault(tool, {"tool": tool, "count": 0, "identity": 0,
+                                         "role": 0, "last": ""})
+        slot["count"] += 1
+        note = r.get("note") or ""
+        kind = ("identity" if "未锁定" in note
+                or (r.get("target") or "").endswith(":identity") else "role")
+        slot[kind] += 1
+        if (r.get("ts") or "") > slot["last"]:
+            slot["last"] = r.get("ts") or ""
+        ag = (r.get("agent") or "").strip().lower() or "unknown"
+        aslot = by_agent.setdefault(ag, {"agent": ag, "count": 0, "identity": 0,
+                                         "role": 0, "last": ""})
+        aslot["count"] += 1
+        aslot[kind] += 1
+        if (r.get("ts") or "") > aslot["last"]:
+            aslot["last"] = r.get("ts") or ""
+    recent = [{"ts": r.get("ts") or "", "agent": r.get("agent") or "unknown",
+               "target": r.get("target") or "-", "note": (r.get("note") or "")[:120]}
+              for r in rows[:5]]
+    return {"days": days, "window_start": cutoff, "total": len(rows),
+            "identity": sum(x["identity"] for x in by_tool.values()),
+            "role": sum(x["role"] for x in by_tool.values()),
+            "by_tool": sorted(by_tool.values(), key=lambda x: (-x["count"], x["tool"])),
+            "by_agent": sorted(by_agent.values(), key=lambda x: (-x["count"], x["agent"])),
+            "recent": recent}
+
+
 def error_add(root: str, agent: str, title: str, detail: str = "",
               project: str = "", undo: str = "") -> str:
     if not title or not title.strip():
@@ -7704,6 +7967,9 @@ def error_set_status(root: str, error_id: int, status: str) -> str:
 
 # ---------------------------------------------------------------- 交接协议（2.2）
 
+HANDOFF_STALE_DAYS = 3  # R88 未认领交接超过该天数标陈旧（只提示复核，不自动关闭）
+
+
 def create_handoff(root: str, project: str, agent: str, done: str = "",
                    next_step: str = "", excluded: str = "") -> str:
     """交接（handoff as a protocol）：换 agent 接手时写下 typed 固定字段——
@@ -7739,7 +8005,21 @@ def list_handoffs(root: str, project: str = "", include_claimed: bool = False) -
         args.append(project)
     q += " ORDER BY id DESC LIMIT 50"
     with db_conn(root) as conn:
-        return [dict(r) for r in conn.execute(q, args)]
+        rows = [dict(r) for r in conn.execute(q, args)]
+    return handoff_annotate(rows)
+
+
+def handoff_annotate(rows: list, now=None) -> list:
+    """R88 交接时效：补 _age_h / _age_days / _stale。时间不可解析不猜；
+    只有 open（待认领）且 ≥ HANDOFF_STALE_DAYS 天算陈旧，已认领不误标。"""
+    now = now or datetime.datetime.now()
+    for r in rows:
+        age_h = _age_hours((r.get("created") or "").strip(), now)
+        r["_age_h"] = age_h
+        r["_age_days"] = round(age_h / 24, 1) if age_h is not None else None
+        r["_stale"] = bool(r.get("status") == "open" and age_h is not None
+                           and age_h >= HANDOFF_STALE_DAYS * 24)
+    return rows
 
 
 def claim_handoff(root: str, handoff_id, agent: str) -> str:
@@ -7756,13 +8036,52 @@ def claim_handoff(root: str, handoff_id, agent: str) -> str:
             "UPDATE handoffs SET status='claimed', claimed_by=?, claimed_at=? "
             "WHERE id=? AND status='open'", (agent, _now(), handoff_id))
         if cur.rowcount == 0:
-            row = conn.execute("SELECT status, claimed_by FROM handoffs WHERE id=?",
-                               (handoff_id,)).fetchone()
+            row = conn.execute(
+                "SELECT status, claimed_by, closed_by, close_note FROM handoffs WHERE id=?",
+                (handoff_id,)).fetchone()
             if not row:
                 return f"交接 #{handoff_id} 不存在"
+            if row["status"] == "closed":
+                return (f"交接 #{handoff_id} 已作废（{row['closed_by'] or '他人'}："
+                        f"{row['close_note'] or '无原因'}），不可认领")
             return f"交接 #{handoff_id} 已被 {row['claimed_by'] or '他人'} 认领（status={row['status']}），不可重复认领"
     journal_add(root, agent, "认领交接", target=f"handoffs#{handoff_id}")
     return f"已认领交接 #{handoff_id}（接手人：{agent}）"
+
+
+def close_handoff(root: str, handoff_id, agent: str, note: str) -> str:
+    """作废未认领交接（open → closed）：必须留原因与操作者，只关 open。
+    已认领的交接是「已发生的事实」，不能作废——那会抹掉接手人与认领时间；
+    接手后要终止，应新建一条交接或发信号说明。返回错误或「已关闭交接 #id」。"""
+    if not isinstance(handoff_id, int) or isinstance(handoff_id, bool) or handoff_id <= 0:
+        return f"交接 id 非法：{handoff_id!r}"
+    agent = _norm_agent(agent)
+    if not agent:
+        return "agent 必填"
+    note = (note or "").strip()
+    if not note:
+        return "note 必填（说明作废原因，便于追溯）"
+    with db_conn(root) as conn:
+        cur = conn.execute(
+            "UPDATE handoffs SET status='closed', closed_by=?, closed_at=?, close_note=? "
+            "WHERE id=? AND status='open'", (agent, _now(), note[:1000], handoff_id))
+        if cur.rowcount == 0:
+            row = conn.execute(
+                "SELECT status, claimed_by, closed_by, closed_at, close_note "
+                "FROM handoffs WHERE id=?", (handoff_id,)).fetchone()
+            if not row:
+                return f"交接 #{handoff_id} 不存在"
+            if row["status"] == "claimed":
+                return (f"交接 #{handoff_id} 已被 {row['claimed_by'] or '他人'} 认领，"
+                        "不能作废（接手已发生；如确需终止，请新建交接或发信号说明）")
+            if row["status"] == "closed":
+                return (f"已关闭交接 #{handoff_id}（此前由 {row['closed_by'] or '他人'} 于 "
+                        f"{row['closed_at'] or '时间未知'} 作废："
+                        f"{row['close_note'] or '无原因'}）")
+            return f"交接 #{handoff_id} 当前状态 {row['status']}，不可作废"
+    journal_add(root, agent, "关闭交接", target=f"handoffs#{handoff_id}",
+                note=note[:120])
+    return f"已关闭交接 #{handoff_id}（操作者 {agent}，作废原因：{note[:120]}）"
 
 
 # ---------------------------------------------------------------- 信号（M3）
@@ -9200,9 +9519,14 @@ def active_sessions(root: str, ttl: int = SESSION_TTL) -> list:
 
 
 def list_agents(root: str) -> list:
-    """注册 agent 全表 + 在线状态（sessions 存活者打 live 标），按最近活跃排序。"""
+    """注册 agent 全表 + 在线状态（sessions 存活者打 live 标），按最近活跃排序。
+
+    并列（同秒注册/同一批种子数据）按 name 升序兜底：SQLite 对 ORDER BY 并列行
+    不保证顺序，曾让下拉框选中值在 zcode/workbuddy 之间漂移，结构快照基线随之抖动。
+    """
     with db_conn(root) as conn:
-        rows = [dict(r) for r in conn.execute("SELECT * FROM agents ORDER BY last_seen DESC")]
+        rows = [dict(r) for r in conn.execute(
+            "SELECT * FROM agents ORDER BY last_seen DESC, name ASC")]
     online = {s["agent"] for s in active_sessions(root)}
     for r in rows:
         r["online"] = r["name"] in online
@@ -9237,8 +9561,9 @@ def status_snapshot(root: str) -> dict:
             "SELECT id, agent, title FROM errors WHERE status='open' ORDER BY id DESC LIMIT 5")]
         out["errors_open_total"] = conn.execute(
             "SELECT COUNT(*) FROM errors WHERE status='open'").fetchone()[0]
-        out["handoffs"] = [dict(r) for r in conn.execute(
-            "SELECT id, project, agent FROM handoffs WHERE status='open' ORDER BY id DESC LIMIT 5")]
+        out["handoffs"] = handoff_annotate([dict(r) for r in conn.execute(
+            "SELECT id, project, agent, status, created FROM handoffs WHERE status='open' "
+            "ORDER BY id DESC LIMIT 5")], now)
         out["handoffs_total"] = conn.execute(
             "SELECT COUNT(*) FROM handoffs WHERE status='open'").fetchone()[0]
         out["pinned"] = [dict(r) for r in conn.execute(
@@ -9274,6 +9599,22 @@ def status_snapshot(root: str) -> dict:
             stale_claims.append(d)
         out["stale_claims"] = stale_claims
         out["claim_ttl_hours"] = CLAIM_TTL_HOURS
+        # R98：审批积压也是「过程可见性」的一部分——只在专门队列里可见，日常状态页
+        # 就会漏掉「有人在等拍板」。口径与 task_approvals 一致（等最久优先）。
+        out["approvals"] = [dict(r) for r in conn.execute(
+            "SELECT id,project,title,owner,claimed_at FROM tasks "
+            "WHERE status='in_progress' AND approval_required=1 "
+            "AND COALESCE(approved_by,'')='' "
+            "ORDER BY CASE WHEN COALESCE(claimed_at,'')='' THEN 1 ELSE 0 END, "
+            "claimed_at ASC, id ASC LIMIT 5")]
+        out["approvals_total"] = conn.execute(
+            "SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND approval_required=1 "
+            "AND COALESCE(approved_by,'')=''").fetchone()[0]
+        for t in out["approvals"]:
+            wait_h = _age_hours((t.get("claimed_at") or "").strip(), now)
+            t["_approval_wait_h"] = wait_h
+            t["_approval_aging"] = bool(wait_h is not None
+                                        and wait_h >= TASK_APPROVAL_AGING_H)
     out["todos"] = extract_todos(root, limit=5)
     return out
 

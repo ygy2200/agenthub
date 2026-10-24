@@ -201,8 +201,18 @@ class BrainPage(QWidget):
                     chip = status_chip(f"已审批 {t['approved_by']}", "success")
                     chip.setToolTip("已由他人复核批准；持有者可标 done")
                 else:
-                    chip = status_chip("待审批", "warning")
-                    chip.setToolTip("done 前需他人/管理面 hub_task_approve 批准（owner 不能自批）")
+                    wait_h = t.get("_approval_wait_h")
+                    if isinstance(wait_h, (int, float)):
+                        aging = bool(t.get("_approval_aging"))
+                        chip = status_chip(f"待批 {wait_h:g}h",
+                                           "warning" if aging else "text_secondary")
+                        chip.setToolTip(
+                            (f"待批过久：已等 {wait_h:g}h（阈值 {brain.TASK_APPROVAL_AGING_H}h）——"
+                             if aging else f"已等批 {wait_h:g}h——")
+                            + "done 前需他人/管理面 hub_task_approve 批准（owner 不能自批）")
+                    else:
+                        chip = status_chip("待审批", "warning")
+                        chip.setToolTip("done 前需他人/管理面 hub_task_approve 批准（owner 不能自批）")
                 r.addWidget(chip)
             # R14 文件租约可见性：挂在本任务上的活跃锁（与 hub_tasks 行尾「锁 N」同口径）
             locks = t.get("_locks") or 0

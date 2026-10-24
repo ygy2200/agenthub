@@ -71,6 +71,11 @@ _DYNAMIC = (
     # 陈旧态还会列出当时漂移的文件名——整句都是运行态投影而非 UI 结构，整句打码。
     (re.compile(r"^(?:⚠\s*)?(?:未找到可用的 python\.exe|MCP server|服务端就绪).*"),
      "<DEPLOY_STATUS>"),
+    # playbook/signal 的 agent 下拉选中项是**裸 agent 名**（R104）：注册表顺序虽已
+    # 确定化（core.agent_known_names 排序），但增删 adapter 仍会改默认选中项——
+    # 选中谁不是 UI 结构，整名打码，下拉结构由 class_count 守住。
+    (re.compile(r"^(?:zcode|workbuddy|qoder|dsh|hermes|claude|codex|deepseek|mcp-server|other)$"),
+     "<AGENT>"),
 )
 
 

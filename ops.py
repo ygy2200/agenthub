@@ -53,6 +53,8 @@ CHECKS = {
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
+    "mcp_drift": ("接入参数漂移巡检（R103）：配了 agenthub 但配得不对的入口——--agent 被删（未锁身份，署名闸会持续拦写）/锁名与注册名不符（归属分裂）/server 脚本路径失效（MCP 起不来）/--root 指向别库。这些事后只在越权拦截流水露痕迹，这里事前点名", False),
+    "usage_health": ("用量异常巡检（R105）：多 agent 共用大脑的行为异常检测——单 agent 近 1h 调用量失控嫌疑（速率限制硬拦前的软信号）、单工具 10 分钟循环调用嫌疑、MCP 已配置但近 7 天零调用的接入闲置、空归属调用计数（归因缺口）。只读不动手", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计 / 零触发按 agent 活性分级）——检测规则有没有被真正执行，而非只写在纸面", False),
     "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
     "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
@@ -74,15 +76,16 @@ CHECKS = {
     "profile_surface": ("被动上下文预算（2026-10-18 R8，C7）：tools/list 每会话推一次，是被动 token 成本——外部研究（wavespeed：模型过 ~40 工具开始退化；上下文爆炸 5 server×12 tool×800 token≈48k）。实测三档 profile 工具数与序列化体积，admin 超预算即 warn，防工具描述无声膨胀。R8 评估结论：默认保持 admin（切 worker 只省 3.8K tok 却藏起 5 个在用工具，不划算）", False),
     "stale_health": ("陈旧健康（2026-10-18 R3，D3）：① 硬不变量——已标 superseded_by 的旧事实不得被检索返回（泄漏=检索管线回归）；② 陈旧 fact 清单（写入 >45 天且零唤起 → 该复核候选）。由来：外部研究一致把 staleness rate 列为记忆系统第一指标（persistence≠truth）。不发明真相预言机，只让泄漏可抓、陈旧可见", False),
     "tasks_health": ("任务治理巡检（R5 2026-10-21，R30/R34/R35/R43 扩展）：在办任务的过期租约/无主/持有者心跳已停/截止日已过/待办饥饿，近 7 天 done 任务的交付物证据核对，「记录称已完成、任务却没关」的闭环漂移，以及重试耗尽的死信任务——认领了没人续、人走了任务还挂着、声明过的产物缺失、完成只停在记录里、失败多次后无声退出队列，都会让「谁在干什么」失真；只报不动手（接管 hub_claim，关单/改派 hub_task_update，死信 hub_task_retry）", False),
+    "governance_health": ("治理面巡检（R93 2026-10-24）：把「等人拍板」的积压收成一张单子——待批超过 TASK_APPROVAL_AGING_H(24h) 的任务、超过 HANDOFF_STALE_DAYS(3天) 仍无人认领的交接、近 7 天越权拦截中的未锁身份（配置漂移，归属不可信）与角色越权≥3 次（反复试探）。与 tasks_health 分工：那边看任务/租约是否健康，这边看管理动作是否积压；只报不动手（hub_task_approve / hub_handoff claim/close / 核对各 agent 的 --agent 启动参数）", False),
     "lease_health": ("文件租约巡检（R12 2026-10-21）：活跃租约互相冲突/任务绑定漂移/持有者未登记一次点名；过期未释放只报数供清理，不算失败——租约不拦写盘，但冲突看不见就会让两个 agent 同时改同一文件；只报不动手（list 看台账、release 释放、先 signal 协调）", False),
 }
 
 # R8 一键自检：巡哪些项 + 每项失败时「下一步怎么做」（修复建议必须可执行，
 # 不是「请检查」这类把活推回人的废话）。巡检项刻意不含需要 target 的（回归/部署比对）。
 PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_chain", "security_health",
-                 "backup_health", "rules_health",
+                 "backup_health", "rules_health", "mcp_drift", "usage_health",
                  "stale_health", "ghost_memory", "dup_mem", "record_quality",
-                 "date_health", "tasks_health", "lease_health", "inbox", "stalled")
+                 "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
     "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
     "env": "按 detail 点名项修环境（Python/代理/磁盘/库路径）；装依赖用 pip install -e .",
@@ -92,12 +95,15 @@ CHECK_FIXES = {
     "security_health": "审计链/N 类问题按各自点名项处理；明文凭据：把密钥改放环境变量或凭据文件，清掉大脑里的明文（记录用 hub_undo/新记录更正，记忆用 hub_memory_supersede，随记/错误用对应工具更新或删除），再轮换已泄露的密钥——删掉文本不等于密钥没泄露过",
     "backup_health": "hub_export action=backup 生成整包；清理用 action=prune（确认后 apply=true）",
     "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门；零触发且有记录的 agent 去其会话实测一次写工具调用，确认钩子加载",
+    "mcp_drift": "按点名项修对应 agent 的 MCP 配置（args）：缺 --agent / 锁名不符 → cli.py onboard <agent> 重写；server 脚本不存在 → cli.py deploy 后改配置路径；--root 指向别库 → 改回 config.root 或删掉 --root（serve 会动态跟随）",
+    "usage_health": "失控/循环：先用 hub_usage_timeline(agent/tool 过滤) 看是否同一调用在反复打——是循环就修触发方（agent 端脚本的 retry 上限），速率限制 AGENTHUB_RATE_* 可临时收紧；接入闲置：确认该 agent 是否还需要，不用就下线接入（防配置漂移无人发现），还用就让它的会话跑一次真实调用",
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
     "record_quality": "hub_log_work 的 content 按四段式写：目的/做了什么/验证结果/如何回滚",
     "date_health": "把 date/valid_until/截止日改成 YYYY-MM-DD（格式歪了到期提醒会静默失效）",
     "tasks_health": "过期/失联持有者：确认后 hub_claim 接管；不再做则 hub_task_update 改派或释放；逾期任务重排截止日；待办饥饿：hub_next 认领，或改优先级/关单；交付物证据不全：补交付，或用 hub_task_update(deliverables=...) 修正声明；完成声明未关单：核对记录后 hub_task_update(status=\"done\") 关单，或用 hub_log_work(task=id) 绑定后续报；死信：看 last_error 后 hub_task_retry 复活，或 hub_task_update(status=\"cancelled\") 放弃",
+    "governance_health": "待批过久：逐个 hub_task_approve（owner 不能自批，换他人/管理面）；陈旧交接：有人接就 hub_handoff action=claim，不要了就 action=close（note 必填）；未锁身份拦截：对应 agent 的 MCP 启动参数缺 --agent，改配置后重启该会话（归属才会锁定）；角色越权≥3：核对被拦工具的所需角色（hub_role），不是该 agent 的职责就别再试，误拦则调角色配置",
     "lease_health": "冲突：先 hub_signal_send 协调，再由一方 hub_lock action=release；任务绑定漂移：brain 会在任务完成/换主时自动释放，出现漂移先 release 再查 journal；过期未释放：hub_lock action=prune 一键回收（只标记释放，活跃不受影响）",
     "inbox": "把 00_Inbox 文件分拣进对应项目目录（或 hub_search_files 找回）",
     "stalled": "显式标记项：归档 hub_archive_project（需拍板）或 hub_task_add 写下下一步（任务写入会自动恢复 active）；[漏标] 项核实最后活动后归档或补记",
@@ -208,6 +214,10 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _compress(root)
     elif name == "agents":
         r = _agents(root)
+    elif name == "mcp_drift":
+        r = _mcp_drift(root)
+    elif name == "usage_health":
+        r = _usage_health(root)
     elif name == "rules_health":
         r = _rules_health(root)
     elif name == "agent_onboard":
@@ -252,6 +262,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _stale_health(root)
     elif name == "tasks_health":
         r = _tasks_health(root)
+    elif name == "governance_health":
+        r = _governance_health(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
@@ -2134,6 +2146,157 @@ def _agent_onboard(root: str, target: str = "") -> dict:
     return {"ok": not bad, "summary": summary, "detail": detail[:8]}
 
 
+def _mcp_drift(root: str) -> dict:
+    """接入参数漂移巡检（R103）：配了 agenthub 但**配得不对**的入口。
+
+    R6/R9 的 onboard 清单只查「有没有配」，不查 args 本身——而 agent 端配置是
+    手工可改的活文件：--agent 被删（会话未锁身份，R82-R101 署名闸会持续拦写）、
+    锁名与注册名不符（归属分裂，undo/复核/审批都找错人）、server 脚本路径失效
+    （MCP 直接起不来）、--root 指向别库（写错数据根目录）。这些都是事后才在
+    「越权拦截」流水里露出痕迹的事前可检项。
+    """
+    if err := _need_root(root):
+        return err
+    core = _import_core()
+    try:
+        rows = [r for r in core.agent_bootstrap_status(root) if r.get("mcp") is True]
+        reg = core.agent_known_names(root)
+        cfg_root = str(core.load_config().get("root") or "")
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"配置读取失败：{type(e).__name__}: {str(e)[:80]}",
+                "detail": []}
+    issues, detail, healthy = [], [], []
+    for r in rows:
+        name = r["agent"]
+        a = core.find_adapter(root, name)
+        spec = core._mcp_spec_of(a) if a else None
+        entry = None
+        if spec:
+            try:
+                entry = core.mcp_agenthub_entry(spec[0], r.get("layout", ""))
+            except Exception:  # noqa: BLE001 单家解析失败不拖垮整单
+                entry = {}
+        if not entry:  # 没配 / bundle / 解析不出——agents 与 onboard 检查项已管
+            continue
+        args = entry.get("args") or []
+        problems = []
+        srv = next((x for x in args if x.replace("\\", "/").endswith("agenthub_mcp.py")), "")
+        if srv and not Path(os.path.expandvars(os.path.expanduser(srv))).is_file():
+            problems.append(("fail", f"server 脚本不存在：{srv}"))
+        locked = ""
+        for i, v in enumerate(args):
+            if v == "--agent" and i + 1 < len(args):
+                locked = args[i + 1]
+                break
+        reg_key = core.agent_key(name)
+        if not locked:
+            problems.append(("warn", "未锁 --agent：R82-R101 署名闸会持续拦写操作（冒名防线生效中，但该 agent 写不了任何东西）"))
+        else:
+            lock_key = core.agent_key(locked)
+            if lock_key != reg_key:
+                if lock_key in reg:
+                    problems.append(("warn", f"--agent {locked} 是别家注册名（本 agent 是 {name}）——归属分裂，undo/复核/审批都找错人"))
+                else:
+                    problems.append(("warn", f"--agent {locked} 不在注册表——写入会被 check_agent 拒收"))
+        for i, v in enumerate(args):
+            if v == "--root" and i + 1 < len(args):
+                arg_root = os.path.normcase(os.path.expandvars(os.path.expanduser(args[i + 1])))
+                cfg = os.path.normcase(os.path.expandvars(os.path.expanduser(cfg_root))) if cfg_root else ""
+                if cfg and arg_root != cfg:
+                    problems.append(("warn", f"--root {args[i + 1]} 与 config.root 不同库（写入目标分裂）"))
+                break
+        if problems:
+            for lvl, msg in problems:
+                issues.append(name)
+                detail.append(f"{name}: {'✗' if lvl == 'fail' else '⚠'} {msg}")
+        else:
+            healthy.append(f"{name}: ✓ 锁名 {locked or '—'}、脚本与 root 均一致")
+    # 漂移行优先展示：detail 是给管理者看的，✓ 行再多也不能把要修的挤出截断窗口
+    detail = (detail + healthy)[:12]
+    if issues:
+        bad = [d for d in detail if "✗" in d]
+        summary = (f"{len(rows)} 家接入里 {len(set(issues))} 家参数漂移"
+                   + (f"（{len(bad)} 项硬故障）" if bad else "（均为告警级）"))
+    else:
+        summary = f"{len(rows)} 家接入参数均与注册表一致（锁名/脚本/root）"
+    return {"ok": not issues, "summary": summary, "detail": detail}
+
+
+def _usage_health(root: str) -> dict:
+    """用量异常巡检（R105）：多 agent 共用大脑，行为异常要看得见——
+    ① 失控嫌疑：单 agent 近 1h 调用量超 AGENTHUB_USAGE_HOURLY_ALARM（默认 300，
+    速率限制 agent 级 2000/60s 之前的软信号，让管理者在硬拦截前看到）；
+    ② 循环嫌疑：单 agent+单工具 10 分钟窗口重复超 USAGE_LOOP_ALARM（默认 60，
+    如反复重试同一失败调用——速率限制兜底前的人可读信号）；
+    ③ 接入闲置：MCP 已配置但近 7 天零调用的注册 agent（与 agents 检查项分工：
+    那边查「接没接上」，这边查「接上了用不用」）；
+    ④ 空 agent 调用计数：tool_calls 里归属为空的调用是归因缺口（417 条空归属教训），
+    只作信息行不算失败。只读不动手。"""
+    if err := _need_root(root):
+        return err
+    import brain as _brain  # noqa: PLC0415
+    core = _import_core()
+    try:
+        hourly_alarm = int(os.environ.get("AGENTHUB_USAGE_HOURLY_ALARM", "300"))
+    except ValueError:
+        hourly_alarm = 300
+    try:
+        loop_alarm = int(os.environ.get("AGENTHUB_USAGE_LOOP_ALARM", "60"))
+    except ValueError:
+        loop_alarm = 60
+    now = datetime.datetime.now()
+    h1 = (now - datetime.timedelta(hours=1)).isoformat(timespec="seconds")
+    m10 = (now - datetime.timedelta(minutes=10)).isoformat(timespec="seconds")
+    d7 = (now - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+    try:
+        with _brain.db_conn(root) as conn:
+            hour_rows = conn.execute(
+                "SELECT agent, COUNT(*) n FROM tool_calls WHERE ts>=? GROUP BY agent",
+                (h1,)).fetchall()
+            loop_rows = conn.execute(
+                "SELECT agent, tool, COUNT(*) n FROM tool_calls WHERE ts>=? "
+                "GROUP BY agent, tool HAVING n>?", (m10, loop_alarm)).fetchall()
+            recent_agents = {r["agent"] for r in conn.execute(
+                "SELECT DISTINCT agent FROM tool_calls WHERE ts>=?", (d7,))}
+            empty_agent = conn.execute(
+                "SELECT COUNT(*) n FROM tool_calls WHERE ts>=? AND (agent='' OR agent IS NULL)",
+                (d7,)).fetchone()["n"]
+            # 空库（无任何工作记录）没有「使用」语义——临时库/测试库里内置适配器
+            # 零调用是常态，按闲置报全是误报；闲置检测只在有使用历史的库上跑。
+            has_history = conn.execute("SELECT EXISTS(SELECT 1 FROM records)").fetchone()[0]
+        configured = {core.agent_key(r["agent"]) for r in core.agent_bootstrap_status(root)
+                      if r.get("mcp") is True}
+        registered = set(core.agent_known_names(root))
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"用量查询失败：{type(e).__name__}: {str(e)[:80]}",
+                "detail": []}
+    issues, detail = [], []
+    for r in hour_rows:
+        if int(r["n"]) > hourly_alarm:
+            who = r["agent"] or "(空归属)"
+            issues.append(who)
+            detail.append(f"{who}: ⚠ 近 1h 调用 {r['n']} 次（>{hourly_alarm}，失控嫌疑——"
+                          "核对是否在循环重试；速率限制在 2000 次/60s 兜底）")
+    for r in loop_rows:
+        who = r["agent"] or "(空归属)"
+        issues.append(who)
+        detail.append(f"{who}: ⚠ 工具 {r['tool']} 10 分钟 {r['n']} 次（>{loop_alarm}，"
+                      "循环调用嫌疑——先 hub_usage_timeline(tool=...) 看是否同一参数反复打）")
+    if has_history:
+        idle = sorted(a for a in registered - recent_agents if a in configured
+                      and a not in _brain._NON_AGENT)
+        if idle:
+            detail.append(f"接入闲置：{'、'.join(idle)}（MCP 已配置但近 7 天零调用——"
+                          "确认还需要吗：不用就下线接入，避免配置漂移无人发现）")
+            issues.extend(idle)
+    detail.append(f"信息：近 7 天空归属调用 {empty_agent} 次"
+                  + ("——归属缺口，核查未锁 --agent 的接入" if empty_agent else ""))
+    if issues:
+        summary = f"用量异常 {len(set(issues))} 家（失控/循环/闲置）"
+        return {"ok": False, "summary": summary, "detail": detail[:12]}
+    return {"ok": True, "summary": "用量正常（无失控/循环/闲置信号）", "detail": detail[:8]}
+
+
 def _runtime_health(root: str = "") -> dict:
     """R7：运行版本体检——进程加载的代码是否落后于磁盘。
 
@@ -2521,6 +2684,77 @@ def _tasks_health(root: str) -> dict:
                         "完成声明未关单：核对后 hub_task_update(status=\"done\") 关单；"
                         "死信：查 last_error 后 hub_task_retry 复活或 hub_task_update(status=\"cancelled\") 放弃"),
             "detail": detail}
+
+
+GOVERNANCE_ROLE_DENY_ALERT = 3  # R93 同窗口内角色越权达该次数才点名；1-2 次只提示（偶发误试≠失控）
+
+
+def _governance_health(root: str) -> dict:
+    """R93 治理面巡检（2026-10-24，只读）：需要管理者拍板的积压，一张单子看完。
+
+    四类信号，都已在 GUI/CLI 单页可见，但没进例行巡检——没人主动看就不会被处理：
+      · 待批任务超过 TASK_APPROVAL_AGING_H（24h）：审批链成了瓶颈；
+      · 未认领交接超过 HANDOFF_STALE_DAYS（3 天）：换了 agent 却没交接/没人接；
+      · 未锁身份拦截：agent 启动参数缺 --agent，归属不可信（配置漂移）；
+      · 角色越权 ≥ GOVERNANCE_ROLE_DENY_ALERT 次：反复试探，不是误触。
+    与 tasks_health 分工：那边看任务/租约本身是否健康，这边看管理动作是否积压。
+    只报不动手：审批 hub_task_approve，交接 hub_handoff claim/close，
+    身份漂移核对各 agent 接入配置。
+    """
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        approvals = brain.task_approvals(root, limit=200)
+        brain.task_annotate(root, approvals)
+        handoffs = brain.list_handoffs(root)
+        sec = brain.security_snapshot(root, days=brain.SECURITY_WINDOW_DAYS)
+        aging_h = brain.TASK_APPROVAL_AGING_H
+        stale_days = brain.HANDOFF_STALE_DAYS
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False,
+                "summary": f"治理巡检查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    aging = [t for t in approvals if t.get("_approval_aging")]
+    stale = [h for h in handoffs if h.get("_stale")]
+    wait_known = [t["_approval_wait_h"] for t in approvals
+                  if isinstance(t.get("_approval_wait_h"), (int, float))]
+    longest = max(wait_known, default=0.0)
+    identity = int(sec.get("identity") or 0)
+    role = int(sec.get("role") or 0)
+    problems, detail = [], []
+    if aging:
+        problems.append(f"待批过久 {len(aging)}")
+        for t in aging[:3]:
+            detail.append(f"任务 #{t['id']}「{(t.get('title') or '')[:24]}」等批 "
+                          f"{t['_approval_wait_h']:.1f}h（@{t.get('owner') or '无主'}）"
+                          "— hub_task_approve")
+    if stale:
+        problems.append(f"陈旧交接 {len(stale)}")
+        for h in stale[:3]:
+            detail.append(f"交接 #{h['id']}「{(h.get('project') or '')[:20]}」已等 "
+                          f"{h['_age_days']:g} 天 — hub_handoff claim/close")
+    if identity:
+        problems.append(f"未锁身份拦截 {identity}")
+        detail.append("未锁身份拦截：agent 启动参数缺 --agent，归属不可信——核对接入配置后重启会话")
+    if role >= GOVERNANCE_ROLE_DENY_ALERT:
+        problems.append(f"角色越权 {role}")
+    if identity or role >= GOVERNANCE_ROLE_DENY_ALERT:
+        for slot in sec.get("by_tool", [])[:3]:
+            detail.append(f"近 {sec['days']} 天 {slot['tool']} 被拦 {slot['count']} 次"
+                          f"（未锁身份 {slot['identity']}/角色 {slot['role']}）")
+    if not problems:
+        note = f"待批 {len(approvals)} 条"
+        if approvals:
+            note += f"（最长 {longest:.1f}h，阈值 {aging_h}h）"
+        note += f"、无陈旧交接、近 {sec['days']} 天无未锁身份拦截"
+        if role:
+            note += f"（角色越权 {role} 次，未达告警阈值 {GOVERNANCE_ROLE_DENY_ALERT}）"
+        return {"ok": True, "summary": f"治理面健康：{note}", "detail": detail[:8]}
+    return {"ok": False,
+            "summary": (f"治理面发现 {len(problems)} 类积压（{' / '.join(problems)}）——"
+                        f"审批 hub_task_approve；交接 hub_handoff claim/close（>{stale_days:g} 天判陈旧）；"
+                        "身份漂移核对各 agent 的 --agent 启动参数"),
+            "detail": detail[:8]}
 
 
 def _lease_health(root: str) -> dict:

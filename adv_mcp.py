@@ -247,7 +247,7 @@ def t_protocol(root):
             "hub_skill_match", "hub_skill_sync"} <= names, names
     # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
     # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
-    assert len(names) == 78  # ...；78=+hub_freeze（R48：全局写入冻结——事故止损先停写，读面照常）；77=+hub_task_approve（R45：完成审批 four-eyes）；76=+hub_task_retry（R42/R43：失败重试指数退避 + 死信复活——失败不是静默消失）；75=+hub_task_quality（R40：完成质量体检——done 不只是状态，还要看关得扎不扎实）；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
+    assert len(names) == 79  # ...；79=+hub_task_reject（R100：审批退回——four-eyes 闭环的「不通过」出口）；78=+hub_freeze（R48：全局写入冻结——事故止损先停写，读面照常）；77=+hub_task_approve（R45：完成审批 four-eyes）；76=+hub_task_retry（R42/R43：失败重试指数退避 + 死信复活——失败不是静默消失）；75=+hub_task_quality（R40：完成质量体检——done 不只是状态，还要看关得扎不扎实）；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -1150,10 +1150,16 @@ def t_root_follow(tmp):
 
         old_in = sys.stdin
         sys.stdin = FakeIn([req])
+        # 模拟已接入的锁定会话（生产四家均 --agent 锁定）：serve 路径 session=True，
+        # 未锁会话自报在册名会被 R101 追加型写入署名闸拦截——锁定后 apply_server_agent
+        # 覆盖 agent 参数，写入归属真实身份，R101 闸放行。
+        old_srv2 = m.SERVER_AGENT
+        m.SERVER_AGENT = "zcode"
         try:
             with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
                 m.serve(str(hub_a), fixed=False)
         finally:
+            m.SERVER_AGENT = old_srv2
             sys.stdin = old_in
         assert any("迁移后写新库" in r["content"]
                    for r in brain.list_records(str(hub_b), "测试-项目")), "新库未收到写入"
@@ -1394,11 +1400,28 @@ def t_status_tool(tmp):
     m.call_tool("hub_report_error", {"title": "status用例未关闭坑", "agent": "zcode"}, root_s)
     m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目", "agent": "zcode",
                                 "done": "A", "next_step": "B"}, root_s)
+    # R98：审批积压也必须进日常状态页（30h 过久 + 刚认领；owner 不能自批口径不变）
+    _, aged_a = brain.task_add(root_s, "status待批过久", project="测试-项目",
+                               approval_required=True)
+    _, fresh_a = brain.task_add(root_s, "status刚进队列", project="测试-项目",
+                                approval_required=True)
+    assert brain.task_claim(root_s, aged_a, "zcode")[0] == ""
+    assert brain.task_claim(root_s, fresh_a, "dsh")[0] == ""
+    stale_ts = (datetime.datetime.now() - datetime.timedelta(hours=30)) \
+        .isoformat(timespec="seconds")
     brain.add_memory(root_s, "置顶铁律测试%pinned_%", kind="lesson", pinned=True)
     brain.heartbeat_touch(root_s, "zcode", "测试-项目", note="在线中")
+    # 心跳即续租：heartbeat_touch 会把同项目在办任务的 claimed_at 拉到当前，
+    # 故 30h 回填必须放在心跳之后，否则老化标记被静默抹平。
+    with brain.db_conn(root_s) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (stale_ts, aged_a))
     out = m.call_tool("hub_status", {}, root_s)
     assert "①" in out and "在线会话" in out and "zcode" in out, out
     assert "活跃项目" in out and "测试-项目" in out, out
+    assert "待审批 2 条" in out and "待批过久 1" in out, out
+    assert "status待批过久" in out and "status刚进队列" in out, out
+    assert "等批 30 小时" in out, out
+    assert out.count("⚠待批过久") == 1, out
     assert "今日新增" in out and "最近操作" in out, out
     assert "未关闭错误 1 条" in out and "status用例未关闭坑" in out, out
     assert "待认领交接 1 条" in out, out
@@ -1412,6 +1435,7 @@ def t_status_tool(tmp):
     out = m.call_tool("hub_status", {}, str(bare))
     assert "①" in out and "在线会话：无" in out and "活跃项目（近7天）：无" in out, out
     assert "未关闭错误：无" in out and "待认领交接：无" in out and "待办线索：无" in out, out
+    assert "待审批：无" in out, out
     # 活跃窗口边界确定性：远古记录不算活跃、今日记录算——不随运行日期漂移
     ctl = fresh_hub(tmp, "status_ctl")
     brain.add_record(str(ctl), "古老-项目", "hermes", "2020-01-01", "远古记录", "内容")
@@ -3846,6 +3870,1036 @@ def t_agent_control_surface(hub):
     assert "state" not in (schema.get("required") or []), schema
 
 
+def t_role_policy_surface(hub):
+    """R79 角色边界：MCP 会话 worker 被拒管理动作（冻结/归档/隔离/合并/自动化/清备份/管他人），
+    日常写不受影响；读自己角色放行；越权留审计；管理通道可授权；manager 放行；列表显示角色。"""
+    rs = str(hub)
+    old_agent, old_client = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        def c(name, args, sess=False):
+            return m.call_tool(name, args, rs, session=sess)
+
+        # 管理通道建项目（不会触发角色闸门）
+        m.SERVER_AGENT = ""
+        out = c("hub_create_project", {"project": "测试-角色项目"})
+        assert "项目已创建" in out, out
+
+        m.SERVER_AGENT = "worker-a"
+
+        # 读自己角色放行；自我提权被拒
+        role = c("hub_agent", {"action": "role"}, True)
+        assert "worker" in role and "执行" in role, role
+        esc = c("hub_agent", {"action": "role", "role": "manager"}, True)
+        assert "无权" in esc and "worker" in esc, esc
+        assert m.brain.agent_role_get(rs, "worker-a") == "worker"
+
+        # 典型管理动作全被拒，且没有产生副作用
+        frz = c("hub_freeze", {"action": "freeze", "minutes": 5, "reason": "越权"}, True)
+        assert "无权" in frz and "管理动作" in frz, frz
+        assert not m.brain.freeze_get(rs).get("active"), m.brain.freeze_get(rs)
+        arc = c("hub_archive_project", {"project": "测试-角色项目"}, True)
+        assert "无权" in arc, arc
+        with m.brain.db_conn(rs) as conn:
+            prow = conn.execute("SELECT status FROM projects WHERE name=?",
+                                ("测试-角色项目",)).fetchone()
+        assert prow and prow["status"] == "active", prow
+        qua = c("hub_quarantine", {"action": "quarantine", "target": "record"}, True)
+        assert "无权" in qua, qua
+        con = c("hub_consolidate", {"action": "apply"}, True)
+        assert "无权" in con, con
+        trg = c("hub_trigger", {"action": "add"}, True)
+        assert "无权" in trg, trg
+        exp = c("hub_export", {"action": "prune", "apply": True}, True)
+        assert "无权" in exp, exp
+        ctl = c("hub_agent", {"action": "control", "agent": "worker-b",
+                              "state": "paused", "confirm": True}, True)
+        assert "无权" in ctl, ctl
+        assert m.brain.agent_control_get(rs, "worker-b")["state"] == "active"
+
+        # 协议入口与会话内转发都不能绕过角色闸门
+        def via_mcp(name, args, mid=1):
+            r = m.handle_message(rpc("tools/call", {"name": name, "arguments": args},
+                                     mid), rs, session=True)
+            return r["result"]["content"][0]["text"]
+        assert "无权" in via_mcp("hub_freeze", {"action": "freeze", "minutes": 1,
+                                                "reason": "协议入口"}), "tools/call 绕过"
+        assert "无权" in via_mcp("hub_call_tool", {
+            "name": "hub_freeze",
+            "arguments": {"action": "freeze", "minutes": 1, "reason": "转发"}},
+            2), "hub_call_tool 绕过"
+
+        # 未锁定身份时 clientInfo 名不可作为管理权依据
+        m.SERVER_AGENT = ""
+        m.CLIENT_NAME = "worker-a"
+        unv = c("hub_freeze", {"action": "freeze", "minutes": 1, "reason": "冒充"}, True)
+        assert "未锁定" in unv and "无权" not in unv, unv
+        assert not m.brain.freeze_get(rs).get("active")
+        m.SERVER_AGENT = "worker-a"
+        m.CLIENT_NAME = old_client
+
+        # 精准放行：只读预演、管自己、日常写都不拦
+        dry = c("hub_export", {"action": "prune"}, True)
+        assert "无权" not in dry, dry
+        own = c("hub_agent", {"action": "control", "state": "active"}, True)
+        assert "无权" not in own and "正常" in own, own
+        wrote = c("hub_log_work", {
+            "project": "测试-角色项目", "agent": "worker-a",
+            "content": "目的：角色边界\n做了什么：worker 日常写\n验证结果：通过\n如何回滚：无"}, True)
+        assert "已记入大脑" in wrote, wrote
+
+        # 越权留审计痕
+        denied_log = [r for r in m.brain.journal_list(rs, 200)
+                      if r.get("action") == "越权拦截" and r.get("agent") == "worker-a"]
+        assert denied_log, "越权拦截必须进流水"
+
+        # 管理通道授权 manager 后，同一 MCP 身份可执行管理动作
+        m.SERVER_AGENT = ""
+        grant = c("hub_agent", {"action": "role", "agent": "worker-a",
+                                "role": "manager"})
+        assert "manager" in grant and "管理" in grant, grant
+        listed = c("hub_list_agents", {})
+        assert "角色:manager" in listed, listed
+
+        m.SERVER_AGENT = "worker-a"
+        assert "manager" in c("hub_agent", {"action": "role"}, True)
+        fz = c("hub_freeze", {"action": "freeze", "minutes": 1,
+                              "reason": "manager 演练"}, True)
+        assert "已冻结至" in fz, fz
+        uz = c("hub_freeze", {"action": "unfreeze"}, True)
+        assert "无权" not in uz, uz
+
+        # 非法角色值拒收
+        bad = c("hub_agent", {"action": "role", "agent": "worker-a", "role": "root"}, True)
+        assert "worker" in bad and "manager" in bad, bad
+        schema = next(t for t in m.TOOLS if t["name"] == "hub_agent")["inputSchema"]
+        assert schema["properties"]["role"]["enum"] == ["worker", "manager"], schema
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_agent, old_client
+        try:
+            m.brain.freeze_set(rs, 0, "", "test")
+        except Exception:  # noqa: BLE001
+            pass
+
+
+def t_task_identity_gate(hub):
+    """R80 任务持有权：MCP 会话空 agent 不能走管理面旁路——完成/交办/重试/延后/审批
+    全部被拒且状态不动；持有者署名可正常流转；管理面空 agent 保持可用。"""
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+        c = lambda n, a, s=False: m.call_tool(n, a, rs, session=s)
+        assert "任务已建" in c("hub_task_add", {"title": "持有权探针",
+                                                "project": "测试-项目", "agent": "qoder"})
+        assert "认领成功" in c("hub_claim", {"task_id": 1, "agent": "zcode"})
+        assert "任务已建" in c("hub_task_add", {"title": "审批探针", "project": "测试-项目",
+                                                "agent": "qoder", "approval_required": True})
+        assert "认领成功" in c("hub_claim", {"task_id": 2, "agent": "zcode"})
+        assert "任务已建" in c("hub_task_add", {"title": "交办探针",
+                                                "project": "测试-项目", "agent": "qoder"})
+        assert "认领成功" in c("hub_claim", {"task_id": 3, "agent": "zcode"})
+
+        for name, args in (
+            ("hub_task_update", {"task_id": 1, "status": "done"}),
+            ("hub_task_update", {"task_id": 1, "handoff_to": "hermes"}),
+            ("hub_task_retry", {"task_id": 1, "reason": "匿名"}),
+            ("hub_task_update", {"task_id": 1, "status": "deferred",
+                                 "defer_until": "2030-01-01", "defer_reason": "匿名"}),
+            ("hub_task_approve", {"task_id": 2}),
+        ):
+            out = c(name, args, True)
+            assert "未锁定" in out and "管理面" in out, (name, out)
+
+        row = m.brain.task_get(rs, 1)
+        assert row["status"] == "in_progress" and row["owner"] == "zcode", row
+        row2 = m.brain.task_get(rs, 2)
+        assert not row2.get("approved_by"), row2
+
+        # 持有者署名可正常流转；manager 也不需要——持有权不是角色特权
+        m.SERVER_AGENT = "zcode"
+        done = c("hub_task_update", {"task_id": 1, "status": "done"}, True)
+        assert "已更新" in done, done
+        hand = c("hub_task_update", {"task_id": 3, "handoff_to": "hermes"}, True)
+        assert "已交办" in hand, hand
+        assert m.brain.task_get(rs, 3)["owner"] == "hermes"
+
+        # 管理面空 agent 保持可用（CLI/GUI 批量善后）
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+        appr = c("hub_task_approve", {"task_id": 2, "note": "管理面复核"})
+        assert "已批准" in appr or "批准" in appr, appr
+        done2 = c("hub_task_update", {"task_id": 2, "status": "done"})
+        assert "已更新" in done2, done2
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_memory_ownership_gate(hub):
+    """R81 记忆归属：MCP 会话改写/取代他人记忆与记录必须署名且为作者或 manager；
+    无主历史条目可整理，管理通道不受影响，坏 supersedes id 不再抛异常。"""
+    import re as _re
+    import brain as _b
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+
+        def c(name, args, sess=True):
+            return m.call_tool(name, args, rs, session=sess)
+
+        def mem_count():
+            with _b.db_conn(rs) as conn:
+                return conn.execute("SELECT COUNT(*) FROM memories").fetchone()[0]
+
+        def live_mem():
+            with _b.db_conn(rs) as conn:
+                return {r["id"] for r in conn.execute(
+                    "SELECT id FROM memories WHERE " + _b._live_sql())}
+
+        def live_rec():
+            with _b.db_conn(rs) as conn:
+                return {r["id"] for r in conn.execute(
+                    "SELECT id FROM records WHERE " + _b._rec_live_sql())}
+
+        body_a = "记忆归属探针 ALPHA7788 代理端口 7890 长期有效"
+        body_b = "记忆归属探针 BRAVO9911 服务器磁盘温度阈值 55 度"
+        a = int(_b.add_memory(rs, body_a, kind="fact", agent="zcode", project="测试-项目"))
+        b = int(_b.add_memory(rs, body_b, kind="fact", agent="qoder", project="测试-项目"))
+        _b.add_memory(rs, "记忆归属探针·无主历史条目", kind="note", agent="")
+        ra = int(_b.add_record(rs, "测试-项目", "zcode", "2026-10-24", "归属记录甲",
+                               "【目的】记忆归属\n【做了什么】甲\n【验证结果】无\n【如何回滚】无"))
+        rb = int(_b.add_record(rs, "测试-项目", "qoder", "2026-10-24", "归属记录乙",
+                               "【目的】记忆归属\n【做了什么】乙\n【验证结果】无\n【如何回滚】无"))
+        n0 = mem_count()
+
+        # 跨 agent 改写：拒，内容/类型/归属/取代链都不动
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_memory_write", {"content": body_a, "mode": "overwrite", "kind": "lesson"})
+        assert "归属" in out and "zcode" in out, out
+        with _b.db_conn(rs) as conn:
+            row = conn.execute("SELECT kind,agent,superseded_by FROM memories WHERE id=?",
+                               (a,)).fetchone()
+        assert row["kind"] == "fact" and row["agent"] == "zcode" and not row["superseded_by"], dict(row)
+
+        # feedback=archive 也是下架：跨 agent 拒，条目仍 active
+        out = c("hub_memory_write", {"feedback": "archive", "memory_id": a})
+        assert "归属" in out, out
+        with _b.db_conn(rs) as conn:
+            st = conn.execute("SELECT status FROM memories WHERE id=?", (a,)).fetchone()["status"]
+        assert st == "active", st
+        # 投票类反馈不是下架：跨 agent 仍可用（只影响显著性）
+        out = c("hub_memory_write", {"feedback": "stale", "memory_id": b})
+        assert "salience" in out or "已记录" in out, out
+
+        # 跨 agent 用 supersedes 退休他人记忆：拒且不新增
+        out = c("hub_memory_write", {"content": "记忆归属探针·不该写入的新版", "kind": "fact",
+                                     "supersedes": a})
+        assert "归属" in out, out
+        assert mem_count() == n0 and a in live_mem(), "跨 agent supersedes 不该落库"
+
+        # 无主历史条目：允许整理（宽松，不拦历史数据）
+        out = c("hub_memory_write", {"content": "记忆归属探针·无主历史条目",
+                                     "mode": "overwrite", "kind": "lesson"})
+        assert "已更新" in out, out
+
+        # 本人新增 → 改写 → 自己取代：放行
+        own = c("hub_memory_write", {"content": "记忆归属探针·worker-b 自有记忆 原始", "kind": "note"})
+        assert "已写入" in own, own
+        own_id = int(_re.search(r"#(\d+)", own).group(1))
+        out = c("hub_memory_write", {"content": "记忆归属探针·worker-b 自有记忆 原始",
+                                     "mode": "overwrite", "kind": "lesson"})
+        assert "已更新" in out, out
+        out = c("hub_memory_write", {"content": "记忆归属探针·worker-b 自有记忆 新版",
+                                     "kind": "note", "supersedes": own_id})
+        assert "已取代" in out, out
+        assert own_id not in live_mem()
+
+        # 作者归档自己的记忆：放行并留 journal
+        arch = c("hub_memory_write", {"content": "记忆归属探针·worker-b 待归档", "kind": "note"})
+        arch_id = int(_re.search(r"#(\d+)", arch).group(1))
+        out = c("hub_memory_write", {"feedback": "archive", "memory_id": arch_id})
+        assert "已归档" in out, out
+        with _b.db_conn(rs) as conn:
+            st = conn.execute("SELECT status FROM memories WHERE id=?",
+                              (arch_id,)).fetchone()["status"]
+        assert st == "archived", st
+
+        # 两条他人记忆裁决：拒，链不动
+        out = c("hub_memory_supersede", {"keep_id": b, "drop_id": a})
+        assert "归属" in out and ("zcode" in out or "qoder" in out), out
+        assert a in live_mem() and b in live_mem()
+
+        # 记录裁决：拒，记录仍在检索内
+        out = c("hub_memory_supersede", {"target": "record", "keep_id": rb, "drop_id": ra})
+        assert "归属" in out, out
+        assert {ra, rb} <= live_rec()
+
+        # 未锁身份：碰有主条目拒；纯新增仍可用
+        m.SERVER_AGENT, m.CLIENT_NAME = "", "worker-b"
+        out = c("hub_memory_write", {"content": body_a, "mode": "overwrite", "kind": "lesson"})
+        assert "未锁定" in out, out
+        out = c("hub_memory_supersede", {"keep_id": b, "drop_id": a})
+        assert "未锁定" in out, out
+        out = c("hub_memory_write", {"feedback": "archive", "memory_id": a})
+        assert "未锁定" in out, out
+        out = c("hub_memory_write", {"content": "记忆归属探针·未锁身份的新增记忆", "kind": "note"})
+        assert "已写入" in out, out
+
+        # 坏 supersedes id：友好错误，不新增（此前会抛 ValueError）
+        n1 = mem_count()
+        out = c("hub_memory_write", {"content": "记忆归属探针·坏目标", "supersedes": 999999})
+        assert "不存在" in out and "已写入" not in out, out
+        assert mem_count() == n1
+
+        # manager：跨 agent 改写/裁决放行（管理授权，且需锁定身份）
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+        grant = c("hub_agent", {"action": "role", "agent": "worker-b", "role": "manager"}, sess=False)
+        assert "manager" in grant, grant
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_memory_supersede", {"keep_id": b, "drop_id": a})
+        assert "已裁决" in out, out
+        out = c("hub_memory_supersede", {"target": "record", "keep_id": rb, "drop_id": ra})
+        assert "已裁决" in out, out
+
+        # 越权留痕（跨 agent 与未锁身份两类）+ 合法归档留痕
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截" and "R81" in (r.get("note") or "")]
+        assert denied, "记忆越权必须留 journal"
+        archived = [r for r in _b.journal_list(rs, 300) if r.get("action") == "memory_archive"]
+        assert archived, "归档要留 journal（可追溯）"
+
+        # 管理通道不受归属闸影响
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+        out = c("hub_memory_write", {"content": body_b, "mode": "overwrite", "kind": "note"},
+                sess=False)
+        assert "已更新" in out, out
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_attestation_identity_gate(hub):
+    """R82 撤销/复核署名：未锁 --agent 的 MCP 会话不能按 agent 参数撤记录，
+    也不能匿名复核记忆；锁定会话只撤自己的、可协作复核；管理通道不受影响。"""
+    import brain as _b
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+
+        def c(name, args, sess=True):
+            return m.call_tool(name, args, rs, session=sess)
+
+        def rec_ids():
+            with _b.db_conn(rs) as conn:
+                return {r["id"] for r in conn.execute(
+                    "SELECT id FROM records WHERE " + _b._rec_live_sql())}
+
+        def confirmed(mid):
+            with _b.db_conn(rs) as conn:
+                return conn.execute("SELECT confirmed FROM memories WHERE id=?",
+                                    (mid,)).fetchone()["confirmed"]
+
+        rz = int(_b.add_record(rs, "测试-项目", "zcode", "2026-10-24", "复核探针记录",
+                               "【目的】R82\n【做了什么】甲\n【验证结果】无\n【如何回滚】hub_undo"))
+        mid = int(_b.add_memory(rs, "复核探针记忆 R82：归属判定需要身份", kind="fact",
+                                agent="zcode", project="测试-项目"))
+
+        # 未锁定：撤他人记录 → 拒，记录还在（R82 前实测会被直接软删）
+        out = c("hub_undo", {"agent": "zcode"})
+        assert "未锁定" in out, out
+        assert rz in rec_ids(), "未锁身份撤销不该生效"
+
+        # 未锁定：匿名复核 → 拒，confirmed 不动
+        before = confirmed(mid)
+        out = c("hub_memory_confirm", {"ids": [mid]})
+        assert "未锁定" in out, out
+        assert confirmed(mid) == before, "未锁身份复核不该落库"
+
+        # 锁定 worker-b：hub_undo 只撤自己的（传 zcode 被进程身份覆盖）
+        m.SERVER_AGENT = "worker-b"
+        own = int(_b.add_record(rs, "测试-项目", "worker-b", "2026-10-24", "复核探针自有记录",
+                                "【目的】R82\n【做了什么】乙\n【验证结果】无\n【如何回滚】hub_undo"))
+        out = c("hub_undo", {"agent": "zcode"})
+        assert "已撤销" in out and f"#{own}" in out, out
+        assert rz in rec_ids(), "锁定会话不该撤到他人记录"
+
+        # 锁定 worker-b：复核他人记忆放行（复核是协作信号，不是内容改写）
+        out = c("hub_memory_confirm", {"ids": [mid]})
+        assert "已确认" in out and confirmed(mid), out
+
+        # 管理通道：可撤指定 agent 的记录（CLI/GUI 进程没有 SERVER_AGENT 覆盖）
+        m.SERVER_AGENT = ""
+        out = c("hub_undo", {"agent": "zcode"}, sess=False)
+        assert "已撤销" in out and rz not in rec_ids(), out
+
+        # 两类未锁拦截都留 journal（R82 标记）
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截" and "R82" in (r.get("note") or "")]
+        assert len(denied) >= 2, denied
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_task_lease_identity_gate(hub):
+    """R83 任务/租约写动作署名：未锁 --agent 的 MCP 会话不能冒名认领任务、
+    写检查点、动文件租约或创建/认领交接；读动作保持匿名可用；锁定会话与管理面正常。"""
+    import brain as _b
+    import re as _re
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+
+        def c(name, args, sess=True):
+            return m.call_tool(name, args, rs, session=sess)
+
+        def task_row(tid):
+            with _b.db_conn(rs) as conn:
+                return dict(conn.execute("SELECT status,owner FROM tasks WHERE id=?",
+                                         (tid,)).fetchone())
+
+        add = c("hub_task_add", {"title": "R83 冒名认领探针", "project": "测试-项目"}, sess=False)
+        tid = int(add.split("#")[1].split("：")[0].split()[0])
+
+        # 未锁定：认领 → 拒，任务仍无主
+        out = c("hub_claim", {"task_id": tid, "agent": "zcode"})
+        assert "未锁定" in out, out
+        assert task_row(tid)["owner"] in ("", None), task_row(tid)
+
+        # 未锁定：检查点缺 action 也按 save 拦；list 只读放行
+        out = c("hub_checkpoint", {"task_id": tid, "agent": "zcode", "content": "冒名检查点"})
+        assert "未锁定" in out, out
+        out = c("hub_checkpoint", {"action": "list", "task_id": tid})
+        assert "未锁定" not in out, out
+
+        # 未锁定：租约 acquire → 拒；check 只读放行
+        out = c("hub_lock", {"action": "acquire", "path": "r83-shared.txt", "agent": "zcode"})
+        assert "未锁定" in out, out
+        out = c("hub_lock", {"action": "check", "path": "r83-shared.txt"})
+        assert "未锁定" not in out, out
+
+        # 未锁定：交接 create → 拒；list 只读放行
+        out = c("hub_handoff", {"action": "create", "project": "测试-项目",
+                                "agent": "zcode", "done": "冒名交接"})
+        assert "未锁定" in out, out
+        out = c("hub_handoff", {"action": "list", "project": "测试-项目"})
+        assert "未锁定" not in out, out
+
+        # 锁定 worker-b：传 zcode 也被进程身份覆盖
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_claim", {"task_id": tid, "agent": "zcode"})
+        assert "认领成功" in out and "worker-b" in out, out
+        assert task_row(tid)["owner"] == "worker-b", task_row(tid)
+
+        # 锁定 worker-b：写自己持有任务的检查点放行
+        out = c("hub_checkpoint", {"task_id": tid, "agent": "zcode", "content": "R83 自有检查点"})
+        assert "检查点已存" in out, out
+
+        # 锁定 worker-b：获取/续/释放租约放行
+        out = c("hub_lock", {"action": "acquire", "path": "r83-shared.txt",
+                             "agent": "zcode", "task_id": tid})
+        assert "文件租约已获取" in out and "worker-b" in out, out
+        with _b.db_conn(rs) as conn:
+            lid = conn.execute("SELECT id FROM file_leases WHERE owner='worker-b' "
+                               "ORDER BY id DESC").fetchone()["id"]
+        out = c("hub_lock", {"action": "renew", "lease_id": lid, "agent": "zcode"})
+        assert "文件租约已续" in out, out
+        out = c("hub_lock", {"action": "release", "lease_id": lid, "agent": "zcode"})
+        assert "已释放" in out, out
+
+        # 锁定 worker-b：创建并认领交接放行
+        out = c("hub_handoff", {"action": "create", "project": "测试-项目",
+                                "agent": "zcode", "done": "R83 交接", "next_step": "接手"})
+        assert "已创建交接" in out, out
+        hid = int(_re.search(r"#(\d+)", out).group(1))
+        out = c("hub_handoff", {"action": "claim", "handoff_id": hid, "agent": "zcode"})
+        assert "已认领交接" in out and "worker-b" in out, out
+
+        # 管理通道：可替指定 agent 认领（CLI/GUI 进程没有 SERVER_AGENT 覆盖）
+        add2 = c("hub_task_add", {"title": "R83 管理面认领探针", "project": "测试-项目"}, sess=False)
+        tid2 = int(add2.split("#")[1].split("：")[0].split()[0])
+        m.SERVER_AGENT = ""
+        out = c("hub_claim", {"task_id": tid2, "agent": "zcode"}, sess=False)
+        assert "认领成功" in out and "zcode" in out, out
+
+        # 拦截留 journal（R83 标记）
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截" and "R83" in (r.get("note") or "")]
+        assert len(denied) >= 3, denied
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_append_identity_gate(hub):
+    """R101 追加型写入署名：未锁 --agent 的 MCP 会话不能自报在册 agent 名写记录/
+    错误/记忆/心跳/任务；unknown 与空参仍可用（无主语义 + CLIENT_NAME 补写是设计内
+    路径）；不在册名走 check_agent 原路径；锁定会话按进程身份覆盖；管理通道不受影响；
+    拦截留 journal「越权拦截」（R101 标记）。"""
+    import brain as _b
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+
+        def c(name, args, sess=True):
+            return m.call_tool(name, args, rs, session=sess)
+
+        def rec_agents():
+            with _b.db_conn(rs) as conn:
+                return {r["agent"] for r in conn.execute(
+                    "SELECT agent FROM records")}
+
+        four = "【目的】R101\n【做了什么】甲\n【验证结果】无\n【如何回滚】hub_undo"
+
+        # 未锁定：自报在册名写记录 → 拒，不落库（R101 前实测会冒名成功）
+        out = c("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": four})
+        assert "不能以他人身份写入" in out, out[:220]
+        assert "zcode" not in rec_agents(), "冒名记录不该落库"
+
+        # 未锁定：unknown 与空参放行（无主语义；空参由 CLIENT_NAME 补写路径处理）
+        out = c("hub_log_work", {"project": "测试-项目", "agent": "unknown",
+                                 "content": four})
+        assert "错误" not in out, out[:220]
+        out = c("hub_log_work", {"project": "测试-项目", "content": four})
+        assert "错误" not in out, out[:220]
+
+        # 未锁定：不在册名字原路径报错（check_agent，不进 R101 拦截）
+        out = c("hub_log_work", {"project": "测试-项目", "agent": "ghost-x",
+                                 "content": four})
+        assert "不能以他人身份写入" not in out and "错误" in out, out[:220]
+
+        # 同族工具抽样：错误登记/心跳/记忆/任务 自报在册名 → 拒
+        for name, args in (
+            ("hub_report_error", {"agent": "zcode", "title": "R101 冒名错误"}),
+            ("hub_heartbeat", {"agent": "zcode"}),
+            ("hub_memory_write", {"agent": "zcode", "content": "R101 冒名记忆"}),
+            ("hub_task_add", {"agent": "zcode", "title": "R101 冒名任务"}),
+        ):
+            out = c(name, args)
+            assert "不能以他人身份写入" in out, (name, out[:220])
+
+        # 锁定 worker-b：传 zcode 被进程身份覆盖，正常落库且归属真实身份
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": four})
+        assert "错误" not in out, out[:220]
+        with _b.db_conn(rs) as conn:
+            last = conn.execute("SELECT agent FROM records "
+                                "ORDER BY id DESC").fetchone()["agent"]
+        assert last == "worker-b", last
+
+        # 管理通道：空进程身份下按显式 agent 写入放行（CLI/GUI 无 SERVER_AGENT 覆盖）
+        m.SERVER_AGENT = ""
+        out = c("hub_log_work", {"project": "测试-项目", "agent": "zcode",
+                                 "content": four}, sess=False)
+        assert "错误" not in out, out[:220]
+
+        # 拦截留痕：journal「越权拦截」+ R101 标记
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截" and "R101" in (r.get("note") or "")]
+        assert denied, "R101 拦截应留 journal"
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_signal_identity_gate(hub):
+    """R84 通信署名：未锁 --agent 的 MCP 会话不能冒名发信号或替他人标已读；
+    锁定会话按进程身份；管理通道可代发/代标；收件箱读取保持匿名可用。"""
+    import brain as _b
+    import re as _re
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+
+        def c(name, args, sess=True):
+            return m.call_tool(name, args, rs, session=sess)
+
+        def sig_count():
+            with _b.db_conn(rs) as conn:
+                return conn.execute("SELECT COUNT(*) FROM signals").fetchone()[0]
+
+        def reads(sid):
+            with _b.db_conn(rs) as conn:
+                return {r["agent"] for r in conn.execute(
+                    "SELECT agent FROM signal_reads WHERE signal_id=?", (sid,))}
+
+        # 未锁定：冒名发信号 → 拒，不落库
+        n0 = sig_count()
+        out = c("hub_signal_send", {"agent": "zcode", "to_agent": "dsh",
+                                    "content": "R84 冒名信号"})
+        assert "未锁定" in out, out
+        assert sig_count() == n0, "未锁身份发信号不该落库"
+
+        # 管理通道发点对点信号；未锁会话替收件人标已读 → 拒，回执不落库
+        out = c("hub_signal_send", {"agent": "zcode", "to_agent": "dsh",
+                                    "content": "R84 管理面信号"}, sess=False)
+        assert "已发送信号" in out, out
+        sid = int(_re.search(r"#(\d+)", out).group(1))
+        out = c("hub_signal_read", {"signal_id": sid, "agent": "dsh"})
+        assert "未锁定" in out, out
+        assert "dsh" not in reads(sid), "未锁身份不该伪造已读回执"
+
+        # 锁定 worker-b：传 zcode 也被进程身份覆盖
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_signal_send", {"agent": "zcode", "to_agent": "dsh",
+                                    "content": "R84 署名信号"})
+        assert "已发送信号" in out, out
+        with _b.db_conn(rs) as conn:
+            sender = conn.execute(
+                "SELECT from_agent FROM signals ORDER BY id DESC").fetchone()[0]
+        assert sender == "worker-b", sender
+
+        # 管理通道给 worker-b 发信号（先清空进程身份，避免被覆盖成自发自收）
+        m.SERVER_AGENT = ""
+        out = c("hub_signal_send", {"agent": "zcode", "to_agent": "worker-b",
+                                    "content": "R84 发给 worker-b"}, sess=False)
+        assert "已发送信号" in out, out
+        sid2 = int(_re.search(r"#(\d+)", out).group(1))
+
+        # 锁定 worker-b：标自己的收件放行；替 dsh 标点对点信号被 brain 拒
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_signal_read", {"signal_id": sid2, "agent": "zcode"})
+        assert "已标已读" in out, out
+        assert "worker-b" in reads(sid2), reads(sid2)
+        out = c("hub_signal_read", {"signal_id": sid, "agent": "zcode"})
+        assert "发给 dsh" in out, out
+        assert "worker-b" not in reads(sid), reads(sid)
+
+        # 管理通道可代标；收件箱读取不受闸门影响
+        m.SERVER_AGENT = ""
+        out = c("hub_signal_read", {"signal_id": sid, "agent": "dsh"}, sess=False)
+        assert "已标已读" in out, out
+        assert "dsh" in reads(sid), reads(sid)
+        out = c("hub_signals", {"agent": "worker-b"})
+        assert "未锁定" not in out, out
+
+        # 拦截留 journal（R84 标记）
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截" and "R84" in (r.get("note") or "")]
+        assert len(denied) >= 2, denied
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_triage_identity_gate(hub):
+    """R85 闭环署名：未锁 --agent 的 MCP 会话不能冒名勾销待办或关错误；
+    锁定会话按进程身份留痕；管理通道可代勾/代关；读取列表保持匿名可用。"""
+    import brain as _b
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    try:
+        m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+
+        def c(name, args, sess=True):
+            return m.call_tool(name, args, rs, session=sess)
+
+        def todo_count():
+            with _b.db_conn(rs) as conn:
+                return conn.execute("SELECT COUNT(*) FROM todos_done").fetchone()[0]
+
+        def err_status(eid):
+            with _b.db_conn(rs) as conn:
+                return conn.execute("SELECT status FROM errors WHERE id=?",
+                                    (eid,)).fetchone()["status"]
+
+        # 未锁定：冒名勾销待办 → 拒，不落库
+        n0 = todo_count()
+        out = c("hub_todo_done", {"record_id": 1, "todo": "R85 冒名勾销", "agent": "zcode"})
+        assert "未锁定" in out, out
+        assert todo_count() == n0, "未锁身份勾销不该落库"
+
+        # 管理通道可代勾
+        out = c("hub_todo_done", {"record_id": 1, "todo": "R85 管理面勾销",
+                                  "agent": "zcode"}, sess=False)
+        assert "待办已勾销" in out, out
+
+        # 管理通道登记错误；未锁会话关单 → 拒，状态仍 open
+        c("hub_report_error", {"title": "R85 错误甲", "detail": "身份探针",
+                               "undo": "无需", "agent": "zcode"}, sess=False)
+        with _b.db_conn(rs) as conn:
+            eid = conn.execute("SELECT id FROM errors ORDER BY id DESC").fetchone()[0]
+        out = c("hub_error_close", {"error_id": eid, "agent": "zcode", "note": "冒名关单"})
+        assert "未锁定" in out, out
+        assert err_status(eid) == "open", err_status(eid)
+
+        # 锁定 worker-b：传 zcode 也被进程身份覆盖，流水记 worker-b
+        m.SERVER_AGENT = "worker-b"
+        out = c("hub_error_close", {"error_id": eid, "agent": "zcode", "note": "已修"})
+        assert "已关闭错误" in out and "worker-b" in out, out
+        assert err_status(eid) == "fixed", err_status(eid)
+        closed = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "关闭错误"
+                  and (r.get("target") or "") == f"errors#{eid}"]
+        assert closed and closed[0]["agent"] == "worker-b", closed
+
+        # 锁定 worker-b：勾销待办同样按进程身份
+        out = c("hub_todo_done", {"record_id": 1, "todo": "R85 署名勾销", "agent": "zcode"})
+        assert "待办已勾销" in out, out
+        done_rows = [r for r in _b.journal_list(rs, 300) if r.get("action") == "todo_done"]
+        assert any(r["agent"] == "worker-b" for r in done_rows), done_rows
+
+        # 管理通道可关另一条；读取列表不受闸门影响
+        c("hub_report_error", {"title": "R85 错误乙", "detail": "管理面关单",
+                               "undo": "无需", "agent": "zcode"}, sess=False)
+        with _b.db_conn(rs) as conn:
+            eid2 = conn.execute("SELECT id FROM errors ORDER BY id DESC").fetchone()[0]
+        out = c("hub_error_close", {"error_id": eid2, "agent": "zcode"}, sess=False)
+        assert "已关闭错误" in out, out
+        out = c("hub_list_errors", {"status": "open"})
+        assert "未锁定" not in out, out
+
+        # 拦截留 journal（R85 标记）
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截" and "R85" in (r.get("note") or "")]
+        assert len(denied) >= 2, denied
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_task_approval_queue(hub):
+    """R86 待审批队列：只列在办+要求审批+未批准，按认领时间升序（等最久的先看）；
+    项目过滤、空态、已批准/普通任务排除与 schema 同步。"""
+    import brain as _b
+    rs = str(hub)
+
+    def add(title, proj="测试-项目", appr=True):
+        out = m.call_tool("hub_task_add", {"title": title, "project": proj,
+                                           "approval_required": appr}, rs)
+        return int(out.split("#")[1].split("：")[0].split()[0])
+
+    tid_a = add("审批队列甲")
+    tid_b = add("审批队列乙")
+    tid_c = add("普通任务", appr=False)
+    tid_d = add("审批队列丁")
+    for tid, who in ((tid_a, "zcode"), (tid_b, "dsh"), (tid_c, "zcode"), (tid_d, "worker")):
+        out = m.call_tool("hub_claim", {"task_id": tid, "agent": who}, rs)
+        assert "认领成功" in out, out
+    out = m.call_tool("hub_task_approve", {"task_id": tid_b, "agent": "qoder"}, rs)
+    assert "已批准完成" in out, out
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?",
+                     ("2026-10-01 09:00:00", tid_a))
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?",
+                     ("2026-10-02 09:00:00", tid_d))
+
+    out = m.call_tool("hub_tasks", {"view": "approvals", "project": "测试-项目"}, rs)
+    assert "待审批任务 2 条" in out, out
+    assert f"#{tid_a}" in out and f"#{tid_d}" in out, out
+    assert f"#{tid_b}" not in out and f"#{tid_c}" not in out, out
+    assert out.index(f"#{tid_a}") < out.index(f"#{tid_d}"), out
+
+    # 项目过滤：别项目不进本项目的队列
+    tid_e = add("审批队列别项目", proj="测试-项目2")
+    out = m.call_tool("hub_claim", {"task_id": tid_e, "agent": "zcode"}, rs)
+    assert "认领成功" in out, out
+    out = m.call_tool("hub_tasks", {"view": "approvals", "project": "测试-项目"}, rs)
+    assert f"#{tid_e}" not in out, out
+    out = m.call_tool("hub_tasks", {"view": "approvals", "project": "测试-项目2"}, rs)
+    assert f"#{tid_e}" in out and f"#{tid_a}" not in out, out
+
+    # 空态与 schema
+    out = m.call_tool("hub_tasks", {"view": "approvals", "project": "无此项目"}, rs)
+    assert "无待审批任务" in out, out
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_tasks")["inputSchema"]
+    assert schema["properties"]["view"]["enum"] == ["board", "stats", "approvals"], schema
+    bad = m.call_tool("hub_tasks", {"view": "timeline"}, rs)
+    assert "board/stats/approvals" in bad, bad
+
+
+def t_task_approval_aging(hub):
+    """R87 审批时效：等批从认领起算，≥24h 标待批过久；队列/统计/日结同口径，
+    已批准与未要求审批不参与，缺少认领时间不硬造时长。"""
+    import datetime as _dt
+    import brain as _b
+    rs = str(hub)
+
+    def add(title, appr=True):
+        out = m.call_tool("hub_task_add", {"title": title, "project": "审批时效",
+                                           "approval_required": appr}, rs)
+        return int(out.split("#")[1].split("：")[0].split()[0])
+
+    tid_old = add("久等审批")
+    tid_new = add("新近待批")
+    tid_ok = add("已批准")
+    tid_plain = add("无需审批", appr=False)
+    tid_free = add("缺认领时间")
+    for tid, who in ((tid_old, "zcode"), (tid_new, "dsh"), (tid_ok, "worker"),
+                     (tid_plain, "worker"), (tid_free, "worker")):
+        out = m.call_tool("hub_claim", {"task_id": tid, "agent": who}, rs)
+        assert "认领成功" in out, out
+    out = m.call_tool("hub_task_approve", {"task_id": tid_ok, "agent": "qoder"}, rs)
+    assert "已批准完成" in out, out
+    now = _dt.datetime.now()
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?",
+                     ((now - _dt.timedelta(hours=30)).isoformat(timespec="seconds"), tid_old))
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?",
+                     ((now - _dt.timedelta(hours=23)).isoformat(timespec="seconds"), tid_new))
+        conn.execute("UPDATE tasks SET claimed_at='' WHERE id=?", (tid_free,))
+
+    out = m.call_tool("hub_tasks", {"view": "approvals", "project": "审批时效"}, rs)
+    assert "待审批任务 3 条" in out, out
+    assert f"#{tid_old}" in out and f"#{tid_new}" in out and f"#{tid_free}" in out, out
+    assert f"#{tid_ok}" not in out and f"#{tid_plain}" not in out, out
+    assert "等批 30 小时" in out and "等批 23 小时" in out and "等批 —" in out, out
+    assert out.count("⚠待批过久") == 1, out
+    assert out.index(f"#{tid_old}") < out.index(f"#{tid_new}"), out
+
+    met = _b.task_metrics(rs, days=7, project="审批时效")
+    assert met["wip"]["approval_waiting"] == 3, met["wip"]
+    assert met["wip"]["approval_aging"] == 1, met["wip"]
+    kinds = {r["kind"] for r in met["risks"]}
+    assert {"approval_waiting", "approval_aging"} <= kinds, met["risks"]
+
+    dg = _b.team_digest(rs, days=1)
+    assert dg["current"]["wip"]["approval_waiting"] == 3, dg["current"]["wip"]
+    assert dg["current"]["wip"]["approval_aging"] == 1, dg["current"]["wip"]
+    assert "approval_aging" in {r["kind"] for r in dg["risks"]}, dg["risks"]
+    rendered = m._render_team_digest(dg)
+    assert "待批过久 1" in rendered and "≥24h" in rendered, rendered
+
+    # 阈值边界：恰好 24h 算过久（>=），23h 的仍只算等批
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?",
+                     ((now - _dt.timedelta(hours=24)).isoformat(timespec="seconds"), tid_new))
+    out = m.call_tool("hub_tasks", {"view": "approvals", "project": "审批时效"}, rs)
+    assert out.count("⚠待批过久") == 2, out
+    assert _b.task_metrics(rs, days=7, project="审批时效")["wip"]["approval_aging"] == 2
+
+
+def t_handoff_aging(hub):
+    """R88 交接老化：open 交接显示等待时长，≥3 天标陈旧；已认领不误标；
+    缺/坏时间显示未知，状态快照与团队日结同口径。"""
+    import datetime as _dt
+    import brain as _b
+    rs = str(hub)
+
+    def create(title):
+        out = m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目",
+                                          "agent": "zcode", "done": title,
+                                          "next_step": "接手继续"}, rs)
+        assert "已创建交接 #" in out, out
+        return int(out.split("#")[1].split("（")[0])
+
+    h_old = create("旧交接")
+    h_new = create("新交接")
+    h_bad = create("坏时间交接")
+    now = _dt.datetime.now()
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE handoffs SET created=? WHERE id=?",
+                     ((now - _dt.timedelta(days=4)).isoformat(timespec="seconds"), h_old))
+        conn.execute("UPDATE handoffs SET created=? WHERE id=?",
+                     ((now - _dt.timedelta(hours=5)).isoformat(timespec="seconds"), h_new))
+        conn.execute("UPDATE handoffs SET created='' WHERE id=?", (h_bad,))
+
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, rs)
+    assert f"#{h_old}" in out and f"#{h_new}" in out and f"#{h_bad}" in out, out
+    assert "已等 4 天" in out and "已等 5 小时" in out, out
+    assert out.count("⚠陈旧") == 1, out
+    assert "时间未知" in out, out
+
+    # 已认领不误标陈旧；open 清单里消失
+    out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": h_old,
+                                      "agent": "qoder"}, rs)
+    assert "已认领" in out, out
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目",
+                                      "include_claimed": True}, rs)
+    assert "已被 qoder 认领" in out and "⚠陈旧" not in out, out
+
+    # 阈值边界：恰好 3 天算陈旧
+    with _b.db_conn(rs) as conn:
+        conn.execute("UPDATE handoffs SET created=? WHERE id=?",
+                     ((now - _dt.timedelta(days=3)).isoformat(timespec="seconds"), h_new))
+    out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, rs)
+    assert "已等 3 天" in out and out.count("⚠陈旧") == 1, out
+
+    out = m.call_tool("hub_status", {"view": "now"}, rs)
+    assert f"#{h_new}" in out and "已等 3 天" in out and "⚠陈旧" in out, out
+    assert f"#{h_old}" not in out.split("待认领交接")[1].split("④")[0], out
+
+    dg = _b.team_digest(rs, days=1)
+    assert dg["current"]["handoffs"] == {"open": 2, "stale": 1}, dg["current"]["handoffs"]
+    assert "handoff_stale" in {r["kind"] for r in dg["risks"]}, dg["risks"]
+    rendered = m._render_team_digest(dg)
+    assert "交接 2（陈旧 1）" in rendered and "交接陈旧 1" in rendered, rendered
+
+
+def t_handoff_close(hub):
+    """R89 交接作废：open 可关且必须留原因与操作者；已认领/已作废不可再关；
+    已作废不可认领；列表展示作废人与原因；署名闸与 journal 留痕。"""
+    import brain as _b
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+    try:
+        def create(title):
+            out = m.call_tool("hub_handoff", {"action": "create", "project": "测试-项目",
+                                              "agent": "zcode", "done": title,
+                                              "next_step": "接手继续"}, rs)
+            assert "已创建交接 #" in out, out
+            return int(out.split("#")[1].split("（")[0])
+
+        def status(hid):
+            with _b.db_conn(rs) as conn:
+                return conn.execute(
+                    "SELECT status, closed_by, close_note FROM handoffs WHERE id=?",
+                    (hid,)).fetchone()
+
+        h1 = create("废弃交接")
+        h2 = create("已认领交接")
+        h3 = create("署名闸交接")
+
+        # 必填与非法 id
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h1,
+                                          "close_note": "需求取消"}, rs)
+        assert "agent 必填" in out, out
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h1,
+                                          "agent": "qoder", "close_note": "  "}, rs)
+        assert "note 必填" in out, out
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": 999999,
+                                          "agent": "qoder", "close_note": "不存在"}, rs)
+        assert "不存在" in out, out
+        # 必填失败不落库
+        assert status(h1)["status"] == "open", status(h1)
+
+        # 正常作废
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h1,
+                                          "agent": "qoder", "close_note": "需求取消"}, rs)
+        assert "已关闭交接 #" in out and "需求取消" in out, out
+        row = status(h1)
+        assert row["status"] == "closed" and row["closed_by"] == "qoder", row
+
+        out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目"}, rs)
+        assert f"#{h1}" not in out, out
+        out = m.call_tool("hub_handoff", {"action": "list", "project": "测试-项目",
+                                          "include_claimed": True}, rs)
+        assert f"#{h1}" in out and "已作废" in out and "qoder" in out and "需求取消" in out, out
+
+        # 已作废不可认领
+        out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": h1,
+                                          "agent": "dsh"}, rs)
+        assert "已作废" in out and "不可认领" in out, out
+
+        # 重复关闭幂等：原因/操作者不被覆盖
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h1,
+                                          "agent": "dsh", "close_note": "二次关闭"}, rs)
+        assert "已关闭交接 #" in out and "此前由 qoder" in out and "需求取消" in out, out
+        row = status(h1)
+        assert row["closed_by"] == "qoder" and row["close_note"] == "需求取消", row
+
+        # 已认领不可作废（不能抹掉接手事实）
+        out = m.call_tool("hub_handoff", {"action": "claim", "handoff_id": h2,
+                                          "agent": "dsh"}, rs)
+        assert "已认领" in out, out
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h2,
+                                          "agent": "qoder", "close_note": "想收尾"}, rs)
+        assert "不能作废" in out and "dsh" in out, out
+        assert status(h2)["status"] == "claimed", status(h2)
+
+        # 状态快照只列 open：已作废/已认领都不出现
+        out = m.call_tool("hub_status", {"view": "now"}, rs)
+        seg = out.split("待认领交接")[1].split("④")[0] if "待认领交接" in out else ""
+        assert f"#{h1}" not in seg and f"#{h2}" not in seg and f"#{h3}" in seg, out
+
+        # 署名闸：未锁 MCP 会话不能作废；锁定后按进程身份留痕
+        # 署名闸拒绝流水按「进程内每工具一次」去重：整套跑时 R83 用例已记过
+        # hub_handoff 的拦截，此处清键以验证本次拦截确实落到本 hub 的流水。
+        m._POLICY_DENY_SEEN.discard(("", "hub_handoff", "identity", "unverified_write"))
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h3,
+                                          "agent": "zcode", "close_note": "冒名作废"},
+                          rs, session=True)
+        assert "未锁定" in out, out
+        assert status(h3)["status"] == "open", status(h3)
+        m.SERVER_AGENT = "worker-b"
+        out = m.call_tool("hub_handoff", {"action": "close", "handoff_id": h3,
+                                          "agent": "zcode", "close_note": "身份覆盖"},
+                          rs, session=True)
+        assert "已关闭交接 #" in out and "worker-b" in out, out
+        assert status(h3)["closed_by"] == "worker-b", status(h3)
+        closed_j = [r for r in _b.journal_list(rs, 300)
+                    if r.get("action") == "关闭交接"
+                    and (r.get("target") or "") == f"handoffs#{h3}"]
+        assert closed_j and closed_j[0]["agent"] == "worker-b", closed_j
+        denied = [r for r in _b.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截"
+                  and (r.get("target") or "") == "hub_handoff:identity"]
+        assert denied, denied
+
+        # schema 同步
+        schema = next(t for t in m.TOOLS if t["name"] == "hub_handoff")["inputSchema"]
+        assert "close" in schema["properties"]["action"]["enum"], schema
+        assert "close_note" in schema["properties"], schema
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
+def t_security_observability(hub):
+    """R90 越权拦截可观测：聚合近 N 天 journal 拦截，按工具归并并区分
+    未锁身份/角色越权；窗口外不计；视图只读；日结与 CLI 同口径。"""
+    import brain as _b
+    rs = str(hub)
+    old_srv, old_cli = m.SERVER_AGENT, m.CLIENT_NAME
+    m.SERVER_AGENT, m.CLIENT_NAME = "", ""
+    try:
+        out = m.call_tool("hub_status", {"view": "security"}, rs)
+        assert "无越权拦截记录" in out, out
+
+        # 署名闸/管理闸按进程内每工具一次去重：整套跑时前序用例可能已记过，
+        # 清掉目标工具键，确保本 hub 真实落 4 条身份拒绝。
+        for k in list(m._POLICY_DENY_SEEN):
+            if k[1] in ("hub_claim", "hub_todo_done", "hub_handoff", "hub_freeze"):
+                m._POLICY_DENY_SEEN.discard(k)
+        for name, args in (
+                ("hub_claim", {"task_id": 1, "agent": "zcode"}),
+                ("hub_todo_done", {"record_id": 1, "todo": "R90", "agent": "zcode"}),
+                ("hub_handoff", {"action": "close", "handoff_id": 1,
+                                 "agent": "zcode", "close_note": "R90"}),
+                ("hub_freeze", {"action": "freeze", "agent": "zcode", "reason": "R90"})):
+            out = m.call_tool(name, args, rs, session=True)
+            assert "未锁定" in out, out
+
+        # 角色越权（真实流水）+ 窗口外旧记录（不参与近 7 天统计）
+        _b.journal_add(rs, "worker-a", "越权拦截", "hub_freeze:freeze",
+                       note="worker 角色无权执行管理动作（R79）")
+        with _b.db_conn(rs) as conn:
+            conn.execute("INSERT INTO journal(ts,agent,action,target,note) VALUES(?,?,?,?,?)",
+                         ("2026-01-01T00:00:00", "old", "越权拦截", "hub_cli:identity",
+                          "窗口外旧记录"))
+
+        out = m.call_tool("hub_status", {"view": "security", "days": 7}, rs)
+        assert "安全拦截（近 7 天）：5 次" in out, out
+        assert "未锁身份 4" in out and "角色越权 1" in out, out
+        assert "hub_claim" in out and "hub_freeze" in out and "hub_cli" not in out, out
+        assert "unknown" in out and "认领任务" in out, out
+        assert "按 agent：" in out, out
+        assert "@unknown 4 次（未锁身份 4 / 角色越权 0" in out, out
+        assert "@worker-a 1 次（未锁身份 0 / 角色越权 1" in out, out
+
+        # 只读：查看不产生新流水
+        with _b.db_conn(rs) as conn:
+            n0 = conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0]
+        m.call_tool("hub_status", {"view": "security"}, rs)
+        with _b.db_conn(rs) as conn:
+            assert conn.execute("SELECT COUNT(*) FROM journal").fetchone()[0] == n0
+
+        dg = _b.team_digest(rs, days=7)
+        assert dg["current"]["security"] == {"denied": 5, "identity": 4, "role": 1}, \
+            dg["current"]["security"]
+        assert "security_denied" in {r["kind"] for r in dg["risks"]}, dg["risks"]
+        rendered = m._render_team_digest(dg)
+        assert "越权拦截 5" in rendered, rendered
+
+        # 坏参不猜
+        out = m.call_tool("hub_status", {"view": "security", "days": 0}, rs)
+        assert "days 范围 1..365" in out, out
+
+        schema = next(t for t in m.TOOLS if t["name"] == "hub_status")["inputSchema"]
+        assert "security" in schema["properties"]["view"]["enum"], schema
+    finally:
+        m.SERVER_AGENT, m.CLIENT_NAME = old_srv, old_cli
+
+
 def t_skill_routing_surface(hub):
     """R37：hub_agent(skills) 读/设/清、hub_task_add skills、认领匹配与拒收、前沿过滤。"""
     rs = str(hub)
@@ -3922,7 +4976,7 @@ def t_task_stats_surface(hub):
     bid = m.call_tool("hub_tasks", {"view": "stats", "days": 0}, rs)
     assert "1..365" in bid, bid
     schema = next(t for t in m.TOOLS if t["name"] == "hub_tasks")["inputSchema"]
-    assert schema["properties"]["view"]["enum"] == ["board", "stats"], schema
+    assert schema["properties"]["view"]["enum"] == ["board", "stats", "approvals"], schema
     assert schema["properties"]["days"]["type"] == "integer", schema
 
 
@@ -3998,7 +5052,7 @@ def t_team_digest_surface(hub):
     assert "整数" in bint, bint
     assert "大脑此刻状态" in m.call_tool("hub_status", {}, rs)
     schema = next(t for t in m.TOOLS if t["name"] == "hub_status")["inputSchema"]
-    assert schema["properties"]["view"]["enum"] == ["now", "digest"], schema
+    assert schema["properties"]["view"]["enum"] == ["now", "digest", "security"], schema
     assert schema["properties"]["days"]["type"] == "integer", schema
 
 
@@ -4192,6 +5246,121 @@ def t_task_defer_approve_surface(hub):
     assert upd["properties"]["approval_required"]["type"] == "boolean", upd
     add_schema = next(t for t in m.TOOLS if t["name"] == "hub_task_add")["inputSchema"]
     assert add_schema["properties"]["approval_required"]["type"] == "boolean", add_schema
+
+
+def t_task_reject_surface(hub):
+    """R100：审批退回工具面——原因必填、owner 不能自退、退回后回待办并退出待批队列、
+    看板标 ↩退回、重新认领仍需复核；已批准/非审批任务拒退；
+    未锁身份会话不能冒名批准或退回（four-eyes 不能只剩文案）；schema/help 同步。"""
+    rs = str(hub)
+    old_srv = m.SERVER_AGENT
+    m.SERVER_AGENT = ""
+    try:
+        add = m.call_tool("hub_task_add", {"title": "退回面任务", "project": "测试-项目",
+                                           "approval_required": True}, rs)
+        tid = int(add.split("#")[1].split("：")[0].split()[0])
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+        noreason = m.call_tool("hub_task_reject", {"task_id": tid, "agent": "workbuddy"}, rs)
+        assert "reason" in noreason, noreason
+        selfrej = m.call_tool("hub_task_reject", {"task_id": tid, "agent": "zcode",
+                                                  "reason": "自己退自己"}, rs)
+        assert "不能退回自己" in selfrej, selfrej
+        listed = m.call_tool("hub_tasks", {"view": "approvals"}, rs)
+        assert "退回返工" in listed and "hub_task_reject" in listed, listed
+        assert f"#{tid}" in listed, listed
+
+        # 退回成功：回待办、退出待批队列、看板留痕
+        out = m.call_tool("hub_task_reject", {"task_id": tid, "agent": "workbuddy",
+                                              "reason": "验收证据不足"}, rs)
+        assert "已退回返工" in out and "验收证据不足" in out, out
+        assert "重新 hub_claim" in out, out
+        listed = m.call_tool("hub_tasks", {"view": "approvals"}, rs)
+        assert f"#{tid}" not in listed, listed
+        pending = m.call_tool("hub_tasks", {"status": "pending"}, rs)
+        assert "↩退回 1 次（workbuddy）" in pending and "退回面任务" in pending, pending
+        assert "验收证据不足" in pending, pending
+
+        # 重新认领后再次进入审批队列，完成仍需他人复核
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid, "agent": "zcode"}, rs)
+        listed = m.call_tool("hub_tasks", {"view": "approvals"}, rs)
+        assert f"#{tid}" in listed, listed
+        blocked = m.call_tool("hub_task_update", {"task_id": tid, "status": "done",
+                                                  "agent": "zcode"}, rs)
+        assert "要求完成审批" in blocked, blocked
+
+        # 已批准不可退回
+        assert "已批准完成" in m.call_tool("hub_task_approve", {
+            "task_id": tid, "agent": "dsh", "note": "改好了"}, rs)
+        after = m.call_tool("hub_task_reject", {"task_id": tid, "agent": "workbuddy",
+                                                "reason": "再退"}, rs)
+        assert "已由 dsh 批准" in after, after
+
+        # 非审批任务不可退回
+        add2 = m.call_tool("hub_task_add", {"title": "普通退回面", "project": "测试-项目"}, rs)
+        tid2 = int(add2.split("#")[1].split("：")[0].split()[0])
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid2, "agent": "zcode"}, rs)
+        plain = m.call_tool("hub_task_reject", {"task_id": tid2, "agent": "workbuddy",
+                                                "reason": "x"}, rs)
+        assert "未开启" in plain, plain
+
+        # R100 署名闸：未锁会话不能冒名批准/退回；锁定后按进程身份执行
+        add3 = m.call_tool("hub_task_add", {"title": "退回署名闸", "project": "测试-项目",
+                                            "approval_required": True}, rs)
+        tid3 = int(add3.split("#")[1].split("：")[0].split()[0])
+        assert "认领成功" in m.call_tool("hub_claim", {"task_id": tid3, "agent": "zcode"}, rs)
+        for tool in ("hub_task_approve", "hub_task_reject"):
+            m._POLICY_DENY_SEEN.discard(("", tool, "identity", "unverified_write"))
+        args = {"task_id": tid3, "agent": "workbuddy", "reason": "冒名退回"}
+        spoof = m.call_tool("hub_task_reject", args, rs, session=True)
+        assert "未锁定" in spoof, spoof
+        assert m.brain.task_get(rs, tid3)["status"] == "in_progress"
+        spoof2 = m.call_tool("hub_task_approve", {"task_id": tid3, "agent": "workbuddy"},
+                             rs, session=True)
+        assert "未锁定" in spoof2, spoof2
+        assert m.brain.task_get(rs, tid3)["approved_by"] == ""
+        denied = [r for r in m.brain.journal_list(rs, 300)
+                  if r.get("action") == "越权拦截"
+                  and (r.get("target") or "") in ("hub_task_approve:identity",
+                                                  "hub_task_reject:identity")]
+        assert {r["target"] for r in denied} >= {"hub_task_approve:identity",
+                                                 "hub_task_reject:identity"}, denied
+
+        # 锁定为 owner：拒绝文案不能建议「空传 agent」死路，须给 CLI 管理面
+        try:
+            m.SERVER_AGENT = "zcode"
+            locked = m.handle_message(rpc("tools/call", {
+                "name": "hub_task_reject",
+                "arguments": {"task_id": tid3, "reason": "锁定自退"}}), rs)
+        finally:
+            m.SERVER_AGENT = ""
+        locked_txt = locked["result"]["content"][0]["text"]
+        assert "不能退回自己" in locked_txt, locked_txt
+        assert "cli.py" in locked_txt and "reject" in locked_txt, locked_txt
+        # 锁定为复核人：按进程身份留痕
+        try:
+            m.SERVER_AGENT = "dsh"
+            locked_ok = m.handle_message(rpc("tools/call", {
+                "name": "hub_task_reject",
+                "arguments": {"task_id": tid3, "reason": "锁定复核退回"}}), rs)
+        finally:
+            m.SERVER_AGENT = ""
+        locked_ok_txt = locked_ok["result"]["content"][0]["text"]
+        assert "已退回返工" in locked_ok_txt and "dsh" in locked_ok_txt, locked_ok_txt
+        row = m.brain.task_get(rs, tid3)
+        assert row["status"] == "pending" and row["rejected_by"] == "dsh", row
+    finally:
+        m.SERVER_AGENT = old_srv
+
+    schema = next(t for t in m.TOOLS if t["name"] == "hub_task_reject")["inputSchema"]
+    assert set(schema.get("required") or []) == {"task_id", "reason"}, schema
+    assert schema["properties"]["reason"]["type"] == "string", schema
+    desc = next(t for t in m.TOOLS if t["name"] == "hub_task_reject")["description"]
+    assert "four-eyes" in desc and "原因" in desc and "hub_claim" in desc, desc
+    assert "cli.py reject" in desc, desc
+    appr_desc = next(t for t in m.TOOLS if t["name"] == "hub_task_approve")["description"]
+    assert "hub_task_reject" in appr_desc, appr_desc
+    helps = m.call_tool("hub_help", {"topic": "tasks"}, rs)
+    assert "退回" in helps and "reject" in helps, helps[-400:]
 
 
 def t_freeze_surface(hub):
@@ -4545,6 +5714,34 @@ def main():
          lambda: t_log_work_task_binding(fresh_hub(tmp, "hub_task_binding")))
     case("R36·agent 管控面（读/切状态/替他人confirm/认领闸门/前沿告警/列表徽标/schema）",
          lambda: t_agent_control_surface(fresh_hub(tmp, "hub_agent_control")))
+    case("R79·角色边界（worker 拒管理动作/读自己放行/精准放行/审计/管理面授权/manager 放行）",
+         lambda: t_role_policy_surface(fresh_hub(tmp, "hub_role_policy")))
+    case("R80·任务持有权（会话空 agent 拒完成/交办/重试/延后/审批/状态不动；署名持有者与管理面放行）",
+         lambda: t_task_identity_gate(fresh_hub(tmp, "hub_task_identity")))
+    case("R81·记忆归属（跨 agent 改写/取代/记录裁决拒且链不动；本人/manager/管理面放行；无主可整理）",
+         lambda: t_memory_ownership_gate(fresh_hub(tmp, "hub_memory_ownership")))
+    case("R82·撤销/复核署名（未锁撤销·复核拒且状态不动；锁定只撤自己/可协作复核；管理面放行；journal 留痕）",
+         lambda: t_attestation_identity_gate(fresh_hub(tmp, "hub_attest_identity")))
+    case("R83·任务/租约署名（未锁认领/写检查点/租约/交接全拒；读动作放行；锁定按进程身份；管理面放行）",
+         lambda: t_task_lease_identity_gate(fresh_hub(tmp, "hub_task_lease_identity")))
+    case("R84·通信署名（未锁冒名发信/替人标已读拒且不落库；锁定按进程身份；管理面代发代标；读收件箱放行）",
+         lambda: t_signal_identity_gate(fresh_hub(tmp, "hub_signal_identity")))
+    case("R85·闭环署名（未锁勾销待办/关错误拒且状态不动；锁定按进程身份留痕；管理面代勾代关；读列表放行）",
+         lambda: t_triage_identity_gate(fresh_hub(tmp, "hub_triage_identity")))
+    case("R101·追加型写入署名（未锁自报在册名写记录/错误/记忆/心跳/任务全拒且留痕；unknown/空放行；不在册走 check_agent；锁定覆盖；管理面放行）",
+         lambda: t_append_identity_gate(fresh_hub(tmp, "hub_append_identity")))
+    case("R86·待审批队列（只列在办待批/最久优先/项目过滤/已批与普通排除/空态/schema）",
+         lambda: t_task_approval_queue(fresh_hub(tmp, "hub_approval_queue")))
+    case("R87·审批时效（认领起算/≥24h 标待批过久/缺时间不硬算/统计与日结同口径/阈值边界）",
+         lambda: t_task_approval_aging(fresh_hub(tmp, "hub_approval_aging")))
+    case("R88·交接老化（open 显示已等时长/≥3 天陈旧/已认领不误标/坏时间不猜/状态与日结同口径）",
+         lambda: t_handoff_aging(fresh_hub(tmp, "hub_handoff_aging")))
+    case("R89·交接作废（必填原因/仅 open 可关/已认领拒/重复关闭幂等/已作废不可认领/署名闸/journal）",
+         lambda: t_handoff_close(fresh_hub(tmp, "hub_handoff_close")))
+    case("R90·拦截可观测（空态/身份与角色分类/按工具聚合/窗口过滤/只读/日结与CLI同口径/schema）",
+         lambda: t_security_observability(fresh_hub(tmp, "hub_security_obs")))
+    case("R100·审批退回（原因必填/自退拒/非在办拒/队列移除/看板↩/未锁身份批准退回均拒/锁定文案/schema）",
+         lambda: t_task_reject_surface(fresh_hub(tmp, "hub_task_reject")))
     case("R37·能力路由工具面（技能读设清/任务skills/匹配认领/不匹配拒/前沿过滤/schema）",
          lambda: t_skill_routing_surface(fresh_hub(tmp, "hub_skill_routing")))
     case("R38·WIP 上限工具面（到顶拒收/列表显示/完成释放）",

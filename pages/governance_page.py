@@ -1,9 +1,13 @@
 # -*- coding: utf-8 -*-
 """GovernancePage（GUI 管理面补全·v2.37）：治理中心——M7/M8/M9/M11/M12 的桌面端。
 
-五个分段（LedgerPage 模式：SegmentedWidget + QStackedWidget）：
-  隔离区（M8）/ 整合提案（M7）/ 待验证决策（M11）/ 关注管理（M9）/ 技能统计（M12）。
-桌面管理面：选中条目直接操作（解除隔离/执行整合/记回顾/取消关注），不依赖 MCP 会话。
+八个分段（LedgerPage 模式：SegmentedWidget + QStackedWidget）：
+  待审批（R86/R87/R96/R100）/ 待认领交接（R88/R89/R97）/ 隔离区（M8）/
+  整合提案（M7）/ 待验证决策（M11）/ 关注管理（M9）/ 技能统计（M12）/
+  安全与闸门（R54/R94）。
+桌面管理面：选中条目直接操作（批准完成/退回返工/认领或作废交接/解除隔离/执行整合/
+记回顾/取消关注），不依赖 MCP 会话；批准与退回仍受 four-eyes 约束（owner 不能自批/自退），
+已认领交接不可作废。
 """
 from __future__ import annotations
 
@@ -53,6 +57,259 @@ class _SubPage(QWidget):
     def _fill(self):
         self.listw.clear()
         self._items = {}
+
+
+class _ApprovalsSub(_SubPage):
+    """待审批队列（R86/R87/R96/R100 的桌面操作面）：看到等批时长，批准或退回返工。
+
+    批准/退回走 brain.task_approve/task_reject，署名固定为桌面管理面 gui；four-eyes
+    仍由 brain 强制（owner 不能自批/自退），被拒时把原因原样交给用户，不在这里放宽规则。
+    退回必须写原因：任务回到待办并释放持有权，owner 修改后重新认领、完成仍需复核。
+    """
+
+    TITLE = "待审批"
+    EMPTY_TITLE = "暂无待批任务"
+    EMPTY_DESC = "approval_required 任务认领后才进入队列；owner 不能自批，需他人或本管理面批准或退回"
+
+    def _build_buttons(self):
+        self.approveBtn = PushButton("批准完成")
+        self.approveBtn.setToolTip(
+            "以桌面管理面（gui）署名批准选中任务；owner 不能自批，批准后持有者才能标 done")
+        self.approveBtn.clicked.connect(self.approve)
+        self.rejectBtn = PushButton("退回返工")
+        self.rejectBtn.setToolTip(
+            "退回选中任务返工，必须填写原因；任务回到待办并释放持有权，修改后需重新认领并复核")
+        self.rejectBtn.clicked.connect(self.reject)
+        self.btnRow.addWidget(self.approveBtn)
+        self.btnRow.addWidget(self.rejectBtn)
+        self.btnRow.addStretch(1)
+
+    def _fill(self):
+        super()._fill()
+        if not self.win.root:
+            return
+        try:
+            rows = brain.task_approvals(self.win.root, limit=50)
+            brain.task_annotate(self.win.root, rows)
+        except Exception as e:  # noqa: BLE001
+            self.sumLabel.setText(f"读取失败：{e}")
+            return
+        aging = sum(1 for t in rows if t.get("_approval_aging"))
+        waits = [t["_approval_wait_h"] for t in rows
+                 if isinstance(t.get("_approval_wait_h"), (int, float))]
+        longest = max(waits, default=None)
+        if rows:
+            tail = f"，最久 {longest:g}h" if longest is not None else ""
+            self.sumLabel.setText(
+                f"待批 {len(rows)} 条（待批过久 {aging}{tail}；按等批时长排序）")
+        else:
+            self.sumLabel.setText("无待批任务——approval_required 任务认领后才进入队列")
+        for t in rows:
+            who = f"@{t['owner']}" if (t.get("owner") or "").strip() else "@无主"
+            proj = f"[{t['project']}] " if t.get("project") else ""
+            wait = t.get("_approval_wait_h")
+            wait_s = f"等批 {wait:g}h" if isinstance(wait, (int, float)) else "等批 —"
+            age = t.get("_progress_age_h")
+            age_s = f"｜最近进展 {age:g}h 前" if isinstance(age, (int, float)) else ""
+            flag = " ⚠待批过久" if t.get("_approval_aging") else ""
+            it = QListWidgetItem(
+                f"#{t['id']} {proj}{t['title'][:40]} {who}｜{wait_s}{flag}{age_s}")
+            tips = [f"{t['title']}\n等批从认领起算；≥{brain.TASK_APPROVAL_AGING_H}h "
+                    "标待批过久（只提示复核，不是硬 SLA）\n"
+                    "批准：本页「批准完成」或 hub_task_approve；退回：本页「退回返工」"
+                    "或 hub_task_reject（原因必填）\n"
+                    "owner 不能自批/自退"]
+            if t.get("_reject_count"):
+                tips.append(f"此前退回 {t['_reject_count']} 次"
+                            f"（最近 {t.get('_rejected_by') or '管理面'}"
+                            f"：{(t.get('_reject_note') or '未填写')[:120]}）")
+            it.setToolTip("\n".join(tips))
+            self._items[id(it)] = t
+            self.listw.addItem(it)
+
+    def approve(self):
+        t = self._selected()
+        if not t:
+            InfoBar.warning("先选中一条待批任务",
+                            "在「待审批」列表里选中一条，再点「批准完成」", parent=self)
+            return
+        note, ok = QInputDialog.getText(
+            self, "批准完成",
+            f"任务 #{t['id']}「{t['title'][:40]}」\n复核意见（可空）：")
+        if not ok:
+            return
+        try:
+            err, row = brain.task_approve(self.win.root, t["id"], "gui", note)
+        except Exception as e:  # noqa: BLE001
+            op_failed("批准完成", e, parent=self)
+            return
+        if err:
+            InfoBar.error("批准失败", err, parent=self)
+            return
+        InfoBar.success(
+            "已批准", f"任务 #{row['id']}（复核人 {row['_approved_by']}）——"
+                     "持有者现在可以标 done", parent=self)
+        self.reload()
+
+    def reject(self):
+        t = self._selected()
+        if not t:
+            InfoBar.warning("先选中一条待批任务",
+                            "在「待审批」列表里选中一条，再点「退回返工」", parent=self)
+            return
+        reason, ok = QInputDialog.getText(
+            self, "退回返工",
+            f"任务 #{t['id']}「{t['title'][:40]}」\n"
+            "退回原因（必填，owner 按此修改后重新认领）：")
+        if not ok:
+            return
+        if not (reason or "").strip():
+            InfoBar.warning("原因必填", "退回必须写明哪里不合格，owner 才知道怎么改", parent=self)
+            return
+        try:
+            err, row = brain.task_reject(self.win.root, t["id"], "gui", reason)
+        except Exception as e:  # noqa: BLE001
+            op_failed("退回返工", e, parent=self)
+            return
+        if err:
+            InfoBar.error("退回失败", err, parent=self)
+            return
+        InfoBar.success(
+            "已退回", f"任务 #{row['id']} 已回到待办并释放持有权——"
+                     "owner 修改后重新认领，完成仍需复核", parent=self)
+        self.reload()
+
+
+class _HandoffsSub(_SubPage):
+    """待认领交接（R88/R89 的桌面操作面）：看老化、直接认领或作废。
+
+    认领/作废走 brain.claim_handoff / close_handoff，署名桌面管理面 gui；
+    已认领交接不可作废（brain 强制），拒绝原因原样回显，不在这里放宽规则。
+    """
+
+    TITLE = "待认领交接"
+    EMPTY_TITLE = "暂无待认领交接"
+    EMPTY_DESC = "交接由 hub_handoff(create) 产生；认领后接手人继续推进，陈旧交接可在此作废"
+
+    def _build_buttons(self):
+        self.claimBtn = PushButton("认领交接")
+        self.claimBtn.setToolTip(
+            "以桌面管理面（gui）认领选中交接；认领后接手人继续推进（状态变 claimed）")
+        self.claimBtn.clicked.connect(self.claim)
+        self.closeBtn = PushButton("作废交接")
+        self.closeBtn.setToolTip(
+            "作废选中的 open 交接，必须填写原因；已认领交接不能作废（接手已发生）")
+        self.closeBtn.clicked.connect(self.close)
+        self.allChk = CheckBox("含已认领/已作废")
+        self.allChk.setToolTip("勾选后显示 claimed/closed 交接，用于复核接手人与作废原因")
+        self.allChk.toggled.connect(lambda _on: self.reload())
+        self.btnRow.addWidget(self.claimBtn)
+        self.btnRow.addWidget(self.closeBtn)
+        self.btnRow.addStretch(1)
+        self.btnRow.addWidget(self.allChk)
+
+    def _fill(self):
+        super()._fill()
+        if not self.win.root:
+            return
+        include = bool(self.allChk.isChecked())
+        try:
+            rows = brain.list_handoffs(self.win.root, include_claimed=include)
+        except Exception as e:  # noqa: BLE001
+            self.sumLabel.setText(f"读取失败：{e}")
+            return
+        open_rows = [r for r in rows if r.get("status") == "open"]
+        stale = sum(1 for r in open_rows if r.get("_stale"))
+        ages = [r["_age_days"] for r in open_rows
+                if isinstance(r.get("_age_days"), (int, float))]
+        longest = max(ages, default=None)
+        if include:
+            claimed = sum(1 for r in rows if r.get("status") == "claimed")
+            closed = sum(1 for r in rows if r.get("status") == "closed")
+            self.sumLabel.setText(
+                f"待认领 {len(open_rows)} 条（陈旧 {stale}）｜已认领 {claimed}｜已作废 {closed}")
+        elif open_rows:
+            tail = f"，最久 {longest:g} 天" if longest is not None else ""
+            self.sumLabel.setText(
+                f"待认领交接 {len(open_rows)} 条（陈旧 {stale}{tail}；按创建时间倒序）")
+        else:
+            self.sumLabel.setText("无待认领交接——换手前用 hub_handoff(create) 留下下一步")
+        for r in rows:
+            status = r.get("status") or "open"
+            badge = {"open": "待认领", "claimed": "已认领", "closed": "已作废"}.get(
+                status, status)
+            flag = " ⚠陈旧" if r.get("_stale") else ""
+            age = r.get("_age_h")
+            age_s = f"创建于 {age:g}h 前" if isinstance(age, (int, float)) else "创建时间未知"
+            who = f"来自 {r.get('agent')}" if r.get("agent") else "来源未署名"
+            proj = f"[{r.get('project')}] " if r.get("project") else ""
+            nxt = (r.get("next_step") or "").strip()
+            nxt_s = f"｜下一步 {nxt[:40]}" if nxt else ""
+            it = QListWidgetItem(
+                f"#{r['id']} {proj}{who}｜{badge}{flag}｜{age_s}{nxt_s}")
+            tips = [f"完成：{(r.get('done') or '未填写')[:200]}",
+                    f"下一步：{(r.get('next_step') or '未填写')[:200]}",
+                    f"已排除：{(r.get('excluded') or '未填写')[:200]}"]
+            if status == "claimed":
+                tips.append(f"接手人：{r.get('claimed_by') or '未署名'}（{r.get('claimed_at') or '时间未知'}）")
+            elif status == "closed":
+                tips.append(f"作废：{r.get('closed_by') or '未署名'}（{r.get('closed_at') or '时间未知'}）"
+                            f"｜原因：{r.get('close_note') or '未填写'}")
+            tips.append(f"创建于 {r.get('created') or '时间未知'}；≥{brain.HANDOFF_STALE_DAYS} 天未认领标陈旧")
+            it.setToolTip("\n".join(tips))
+            self._items[id(it)] = r
+            self.listw.addItem(it)
+
+    def claim(self):
+        r = self._selected()
+        if not r:
+            InfoBar.warning("先选中一条交接",
+                            "在「待认领交接」列表里选中一条，再点「认领交接」", parent=self)
+            return
+        if r.get("status") != "open":
+            InfoBar.warning("只能认领待认领交接",
+                            f"#{r['id']} 当前为 {r.get('status')}，不可重复认领", parent=self)
+            return
+        try:
+            msg = brain.claim_handoff(self.win.root, r["id"], "gui")
+        except Exception as e:  # noqa: BLE001
+            op_failed("认领交接", e, parent=self)
+            return
+        if not msg.startswith("已认领"):
+            InfoBar.error("认领失败", msg, parent=self)
+            return
+        InfoBar.success("已认领", msg, parent=self)
+        self.reload()
+
+    def close(self):
+        r = self._selected()
+        if not r:
+            InfoBar.warning("先选中一条交接",
+                            "在「待认领交接」列表里选中一条，再点「作废交接」", parent=self)
+            return
+        if r.get("status") != "open":
+            InfoBar.warning("只能作废待认领交接",
+                            f"#{r['id']} 当前为 {r.get('status')}；已认领交接不能作废", parent=self)
+            return
+        note, ok = QInputDialog.getText(
+            self, "作废交接",
+            f"交接 #{r['id']}「{(r.get('next_step') or r.get('done') or '')[:40]}」\n"
+            "作废原因（必填，便于追溯）：")
+        if not ok:
+            return
+        if not (note or "").strip():
+            InfoBar.warning("原因必填", "作废交接必须填写原因，便于后续追溯", parent=self)
+            return
+        try:
+            msg = brain.close_handoff(self.win.root, r["id"], "gui", note)
+        except Exception as e:  # noqa: BLE001
+            op_failed("作废交接", e, parent=self)
+            return
+        if not msg.startswith("已关闭"):
+            InfoBar.error("作废失败", msg, parent=self)
+            return
+        InfoBar.success("已作废", msg, parent=self)
+        self.reload()
 
 
 class _QuarantineSub(_SubPage):
@@ -359,6 +616,26 @@ class _SecuritySub(_SubPage):
                 self.listw.addItem("写入闸门：未冻结")
         except Exception as e:  # noqa: BLE001
             self.listw.addItem(f"写入闸门：读取失败（{type(e).__name__}: {str(e)[:80]}）")
+        # R99：越权拦截此前只有 MCP/CLI 出口——桌面安全页直接按工具/agent 聚合，
+        # 反复冒名或越权的来源不必切命令行才能定位。
+        try:
+            sec = brain.security_snapshot(root)
+            if sec["total"]:
+                self.listw.addItem(
+                    f"越权拦截（近 {sec['days']} 天）：{sec['total']} 次"
+                    f"（未锁身份 {sec['identity']} · 角色越权 {sec['role']}）")
+                self.listw.addItem("  按 agent：" + "；".join(
+                    f"@{a['agent']} {a['count']} 次（身份 {a['identity']}/角色 {a['role']}）"
+                    for a in sec["by_agent"][:4]))
+                for t in sec["by_tool"][:5]:
+                    self.listw.addItem(
+                        f"  {t['tool']} {t['count']} 次"
+                        f"（身份 {t['identity']}/角色 {t['role']}，"
+                        f"最近 {t['last'][:16].replace('T', ' ') or '时间未知'}）")
+            else:
+                self.listw.addItem(f"越权拦截（近 {sec['days']} 天）：无")
+        except Exception as e:  # noqa: BLE001 拦截聚合失败不拖垮整页
+            self.listw.addItem(f"越权拦截：读取失败（{type(e).__name__}: {str(e)[:80]}）")
         try:
             h = ops.run_check("security_health", "", root)
             health_ok = h["ok"]
@@ -367,8 +644,21 @@ class _SecuritySub(_SubPage):
                 self.listw.addItem("  " + d)
         except Exception as e:  # noqa: BLE001
             self.listw.addItem(f"安全体检：执行失败（{type(e).__name__}: {str(e)[:80]}）")
+        # R94：治理积压（审批老化/陈旧交接/未锁身份/角色越权）与安全同页可见，
+        # 免去为了看一眼「有没有人要拍板」去跑 hub_ops_run。
+        gov_ok = True
+        try:
+            g = ops.run_check("governance_health", "", root)
+            gov_ok = g["ok"]
+            self.listw.addItem(("✓ " if g["ok"] else "✗ ") + "治理巡检：" + g["summary"])
+            for d in g.get("detail", [])[:8]:
+                self.listw.addItem("  " + d)
+        except Exception as e:  # noqa: BLE001
+            gov_ok = False
+            self.listw.addItem(f"治理巡检：执行失败（{type(e).__name__}: {str(e)[:80]}）")
         self.sumLabel.setText(
-            ("✓ 安全面正常" if (chain_ok and health_ok) else "⚠ 安全面有异常，见下方逐条")
+            ("✓ 安全面正常" if (chain_ok and health_ok and gov_ok)
+             else "⚠ 安全面有异常，见下方逐条")
             + "——审计链只读校验，冻结/解冻动作会记入审计链")
 
     def freeze(self):
@@ -419,7 +709,7 @@ class _SecuritySub(_SubPage):
 
 
 class GovernancePage(QWidget):
-    """治理中心：隔离区/整合提案/待验证决策/关注管理/技能统计/安全与闸门 六段。"""
+    """治理中心：待审批/待认领交接/隔离区/整合提案/待验证决策/关注管理/技能统计/安全与闸门 八段。"""
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -427,24 +717,25 @@ class GovernancePage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head(
-            "治理中心", "大脑的日常治理面：可疑内容隔离、重复记忆整合、决策到期回顾、"
-                        "关注项目管理、技能使用统计、审计链与写闸门——桌面直接操作"))
+            "治理中心", "大脑的日常治理面：待审批任务、待认领交接、可疑内容隔离、重复记忆整合、"
+                        "决策到期回顾、关注项目管理、技能使用统计、审计链与写闸门——桌面直接操作"))
 
         self.seg = SegmentedWidget(self)
         self.stack = QStackedWidget(self)
-        self.subs = (_QuarantineSub(win), _ConsolidateSub(win), _DecisionSub(win),
-                     _ViewSub(win), _SkillStatsSub(win), _SecuritySub(win))
-        for key, sub in zip(("quarantine", "consolidate", "decision", "view", "skill",
-                             "security"), self.subs):
+        self.subs = (_ApprovalsSub(win), _HandoffsSub(win), _QuarantineSub(win),
+                     _ConsolidateSub(win), _DecisionSub(win), _ViewSub(win),
+                     _SkillStatsSub(win), _SecuritySub(win))
+        for key, sub in zip(("approvals", "handoffs", "quarantine", "consolidate",
+                             "decision", "view", "skill", "security"), self.subs):
             self.seg.addItem(key, sub.TITLE)
             self.stack.addWidget(sub)
         self.seg.currentItemChanged.connect(
             lambda key: self.stack.setCurrentIndex(
-                {"quarantine": 0, "consolidate": 1, "decision": 2, "view": 3,
-                 "skill": 4, "security": 5}.get(key, 0)))
+                {"approvals": 0, "handoffs": 1, "quarantine": 2, "consolidate": 3,
+                 "decision": 4, "view": 5, "skill": 6, "security": 7}.get(key, 0)))
         lay.addWidget(self.seg)
         lay.addWidget(self.stack, 1)
-        self.seg.setCurrentItem("quarantine")
+        self.seg.setCurrentItem("approvals")
 
     def reload(self):
         for sub in self.subs:

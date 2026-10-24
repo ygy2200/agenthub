@@ -5025,6 +5025,8 @@ def main():
     case("P1-1 记忆版本化（编辑/删除留痕+回滚+records双时相失效不删）", lambda: t_memory_revisions(tmp))
     case("P1-2 schema收口（record_type枚举/标签规约与注册表归一）", lambda: t_record_type_and_tags(tmp))
     case("P1-3 关系+属性继承（双链抽取/反链/属性下行）", lambda: t_relations_and_attrs(tmp))
+    case("R91·治理查询索引（安全/审计/交接命中索引/5000行窗口过滤等价/存量库幂等重建）",
+         lambda: t_governance_indexes(tmp))
     case("项目归属（写入即落/存量回填/前缀目录/保留目录剔除/幂等，修「归属:未知」）", lambda: t_project_owner(tmp))
     case("agent 活跃度回填（存量补 last_seen/不覆盖/不妄填/幂等，修「谁静默了不可判定」）", lambda: t_agents_lastseen(tmp))
     case("工具 schema 同步（ops.CHECKS/记忆kind/任务状态/事件kind 的 enum 不许手抄漂移）", lambda: t_tool_schema_sync(tmp))
@@ -5114,6 +5116,8 @@ def main():
          lambda: t_coverage_gate_reuses_df(tmp))
     case("R60 BM25 分词缓存有上限（FIFO 淘汰/两个命名空间各自受限）",
          lambda: t_tok_cache_bounded(tmp))
+    case("R100 审批退回（原因必填/owner 不能自退/非审批与非在办拒/批准后拒/释放持有与租约/留痕累计/信号/journal）",
+         lambda: t_task_reject(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:
@@ -5763,6 +5767,114 @@ def t_task_defer_approve(tmp):
     assert int(row["approval_required"]) == 0, row
 
 
+def t_task_reject(tmp):
+    """R100 审批退回：原因必填、owner 不能自退、已批准/非在办/非审批任务拒退；
+    退回把任务放回 pending 并释放 owner/租约/文件锁，保留退回人/原因/次数；
+    重新认领后再次进入审批队列，完成仍需他人复核；信号/journal/看板标注齐全。"""
+    root = str(Path(tmp) / "AgentHub-审批退回")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    # 老库补列（迁移幂等）
+    with brain.db_conn(root) as conn:
+        for c in ("rejected_by", "rejected_at", "reject_note", "reject_count"):
+            conn.execute(f"ALTER TABLE tasks DROP COLUMN {c}")
+    brain.init_db(root)
+    with brain.db_conn(root) as conn:
+        cols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
+    assert {"rejected_by", "rejected_at", "reject_note", "reject_count"} <= cols, cols
+
+    # ---- 参数/状态闸门 ----
+    err, t1 = brain.task_add(root, "等复核交付", project="项目-辛",
+                             approval_required=True)
+    assert not err and brain.task_claim(root, t1, "zcode")[0] == ""
+    err, _ = brain.task_reject(root, t1, agent="workbuddy", reason="")
+    assert "原因" in err, err
+    err, _ = brain.task_reject(root, t1, agent="workbuddy", reason="   ")
+    assert "原因" in err, err
+    err, _ = brain.task_reject(root, "abc", agent="workbuddy", reason="x")
+    assert "非法" in err, err
+    err, _ = brain.task_reject(root, 99999, agent="workbuddy", reason="x")
+    assert "不存在" in err, err
+    err, _ = brain.task_reject(root, t1, agent="zcode", reason="自己退自己")
+    assert "不能退回自己" in err, err
+    row = brain.task_get(root, t1)
+    assert row["status"] == "in_progress" and row["owner"] == "zcode", row
+
+    # 非审批任务不可退回（提示走 task_update）
+    err, plain = brain.task_add(root, "普通任务", project="项目-辛")
+    assert not err and brain.task_claim(root, plain, "zcode")[0] == ""
+    err, _ = brain.task_reject(root, plain, agent="workbuddy", reason="x")
+    assert "未开启" in err and "hub_task_update" in err, err
+
+    # 未在办的任务不可退回
+    err, idle = brain.task_add(root, "待办任务", project="项目-辛",
+                               approval_required=True)
+    assert not err
+    err, _ = brain.task_reject(root, idle, agent="workbuddy", reason="x")
+    assert "不在审批队列" in err, err
+
+    # ---- 退回成功：回待办、释放持有与文件锁、留痕 ----
+    assert brain.file_lease_acquire(root, "src/reject.py", "zcode", task_id=t1,
+                                    reason="等复核")[0] == ""
+    err, row = brain.task_reject(root, t1, agent="workbuddy",
+                                 reason="验收证据不足，补测试")
+    assert not err and row["status"] == "pending" and row["owner"] == "", row
+    assert row["claimed_at"] == "" and row["blocked_by"] == "", row
+    assert row["rejected_by"] == "workbuddy" and row["reject_count"] == 1, row
+    assert row["reject_note"] == "验收证据不足，补测试" and row["rejected_at"], row
+    assert row["_rejected"] and row["_rejected_by"] == "workbuddy", row
+    with brain.db_conn(root) as conn:
+        lease = conn.execute("SELECT released_at FROM file_leases WHERE task_id=?",
+                             (t1,)).fetchone()
+        j = conn.execute("SELECT COUNT(*) FROM journal WHERE action='任务退回' "
+                         "AND target=?", (f"tasks#{t1}",)).fetchone()[0]
+        sig = conn.execute("SELECT COUNT(*) FROM signals WHERE to_agent='zcode' "
+                           "AND content LIKE '%审批退回%'").fetchone()[0]
+    assert lease and lease["released_at"], dict(lease or {})
+    assert j == 1 and sig == 1, (j, sig)
+
+    rows = brain.task_list(root, status="pending")
+    brain.task_annotate(root, rows)
+    shown = next(r for r in rows if r["id"] == t1)
+    assert shown["_rejected"] and shown["_reject_count"] == 1, shown
+    assert shown["_reject_note"].startswith("验收证据不足"), shown
+    assert all(r["id"] != t1 for r in brain.task_list(root, status="in_progress")), rows
+
+    # 重新认领后再次进入审批：完成仍需他人复核；不能退回已批准
+    assert brain.task_claim(root, t1, "zcode")[0] == ""
+    err, _ = brain.task_update(root, t1, status="done", agent="zcode")
+    assert "审批" in err, err
+    err, row = brain.task_approve(root, t1, agent="dsh", note="改好了")
+    assert not err and row["_approved"], row
+    err, _ = brain.task_reject(root, t1, agent="workbuddy", reason="再退")
+    assert "已由 dsh 批准" in err, err
+
+    # 第二次退回：次数累计、保留最近一次原因
+    err, t2 = brain.task_add(root, "两次退回", project="项目-辛",
+                             approval_required=True)
+    assert not err and brain.task_claim(root, t2, "zcode")[0] == ""
+    assert brain.task_reject(root, t2, agent="workbuddy", reason="第一次")[0] == ""
+    assert brain.task_claim(root, t2, "zcode")[0] == ""
+    err, row = brain.task_reject(root, t2, agent="dsh", reason="第二次")
+    assert not err and row["reject_count"] == 2 and row["_rejected_by"] == "dsh", row
+    assert row["reject_note"] == "第二次", row
+
+    # 终态不可退回
+    assert brain.task_claim(root, t1, "zcode")[0] == ""
+    err, row = brain.task_update(root, t1, status="done", agent="zcode")
+    assert not err and row["status"] == "done", row
+    err, _ = brain.task_reject(root, t1, agent="workbuddy", reason="终态")
+    assert "终态" in err, err
+
+    # 管理面空传 agent：署名「管理面」，four-eyes 不拦
+    err, t3 = brain.task_add(root, "管理面退回", project="项目-辛",
+                             approval_required=True)
+    assert not err and brain.task_claim(root, t3, "zcode")[0] == ""
+    err, row = brain.task_reject(root, t3, reason="管理面复核不通过")
+    assert not err and row["_rejected_by"] == "管理面", row
+
+
 def t_journal_chain(tmp):
     """R47 审计链：新流水逐条接链并更新头锚；改字段/删行/截尾分别按内容、断层、头锚点名；
     历史未封存行不算篡改（如实计数）；老库补列时按 id 顺序自动封存且不改内容。"""
@@ -6190,6 +6302,58 @@ def t_tok_cache_bounded(tmp):
     finally:
         brain._TOK_CACHE_MAX = old
         brain._TOK_CACHE.clear()
+
+
+def t_governance_indexes(tmp):
+    """R91 治理查询索引：安全态势/审计/交接查询命中索引；功能等价；
+    存量库删索引后 init_db 能幂等重建。"""
+    root = str(Path(tmp) / "hub_indexes")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    def plan(sql, args=()):
+        with brain.db_conn(root) as conn:
+            return "\n".join(str(r["detail"]) for r in
+                             conn.execute("EXPLAIN QUERY PLAN " + sql, args))
+
+    p = plan("SELECT id,ts,agent,action,target,note FROM journal"
+             " WHERE action='越权拦截' AND ts>=?", ("2026-01-01T00:00:00",))
+    assert "idx_journal_action_ts" in p, p
+    p = plan("SELECT * FROM journal WHERE ts>=?", ("2026-01-01T00:00:00",))
+    assert "idx_journal_ts" in p, p
+    p = plan("SELECT COUNT(*) FROM handoffs WHERE status='open'")
+    assert "idx_handoffs_status" in p, p
+
+    # 功能等价：5000 条混合流水，只有近 7 天的「越权拦截」计数
+    now = brain.datetime.datetime.now()
+    rows = []
+    for i in range(5000):
+        if i % 2 == 0:
+            ts = (now - brain.datetime.timedelta(days=10)).isoformat(timespec="seconds")
+            act = "越权拦截" if i % 4 == 0 else "记录"
+        else:
+            ts = (now - brain.datetime.timedelta(hours=1)).isoformat(timespec="seconds")
+            act = "越权拦截" if i % 5 == 0 else "记录"
+        rows.append((ts, "bulk", act, "hub_claim:identity", "未锁定"))
+    with brain.db_conn(root) as conn:
+        conn.executemany(
+            "INSERT INTO journal(ts,agent,action,target,note) VALUES(?,?,?,?,?)", rows)
+    snap = brain.security_snapshot(root, days=7)
+    expect = sum(1 for i in range(5000) if i % 2 == 1 and i % 5 == 0)
+    assert snap["total"] == expect, (snap["total"], expect)
+    assert snap["identity"] == expect, snap
+
+    # 存量库迁移：删掉索引后 init_db 重建，计划恢复
+    with brain.db_conn(root) as conn:
+        conn.execute("DROP INDEX idx_journal_action_ts")
+        conn.execute("DROP INDEX idx_journal_ts")
+        conn.execute("DROP INDEX idx_handoffs_status")
+    brain.init_db(root)
+    p = plan("SELECT id FROM journal WHERE action='越权拦截' AND ts>=?",
+             ("2026-01-01T00:00:00",))
+    assert "idx_journal_action_ts" in p, p
+    p = plan("SELECT COUNT(*) FROM handoffs WHERE status='open'")
+    assert "idx_handoffs_status" in p, p
 
 
 def shutil_rmtree(tmp):

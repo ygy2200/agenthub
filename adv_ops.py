@@ -141,10 +141,127 @@ def t_release_manifest(tmp):
           str(r)[:200])
 
 
+def t_mcp_drift(tmp):
+    """R103 接入参数漂移：server 脚本缺失 fail、未锁 --agent/锁名不符/不在册/root
+    指向别库 warn、配置正确 ok、bundle 与未配置不重复报。"""
+    import brain
+    root = tmp / "hub_drift"
+    root.mkdir()
+    brain.init_db(str(root))
+    srv = Path(__file__).parent / "agenthub_mcp.py"   # 真实存在的脚本
+    cfg = root / "config.agents.json"
+
+    def _agents_entry(agent, args, mcp=True):
+        entry = {"agent": agent, "channel": "instr_file",
+                 "instr_path": str(root / f"{agent}.md")}
+        if mcp:
+            entry["mcp"] = {"path": str(root / f"{agent}.json"), "layout": "standard"}
+            (root / f"{agent}.json").write_text(json.dumps(
+                {"mcpServers": {"agenthub": {"command": "python", "args": args}}},
+                ensure_ascii=False), encoding="utf-8")
+        return entry
+
+    # 注意：agent 名不能含连字符/下划线——agent_key 取首词归一，drift-ok 与
+    # drift-nolock 会归并成同一个 key 互相覆盖（R103 实测），测试名必须首词唯一。
+    agents = [
+        _agents_entry("oklock", [str(srv), "--agent", "oklock"]),
+        _agents_entry("nolock", [str(srv)]),
+        _agents_entry("foreign", [str(srv), "--agent", "oklock"]),  # 用别家在册名
+        _agents_entry("ghostname", [str(srv), "--agent", "ghost-x"]),
+        _agents_entry("deadsrv", [str(tmp / "nope" / "agenthub_mcp.py"), "--agent", "deadsrv"]),
+        _agents_entry("rootdrift", [str(srv), "--agent", "rootdrift", "--root", str(tmp / "elsewhere")]),
+        _agents_entry("bundleagent", [], mcp=False),  # 未配 mcp：agents/onboard 管，drift 不重复报
+    ]
+    cfg.write_text(json.dumps({"agents": agents}, ensure_ascii=False), encoding="utf-8")
+
+    r = ops.run_check("mcp_drift", "", str(root))
+    det = "\n".join(r["detail"])
+    check("mcp_drift 汇总：5 家漂移 1 家健康", (not r["ok"]) and "5 家" in r["summary"],
+          r["summary"])
+    check("缺 --agent → warn 未锁身份（署名闸会拦写）",
+          "nolock" in det and "未锁 --agent" in det, det)
+    check("锁名是别家在册名 → warn 归属分裂",
+          "foreign" in det and "别家注册名" in det, det)
+    check("锁名不在注册表 → warn check_agent 会拒收",
+          "ghostname" in det and "不在注册表" in det, det)
+    check("server 脚本不存在 → fail（MCP 起不来）",
+          "deadsrv" in det and "✗" in det and "不存在" in det, det)
+    check("--root 指向别库 → warn 写入目标分裂",
+          "rootdrift" in det and "不同库" in det, det)
+    check("配置正确 → ✓ 且未配置 mcp 的 agent 不重复报",
+          "oklock: ✓" in det and "bundleagent" not in det, det)
+
+    # 空接入（无任何 agent 配 mcp）→ ok 空态
+    empty = tmp / "hub_drift_empty"
+    empty.mkdir()
+    brain.init_db(str(empty))
+    (empty / "config.agents.json").write_text(json.dumps(
+        {"agents": [_agents_entry("solo", [str(srv), "--agent", "solo"], mcp=False)]},
+        ensure_ascii=False), encoding="utf-8")
+    r2 = ops.run_check("mcp_drift", "", str(empty))
+    check("无 MCP 配置 → ok 空态（内置适配器照常体检，不因无人配置报错）",
+          r2["ok"] and "均与注册表一致" in r2["summary"], r2["summary"])
+
+
+def t_usage_health(tmp):
+    """R105 用量异常：失控嫌疑（1h 超阈值）、循环嫌疑（单工具 10min 超阈值）、
+    接入闲置（MCP 配置但 7 天零调用）、空归属信息行、正常空态。"""
+    import brain
+    root = tmp / "hub_usage"
+    root.mkdir()
+    brain.init_db(str(root))
+    brain.add_record(root, "用量-项目", "zcode", "2026-10-24", "种子记录",
+                     "【目的】让闲置检测生效（空库无使用语义）\n【做了什么】种子\n"
+                     "【验证结果】无\n【如何回滚】删")
+    now = __import__("datetime").datetime.now()
+    iso = lambda s: (now - __import__("datetime").timedelta(seconds=s)).isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        for i in range(5):  # 失控：301 次/1h（阈值 300）
+            pass
+        conn.executemany("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
+                         [(iso(60), "busybee", "hub_search")] * 301)
+        conn.executemany("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
+                         [(iso(120), "looper", "hub_status")] * 61)   # 循环：61 次/10min
+        conn.executemany("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
+                         [(iso(180), "", "hub_search")] * 3)          # 空归属
+        # quietbee：注册 + MCP 配置但 7 天零调用 → 接入闲置
+    (root / "config.agents.json").write_text(json.dumps({"agents": [
+        {"agent": "quietbee", "channel": "instr_file",
+         "instr_path": str(root / "quietbee.md"),
+         "mcp": {"path": str(root / "quietbee.json"), "layout": "standard"}},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    (root / "quietbee.json").write_text(json.dumps(
+        {"mcpServers": {"agenthub": {"command": "python",
+                                     "args": ["agenthub_mcp.py", "--agent", "quietbee"]}}}),
+        encoding="utf-8")
+
+    r = ops.run_check("usage_health", "", str(root))
+    det = "\n".join(r["detail"])
+    check("失控嫌疑：busybee 近 1h 301 次 > 300 被点名",
+          (not r["ok"]) and "busybee" in det and "失控嫌疑" in det, r["summary"])
+    check("循环嫌疑：looper 单工具 10min 61 次 > 60 被点名",
+          "looper" in det and "循环调用" in det, det)
+    check("接入闲置：quietbee 配置在但零调用被点名",
+          "quietbee" in det and "零调用" in det, det)
+    check("空归属信息行：3 次空归属如实呈现",
+          "空归属调用 3 次" in det, det)
+    check("修复建议已注册", "usage_health" in ops.CHECK_FIXES
+          and "hub_usage_timeline" in ops.CHECK_FIXES["usage_health"], "")
+
+    # 正常空态：无调用无配置 → ok
+    empty = tmp / "hub_usage_empty"
+    empty.mkdir()
+    brain.init_db(str(empty))
+    r2 = ops.run_check("usage_health", "", str(empty))
+    check("无调用无配置 → ok 正常", r2["ok"] and "用量正常" in r2["summary"], r2["summary"])
+
+
 def main():
     tmp = Path(tempfile.mkdtemp(prefix="agenthub_adv_ops_"))
     build_fake_hub(tmp)
     t_release_manifest(tmp)
+    t_mcp_drift(tmp)
+    t_usage_health(tmp)
 
     # ---- 正常路径
     proj = tmp / "测试项目-检查工具箱"
@@ -1192,6 +1309,75 @@ def main():
     rq = ops.run_check("record_quality", root=q_root)
     check("record_quality 接线（summary 标明标准上线后口径）",
           rq["ok"] and "标准上线后" in rq["summary"], str(rq["summary"]))
+
+    # ---- R93 治理面巡检：审批老化 / 陈旧交接 / 未锁身份 / 角色越权阈值
+    import brain as _brain_g
+    g_root = str(tmp / "hub_gov")
+    Path(g_root).mkdir()
+    _brain_g.init_db(g_root)
+    g_now = datetime.datetime.now()
+    g_iso = lambda h: (g_now - datetime.timedelta(hours=h)).isoformat(timespec="seconds")
+    g0 = ops.run_check("governance_health", "", g_root)
+    check("governance_health 空库通过", g0["ok"] is True and "治理面健康" in g0["summary"],
+          str(g0)[:240])
+    _e1, ga = _brain_g.task_add(g_root, "等批任务A", project="治理", approval_required=True)
+    _e2, gb = _brain_g.task_add(g_root, "等批任务B", project="治理", approval_required=True)
+    check("治理任务创建", not _e1 and not _e2, (_e1, _e2))
+    check("治理任务认领A", _brain_g.task_claim(g_root, ga, "zcode")[0] == "")
+    check("治理任务认领B", _brain_g.task_claim(g_root, gb, "dsh")[0] == "")
+    with _brain_g.db_conn(g_root) as _cg:
+        _cg.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (g_iso(30), ga))
+        _cg.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (g_iso(1), gb))
+    g1 = ops.run_check("governance_health", "", g_root)
+    check("governance_health 待批过久只算超阈值",
+          (not g1["ok"]) and "待批过久 1" in g1["summary"], str(g1["summary"]))
+    check("待批明细点名任务与等批时长",
+          any(f"#{ga}" in d and "30.0h" in d for d in g1["detail"]), str(g1["detail"]))
+    check("未超阈值的待批不误报",
+          all(f"#{gb}" not in d for d in g1["detail"]), str(g1["detail"]))
+
+    _h1 = _brain_g.create_handoff(g_root, "治理", "zcode", done="a", next_step="b")
+    _h2 = _brain_g.create_handoff(g_root, "治理", "zcode", done="c", next_step="d")
+    check("治理交接创建", "已创建交接 #" in _h1 and "已创建交接 #" in _h2, (_h1, _h2))
+    g_old = int(_h1.split("#")[1].split("（")[0])
+    g_new = int(_h2.split("#")[1].split("（")[0])
+    with _brain_g.db_conn(g_root) as _cg:
+        _cg.execute("UPDATE handoffs SET created=? WHERE id=?", (g_iso(4 * 24), g_old))
+    g2 = ops.run_check("governance_health", "", g_root)
+    check("governance_health 陈旧交接只算超龄的",
+          "陈旧交接 1" in g2["summary"], str(g2["summary"]))
+    check("陈旧交接明细点名与天数",
+          any(f"#{g_old}" in d and "4 天" in d for d in g2["detail"]), str(g2["detail"]))
+    check("新交接不误报",
+          all(f"#{g_new}「" not in d for d in g2["detail"]), str(g2["detail"]))
+
+    _brain_g.journal_add(g_root, "zcode", "越权拦截", target="hub_claim:identity",
+                         note="未锁定身份")
+    _brain_g.journal_add(g_root, "dsh", "越权拦截", target="hub_freeze", note="角色不足")
+    g3 = ops.run_check("governance_health", "", g_root)
+    check("未锁身份拦截即判失败", "未锁身份拦截 1" in g3["summary"], str(g3["summary"]))
+    check("拦截明细给出工具与分类",
+          any("hub_claim" in d and "未锁身份 1" in d for d in g3["detail"]), str(g3["detail"]))
+    check("governance_health detail ≤ 8", len(g3["detail"]) <= 8, str(len(g3["detail"])))
+
+    # 角色越权阈值单独验：1-2 次只提示（健康分支），第 3 次才点名
+    g_root2 = str(tmp / "hub_gov_role")
+    Path(g_root2).mkdir()
+    _brain_g.init_db(g_root2)
+    for _ in range(2):
+        _brain_g.journal_add(g_root2, "dsh", "越权拦截", target="hub_freeze", note="角色不足")
+    gr2 = ops.run_check("governance_health", "", g_root2)
+    check("角色越权 2 次不判失败但如实提示",
+          gr2["ok"] is True and "角色越权 2 次" in gr2["summary"], str(gr2["summary"]))
+    _brain_g.journal_add(g_root2, "dsh", "越权拦截", target="hub_freeze", note="角色不足")
+    gr3 = ops.run_check("governance_health", "", g_root2)
+    check("角色越权第 3 次点名失败",
+          (not gr3["ok"]) and "角色越权 3" in gr3["summary"], str(gr3["summary"]))
+    check("governance_health 已注册巡检且建议可执行",
+          "governance_health" in ops.CHECKS and "governance_health" in ops.PATROL_CHECKS
+          and all(k in ops.CHECK_FIXES.get("governance_health", "")
+                  for k in ("hub_task_approve", "hub_handoff", "--agent")),
+          str(ops.CHECK_FIXES.get("governance_health")))
 
     # ---- R59 库完整性体检：坏库点名 + 巡检短路，避免一屏次生失败
     c_root = tmp / "hub_corrupt"

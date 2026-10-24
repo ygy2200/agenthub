@@ -750,6 +750,158 @@ def t_backup_drill_cli(tmp):
     assert rc == 1 and "不存在" in out, (rc, out)
 
 
+def t_reject_cli(tmp):
+    """R100 CLI 退回面：原因必填、owner 自退拒、非审批任务拒、退回成功回执与
+    状态可见性、已批准不可退、argparse --reason 必填接线。CLI 是管理面（空 agent 可代）。"""
+    import brain
+    root = str(Path(tmp) / "hub_reject_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+
+    # 原因必填（brain 层拦截；argparse 层由 --reason required 兜底）
+    t = brain.task_add(root, "CLI 退回面", project="P", approval_required=True)[1]
+    brain.task_claim(root, t, "zcode")
+    rc, out = _capture(cli.cmd_reject, root, t, reason="")
+    assert rc == 1 and "退回必须写明原因" in out, (rc, out)
+
+    # owner 不能自退（CLI 是管理面，但显式传 owner 名仍被 four-eyes 拦）
+    rc, out = _capture(cli.cmd_reject, root, t, reason="自己退自己", agent="zcode")
+    assert rc == 1 and "不能退回自己" in out, (rc, out)
+
+    # 非审批任务拒退
+    t2 = brain.task_add(root, "普通任务", project="P")[1]
+    brain.task_claim(root, t2, "zcode")
+    rc, out = _capture(cli.cmd_reject, root, t2, reason="x")
+    assert rc == 1 and "未开启" in out, (rc, out)
+
+    # 退回成功：回执含退回人/原因/重新认领指引；任务回待办
+    rc, out = _capture(cli.cmd_reject, root, t, reason="验收证据不足")
+    assert rc == 0 and "已退回返工" in out and "验收证据不足" in out, (rc, out)
+    assert "退回人 管理面" in out and "重新认领" in out, out
+    row = brain.task_get(root, t)
+    assert row["status"] == "pending" and not row["owner"], row
+    assert row["reject_count"] == 1 and "管理面" in (row["rejected_by"] or ""), row
+
+    # 已批准不可退回
+    t3 = brain.task_add(root, "已批退回面", project="P", approval_required=True)[1]
+    brain.task_claim(root, t3, "zcode")
+    brain.task_approve(root, t3, "reviewer", "过")
+    rc, out = _capture(cli.cmd_reject, root, t3, reason="再退")
+    assert rc == 1 and "已由 reviewer 批准" in out, (rc, out)
+
+    # argparse 接线：--reason 必填（直接调 cmd_main 会真实执行，只测 parse 段）
+    try:
+        cli.main(["--root", root, "reject", str(t)])
+        raise AssertionError("缺 --reason 应该 argparse 报错")
+    except SystemExit:
+        pass
+
+
+def t_governance_cli(tmp):
+    """R92 CLI 治理三件套：待审批队列 / 交接清单与作废 / 越权拦截态势。
+
+    R86–R90 的能力此前只在 MCP/桌面可达，headless 值班只能 `call hub_*` 裸传 JSON。
+    这里守三条最容易口径漂移的接线：队列排序与排除（已批/普通/未认领不混入）、
+    交接状态机与坏参拒绝（原因必填/已认领不可作废/已作废不出现在 open 列表）、
+    拦截分类与窗口校验（未锁身份 vs 角色越权、窗口外不计），以及 argparse 子命令。
+    """
+    import brain
+    import datetime as _dt
+    root = str(Path(tmp) / "hub_gov_cli")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    now = _dt.datetime.now()
+    iso = lambda h: (now - _dt.timedelta(hours=h)).isoformat(timespec="seconds")
+
+    # —— 待审批队列
+    rc, out = _capture(cli.cmd_tasks, root, approvals=True)
+    assert rc == 0 and "审批队列为空" in out, (rc, out)
+    a = brain.task_add(root, "等批旧", project="P", approval_required=True)[1]
+    b = brain.task_add(root, "等批新", project="Q", approval_required=True)[1]
+    c = brain.task_add(root, "普通在办", project="P")[1]
+    d = brain.task_add(root, "已批在办", project="P", approval_required=True)[1]
+    e = brain.task_add(root, "未认领待批", project="P", approval_required=True)[1]
+    for tid, who in ((a, "zcode"), (b, "workbuddy"), (c, "zcode"), (d, "zcode")):
+        err, _ = brain.task_claim(root, tid, who)
+        assert err == "", (tid, err)
+    assert brain.task_approve(root, d, "reviewer", "过")[0] == ""
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (iso(30), a))
+        conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (iso(1), b))
+    rc, out = _capture(cli.cmd_tasks, root, approvals=True)
+    assert rc == 0 and "待审批任务 2 条" in out, (rc, out)
+    assert f"#{a}" in out and f"#{b}" in out, out
+    assert f"#{c}" not in out and f"#{d}" not in out and f"#{e}" not in out, out
+    assert out.index("等批旧") < out.index("等批新"), "队列必须等最久的先看：" + out
+    assert "⚠待批过久" in out and "@zcode" in out, out
+    rc, out = _capture(cli.cmd_tasks, root, project="Q", approvals=True)
+    assert rc == 0 and f"#{b}" in out and f"#{a}" not in out, (rc, out)
+    rc, out = _capture(cli.cmd_tasks, root, project="无此项目", approvals=True)
+    assert rc == 0 and "审批队列为空" in out, (rc, out)
+
+    # —— 交接清单与作废
+    rc, out = _capture(cli.cmd_handoffs, root)
+    assert rc == 0 and "无未认领交接" in out, (rc, out)
+    for title in ("陈旧交接", "被认领交接", "待作废交接"):
+        assert brain.create_handoff(root, "P", "zcode", done=title,
+                                    next_step="继续").startswith("已创建交接"), title
+    with brain.db_conn(root) as conn:
+        h1, h2, h3 = [r["id"] for r in conn.execute(
+            "SELECT id FROM handoffs ORDER BY id")]
+        conn.execute("UPDATE handoffs SET created=? WHERE id=?", (iso(24 * 4), h1))
+    assert brain.claim_handoff(root, h2, "workbuddy").startswith("已认领"), "认领失败"
+    rc, out = _capture(cli.cmd_handoffs, root)
+    assert rc == 0 and f"#{h1}" in out and f"#{h3}" in out and f"#{h2}" not in out, out
+    assert "⚠陈旧" in out and "已等" in out, out
+    rc, out = _capture(cli.cmd_handoffs, root, include_all=True)
+    assert rc == 0 and "全部" in out and f"#{h2}" in out, out
+    assert "已被 workbuddy 认领" in out, out
+    rc, out = _capture(cli.cmd_handoffs, root, close_id=h3, reason="")
+    assert rc == 2 and "note 必填" in out, (rc, out)
+    rc, out = _capture(cli.cmd_handoffs, root, close_id=999999, reason="x")
+    assert rc == 2 and "不存在" in out, (rc, out)
+    rc, out = _capture(cli.cmd_handoffs, root, close_id=h2, reason="x")
+    assert rc == 2 and "认领" in out and "不能作废" in out, (rc, out)
+    rc, out = _capture(cli.cmd_handoffs, root, close_id=h3, reason="需求取消",
+                       agent="reviewer")
+    assert rc == 0 and "已关闭交接" in out and "reviewer" in out and "需求取消" in out, (rc, out)
+    rc, out = _capture(cli.cmd_handoffs, root)
+    assert rc == 0 and f"#{h3}" not in out, out
+    rc, out = _capture(cli.cmd_handoffs, root, include_all=True)
+    assert "已作废" in out and "需求取消" in out, out
+
+    # —— 越权拦截态势
+    rc, out = _capture(cli.cmd_security, root)
+    assert rc == 0 and "安全拦截（近 7 天）：0 次" in out and "无越权拦截记录" in out, (rc, out)
+    brain.journal_add(root, "zcode", "越权拦截", target="hub_claim:identity",
+                      note="MCP 会话未锁定 agent 身份（R81 记忆归属）")
+    brain.journal_add(root, "worker", "越权拦截", target="hub_freeze:role",
+                      note="worker 不能执行管理动作")
+    with brain.db_conn(root) as conn:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,note) VALUES(?,?,?,?,?)",
+                     ("2020-01-01T00:00:00", "zcode", "越权拦截", "hub_old:identity", "旧"))
+    rc, out = _capture(cli.cmd_security, root)
+    assert rc == 0 and "2 次" in out, (rc, out)
+    assert "未锁身份 1" in out and "角色越权 1" in out, out
+    assert "hub_claim" in out and "hub_freeze" in out and "hub_old" not in out, out
+    assert "处置" in out, out
+    rc, out = _capture(cli.cmd_security, root, 0)
+    assert rc == 2 and "1..365" in out, (rc, out)
+    rc, out = _capture(cli.cmd_security, root, 400)
+    assert rc == 2 and "1..365" in out, (rc, out)
+
+    # —— argparse 子命令接线
+    rc, out = _capture(cli.main, ["--root", root, "tasks", "--approvals", "--project", "Q"])
+    assert rc == 0 and f"#{b}" in out and "待审批任务" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "handoffs", "--all"])
+    assert rc == 0 and "交接" in out and "已作废" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "handoffs", "--close", str(h1),
+                                  "--reason", "过期作废", "--agent", "reviewer"])
+    assert rc == 0 and "已关闭交接" in out and "过期作废" in out, (rc, out)
+    rc, out = _capture(cli.main, ["--root", root, "security", "--days", "7"])
+    assert rc == 0 and "安全拦截" in out and "2 次" in out, (rc, out)
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_cli_")
     print(f"临时目录：{tmp}\n")
@@ -785,6 +937,10 @@ def main():
          lambda: t_corrupt_db_cli(tmp))
     case("R61·恢复演练子命令（默认最新整包/显式 path/坏路径退 1）",
          lambda: t_backup_drill_cli(tmp))
+    case("R92·CLI 治理三件套（审批队列排序与排除/交接清单与作废/拦截分类与窗口/子命令接线）",
+         lambda: t_governance_cli(tmp))
+    case("R100·CLI 审批退回（原因必填/自退拒/非审批拒/成功回执与状态/已批准不可退/argparse 接线）",
+         lambda: t_reject_cli(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

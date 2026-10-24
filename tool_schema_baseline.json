@@ -1,876 +1,890 @@
 {
-  "hub_agent": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "note": "string",
-      "skills": "string",
-      "state": "string",
-      "target": "string"
-    },
-    "required": []
-  },
-  "hub_archive_project": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "project": "string"
-    },
-    "required": [
-      "project"
-    ]
-  },
-  "hub_ask": {
-    "props": {
-      "max_chars": "integer",
-      "project": "string",
-      "question": "string"
-    },
-    "required": [
-      "question"
-    ]
-  },
-  "hub_asset_find": {
-    "props": {
-      "keyword": "string",
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": [
-      "keyword"
-    ]
-  },
-  "hub_audit": {
-    "props": {
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_bootstrap_status": {
-    "props": {
-      "agent": "string",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_call_tool": {
-    "props": {
-      "arguments": "object",
-      "max_chars": "integer",
-      "name": "string"
-    },
-    "required": [
-      "name"
-    ]
-  },
-  "hub_checkpoint": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "content": "string",
-      "dry_run": "boolean",
-      "kind": "string",
-      "max_chars": "integer",
-      "task_id": "integer"
-    },
-    "required": [
-      "task_id"
-    ]
-  },
-  "hub_claim": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "task_id": "integer"
-    },
-    "required": [
-      "agent",
-      "task_id"
-    ]
-  },
-  "hub_consolidate": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "ids": "array",
-      "max_chars": "integer",
-      "merged_content": "string"
-    },
-    "required": []
-  },
-  "hub_create_project": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "project": "string"
-    },
-    "required": [
-      "project"
-    ]
-  },
-  "hub_crystallize": {
-    "props": {
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "force": "boolean",
-      "max_chars": "integer",
-      "task_id": "integer"
-    },
-    "required": [
-      "task_id"
-    ]
-  },
-  "hub_decision_review": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "note": "string",
-      "review_id": "integer",
-      "verdict": "string"
-    },
-    "required": []
-  },
-  "hub_distill": {
-    "props": {
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_duplicates": {
-    "props": {
-      "max_chars": "integer",
-      "min_len": "integer"
-    },
-    "required": []
-  },
-  "hub_env_list": {
-    "props": {
-      "category": "string",
-      "kw": "string",
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_env_set": {
-    "props": {
-      "agent": "string",
-      "category": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "key": "string",
-      "max_chars": "integer",
-      "value": "string"
-    },
-    "required": [
-      "category",
-      "key",
-      "value"
-    ]
-  },
-  "hub_error_close": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "error_id": "integer",
-      "max_chars": "integer",
-      "note": "string"
-    },
-    "required": [
-      "error_id"
-    ]
-  },
-  "hub_event_write": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "content": "string",
-      "dry_run": "boolean",
-      "kind": "string",
-      "max_chars": "integer",
-      "project": "string",
-      "ref": "string"
-    },
-    "required": [
-      "content"
-    ]
-  },
-  "hub_events": {
-    "props": {
-      "agent": "string",
-      "limit": "integer",
-      "max_chars": "integer",
-      "project": "string",
-      "since_id": "integer"
-    },
-    "required": []
-  },
-  "hub_export": {
-    "props": {
-      "action": "string",
-      "audit_format": "string",
-      "confirm": "boolean",
-      "days": "integer",
-      "dest": "string",
-      "dry_run": "boolean",
-      "fmt": "string",
-      "limit": "integer",
-      "max_chars": "integer",
-      "path": "string"
-    },
-    "required": []
-  },
-  "hub_flush_index": {
-    "props": {
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "force": "boolean",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_freeze": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "minutes": "integer",
-      "reason": "string"
-    },
-    "required": []
-  },
-  "hub_get_progress": {
-    "props": {
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_get_project": {
-    "props": {
-      "max_chars": "integer",
-      "project": "string"
-    },
-    "required": [
-      "project"
-    ]
-  },
-  "hub_get_record": {
-    "props": {
-      "level": "string",
-      "max_chars": "integer",
-      "record_id": "integer"
-    },
-    "required": [
-      "record_id"
-    ]
-  },
-  "hub_get_rules": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_graph": {
-    "props": {
-      "action": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "from_node": "string",
-      "limit": "integer",
-      "max_chars": "integer",
-      "max_depth": "integer",
-      "node": "string",
-      "to_node": "string"
-    },
-    "required": []
-  },
-  "hub_handoff": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "done": "string",
-      "dry_run": "boolean",
-      "excluded": "string",
-      "handoff_id": "integer",
-      "include_claimed": "boolean",
-      "max_chars": "integer",
-      "next_step": "string",
-      "project": "string"
-    },
-    "required": []
-  },
-  "hub_health": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_heartbeat": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "note": "string",
-      "project": "string"
-    },
-    "required": [
-      "agent"
-    ]
-  },
-  "hub_help": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_history": {
-    "props": {
-      "id": "integer",
-      "kind": "string",
-      "max_chars": "integer"
-    },
-    "required": [
-      "id"
-    ]
-  },
-  "hub_list_agents": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_list_errors": {
-    "props": {
-      "max_chars": "integer",
-      "status": "string"
-    },
-    "required": []
-  },
-  "hub_list_mcps": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_list_projects": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_list_skills": {
-    "props": {
-      "agent": "string",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_list_todos": {
-    "props": {
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_lock": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "include_released": "boolean",
-      "lease_id": "integer",
-      "limit": "integer",
-      "max_chars": "integer",
-      "path": "string",
-      "project": "string",
-      "reason": "string",
-      "task_id": "integer",
-      "ttl_min": "integer"
-    },
-    "required": []
-  },
-  "hub_log_work": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "content": "string",
-      "context": "string",
-      "date": "string",
-      "decision": "string",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "options": "string",
-      "project": "string",
-      "record_type": "string",
-      "review_date": "string",
-      "task": "integer",
-      "tradeoffs": "string",
-      "waive": "string"
-    },
-    "required": [
-      "agent",
-      "content",
-      "project"
-    ]
-  },
-  "hub_memory_confirm": {
-    "props": {
-      "agent": "string",
-      "all_stale": "boolean",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "ids": "array",
-      "kind": "string",
-      "limit": "integer",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_memory_read": {
-    "props": {
-      "kind": "string",
-      "limit": "integer",
-      "max_chars": "integer",
-      "query": "string"
-    },
-    "required": []
-  },
-  "hub_memory_supersede": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "drop_id": "integer",
-      "dry_run": "boolean",
-      "keep_id": "integer",
-      "max_chars": "integer"
-    },
-    "required": [
-      "drop_id",
-      "keep_id"
-    ]
-  },
-  "hub_memory_write": {
-    "props": {
-      "agent": "string",
-      "confidence": "number",
-      "confirm": "boolean",
-      "content": "string",
-      "dry_run": "boolean",
-      "evidence": "string",
-      "feedback": "string",
-      "kind": "string",
-      "maturity": "string",
-      "max_chars": "integer",
-      "memory_id": "integer",
-      "mode": "string",
-      "pinned": "boolean",
-      "project": "string",
-      "supersedes": "integer",
-      "tags": "string",
-      "valid_until": "string"
-    },
-    "required": [
-      "content"
-    ]
-  },
-  "hub_metacognition": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_next": {
-    "props": {
-      "agent": "string",
-      "limit": "integer",
-      "max_chars": "integer",
-      "project": "string"
-    },
-    "required": []
-  },
-  "hub_note": {
-    "props": {
-      "confirm": "boolean",
-      "content": "string",
-      "dry_run": "boolean",
-      "link": "string",
-      "max_chars": "integer",
-      "mood": "string",
-      "tags": "string"
-    },
-    "required": [
-      "content"
-    ]
-  },
-  "hub_note_read": {
-    "props": {
-      "max_chars": "integer",
-      "note_id": "string"
-    },
-    "required": [
-      "note_id"
-    ]
-  },
-  "hub_ops_list": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_ops_run": {
-    "props": {
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "name": "string",
-      "target": "string"
-    },
-    "required": [
-      "name"
-    ]
-  },
-  "hub_playbook": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "desc": "string",
-      "dry_run": "boolean",
-      "limit": "integer",
-      "max_chars": "integer",
-      "name": "string",
-      "plan": "boolean",
-      "project": "string",
-      "run_id": "integer",
-      "steps": "array",
-      "target": "string",
-      "title": "string"
-    },
-    "required": []
-  },
-  "hub_quarantine": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "id": "integer",
-      "max_chars": "integer",
-      "reason": "string",
-      "target": "string"
-    },
-    "required": []
-  },
-  "hub_report": {
-    "props": {
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_report_error": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "detail": "string",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "project": "string",
-      "title": "string",
-      "undo": "string"
-    },
-    "required": [
-      "title"
-    ]
-  },
-  "hub_search": {
-    "props": {
-      "keyword": "string",
-      "max_chars": "integer"
-    },
-    "required": [
-      "keyword"
-    ]
-  },
-  "hub_search_files": {
-    "props": {
-      "limit": "integer",
-      "max_chars": "integer",
-      "query": "string"
-    },
-    "required": [
-      "query"
-    ]
-  },
-  "hub_search_tools": {
-    "props": {
-      "keyword": "string",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_sentry": {
-    "props": {
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_signal_read": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "signal_id": "integer"
-    },
-    "required": [
-      "agent",
-      "signal_id"
-    ]
-  },
-  "hub_signal_send": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "content": "string",
-      "dry_run": "boolean",
-      "kind": "string",
-      "max_chars": "integer",
-      "project": "string",
-      "to_agent": "string"
-    },
-    "required": [
-      "agent",
-      "content"
-    ]
-  },
-  "hub_signals": {
-    "props": {
-      "agent": "string",
-      "limit": "integer",
-      "max_chars": "integer",
-      "unread_only": "boolean"
-    },
-    "required": []
-  },
-  "hub_skill_match": {
-    "props": {
-      "agent": "string",
-      "max_chars": "integer",
-      "query": "string",
-      "topk": "integer"
-    },
-    "required": [
-      "query"
-    ]
-  },
-  "hub_skill_stats": {
-    "props": {
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_skill_sync": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "rows": "array"
-    },
-    "required": []
-  },
-  "hub_status": {
-    "props": {
-      "days": "integer",
-      "max_chars": "integer",
-      "view": "string"
-    },
-    "required": []
-  },
-  "hub_task_add": {
-    "props": {
-      "agent": "string",
-      "blocked_by": "string",
-      "confirm": "boolean",
-      "deliverables": "string",
-      "deps": "string",
-      "detail": "string",
-      "dry_run": "boolean",
-      "due": "string",
-      "max_chars": "integer",
-      "priority": "integer",
-      "project": "string",
-      "skills": "string",
-      "title": "string"
-    },
-    "required": [
-      "title"
-    ]
-  },
-  "hub_task_approve": {
-    "props": {
-      "agent": "string",
-      "note": "string",
-      "task_id": "integer"
-    },
-    "required": [
-      "task_id"
-    ]
-  },
-  "hub_task_quality": {
-    "props": {
-      "days": "integer",
-      "limit": "integer",
-      "project": "string",
-      "task_id": "integer"
-    },
-    "required": []
-  },
-  "hub_task_retry": {
-    "props": {
-      "agent": "string",
-      "delay": "integer",
-      "reason": "string",
-      "task_id": "integer"
-    },
-    "required": [
-      "task_id",
-      "reason"
-    ]
-  },
-  "hub_task_update": {
-    "props": {
-      "agent": "string",
-      "blocked_by": "string",
-      "cancel_reason": "string",
-      "confirm": "boolean",
-      "deliverables": "string",
-      "deps": "string",
-      "detail": "string",
-      "dry_run": "boolean",
-      "due": "string",
-      "handoff_note": "string",
-      "handoff_to": "string",
-      "max_chars": "integer",
-      "priority": "integer",
-      "skills": "string",
-      "status": "string",
-      "task_id": "integer"
-    },
-    "required": [
-      "task_id"
-    ]
-  },
-  "hub_tasks": {
-    "props": {
-      "days": "integer",
-      "limit": "integer",
-      "max_chars": "integer",
-      "owner": "string",
-      "project": "string",
-      "status": "string",
-      "view": "string"
-    },
-    "required": []
-  },
-  "hub_todo_done": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "record_id": "integer",
-      "todo": "string"
-    },
-    "required": [
-      "todo"
-    ]
-  },
-  "hub_trigger": {
-    "props": {
-      "action": "string",
-      "action_args": "object",
-      "action_type": "string",
-      "agent": "string",
-      "condition": "object",
-      "confirm": "boolean",
-      "cooldown_min": "integer",
-      "dry_run": "boolean",
-      "force": "boolean",
-      "id": "integer",
-      "max_chars": "integer",
-      "name": "string",
-      "on_event": "string",
-      "project": "string"
-    },
-    "required": []
-  },
-  "hub_undo": {
-    "props": {
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer"
-    },
-    "required": [
-      "agent"
-    ]
-  },
-  "hub_usage_timeline": {
-    "props": {
-      "agent": "string",
-      "days": "integer",
-      "limit": "integer",
-      "max_chars": "integer",
-      "tool": "string",
-      "view": "string"
-    },
-    "required": []
-  },
-  "hub_user_profile": {
-    "props": {
-      "max_chars": "integer"
-    },
-    "required": []
-  },
-  "hub_view": {
-    "props": {
-      "action": "string",
-      "agent": "string",
-      "confirm": "boolean",
-      "dry_run": "boolean",
-      "max_chars": "integer",
-      "scope_type": "string",
-      "scope_value": "string"
-    },
-    "required": []
-  }
+ "hub_agent": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "note": "string",
+   "skills": "string",
+   "state": "string",
+   "target": "string"
+  },
+  "required": []
+ },
+ "hub_archive_project": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "project": "string"
+  },
+  "required": [
+   "project"
+  ]
+ },
+ "hub_ask": {
+  "props": {
+   "max_chars": "integer",
+   "project": "string",
+   "question": "string"
+  },
+  "required": [
+   "question"
+  ]
+ },
+ "hub_asset_find": {
+  "props": {
+   "keyword": "string",
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": [
+   "keyword"
+  ]
+ },
+ "hub_audit": {
+  "props": {
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_bootstrap_status": {
+  "props": {
+   "agent": "string",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_call_tool": {
+  "props": {
+   "arguments": "object",
+   "max_chars": "integer",
+   "name": "string"
+  },
+  "required": [
+   "name"
+  ]
+ },
+ "hub_checkpoint": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "content": "string",
+   "dry_run": "boolean",
+   "kind": "string",
+   "max_chars": "integer",
+   "task_id": "integer"
+  },
+  "required": [
+   "task_id"
+  ]
+ },
+ "hub_claim": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "task_id": "integer"
+  },
+  "required": [
+   "agent",
+   "task_id"
+  ]
+ },
+ "hub_consolidate": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "ids": "array",
+   "max_chars": "integer",
+   "merged_content": "string"
+  },
+  "required": []
+ },
+ "hub_create_project": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "project": "string"
+  },
+  "required": [
+   "project"
+  ]
+ },
+ "hub_crystallize": {
+  "props": {
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "force": "boolean",
+   "max_chars": "integer",
+   "task_id": "integer"
+  },
+  "required": [
+   "task_id"
+  ]
+ },
+ "hub_decision_review": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "note": "string",
+   "review_id": "integer",
+   "verdict": "string"
+  },
+  "required": []
+ },
+ "hub_distill": {
+  "props": {
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_duplicates": {
+  "props": {
+   "max_chars": "integer",
+   "min_len": "integer"
+  },
+  "required": []
+ },
+ "hub_env_list": {
+  "props": {
+   "category": "string",
+   "kw": "string",
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_env_set": {
+  "props": {
+   "agent": "string",
+   "category": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "key": "string",
+   "max_chars": "integer",
+   "value": "string"
+  },
+  "required": [
+   "category",
+   "key",
+   "value"
+  ]
+ },
+ "hub_error_close": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "error_id": "integer",
+   "max_chars": "integer",
+   "note": "string"
+  },
+  "required": [
+   "error_id"
+  ]
+ },
+ "hub_event_write": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "content": "string",
+   "dry_run": "boolean",
+   "kind": "string",
+   "max_chars": "integer",
+   "project": "string",
+   "ref": "string"
+  },
+  "required": [
+   "content"
+  ]
+ },
+ "hub_events": {
+  "props": {
+   "agent": "string",
+   "limit": "integer",
+   "max_chars": "integer",
+   "project": "string",
+   "since_id": "integer"
+  },
+  "required": []
+ },
+ "hub_export": {
+  "props": {
+   "action": "string",
+   "audit_format": "string",
+   "confirm": "boolean",
+   "days": "integer",
+   "dest": "string",
+   "dry_run": "boolean",
+   "fmt": "string",
+   "limit": "integer",
+   "max_chars": "integer",
+   "path": "string"
+  },
+  "required": []
+ },
+ "hub_flush_index": {
+  "props": {
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "force": "boolean",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_freeze": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "minutes": "integer",
+   "reason": "string"
+  },
+  "required": []
+ },
+ "hub_get_progress": {
+  "props": {
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_get_project": {
+  "props": {
+   "max_chars": "integer",
+   "project": "string"
+  },
+  "required": [
+   "project"
+  ]
+ },
+ "hub_get_record": {
+  "props": {
+   "level": "string",
+   "max_chars": "integer",
+   "record_id": "integer"
+  },
+  "required": [
+   "record_id"
+  ]
+ },
+ "hub_get_rules": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_graph": {
+  "props": {
+   "action": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "from_node": "string",
+   "limit": "integer",
+   "max_chars": "integer",
+   "max_depth": "integer",
+   "node": "string",
+   "to_node": "string"
+  },
+  "required": []
+ },
+ "hub_handoff": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "done": "string",
+   "dry_run": "boolean",
+   "excluded": "string",
+   "handoff_id": "integer",
+   "include_claimed": "boolean",
+   "max_chars": "integer",
+   "next_step": "string",
+   "project": "string"
+  },
+  "required": []
+ },
+ "hub_health": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_heartbeat": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "note": "string",
+   "project": "string"
+  },
+  "required": [
+   "agent"
+  ]
+ },
+ "hub_help": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_history": {
+  "props": {
+   "id": "integer",
+   "kind": "string",
+   "max_chars": "integer"
+  },
+  "required": [
+   "id"
+  ]
+ },
+ "hub_list_agents": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_list_errors": {
+  "props": {
+   "max_chars": "integer",
+   "status": "string"
+  },
+  "required": []
+ },
+ "hub_list_mcps": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_list_projects": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_list_skills": {
+  "props": {
+   "agent": "string",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_list_todos": {
+  "props": {
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_lock": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "include_released": "boolean",
+   "lease_id": "integer",
+   "limit": "integer",
+   "max_chars": "integer",
+   "path": "string",
+   "project": "string",
+   "reason": "string",
+   "task_id": "integer",
+   "ttl_min": "integer"
+  },
+  "required": []
+ },
+ "hub_log_work": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "content": "string",
+   "context": "string",
+   "date": "string",
+   "decision": "string",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "options": "string",
+   "project": "string",
+   "record_type": "string",
+   "review_date": "string",
+   "task": "integer",
+   "tradeoffs": "string",
+   "waive": "string"
+  },
+  "required": [
+   "agent",
+   "content",
+   "project"
+  ]
+ },
+ "hub_memory_confirm": {
+  "props": {
+   "agent": "string",
+   "all_stale": "boolean",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "ids": "array",
+   "kind": "string",
+   "limit": "integer",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_memory_read": {
+  "props": {
+   "kind": "string",
+   "limit": "integer",
+   "max_chars": "integer",
+   "query": "string"
+  },
+  "required": []
+ },
+ "hub_memory_supersede": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "drop_id": "integer",
+   "dry_run": "boolean",
+   "keep_id": "integer",
+   "max_chars": "integer"
+  },
+  "required": [
+   "drop_id",
+   "keep_id"
+  ]
+ },
+ "hub_memory_write": {
+  "props": {
+   "agent": "string",
+   "confidence": "number",
+   "confirm": "boolean",
+   "content": "string",
+   "dry_run": "boolean",
+   "evidence": "string",
+   "feedback": "string",
+   "kind": "string",
+   "maturity": "string",
+   "max_chars": "integer",
+   "memory_id": "integer",
+   "mode": "string",
+   "pinned": "boolean",
+   "project": "string",
+   "supersedes": "integer",
+   "tags": "string",
+   "valid_until": "string"
+  },
+  "required": [
+   "content"
+  ]
+ },
+ "hub_metacognition": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_next": {
+  "props": {
+   "agent": "string",
+   "limit": "integer",
+   "max_chars": "integer",
+   "project": "string"
+  },
+  "required": []
+ },
+ "hub_note": {
+  "props": {
+   "confirm": "boolean",
+   "content": "string",
+   "dry_run": "boolean",
+   "link": "string",
+   "max_chars": "integer",
+   "mood": "string",
+   "tags": "string"
+  },
+  "required": [
+   "content"
+  ]
+ },
+ "hub_note_read": {
+  "props": {
+   "max_chars": "integer",
+   "note_id": "string"
+  },
+  "required": [
+   "note_id"
+  ]
+ },
+ "hub_ops_list": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_ops_run": {
+  "props": {
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "name": "string",
+   "target": "string"
+  },
+  "required": [
+   "name"
+  ]
+ },
+ "hub_playbook": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "desc": "string",
+   "dry_run": "boolean",
+   "limit": "integer",
+   "max_chars": "integer",
+   "name": "string",
+   "plan": "boolean",
+   "project": "string",
+   "run_id": "integer",
+   "steps": "array",
+   "target": "string",
+   "title": "string"
+  },
+  "required": []
+ },
+ "hub_quarantine": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "id": "integer",
+   "max_chars": "integer",
+   "reason": "string",
+   "target": "string"
+  },
+  "required": []
+ },
+ "hub_report": {
+  "props": {
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_report_error": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "detail": "string",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "project": "string",
+   "title": "string",
+   "undo": "string"
+  },
+  "required": [
+   "title"
+  ]
+ },
+ "hub_search": {
+  "props": {
+   "keyword": "string",
+   "max_chars": "integer"
+  },
+  "required": [
+   "keyword"
+  ]
+ },
+ "hub_search_files": {
+  "props": {
+   "limit": "integer",
+   "max_chars": "integer",
+   "query": "string"
+  },
+  "required": [
+   "query"
+  ]
+ },
+ "hub_search_tools": {
+  "props": {
+   "keyword": "string",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_sentry": {
+  "props": {
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_signal_read": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "signal_id": "integer"
+  },
+  "required": [
+   "agent",
+   "signal_id"
+  ]
+ },
+ "hub_signal_send": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "content": "string",
+   "dry_run": "boolean",
+   "kind": "string",
+   "max_chars": "integer",
+   "project": "string",
+   "to_agent": "string"
+  },
+  "required": [
+   "agent",
+   "content"
+  ]
+ },
+ "hub_signals": {
+  "props": {
+   "agent": "string",
+   "limit": "integer",
+   "max_chars": "integer",
+   "unread_only": "boolean"
+  },
+  "required": []
+ },
+ "hub_skill_match": {
+  "props": {
+   "agent": "string",
+   "max_chars": "integer",
+   "query": "string",
+   "topk": "integer"
+  },
+  "required": [
+   "query"
+  ]
+ },
+ "hub_skill_stats": {
+  "props": {
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_skill_sync": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "rows": "array"
+  },
+  "required": []
+ },
+ "hub_status": {
+  "props": {
+   "days": "integer",
+   "max_chars": "integer",
+   "view": "string"
+  },
+  "required": []
+ },
+ "hub_task_add": {
+  "props": {
+   "agent": "string",
+   "blocked_by": "string",
+   "confirm": "boolean",
+   "deliverables": "string",
+   "deps": "string",
+   "detail": "string",
+   "dry_run": "boolean",
+   "due": "string",
+   "max_chars": "integer",
+   "priority": "integer",
+   "project": "string",
+   "skills": "string",
+   "title": "string"
+  },
+  "required": [
+   "title"
+  ]
+ },
+ "hub_task_approve": {
+  "props": {
+   "agent": "string",
+   "note": "string",
+   "task_id": "integer"
+  },
+  "required": [
+   "task_id"
+  ]
+ },
+ "hub_task_quality": {
+  "props": {
+   "days": "integer",
+   "limit": "integer",
+   "project": "string",
+   "task_id": "integer"
+  },
+  "required": []
+ },
+ "hub_task_retry": {
+  "props": {
+   "agent": "string",
+   "delay": "integer",
+   "reason": "string",
+   "task_id": "integer"
+  },
+  "required": [
+   "task_id",
+   "reason"
+  ]
+ },
+ "hub_task_update": {
+  "props": {
+   "agent": "string",
+   "blocked_by": "string",
+   "cancel_reason": "string",
+   "confirm": "boolean",
+   "deliverables": "string",
+   "deps": "string",
+   "detail": "string",
+   "dry_run": "boolean",
+   "due": "string",
+   "handoff_note": "string",
+   "handoff_to": "string",
+   "max_chars": "integer",
+   "priority": "integer",
+   "skills": "string",
+   "status": "string",
+   "task_id": "integer"
+  },
+  "required": [
+   "task_id"
+  ]
+ },
+ "hub_tasks": {
+  "props": {
+   "days": "integer",
+   "limit": "integer",
+   "max_chars": "integer",
+   "owner": "string",
+   "project": "string",
+   "status": "string",
+   "view": "string"
+  },
+  "required": []
+ },
+ "hub_todo_done": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "record_id": "integer",
+   "todo": "string"
+  },
+  "required": [
+   "todo"
+  ]
+ },
+ "hub_trigger": {
+  "props": {
+   "action": "string",
+   "action_args": "object",
+   "action_type": "string",
+   "agent": "string",
+   "condition": "object",
+   "confirm": "boolean",
+   "cooldown_min": "integer",
+   "dry_run": "boolean",
+   "force": "boolean",
+   "id": "integer",
+   "max_chars": "integer",
+   "name": "string",
+   "on_event": "string",
+   "project": "string"
+  },
+  "required": []
+ },
+ "hub_undo": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer"
+  },
+  "required": [
+   "agent"
+  ]
+ },
+ "hub_usage_timeline": {
+  "props": {
+   "agent": "string",
+   "days": "integer",
+   "limit": "integer",
+   "max_chars": "integer",
+   "tool": "string",
+   "view": "string"
+  },
+  "required": []
+ },
+ "hub_user_profile": {
+  "props": {
+   "max_chars": "integer"
+  },
+  "required": []
+ },
+ "hub_view": {
+  "props": {
+   "action": "string",
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "scope_type": "string",
+   "scope_value": "string"
+  },
+  "required": []
+ },
+ "hub_task_reject": {
+  "props": {
+   "task_id": "integer",
+   "reason": "string",
+   "agent": "string",
+   "max_chars": "integer",
+   "dry_run": "boolean",
+   "confirm": "boolean"
+  },
+  "required": [
+   "task_id",
+   "reason"
+  ]
+ }
 }
