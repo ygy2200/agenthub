@@ -45,6 +45,9 @@ def main():
         [sys.executable, str(ROOT / "tools" / "perf_walkthrough.py")],
         lambda out: "；".join(f"{t} {s:.2f}s" for t, s in re.findall(
             r"  (\S+): ([\d.]+)s", out) if float(s) > 1) or "全部 <1s")
+    run("老化快测（全页 20 轮内存）",
+        [sys.executable, str(ROOT / "tools" / "soak_test.py"), "20"],
+        lambda out: _soak_last(out))
 
     print("=== UI 体检摘要 ===")
     bad = 0
@@ -53,6 +56,12 @@ def main():
         bad += 0 if ok else 1
     print(f"结论：{'全过' if bad == 0 else f'{bad} 项 FAIL'}")
     sys.exit(1 if bad else 0)
+
+
+def _soak_last(out: str) -> str:
+    hits = re.findall(r"RSS (\d+) MB", out)
+    tail = f"末轮 {hits[-1]} MB" if hits else "无采样"
+    return tail + "（快测仅采样，泄漏判定请跑 soak_test 40+ 轮）"
 
 
 if __name__ == "__main__":

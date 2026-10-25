@@ -73,7 +73,7 @@ def main():
             print(f"第 {i:3d} 轮: RSS {m:.0f} MB（基线 {base:.0f}，涨 {m - base:+.0f}）")
     w.close()
     # 泄漏判定：最后 3 个采样点相对第 10 轮的涨幅（首几轮有缓存爬坡属正常）
-    if len(samples) >= 4:
+    if len(samples) >= 2:
         early = samples[0][1]
         late = sum(s[1] for s in samples[-3:]) / 3
         growth = late - early
