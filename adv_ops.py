@@ -271,6 +271,19 @@ def t_usage_health(tmp):
     check("修复建议已注册", "usage_health" in ops.CHECK_FIXES
           and "hub_usage_timeline" in ops.CHECK_FIXES["usage_health"], "")
 
+    # R164：paused 持有者在办任务被点名（管控下游观测）
+    pr = tmp / "hub_paused_owner"
+    pr.mkdir()
+    brain.init_db(str(pr))
+    _, tid = brain.task_add(str(pr), "暂停者任务", project="P")
+    brain.task_claim(str(pr), tid, "sleeper")
+    with brain.db_conn(str(pr)) as conn:
+        conn.execute("INSERT OR REPLACE INTO agents(name, control_state) VALUES('sleeper','paused')")
+    rr = ops.run_check("tasks_health", "", str(pr))
+    check("R164 paused 持有者在办任务被点名（含决策选项）",
+          (not rr["ok"]) and "持有者被管控暂停" in "".join(rr["detail"])
+          and "改派" in "".join(rr["detail"]), rr["summary"][:80])
+
     # 正常空态：无调用无配置 → ok
     empty = tmp / "hub_usage_empty"
     empty.mkdir()

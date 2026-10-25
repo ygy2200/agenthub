@@ -2576,6 +2576,12 @@ def _tasks_health(root: str) -> dict:
             sessions = {r["agent"]: r["ts"] for r in conn.execute(
                 "SELECT agent, ts FROM sessions")}
             registered = {r["name"] for r in conn.execute("SELECT name FROM agents")}
+            # R164：持有者的管控状态——paused/draining 是**显式**管控（非心跳断），
+            # 名下在办任务的去向（等恢复/改派/取消）需要被看见：原「失联/停滞」按
+            # 心跳与进展判，paused 且心跳在线的任务会静默悬挂（真缺口：管控动作
+            # 的下游效果无观测）。
+            ctrl = {r["name"]: (r["control_state"] or "") for r in conn.execute(
+                "SELECT name, control_state FROM agents")}
             # R34：近 7 天 done 且声明过交付物的任务（只读核对，失败静默跳过）
             done_rows = [dict(r) for r in conn.execute(
                 "SELECT id,project,title,owner,deliverables,created FROM tasks "
@@ -2590,7 +2596,7 @@ def _tasks_health(root: str) -> dict:
                 "detail": []}
     counts = {"stale": 0, "unleased": 0, "ownerless": 0, "idle": 0, "stalled": 0,
               "starving": 0, "overdue": 0, "unregistered": 0, "dangling": 0, "cycles": 0,
-              "residual": 0, "drift": 0, "dead": len(dead_rows)}
+              "residual": 0, "drift": 0, "dead": len(dead_rows), "paused_owner": 0}
     starve_map = {r["id"]: r["_age_days"] for r in starve["starving"]}
     # 结构缺陷挂到具体任务上（与租约/归属原因合并展示），看板/巡检口径同源
     struct: dict = {}
@@ -2623,6 +2629,11 @@ def _tasks_health(root: str) -> dict:
             if owner and owner not in registered and owner not in brain._NON_AGENT:
                 counts["unregistered"] += 1
                 reasons.append("持有者未登记")
+            if owner and ctrl.get(owner) in ("paused", "draining"):
+                counts["paused_owner"] += 1
+                st = "暂停" if ctrl.get(owner) == "paused" else "收尾中"
+                reasons.append(f"持有者被管控{st}（draining/paused）——"
+                               "任务去向需决策：等恢复 / hub_task_update 改派 / 取消")
             if owner:
                 progress_seen = max(r["updated"] or "", r["last_cp"] or "")
                 seen = max(sessions.get(owner, ""), progress_seen)
@@ -2687,7 +2698,7 @@ def _tasks_health(root: str) -> dict:
     return {"ok": False,
             "summary": (f"任务治理：{len(problems) + len(ev_bad) + len(drift_bad) + len(dead_bad)} 项需关注（过期租约 {counts['stale']} / "
                         f"租约缺失 {counts['unleased']} / "
-                        f"无主 {counts['ownerless']} / 持有者失联 {counts['idle']} / "
+                        f"无主 {counts['ownerless']} / 持有者失联 {counts['idle']} / 持有者被管控 {counts['paused_owner']} / "
                         f"进展停滞 {counts['stalled']} / "
                         f"待办饥饿 {counts['starving']} / "
                         f"交付物证据不全 {counts['evidence']} / "
