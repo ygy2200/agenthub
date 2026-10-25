@@ -4972,6 +4972,7 @@ def main():
     case("待办提取对抗（复合词/引用/功能名不误抓+单条全文读取）", lambda: t_todo_extraction_adversarial(tmp))
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
     case("R106 冲突对现行标注（较新 current/较旧 superseded/打平不假装/MCP 渲染）", lambda: t_conflict_current_hint(tmp))
+    case("R107 终态流转保留认领时刻（done/cancelled 不重写/in_progress 续租保留）", lambda: t_terminal_flow_keeps_claim_time(tmp))
     case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
     case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
@@ -6407,6 +6408,43 @@ def t_conflict_current_hint(tmp):
     assert "✅现行" in out and "⧗对面" in out, out[:300]
     # 排序不动：旧版 BM25 更高时仍可排前（相关性公平竞争，标注不越权）
     assert out.index(f"#{with_new}") < out.index(f"#{rid_new}") or True  # 顺序不设硬断言
+
+
+
+
+def t_terminal_flow_keeps_claim_time(tmp):
+    """R107：终态流转不得重写认领时刻——owner 标 done/cancelled 后 claimed_at 保持
+    原认领时间（时长统计与 task_quality 依赖它）；in_progress 内字段更新仍续租。"""
+    import datetime
+    root = str(Path(tmp) / "hub_term_claim")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    t1 = brain.task_add(root, "终态认领时刻A", project="P", approval_required=True)[1]
+    t2 = brain.task_add(root, "终态认领时刻B", project="P")[1]
+    t3 = brain.task_add(root, "续租保留C", project="P")[1]
+    assert brain.task_claim(root, t1, "zcode")[0] == ""
+    assert brain.task_claim(root, t2, "zcode")[0] == ""
+    assert brain.task_claim(root, t3, "zcode")[0] == ""
+    old = datetime.datetime.now() - datetime.timedelta(hours=2)
+    iso = old.isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        for tid in (t1, t2, t3):
+            conn.execute("UPDATE tasks SET claimed_at=? WHERE id=?", (iso, tid))
+    # owner 标 done（先批准过审）：claimed_at 必须保持 2h 前，不被关单动作重写
+    assert brain.task_approve(root, t1, "reviewer", "过")[0] == ""
+    err, row = brain.task_update(root, t1, status="done", agent="zcode")
+    assert err == "", err
+    assert row["claimed_at"] == iso, f"done 重写了认领时刻: {row['claimed_at']}"
+    assert row["done_at"] > iso
+    # owner 取消同理
+    err, row = brain.task_update(root, t2, status="cancelled", agent="zcode",
+                                 cancel_reason="不做")
+    assert err == "", err
+    assert row["claimed_at"] == iso, f"cancelled 重写了认领时刻: {row['claimed_at']}"
+    # in_progress 内更新 detail：续租保留（原行为）
+    err, row = brain.task_update(root, t3, detail="推进中", agent="zcode")
+    assert err == "", err
+    assert row["claimed_at"] > iso, "字段更新应续租"
 
 
 

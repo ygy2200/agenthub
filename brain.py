@@ -3638,7 +3638,12 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
                 sets.append("approved_at=''")
         # 持有者在更新进展时顺手续租：任务被持续编辑说明人还在干，
         # 不应因为忘了重新 hub_claim 就被 2h TTL 判死。
+        # R107：仅**非终态**流转续租——done/cancelled 是历史事实的封口，认领时刻
+        # 不能被关单动作重写（实测 #13：owner 标 done 后 claimed_at=done_at=updated
+        # 三时间戳同秒，任务时长归零、task_quality 报「0 秒即完成」、审批等待时长
+        # 也被抹平）。终态后租约无意义，claimed_at 保留原认领时刻供时长统计。
         if (row["status"] == "in_progress" and row["owner"] and row["owner"] == who
+                and status not in ("done", "cancelled")
                 and not any(s.startswith("claimed_at") for s in sets)):
             sets.append("claimed_at=?")
             args.append(_now())
