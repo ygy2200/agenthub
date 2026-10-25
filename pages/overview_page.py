@@ -197,7 +197,10 @@ class OverviewPage(QWidget):
             self.recentBox.addWidget(empty_state(
                 "HISTORY", "暂无记录", "agent 记一笔工作后，最近动态出现在这里"))
 
-    def set_agents(self, agents):
+    def set_agents(self, agents, reg=None):
+        """R132：阵容行改「状态优先」——在线/离线 + 最近项目（大脑注册表），
+        技能/MCP/记忆数退到 tooltip（原来三组数字堆在行里，看不出谁在干活）。"""
+        reg = reg or {}
         while self.agentBox.count():
             it = self.agentBox.takeAt(0)
             if it.widget():
@@ -207,8 +210,23 @@ class OverviewPage(QWidget):
                 "（探测中，或未检测到 agent——去「Agent 中心」点「重新探测」，或手动添加 agent 目录）"))
             return
         for a in agents:
-            line = CaptionLabel(f"{'●' if a.detected else '○'} {a.name}：技能 {len(a.skills)} · MCP {len(a.mcps)} · 记忆 {len(a.memories)}")
-            line.setToolTip(a.home or "未检测到，可在 Agent 中心手动添加目录")
+            r = reg.get((a.name or "").lower())
+            tip_bits = [f"技能 {len(a.skills)} · MCP {len(a.mcps)} · 记忆 {len(a.memories)}",
+                        a.home or ""]
+            if r:
+                state = "● 在线" if r.get("online") else "○ 离线"
+                last_p = (r.get("last_project") or "").strip()
+                seen = (r.get("last_seen") or "").strip()
+                if seen and "T" in seen:
+                    d, _, hm = seen.partition("T")
+                    seen = (d[5:] + " " + hm[:5]) if d[:4] == str(__import__("datetime").date.today().year) else d
+                main = f"{state} · {a.name}" + (f" —— 最近在「{last_p}」" if last_p else "")
+                if seen:
+                    main += f"（{seen}）"
+            else:
+                main = f"{'●' if a.detected else '○'} {a.name}（未接入大脑）"
+            line = CaptionLabel(main)
+            line.setToolTip(" / ".join(b for b in tip_bits if b))
             self.agentBox.addWidget(line)
 
     def set_sessions(self, sessions):

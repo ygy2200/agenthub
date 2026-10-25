@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+import brain  # noqa: F401  R132：总览阵容行读注册表在线状态
 
 
 def memory_badge(fr: dict) -> str:
@@ -168,7 +169,11 @@ class HubPage(QWidget):
         self.fill_env()
         self.fill_assets(self.cfgList, [(a.name, c) for a in self.agents for c in a.configs])
         self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选左侧技能 / MCP / 记忆查看详情，双击打开所在目录</p>")
-        self.win.overview_page.set_agents(self.agents)
+        try:
+            reg = {r['name'].lower(): r for r in brain.list_agents(self.win.root)}
+        except Exception:
+            reg = {}
+        self.win.overview_page.set_agents(self.agents, reg)
         InfoBar.success("探测完成", f"{len(self.agents)} 个 agent", duration=2000, parent=self.win)
 
     def fill_memories(self):
