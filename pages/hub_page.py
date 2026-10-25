@@ -184,8 +184,12 @@ class HubPage(QWidget):
         kw = self.memFilter.text().strip().lower() if hasattr(self, "memFilter") else ""
         try:
             self._mem_rows = brain.search_memories(self.win.root, "", "", 500)
-        except Exception:
-            pass
+        except Exception as e:
+            # R147：主数据路径读失败给可见错误（原静默 pass——用户分不清没数据和坏了）
+            self._mem_rows = []
+            self.preview.setHtml(
+                f"<p style='color:{tokens.C(tokens.TEXT_3)}'>记忆读取失败："
+                f"{type(e).__name__}: {str(e)[:80]}</p>")
         for m in self._mem_rows:
             if kw and kw not in m["content"].lower() and kw not in (m["tags"] or "").lower():
                 continue

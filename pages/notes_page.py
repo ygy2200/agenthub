@@ -265,7 +265,10 @@ class NotesPage(QWidget):
     def _star(self, nid, on):
         try:
             brain.star_note(self.win.root, nid, on)
-        except Exception:
+        except Exception as e:
+            # R147：星标写失败给提示（原静默 return——点了没反应像失灵）
+            InfoBar.error("星标失败", f"{type(e).__name__}: {str(e)[:80]}",
+                          duration=4000, parent=self.win)
             return
         self.reload()
 
