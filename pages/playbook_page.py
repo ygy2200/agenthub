@@ -29,8 +29,8 @@ class PlaybookPage(QWidget):
         set_page_margins(lay)
         lay.addWidget(_page_head(
             "编排中心",
-            "把每次都要手工重走的流程固化成**可执行**的 playbook（Y1）+ 事件自动触发（Y2）+ "
-            "知识图谱关联（Y3）。桌面端可直接跑流程、续跑断点、启停触发器——不必开 MCP 会话"))
+            "把每次都要手工重走的流程固化成可执行的流程模板，加上事件自动触发与知识图谱关联。"
+            "桌面端可直接跑流程、续跑断点、启停触发器——不必开 MCP 会话"))
 
         top = QWidget()
         tl = QHBoxLayout(top)

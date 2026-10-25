@@ -370,9 +370,15 @@ class NotesPage(QWidget):
                 color = MOOD_COLOR.get(mood, tokens.C(tokens.SUCCESS))
             elif cnt:
                 color = tokens.C(tokens.SUCCESS)
+            elif mood:
+                color = dim_gray  # 有心情无正文也显灰
             else:
-                color = dim_gray
-            # 热力格：小色块统一 2px 微圆角（Fluent borderRadiusSmall；原 1px 是随手值）
+                # R113：无记录日透明——180 个灰格零间隙连成 540px 实心竖纹带，
+                # 空库下像渲染 bug（走查 R113 实测）。透明后有数据的日期呈散点
+                # 热力（GitHub 风格），空库整条隐形。
+                cell.setStyleSheet("background:transparent;")
+                cell.setToolTip(f"{d}  无随记")
+                continue
             cell.setStyleSheet(f"background:{color};border-radius:2px;")
             cell.setToolTip(f"{d}  {cnt} 条" + (f"  {mood}" if mood else ""))
 

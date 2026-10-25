@@ -25,7 +25,7 @@ class SignalPage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head(
-            "信号中心", "agent 间的消息（M3）：发给指定 agent 或广播——对方下次开工即在心跳里"
+            "信号中心", "agent 之间的消息：发给指定 agent 或广播——对方下次开工即在心跳里"
                         "收到未读提醒；已读有回执。桌面端可直接发、可查收、可标已读"))
 
         # —— 发送区 ——
@@ -73,7 +73,10 @@ class SignalPage(QWidget):
         self.readBtn.setToolTip("给选中的未读信号记回执（幂等）")
         self.readBtn.clicked.connect(self.mark_read)
         row.addWidget(self.readBtn)
-        row.addWidget(CaptionLabel("刷新随全窗扫描（F5）；@提醒靠对方心跳的「[未读信号]」段"))
+        # R113：原文案 41 字被 920 窄窗裁成「刷新随全窗扫描（」——截断比省略更糟
+        tip = CaptionLabel("F5 刷新；@提醒在对方心跳的「[未读信号]」段送达")
+        tip.setToolTip("刷新随全窗扫描（F5）；@提醒靠对方心跳的「[未读信号]」段送达")
+        row.addWidget(tip)
         row.addStretch(1)
         refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新")
         refreshBtn.clicked.connect(self.reload)

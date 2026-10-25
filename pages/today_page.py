@@ -28,8 +28,8 @@ class TodayPage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head(
-            "工作台", "今天该干什么——前沿队列（hub_next 同源）：可认领按优先级排队，"
-                      "进行中 / 可接管 / 等待依赖一屏看全；标记完成走管理通道（自动结晶）"))
+            "工作台", "今天该干什么——可认领的任务按优先级排队，进行中 / 可接管 / 等待依赖一屏看全；"
+                      "标记完成走管理通道（自动归档为成果记录）"))
 
         top = QHBoxLayout()
         self.sumLabel = CaptionLabel("")

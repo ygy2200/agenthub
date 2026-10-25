@@ -22,8 +22,16 @@ class ConnectPage(QWidget):
         refreshBtn.clicked.connect(self.refresh_status)
         top.addWidget(refreshBtn)
         lay.addLayout(top)
+        # R113：工具数动态取自 TOOLS——「25 个」硬编码已过期（实际 79），数字过期
+        # 会让人怀疑整页信息的可信度；实时清单语义与 README「以 hub_help 为准」一致。
+        try:
+            import agenthub_mcp as _m
+            n_tools = len(_m.TOOLS)
+        except Exception:  # noqa: BLE001 导入失败回退不带数字的措辞
+            n_tools = 0
+        n_seg = f"{n_tools} 个工具" if n_tools else "全套工具"
         lay.addWidget(CaptionLabel(
-            "AgentHub 通过标准 MCP 协议向所有 agent 提供 25 个工具：项目登记/新建、工作记录（可撤销）、"
+            f"AgentHub 通过标准 MCP 协议向所有 agent 提供 {n_seg}：项目登记/新建、工作记录（可撤销）、"
             "全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、踩坑拦截、归档、技能/MCP 清单、进度对齐。"
             "「一键接入」写入 MCP 配置，「注入引导」把开工规则写进 agent 的全局指令文件——"
             "两步都做，agent 才会在每次会话自然使用公用大脑，无需口头提醒。"))
