@@ -1774,5 +1774,7 @@ def everything_search(query: str, limit: int = 30) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"error": f"es.exe 调用失败：{e}"}
     if "IPC window not found" in out or "IPC" in err:
-        return {"error": "Everything 界面进程未运行（服务模式无 IPC 窗口）"}
+        # R139：人话版——「服务模式无 IPC 窗口」是 es.exe 的原文，用户要的是「怎么修」
+        return {"error": "全盘文件搜索需要 Everything 正在运行——打开 Everything 主程序后重试"
+                         "（当前只影响「全盘文件」区，全脑检索不受影响）"}
     return {"results": [ln.strip() for ln in out.splitlines() if ln.strip()][:limit]}

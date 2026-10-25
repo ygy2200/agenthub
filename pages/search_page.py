@@ -53,6 +53,8 @@ class SearchPage(QWidget):
         act.addWidget(self.btnCopy)
         rv.addLayout(act)
         self.preview = TextBrowser()
+        self.preview.setHtml(
+            f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选左侧结果查看全文与关键词预览（Ctrl+F 站内直达）</p>")
         rv.addWidget(self.preview, 1)
         split.addWidget(right)
         split.setStretchFactor(0, 5)
@@ -154,7 +156,10 @@ class SearchPage(QWidget):
             elif k == "record":
                 src = (f"（图关联自{h['_cross'][2:]}）" if h.get("_cross")
                        else "（图关联）" if "graph" in (h.get("_channels") or {}) else "")
-                self.result.addItem(f"[记录] {h['date']} {h['project']}（{h['agent']}）：{h['title'][:80]}{src}")
+                # R137：带 #id（与 MCP hub_search 同款精读链路）；标题经 _display_title
+                # 清洗与空洞标题替代，去掉行头重复日期（title 本就含日期）。
+                self.result.addItem(
+                    f"[记录#{h['id']}] {_display_title(h)[:76]} · {h['project']}（{h['agent']}）{src}")
                 self.view_hits.append((k, h))
             elif k == "memory":
                 src = (f"（图关联自{h['_cross'][2:]}）" if h.get("_cross")
