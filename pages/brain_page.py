@@ -71,7 +71,13 @@ class BrainPage(QWidget):
             return
         try:
             h = brain.health_report(root)
-        except Exception:
+        except Exception as e:
+            # R143：读失败时页头给错误而非静默空白（用户分不清「没数据」和「坏了」）
+            self.valMem.setText("—")
+            self.valCrys.setText("—")
+            self.valPush.setText("—")
+            self.valTodo.setText("—")
+            self.sumLabel.setText(f"大脑体检读取失败：{type(e).__name__}: {str(e)[:80]}")
             return
         # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
         self.scroll.verticalScrollBar().setValue(0)

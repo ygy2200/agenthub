@@ -393,7 +393,10 @@ class NotesPage(QWidget):
             return
         try:
             notes = brain.list_notes(root, limit=200)
-        except Exception:
+        except Exception as e:
+            # R143：读失败时列表给错误项而非静默空白
+            self.noteList.clear()
+            self.noteList.addItem(f"（随记读取失败：{type(e).__name__}: {str(e)[:80]}）")
             return
         try:
             self.statLabel.setText(f"累计 {brain.notes_count(root)} 条 · "
