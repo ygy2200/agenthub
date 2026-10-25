@@ -202,6 +202,24 @@ def t_mcp_drift(tmp):
     check("无 MCP 配置 → ok 空态（内置适配器照常体检，不因无人配置报错）",
           r2["ok"] and "均与注册表一致" in r2["summary"], r2["summary"])
 
+    # R110：YAML 布局（hermes 形态：mcp_servers 容器 + command/args 列表）可解析、漂移可检出
+    yaml_root = tmp / "hub_drift_yaml"
+    yaml_root.mkdir()
+    brain.init_db(str(yaml_root))
+    dead = str(tmp / "nope" / "agenthub_mcp.py").replace("\\", "/")
+    (yaml_root / "yagent.yaml").write_text(
+        f"model:\n  provider: x\nmcp_servers:\n  agenthub:\n    command: python\n"
+        f"    args:\n      - {dead}\n      - --agent\n      - yagent\n", encoding="utf-8")
+    (yaml_root / "config.agents.json").write_text(json.dumps({"agents": [
+        {"agent": "yagent", "channel": "instr_file",
+         "instr_path": str(yaml_root / "y.md"),
+         "mcp": {"path": str(yaml_root / "yagent.yaml"), "layout": "yaml"}},
+    ]}, ensure_ascii=False), encoding="utf-8")
+    ry = ops.run_check("mcp_drift", "", str(yaml_root))
+    dety = "\n".join(ry["detail"])
+    check("R110 YAML 条目可解析且漂移检出（脚本失效 fail）",
+          (not ry["ok"]) and "yagent" in dety and "不存在" in dety, ry["summary"])
+
 
 def t_usage_health(tmp):
     """R105 用量异常：失控嫌疑（1h 超阈值）、循环嫌疑（单工具 10min 超阈值）、

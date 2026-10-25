@@ -1394,12 +1394,21 @@ def _read_toml_mcp(p: Path) -> dict:
 
 def read_mcp_config(path: str) -> dict | None:
     """读取 agent 的 MCP 配置；文件不存在返回 None，坏内容返回 {}。
-    .toml 走 _read_toml_mcp（归一为 mcpServers），其余按 json。"""
+    .toml 走 _read_toml_mcp（归一为 mcpServers），.yaml/.yml 走 yaml.safe_load
+    （R110：hermes 等 YAML 布局此前 json 解析失败返回 {}，R103 漂移检测被迫跳过；
+    只读不回写，safe_load 无注释抹除问题），其余按 json。"""
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     if not p.is_file():
         return None
     if p.suffix.lower() == ".toml":
         return _read_toml_mcp(p)
+    if p.suffix.lower() in (".yaml", ".yml"):
+        try:
+            import yaml  # 读路径专用；写路径仍走 codec 外科编辑（safe_dump 抹注释）
+            data = yaml.safe_load(p.read_text(encoding="utf-8", errors="replace"))
+            return data if isinstance(data, dict) else {}
+        except Exception:  # noqa: BLE001 坏 YAML 按无配置处理，不阻断
+            return {}
     try:
         data = json.loads(p.read_text(encoding="utf-8", errors="replace"))
         return data if isinstance(data, dict) else {}

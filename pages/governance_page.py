@@ -655,9 +655,31 @@ class _SecuritySub(_SubPage):
                 self.listw.addItem("  " + d)
         except Exception as e:  # noqa: BLE001
             gov_ok = False
-            self.listw.addItem(f"治理巡检：执行失败（{type(e).__name__}: {str(e)[:80]}）")
+            self.listw.addItem(f"治理巡检：执行失败（{type(e).__name__}: {str(e)[:80]})")
+        # R109：接入参数漂移与用量异常（R103/R105 的巡检新项）铺到桌面——
+        # 巡检项只有桌面可见才会被日常看到（R94 同理：单页可见≠有人看）。
+        drift_ok = True
+        try:
+            d = ops.run_check("mcp_drift", "", root)
+            drift_ok = d["ok"]
+            self.listw.addItem(("✓ " if d["ok"] else "✗ ") + "接入参数：" + d["summary"])
+            for ln in d.get("detail", [])[:6]:
+                self.listw.addItem("  " + ln)
+        except Exception as e:  # noqa: BLE001
+            drift_ok = False
+            self.listw.addItem(f"接入参数：执行失败（{type(e).__name__}: {str(e)[:80]})")
+        usage_ok = True
+        try:
+            u = ops.run_check("usage_health", "", root)
+            usage_ok = u["ok"]
+            self.listw.addItem(("✓ " if u["ok"] else "✗ ") + "用量异常：" + u["summary"])
+            for ln in u.get("detail", [])[:6]:
+                self.listw.addItem("  " + ln)
+        except Exception as e:  # noqa: BLE001
+            usage_ok = False
+            self.listw.addItem(f"用量异常：执行失败（{type(e).__name__}: {str(e)[:80]})")
         self.sumLabel.setText(
-            ("✓ 安全面正常" if (chain_ok and health_ok and gov_ok)
+            ("✓ 安全面正常" if (chain_ok and health_ok and gov_ok and drift_ok and usage_ok)
              else "⚠ 安全面有异常，见下方逐条")
             + "——审计链只读校验，冻结/解冻动作会记入审计链")
 
