@@ -65,7 +65,7 @@ class BrainPage(QWidget):
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         outer.addWidget(self.scroll, 1)
 
-    def reload(self):
+    def reload(self, force: bool = False):
         root = self.win.root
         if not root:
             return
@@ -80,6 +80,19 @@ class BrainPage(QWidget):
             InfoBar.error("大脑体检读取失败", f"{type(e).__name__}: {str(e)[:80]}",
                          duration=6000, parent=self.win)
             return
+        # R162：数据指纹跳过——qfw 组件整页重建在长跑下原生内存线性涨（老化实测
+        # 30 轮 +256MB、60 轮 +505MB 完美线性；对照纯 QLabel 仅 ~4.5KB/个 vs
+        # qfw 组件 ~40KB/个——第三方库固有分配行为）。真实使用中 F5 连点/切页触发
+        # reload 远多于数据实际变化：指纹（报告内容的稳定序列化）相同就跳过整页
+        # 重建；数据变了才真正重画。health_report 本身无泄漏（×30 收敛 +9MB）。
+        import json as _json
+        try:
+            fp = _json.dumps(h, sort_keys=True, ensure_ascii=False, default=str)
+        except Exception:  # noqa: BLE001 有不可序列化字段就退回总是重建
+            fp = ""
+        if not force and fp and getattr(self, "_data_fp", None) == fp:
+            return
+        self._data_fp = fp
         # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
         self.scroll.verticalScrollBar().setValue(0)
         self.valMem.setText(str(h["memories"]))
@@ -97,6 +110,10 @@ class BrainPage(QWidget):
                 sub = it.layout()
                 if sub:  # 行布局（徽章+进度条/文本+按钮）也是布局项，不递归拆净子控件会残留叠加
                     clear(sub)
+                    # R161：布局对象自身也是 QObject——每轮 addLayout 的新行布局不销毁
+                    # 就线性累积（老化实测 30 轮 +256MB，锁定本页；widget 已拆但 layout
+                    # 壳与 spacer item 永生）
+                    sub.deleteLater()
 
         # 唤起排行（验收①：推送 top 应是工作知识而非元信息）
         clear(self.topBox)
