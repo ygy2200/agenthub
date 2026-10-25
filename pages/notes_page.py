@@ -377,10 +377,12 @@ class NotesPage(QWidget):
             elif mood:
                 color = dim_gray  # 有心情无正文也显灰
             else:
-                # R113：无记录日透明——180 个灰格零间隙连成 540px 实心竖纹带，
-                # 空库下像渲染 bug（走查 R113 实测）。透明后有数据的日期呈散点
-                # 热力（GitHub 风格），空库整条隐形。
-                cell.setStyleSheet("background:transparent;")
+                # R113 全透明 → R149 再修：全透明让热力图在空库/少数据时**完全隐形**
+                #（20 条随记只有 1 个 3px 色点在最右端，实测肉眼找不到）——改用卡片
+                # 内嵌色 BG_L2 做「若隐若现的轨道」：不连成脏纹（比 STROKE 灰淡一档）、
+                # 又让用户知道这里有一张热力图。
+                cell.setStyleSheet(f"background:{tokens.C('bg_surface')};"
+                                   f"border-right:1px solid {gap};")
                 cell.setToolTip(f"{d}  无随记")
                 continue
             cell.setStyleSheet(f"background:{color};border-right:1px solid {gap};")
