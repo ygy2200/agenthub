@@ -272,9 +272,16 @@ class HubPage(QWidget):
                                        f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
             reg = getattr(self, "_reg", {}).get(a.name.lower())
             if reg:
+                # R129：ISO 直出在定宽卡片里被裁（实测 Qoder「2026-10-24T」戛然而止）——
+                # 当年省年份、T 换空格（「10-24 19:24」），坏值如实原文。
+                ls = (reg['last_seen'] or "").strip()
+                if "T" in ls:
+                    d, _, hm = ls.partition("T")
+                    ls = (d[5:] + " " + hm[:5]) if d[:4].isdigit() and d[:4] == str(
+                        __import__("datetime").date.today().year) else d + " " + hm[:5]
                 col.addWidget(CaptionLabel(
                     f"{'● 在线' if reg['online'] else '○ 离线'} · 记录 {reg['records']} 条 · "
-                    f"最近活跃 {reg['last_seen'] or '—'}"))
+                    f"最近活跃 {ls or '—'}"))
             wrap = QWidget()
             wrap.setLayout(col)
             wrap.setFixedWidth(AGENT_CARD_W)   # 卡片定宽：文字不再被压没
