@@ -48,7 +48,7 @@ class NotesPage(QWidget):
         self._heat_cells = []
         for _ in range(180):
             cell = QLabel()
-            cell.setFixedSize(3, 18)  # 4→3px：180 格半年图总宽 540（原 720 在 920 窄窗下超限，2026-10-10 溢出体检）
+            cell.setFixedSize(3, 18)  # 3px 含 1px 背景缝（R124：边框色分离，守卫合规）
             self.heatRow.addWidget(cell)
             self._heat_cells.append(cell)
         lay.addLayout(self.heatRow)
@@ -365,6 +365,7 @@ class NotesPage(QWidget):
         except Exception:
             return
         dim_gray = tokens.C(tokens.STROKE)
+        gap = tokens.C("bg_page")  # R124：1px 背景色缝分离相邻色块（间距守卫合规）
         for cell, (d, cnt, mood) in zip(self._heat_cells, data):
             if cnt and mood:
                 color = MOOD_COLOR.get(mood, tokens.C(tokens.SUCCESS))
@@ -379,7 +380,7 @@ class NotesPage(QWidget):
                 cell.setStyleSheet("background:transparent;")
                 cell.setToolTip(f"{d}  无随记")
                 continue
-            cell.setStyleSheet(f"background:{color};border-radius:2px;")
+            cell.setStyleSheet(f"background:{color};border-right:1px solid {gap};")
             cell.setToolTip(f"{d}  {cnt} 条" + (f"  {mood}" if mood else ""))
 
     def showEvent(self, e):  # 切入即重读：agent 侧 hub_note 写入后 GUI 跟上

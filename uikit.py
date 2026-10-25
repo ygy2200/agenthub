@@ -670,13 +670,15 @@ _BARE_TITLE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}（[^）]*）$")
 
 def _display_title(r: dict) -> str:
     """空洞标题（仅"日期（agent）"，MCP 旧写入与迁移记录皆如此）用 content 首行
-    （目的行优先）替代显示——title 原值是迁移幂等键，只改显示不动库。"""
-    t = (r.get("title") or "").strip()
+    （目的行优先）替代显示——title 原值是迁移幂等键，只改显示不动库。
+    R123：剥掉 markdown 加粗星号——auto 捕获与部分历史记录的标题带 `**目的**`，
+    在总览/时间线/项目页原样露出星号（16 条存量实测）。"""
+    t = (r.get("title") or "").strip().replace("**", "")
     if _BARE_TITLE_RE.match(t) and r.get("content"):
         m = re.search(r"目的[】\]:：]\s*(.+)", r["content"])
         first = (m.group(1) if m else
                  next((ln.strip() for ln in r["content"].splitlines() if ln.strip()), ""))
-        first = first.strip("【】 ").strip()
+        first = first.replace("**", "").strip("【】 ").strip()
         if first:
             return f"{t} · {first[:56]}{'…' if len(first) > 56 else ''}"
     return t or "(无标题)"
