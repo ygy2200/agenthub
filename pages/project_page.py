@@ -132,7 +132,10 @@ class ProjectPage(QWidget):
         except Exception:
             recs = []
         if recs:
-            md = "\n\n".join(f"## {r['title']}\n{r['content']}" for r in reversed(recs))
+            # R119：最新在上——list_records 本就 date DESC，原 reversed() 让预览从
+            # 最旧记录开始（实测项目页顶部是 2026-09-27，看进展要滚 500 条）。
+            # 「读项目历史」场景点开任一条目的完整顺序在时间线页，这里默认给现状。
+            md = "\n\n".join(f"## {r['title']}\n{r['content']}" for r in recs)
             self.browser.setHtml(md_to_html(md))
         elif proj_scan and proj_scan.doc_path:
             self.browser.setHtml(md_to_html(core.read_text(Path(proj_scan.doc_path))))

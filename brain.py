@@ -1794,6 +1794,31 @@ def records_page(root: str, offset: int = 0, limit: int = 100,
     return rows, total
 
 
+def recent_diverse(root: str, limit: int = 8, pool: int = 200) -> list:
+    """总览「最近动态」的项目多样性采样（R122）：纯时间序 limit=8 在「单项目密集
+    迭代」时全是同一个项目的同 agent 记录（真实库实测 9 行全是 AgentHub 刷屏），
+    看不出「电脑上都在干什么」。第一遍按项目去重取最新；不足再按时间序回填补齐。
+    返回 ≤limit 条（date DESC 保持不变，只调整入选）。"""
+    lim = max(1, min(int(limit), 50))
+    rows = list_records(root, limit=max(lim * 4, int(pool)))
+    seen: set = set()
+    out = []
+    for r in rows:
+        p = r.get("project") or ""
+        if p in seen:
+            continue
+        seen.add(p)
+        out.append(r)
+        if len(out) >= lim:
+            return out
+    for r in rows:  # 项目数不足 limit：回填其余最新（时间序）
+        if r not in out:
+            out.append(r)
+            if len(out) >= lim:
+                break
+    return out
+
+
 def records_agents(root: str) -> list:
     """records 出现过的 agent（小写去重；虚拟滚动模式填过滤器下拉用）。"""
     with db_conn(root) as conn:

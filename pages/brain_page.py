@@ -108,13 +108,18 @@ class BrainPage(QWidget):
             for k, v in src.items():
                 merged[k] = merged.get(k, 0) + v
         total = max(1, sum(merged.values()))
-        for k, v in sorted(merged.items(), key=lambda x: -x[1]):
+        # R121：probe（闸门探针会话）是系统自检流量不是「谁在用大脑」——混进排名
+        # 会挤掉真 agent 的位置（真实库实测 probe 出现在榜上）；置底并如实标注。
+        rows = sorted(merged.items(), key=lambda x: -x[1])
+        rows.sort(key=lambda kv: 1 if kv[0] == "probe" else 0)
+        for k, v in rows:
             r = QHBoxLayout()
             r.addWidget(badge(k, k))
             bar = ProgressBar()
             bar.setValue(round(v / total * 100))
             r.addWidget(bar, 1)
-            r.addWidget(BodyLabel(str(v)))
+            name = f"{v}（探针，非真实使用）" if k == "probe" else str(v)
+            r.addWidget(BodyLabel(name))
             self.useBox.addLayout(r)
         if not merged:
             self.useBox.addWidget(empty_state(
@@ -280,15 +285,17 @@ class BrainPage(QWidget):
 
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:
-        """唤起/置顶行：类型徽章 + 编号·次数 + 正文（正常字号可换行）。
-        原来是单行 CaptionLabel 灰小字且 [:66]/[:70] 截断，是"看不清"的另一半根因。"""
+        """唤起/置顶行：类型徽章 + 编号·次数 + 正文单行截断，全文进 tooltip。
+        两端平衡（R120）：最早是灰小字 [:66]「看不清」→ 改 [:100] 可换行后 top10
+        每条 2-3 行、列表占满半屏（真实库走查实测）。单行 [:72] + 悬停看全文。"""
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(tokens.SPACE_S)
         h.addWidget(kind_badge(m["kind"]))
-        body = BodyLabel(f"{head}  {m['content'][:100]}")
-        body.setWordWrap(True)
+        body = BodyLabel(f"{head}  {m['content'][:72]}")
+        body.setWordWrap(False)
+        body.setToolTip(f"{head}\n{m['content']}")
         h.addWidget(body, 1)
         return w
 
