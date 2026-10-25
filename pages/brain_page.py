@@ -77,7 +77,8 @@ class BrainPage(QWidget):
             self.valCrys.setText("—")
             self.valPush.setText("—")
             self.valTodo.setText("—")
-            self.sumLabel.setText(f"大脑体检读取失败：{type(e).__name__}: {str(e)[:80]}")
+            InfoBar.error("大脑体检读取失败", f"{type(e).__name__}: {str(e)[:80]}",
+                         duration=6000, parent=self.win)
             return
         # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
         self.scroll.verticalScrollBar().setValue(0)
