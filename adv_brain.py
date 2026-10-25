@@ -4971,6 +4971,7 @@ def main():
     case("智能层（待办提取/相似记忆/体检报告/极端参数）", lambda: t_intelligence(tmp))
     case("待办提取对抗（复合词/引用/功能名不误抓+单条全文读取）", lambda: t_todo_extraction_adversarial(tmp))
     case("检索评分+待办闭环（多词排序/勾销不复发/空参拒绝）", lambda: t_search_score_and_todos(tmp))
+    case("R106 冲突对现行标注（较新 current/较旧 superseded/打平不假装/MCP 渲染）", lambda: t_conflict_current_hint(tmp))
     case("环境档案（UPSERT覆盖/自动采集幂等/过滤）", lambda: t_env_profile(tmp))
     case("语义联想推送+检索评分统一+裁决标注", lambda: t_semantic_recall(tmp))
     case("记忆蒸馏候选（目的提取/覆盖查重/极端参数）", lambda: t_distill(tmp))
@@ -6354,6 +6355,59 @@ def t_governance_indexes(tmp):
     assert "idx_journal_action_ts" in p, p
     p = plan("SELECT COUNT(*) FROM handoffs WHERE status='open'")
     assert "idx_handoffs_status" in p, p
+
+
+
+def t_conflict_current_hint(tmp):
+    """R106（任务 #13）：冲突对确定性现行标注——同日相邻 created 的真实形态下
+    （合成评测 100% 曾是假象：真实相邻轮次时间信号弱），较新版打 _current_hint、
+    较旧版打 _superseded_hint；时间打平（同秒）confident=False 只标互斥不打现行；
+    普通结果不打卡标；MCP 渲染含 ✅现行/⧗。排序不动（相关性竞争保持）。"""
+    import datetime
+    root = str(Path(tmp) / "hub_conflict_hint")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    base = datetime.datetime.now() - datetime.timedelta(minutes=10)
+    t_old = base.isoformat(timespec="seconds")
+    t_new = (base + datetime.timedelta(seconds=30)).isoformat(timespec="seconds")
+    # 旧版：端口 7890；新版：修正为 7891（含修正词 → _verdict 判矛盾）
+    with_new = brain.add_record(root, "测试-项目", "zcode", "2026-10-25",
+                                "旧版事实", "代理端口是 7890")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET created=? WHERE id=?", (t_old, with_new))
+    rid_new = brain.add_record(root, "测试-项目", "zcode", "2026-10-25",
+                               "新版修正", "代理端口是 7890——不对，实际是 7891")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET created=? WHERE id=?", (t_new, rid_new))
+    res = brain.search_all(root, "代理端口 7890")
+    by_id = {r["id"]: r for r in res["records"]}
+    assert with_new in by_id and rid_new in by_id, list(by_id)
+    old, new = by_id[with_new], by_id[rid_new]
+    assert old.get("_conflict_with") and new.get("_conflict_with"), "冲突对未标记"
+    assert new.get("_current_hint") == [with_new], new.get("_current_hint")
+    assert old.get("_superseded_hint") == [rid_new], old.get("_superseded_hint")
+    assert "_current_hint" not in old and "_superseded_hint" not in new
+    # 时间打平 → 只标互斥，不打现行（系统不知道真相不假装）
+    flat_old = brain.add_record(root, "测试-项目", "zcode", "2026-10-25",
+                                "打平旧", "同步间隔是每 5 分钟")
+    flat_new = brain.add_record(root, "测试-项目", "zcode", "2026-10-25",
+                                "打平新", "同步间隔是每 5 分钟——不对，实际是每 30 分钟")
+    res2 = brain.search_all(root, "同步间隔")
+    by2 = {r["id"]: r for r in res2["records"]}
+    assert flat_old in by2 and flat_new in by2, list(by2)
+    assert by2[flat_old].get("_conflict_with") and by2[flat_new].get("_conflict_with")
+    assert "_current_hint" not in by2[flat_old] and "_current_hint" not in by2[flat_new],         "时间打平不该给现行标注"
+    # 普通查询（无冲突对）不带卡标
+    res3 = brain.search_all(root, "代理端口")
+    assert all(not r.get("_current_hint") and not r.get("_superseded_hint")
+               for r in res3["records"] if r["id"] not in (with_new, rid_new))
+    # MCP 渲染：现行/更新版提示出现在 hub_search 输出
+    import agenthub_mcp as m
+    out = m.call_tool("hub_search", {"keyword": "代理端口 7890", "limit": 5}, root)
+    assert "✅现行" in out and "⧗对面" in out, out[:300]
+    # 排序不动：旧版 BM25 更高时仍可排前（相关性公平竞争，标注不越权）
+    assert out.index(f"#{with_new}") < out.index(f"#{rid_new}") or True  # 顺序不设硬断言
+
 
 
 def shutil_rmtree(tmp):

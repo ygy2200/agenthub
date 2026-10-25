@@ -6080,6 +6080,27 @@ def _mark_conflicts(rows: list, threshold: float = 0.0) -> list:
                 continue  # 只标互斥；"疑似重复"已由折叠处理，"相关"不是问题
             rows[i].setdefault("_conflict_with", []).append(rows[j]["id"])
             rows[j].setdefault("_conflict_with", []).append(rows[i]["id"])
+            # R106（任务 #13）：冲突对补「谁现行」确定性标注（A-TMA：给检索证据打
+            # current/historical 标签，冲突解析准确率显著提升——模型从混合物里综合
+            # 是真实失效面）。复用 D5 _adjudicate 的分层规则；仅 confident=True 才打
+            # 标（版本信号打平时系统不知道真相，保持只标互斥）。不改排序、不改数据：
+            # 词法分高者仍可排前（相关性公平竞争），但消费方能看见谁新谁旧。
+            ra, rb = rows[i], rows[j]
+            if "created" in ra and "created" in rb and "updated" not in ra:
+                vers, quals = _REC_VERS, _REC_QUALS
+            else:
+                vers, quals = _MEM_VERS, _MEM_QUALS
+            try:
+                sugg = _adjudicate(ra, rb, vers, quals)
+            except Exception:  # noqa: BLE001 裁决失败退回只标互斥，不拖垮检索
+                continue
+            if not sugg.get("confident"):
+                continue
+            keep, drop = sugg["keep"], sugg["drop"]
+            newer = ra if keep == ra.get("id") else rb
+            older = rb if newer is ra else ra
+            newer.setdefault("_current_hint", []).append(older["id"])
+            older.setdefault("_superseded_hint", []).append(newer["id"])
     return rows
 
 
