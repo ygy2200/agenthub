@@ -32,7 +32,7 @@
 
 ## 公用大脑（MCP）
 
-AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **78 个工具**（实时清单以 `hub_help` 输出为准——本文数字可能滞后于代码）：
+AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支持 MCP 的 agent 接入后获得 **79 个工具**（实时清单以 `hub_help` 输出为准——本文数字可能滞后于代码）：
 
 **核心读写**：`hub_log_work`（写工作记录）、`hub_get_project` / `hub_list_projects` / `hub_create_project`、`hub_get_record`（单条精读）、`hub_get_progress`（进度对齐）
 
@@ -112,6 +112,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 | v2.40.26 | **守卫补缺·lesson #177 落地（2026-10-17，workbuddy，R7）**：①实测基线：铁律四段式（目的/做了什么/验证结果/如何回滚）近 90 天 work_log 俱全率仅 **22%**（280/1266；workbuddy 47%/zcode 25%/dsh 25%/hermes 7%）——标准没有度量必然腐烂；②hub_log_work 回显**软提示**：缺段时点明缺哪段（不阻断/不进存储/todo 等类型不提示）；③新增第 23 个 ops 检查项 `record_quality`（俱全率+缺段分布+按 agent 分解，阈值 60% 诚实信号）；④desc_quality 增 CORE_TOOLS 腐烂守卫（常量引用不存在的工具=守卫静默失效，变异测试抓）；⑤核实 `hub_ops_run` name enum 已是 `sorted(ops.CHECKS)` 动态生成——2026-10-03 那类手抄 enum 漂移结构性防住。 |
 | v2.40.27 | **文档对齐（2026-10-17，workbuddy，R8）**：①README 工具数双区 53/37→**69**（与代码实时清单对齐）；延迟 39ms→**实测中位 ~220ms**（词法两路 ~50ms、语义编码+Everything 文件通道占余量）；②英文区删已移除的 skill marketplace 条目；③补 v2.40.20-26 七条版本记录（R1-R7）；④`brain._encode` 增进程级 query 向量缓存（64 条封顶，重复搜索省约一半语义编码开销）。九套回归全绿 + release 一致。 |
 | v2.40.28 | **反馈报告两处假阳性修复（2026-10-17，workbuddy，R11）**：①元信息摩擦不再「狼来了」——旧 `meta_ratio≥40` 即控「元记忆挤占库容」，实测 `meta_breakdown` 零唤起对照 **元信息 4 == 非元信息 4**（分布健康、占比高只因本项目产物即大脑本身），改为真灌水（零唤起元信息显著更多）才 warn、否则降级 ℹ info 卡片并引用真实 `by_kind` 拆解；②「从未使用」判定合并 `searches ∪ op_audit ∪ todos_done` 三源，修正 `hub_ops_run`（op_audit 42 次调用、全库第 3 常用）等被误判零使用；`adv_report` 新增 2 回归用例。九套回归全绿 + release 一致、6 agent 在线。 |
+| v2.41.47 | **第七十九/八十/一轮 R115-R117·文字逻辑三面收口（2026-10-25，ZCode）**：①错误文案可行动性审计（tools/audit_errmsg.py 可复跑）：46 条全具备出路（动作词/合法值/相近建议/示例四类之一），审计通过零改动；②帮助主题补 2 缺口（start 补 hub_heartbeat 报到、search 补 hub_memory_read 分工）；③命令面板关键词补漏：退回/返工/漂移/用量异常/随记/心情/胶囊/撞车/结晶/踏空 共 10 词接入（含子串匹配语义验证——「用量异常」须整词）。 |
 | v2.41.46 | **第七十七/八轮 R113+R114·UI 走查与文字逻辑修复（2026-10-25，ZCode）**：18 页逐页走查。P1×3：notes 热力条空态竖纹带改散点热力、signal 底部文案窄窗截断、connect 工具数 25→动态 79。P2：内部代号（Y1/Y2/Y3/M3/P3-2/hub_next 同源）与未渲染星号清除，改用户视角措辞。 |
 | v2.41.45 | **第七十六轮 R112·调用留痕通道区分（2026-10-25，ZCode）**：441 次空归属调用主体是 CLI 管理面（设计内不署名），usage_health 旧提示语义误导。`tool_calls` 加 `channel` 列（mcp/admin，建表+惰性迁移），空归属拆三类提示（mcp 真缺口/历史多为管理面/管理面设计内）。生产 441 次全部正确落历史口径。 |
 | v2.41.44 | **第七十五轮 R110·YAML 布局读支持（2026-10-25，ZCode）**：R103 遗留——hermes YAML 配置解析不出（read_mcp_config 只认 toml/json），漂移检测跳过。补 `.yaml/.yml` 分支（safe_load 只读；写路径仍外科编辑保注释）。生产实测 hermes 首次纳入检测（✓），覆盖 6→7 家；adv_ops 新增 YAML 用例。 |
