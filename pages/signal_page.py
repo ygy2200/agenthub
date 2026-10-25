@@ -47,8 +47,11 @@ class SignalPage(QWidget):
         self.toCombo = ComboBox()
         self.toCombo.setMinimumWidth(110)
         sl.addWidget(self.toCombo)
+        # R127：下拉显示纯中文（原来「msg 消息」把内部枚举值露给用户）；
+        # 发送按索引映射回枚举，数据格式不变。
+        self._kinds = [("msg", "消息"), ("alert", "告警"), ("ack_request", "需回执")]
         self.kindCombo = ComboBox()
-        self.kindCombo.addItems(["msg 消息", "alert 告警", "ack_request 需回执"])
+        self.kindCombo.addItems([label for _, label in self._kinds])
         sl.addWidget(self.kindCombo)
         self.edit = LineEdit()
         self.edit.setPlaceholderText("消息内容（回车发送）")
@@ -74,7 +77,7 @@ class SignalPage(QWidget):
         self.readBtn.clicked.connect(self.mark_read)
         row.addWidget(self.readBtn)
         # R113：原文案 41 字被 920 窄窗裁成「刷新随全窗扫描（」——截断比省略更糟
-        tip = CaptionLabel("F5 刷新；@提醒在对方心跳的「[未读信号]」段送达")
+        tip = CaptionLabel("F5 刷新 · @提醒随心跳送达")
         tip.setToolTip("刷新随全窗扫描（F5）；@提醒靠对方心跳的「[未读信号]」段送达")
         row.addWidget(tip)
         row.addStretch(1)
@@ -126,7 +129,7 @@ class SignalPage(QWidget):
             for s in rows:
                 to = f"→{s['to_agent']}" if s["to_agent"] else "→广播"
                 it = QListWidgetItem(
-                    f"#{s['id']} {s['ts'][5:16]} {to}（{s['kind']}）{s['content'][:60]}")
+                    f"#{s['id']} {s['ts'][5:16]} {to}（{self._kind_label(s['kind'])}）{s['content'][:60]}")
                 self._sent_items[id(it)] = s
                 self.listw.addItem(it)
             return
@@ -148,7 +151,7 @@ class SignalPage(QWidget):
             proj = f" [{s['project']}]" if s["project"] else ""
             it = QListWidgetItem(
                 f"{dot} #{s['id']} {s['ts'][5:16]} {s['from_agent']}{to}{proj}"
-                f"（{s['kind']}）{s['content'][:56]}")
+                f"（{self._kind_label(s['kind'])}）{s['content'][:56]}")
             self._inbox_items[id(it)] = s
             self.listw.addItem(it)
 
@@ -159,6 +162,11 @@ class SignalPage(QWidget):
         return self._inbox_items.get(id(it)) if it else None
 
     # ---------- 操作 ----------
+    @staticmethod
+    def _kind_label(kind: str) -> str:
+        kinds = dict([("msg", "消息"), ("alert", "告警"), ("ack_request", "需回执")])
+        return kinds.get((kind or "").strip(), kind or "消息")
+
     def send(self):
         if not self.win.root:
             return
@@ -169,7 +177,7 @@ class SignalPage(QWidget):
         me = self.meCombo.currentText()
         to_text = self.toCombo.currentText()
         to = "" if to_text.startswith("（广播") else to_text
-        kind = self.kindCombo.currentText().split(" ")[0]
+        kind = self._kinds[self.kindCombo.currentIndex()][0]
         try:
             tip, sid = brain.signal_send(self.win.root, me, content, to_agent=to,
                                          kind=kind)
