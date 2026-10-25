@@ -3,9 +3,26 @@
 from __future__ import annotations
 
 import re
+import datetime as _dt
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+def _fmt_ts(ts: str) -> str:
+    """R128：ISO 原文（2026-10-15T10:54:12）→ 人读格式「10-15 10:54」；
+    非当年补年份，解析失败如实原文（不硬造）。"""
+    t = (ts or "").strip()
+    if "T" not in t:
+        return t
+    date, _, hm = t.partition("T")
+    y, _, md = date.partition("-")
+    try:
+        if int(y) == _dt.date.today().year:
+            return f"{md} {hm[:5]}"
+        return f"{y}-{md} {hm[:5]}"
+    except ValueError:
+        return t
+
+
 class JournalPage(QWidget):
     """流水页：错误登记（谁错了、怎么回滚、处理状态）+ 全部写操作流水（可撤销）。
     错误来源：MCP 工具执行异常自动落盘 + agent 主动 hub_report_error。"""
@@ -116,7 +133,7 @@ class JournalPage(QWidget):
         for e in self.errors:
             st = "未关闭" if e["status"] == "open" else "已修复"
             self.errList.addItem(
-                f"#{e['id']} [{st}] {e['ts']}  {e['agent']}"
+                f"#{e['id']} [{st}] {_fmt_ts(e['ts'])}  {e['agent']}"
                 f" · {e['project'] or '无项目'}：{e['title']}"
                 + (f"  ｜回滚：{e['undo'][:60]}" if e["undo"] else ""))
         if not self.errors:
@@ -129,7 +146,7 @@ class JournalPage(QWidget):
             act = self.ACTION_CN.get(e["action"], e["action"])
             tgt = str(e["target"] or "")
             tgt = Path(tgt).name if "/" in tgt or "\\" in tgt else tgt
-            self.jList.addItem(f"{e['ts']}  [{agent_disp(e['agent'])}]  {act}  {tgt}"
+            self.jList.addItem(f"{_fmt_ts(e['ts'])}  [{agent_disp(e['agent'])}]  {act}  {tgt}"
                                + (f"  {str(e['note'])[:70]}" if e["note"] else ""))
         if not self.journal:
             self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
@@ -161,7 +178,7 @@ class JournalPage(QWidget):
                 f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选上方错误查看详情与回滚方式</p>")
             return
         st = "未关闭" if e["status"] == "open" else "已修复"
-        body = f"## {e['title']}\n\n**状态** {st} · **登记** {e['agent']} {e['ts']}"
+        body = f"## {e['title']}\n\n**状态** {st} · **登记** {e['agent']} {_fmt_ts(e['ts'])}"
         if e["project"]:
             body += f" · **项目** {e['project']}"
         if e["detail"]:
