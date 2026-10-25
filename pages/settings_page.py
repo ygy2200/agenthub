@@ -230,6 +230,16 @@ class SettingsPage(QWidget):
         if not self.win.root:
             InfoBar.warning("先选择根目录", "先在上面选好数据根目录，再进行此操作", duration=2000, parent=self.win)
             return
+        # R146：低频结构创建操作加确认——误点会在选定目录里建出一套结构
+        #（00_Inbox/99_Archive/_hub…），选错目录的清理成本远高于点一次确认。
+        from PySide6.QtWidgets import QMessageBox
+        ret = QMessageBox.question(
+            self, "初始化目录结构",
+            f"将在以下目录创建 AgentHub 结构（00_Inbox / 99_Archive / _hub 等，已存在的保持不变）：\n"
+            f"{self.win.root}\n\n继续？",
+            QMessageBox.Yes | QMessageBox.No, QMessageBox.No)
+        if ret != QMessageBox.Yes:
+            return
         err = core.init_hub(self.win.root)
         if err:
             InfoBar.error("初始化失败", err, duration=4000, parent=self.win)
