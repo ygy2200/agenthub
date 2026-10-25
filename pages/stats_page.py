@@ -62,11 +62,13 @@ class StatsPage(QWidget):
 
     def set_db(self, s: dict):
         """统计页数据源 = 大脑数据库。"""
-        self.valProj.setText(str(s.get("projects", 0)))
-        self.valRec.setText(str(s.get("records", 0)))
-        self.valIssue.setText(str(s.get("errors_open", 0)))
-        self.valStalled.setText(str(s.get("projects_stalled", 0)))
-        self.valSearch.setText(f"{s.get('searches_today', 0)} / {s.get('searches_total', 0)}")
+        # R131：千分位——1512 与 1,512 一眼可辨（数字卡走 32px 定宽，逗号占位无害）
+        fmt = lambda n: f"{int(n or 0):,}"
+        self.valProj.setText(fmt(s.get("projects", 0)))
+        self.valRec.setText(fmt(s.get("records", 0)))
+        self.valIssue.setText(fmt(s.get("errors_open", 0)))
+        self.valStalled.setText(fmt(s.get("projects_stalled", 0)))
+        self.valSearch.setText(f"{fmt(s.get('searches_today', 0))} / {fmt(s.get('searches_total', 0))}")
         try:
             h = brain.health_report(self.win.root)
             dup = f"疑似重复记忆 {h['dup_memory_count']} 组"
