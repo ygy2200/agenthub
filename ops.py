@@ -2258,9 +2258,18 @@ def _usage_health(root: str) -> dict:
                 "GROUP BY agent, tool HAVING n>?", (m10, loop_alarm)).fetchall()
             recent_agents = {r["agent"] for r in conn.execute(
                 "SELECT DISTINCT agent FROM tool_calls WHERE ts>=?", (d7,))}
-            empty_agent = conn.execute(
-                "SELECT COUNT(*) n FROM tool_calls WHERE ts>=? AND (agent='' OR agent IS NULL)",
-                (d7,)).fetchone()["n"]
+            # R112：空归属按通道拆分——admin（CLI/GUI/REST）空归属是设计内；
+            # mcp 空归属才是归属缺口（未锁会话，R101 前的存量）。历史行（''）
+            # 按缺口口径提示但注明可能是管理面。
+            gap = conn.execute(
+                "SELECT COUNT(*) n FROM tool_calls WHERE ts>=? "
+                "AND (agent='' OR agent IS NULL) AND channel='mcp'", (d7,)).fetchone()["n"]
+            admin_blank = conn.execute(
+                "SELECT COUNT(*) n FROM tool_calls WHERE ts>=? "
+                "AND (agent='' OR agent IS NULL) AND channel='admin'", (d7,)).fetchone()["n"]
+            legacy_blank = conn.execute(
+                "SELECT COUNT(*) n FROM tool_calls WHERE ts>=? "
+                "AND (agent='' OR agent IS NULL) AND channel=''", (d7,)).fetchone()["n"]
             # 空库（无任何工作记录）没有「使用」语义——临时库/测试库里内置适配器
             # 零调用是常态，按闲置报全是误报；闲置检测只在有使用历史的库上跑。
             has_history = conn.execute("SELECT EXISTS(SELECT 1 FROM records)").fetchone()[0]
@@ -2289,8 +2298,16 @@ def _usage_health(root: str) -> dict:
             detail.append(f"接入闲置：{'、'.join(idle)}（MCP 已配置但近 7 天零调用——"
                           "确认还需要吗：不用就下线接入，避免配置漂移无人发现）")
             issues.extend(idle)
-    detail.append(f"信息：近 7 天空归属调用 {empty_agent} 次"
-                  + ("——归属缺口，核查未锁 --agent 的接入" if empty_agent else ""))
+    bits = []
+    if gap:
+        bits.append(f"mcp 空归属 {gap} 次（归属缺口，核查未锁 --agent 的接入）")
+    if legacy_blank:
+        bits.append(f"历史无通道标注 {legacy_blank} 次（多为管理面）")
+    if bits:
+        detail.append("信息：" + "；".join(bits)
+                      + (f"；管理面不署名 {admin_blank} 次（设计内）" if admin_blank else ""))
+    elif admin_blank:
+        detail.append(f"信息：管理面不署名 {admin_blank} 次（设计内，非缺口）")
     if issues:
         summary = f"用量异常 {len(set(issues))} 家（失控/循环/闲置）"
         return {"ok": False, "summary": summary, "detail": detail[:12]}

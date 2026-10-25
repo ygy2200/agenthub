@@ -241,7 +241,11 @@ def t_usage_health(tmp):
         conn.executemany("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
                          [(iso(120), "looper", "hub_status")] * 61)   # 循环：61 次/10min
         conn.executemany("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
-                         [(iso(180), "", "hub_search")] * 3)          # 空归属
+                         [(iso(180), "", "hub_search")] * 3)          # 空归属（历史无通道）
+        conn.execute("INSERT INTO tool_calls(ts, agent, tool, channel) VALUES(?,?,?,?)",
+                     (iso(180), "", "hub_status", "admin"))           # 管理面空归属（设计内）
+        conn.execute("INSERT INTO tool_calls(ts, agent, tool, channel) VALUES(?,?,?,?)",
+                     (iso(180), "", "hub_help", "mcp"))               # mcp 空归属（缺口）
         # quietbee：注册 + MCP 配置但 7 天零调用 → 接入闲置
     (root / "config.agents.json").write_text(json.dumps({"agents": [
         {"agent": "quietbee", "channel": "instr_file",
@@ -261,8 +265,9 @@ def t_usage_health(tmp):
           "looper" in det and "循环调用" in det, det)
     check("接入闲置：quietbee 配置在但零调用被点名",
           "quietbee" in det and "零调用" in det, det)
-    check("空归属信息行：3 次空归属如实呈现",
-          "空归属调用 3 次" in det, det)
+    check("空归属按通道拆分：缺口/历史/管理面三类如实呈现（R112）",
+          "mcp 空归属 1 次" in det and "历史无通道标注 3 次" in det
+          and "管理面不署名 1 次" in det, det)
     check("修复建议已注册", "usage_health" in ops.CHECK_FIXES
           and "hub_usage_timeline" in ops.CHECK_FIXES["usage_health"], "")
 

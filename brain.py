@@ -386,7 +386,8 @@ CREATE TABLE IF NOT EXISTS tool_calls (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT DEFAULT "",
     agent TEXT DEFAULT "",
-    tool TEXT DEFAULT ""
+    tool TEXT DEFAULT "",
+    channel TEXT DEFAULT ""
 );
 CREATE TABLE IF NOT EXISTS op_audit (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -2252,17 +2253,30 @@ def audit_list(root: str, limit: int = 20) -> list:
             "SELECT * FROM op_audit ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 200)),))]
 
 
-def log_tool_call(root: str, tool: str, agent: str = "") -> None:
+def log_tool_call(root: str, tool: str, agent: str = "",
+                  channel: str = "") -> None:
     """C3→D6/R6：工具调用留痕。**全部工具**都记（R6 扩面前只有 4 个能力型只读工具记，
     导致「48/69 从未被调用」绝大部分是留痕盲区的假象——拿假象治理会把在用工具当僵尸下线）。
     fail-open：留痕失败绝不影响调用本身。写工具另走 op_audit（审计语义含 undo 句柄），
-    与这里的调用计数不可互相替代（一条写调用两边都有记录，是故意的：两个问题两套答案）。"""
+    与这里的调用计数不可互相替代（一条写调用两边都有记录，是故意的：两个问题两套答案）。
+    channel（R112）：mcp=会话调用（session=True）/ admin=管理通道（CLI/GUI/REST——
+    空归属在这里是**设计内**，usage_health 不再把它当归属缺口提示）；历史行 ''。"""
     try:
         with db_conn(root) as conn:
-            conn.execute("INSERT INTO tool_calls(ts, agent, tool) VALUES(?,?,?)",
-                         (_now(), _norm_agent(agent) or "", tool))
+            _ensure_tool_calls_channel(conn)
+            conn.execute(
+                "INSERT INTO tool_calls(ts, agent, tool, channel) VALUES(?,?,?,?)",
+                (_now(), _norm_agent(agent) or "", tool,
+                 channel if channel in ("mcp", "admin") else ""))
     except Exception:  # noqa: BLE001
         pass
+
+
+def _ensure_tool_calls_channel(conn) -> None:
+    """R112 惰性迁移：tool_calls 加 channel 列（历史行保留 ''，不猜）。"""
+    cols = {r[1] for r in conn.execute("PRAGMA table_info(tool_calls)")}
+    if "channel" not in cols:
+        conn.execute("ALTER TABLE tool_calls ADD COLUMN channel TEXT NOT NULL DEFAULT ''")
 
 
 # ---------------------------------------------------------------- D10/R4：使用时间线
