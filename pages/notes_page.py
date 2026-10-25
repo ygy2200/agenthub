@@ -260,6 +260,12 @@ class NotesPage(QWidget):
         self.reload()
         tip = (f"#{nid} 已封存为时光胶囊，{open_at} 开启" if open_at
                else f"#{nid}——思想已进大脑，所有 agent 检索可见")
+        # R158：brain.add_note 落库上限 4000 字——超限静默截断会让用户以为全文已存
+        if len(content) > 4000:
+            InfoBar.warning("随记已按 4000 字上限截断保存",
+                            f"原文 {len(content)} 字，只保留前 4000 字——超长内容建议拆成多条或放进项目工作记录",
+                            duration=6000, parent=self.win)
+            return
         InfoBar.success("已记入随记", tip, duration=3000, parent=self.win)
 
     def _star(self, nid, on):
