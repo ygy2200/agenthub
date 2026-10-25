@@ -1,5 +1,6 @@
 # -*- coding: utf-8 -*-
-"""真实库走查：连真实 root 启动窗口，逐页截图到 output/real-shots/（只读，不种子不改库）。"""
+"""真实库走查：连真实 root 启动窗口逐页截图（只读，不种子不改库）。
+用法：python tools/real_walkthrough.py [root] [dark|light] [输出目录后缀]"""
 import os
 import sys
 from pathlib import Path
@@ -8,12 +9,14 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests" / "gui"))
 
-OUT = ROOT / "output" / "real-shots"
+THEME = sys.argv[2] if len(sys.argv) > 2 else "dark"
+SUFFIX = sys.argv[3] if len(sys.argv) > 3 else ""
+OUT = ROOT / "output" / f"real-shots{SUFFIX}"
 
 
 def main():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    real_root = sys.argv[1] if len(sys.argv) > 1 else r"D:\agent资料\zcode项目记录"
+    real_root = sys.argv[1] if len(sys.argv) > 1 else r"D:gent资料\zcode项目记录"
     from PySide6.QtWidgets import QApplication
     import actions
     import core
@@ -27,7 +30,7 @@ def main():
             from PySide6.QtGui import QFontDatabase
             QFontDatabase.addApplicationFont(f)
             break
-    tokens.apply_theme("dark")
+    tokens.apply_theme(THEME)
     orig = core.get_root
     core.get_root = lambda: real_root
     w = ui.AgentHubWindow()
@@ -46,7 +49,7 @@ def main():
             pm = page.grab()
             if not pm.isNull():
                 pm.save(str(OUT / f"{attr}.png"))
-        print(f"已截图 {len(list(OUT.glob('*.png')))} 页 -> {OUT}")
+        print(f"[{THEME}] 已截图 -> {OUT}")
     finally:
         core.get_root = orig
         w.close()
