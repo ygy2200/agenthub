@@ -25,3 +25,26 @@ def hub_root(tmp_path, monkeypatch):
     monkeypatch.setattr(core, "get_root", lambda: str(root))
     monkeypatch.setattr(core, "save_config", lambda *a, **k: None)
     return str(root)
+
+
+@pytest.fixture(autouse=True)
+def _flush_qt_deletes():
+    """每个用例结束后强制冲刷 Qt 的 DeferredDelete 队列（R199）。
+
+    背景：GUI 用例在同一进程里连开多个窗口时，`deleteLater` 的控件要等事件循环
+    空闲才析构；下一个用例已经建了新窗口，旧控件却在新窗口的事件分发中析构 →
+    实测 20–30s 处随机 `Windows fatal exception: access violation`（同一份代码
+    有时 4 passed、有时崩）。flush + gc 把析构时机钉在用例边界，代价可忽略。
+    """
+    yield
+    try:
+        from PySide6.QtWidgets import QApplication
+        from PySide6.QtCore import QCoreApplication, QEvent
+        app = QApplication.instance()
+        if app is not None:
+            QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+            app.processEvents()
+        import gc
+        gc.collect()
+    except Exception:  # noqa: BLE001 Qt 未启动/已销毁时不该影响用例结论
+        pass

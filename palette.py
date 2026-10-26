@@ -34,7 +34,7 @@ class CommandPalette(QWidget):
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("命令面板")
         self.win = window
-        self._acts = []  # [(icon_name, label, keywords, fn)]
+        self._acts = []  # [(icon_name, label, keywords, fn, group)]
 
         card = QWidget(self)
         card.setObjectName("cpCard")
@@ -57,6 +57,8 @@ class CommandPalette(QWidget):
         lay.addWidget(self.search)
 
         self.listw = ListWidget(card)
+        self.listw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.listw.setTextElideMode(Qt.ElideRight)
         self.listw.itemClicked.connect(self._run_item)
         self.listw.installEventFilter(self)
         lay.addWidget(self.listw)
@@ -88,7 +90,7 @@ class CommandPalette(QWidget):
         w = self.win
         acts = []
         for _attr, title, icon, kw, page in actions.page_entries(w):
-            acts.append((icon, f"打开：{title}", kw, (lambda p=page: w.switchTo(p))))
+            acts.append((icon, f"打开：{title}", kw, (lambda p=page: w.switchTo(p)), "page"))
         handlers = {
             "refresh": w.refresh,
             "new_note": self._focus_note,
@@ -101,19 +103,29 @@ class CommandPalette(QWidget):
         for aid, label, icon, kw in actions.ACTIONS:
             fn = handlers.get(aid)
             if fn is not None:
-                acts.append((icon, label, kw, fn))
+                acts.append((icon, label, kw, fn, "action"))
         snap = getattr(getattr(w, "project_page", None), "snap", None)
-        if snap is not None:
-            for p in list(getattr(snap, "projects", []))[:60]:
-                acts.append(("FOLDER", f"项目：{p.name}", "proj 打开项目 工作记录",
-                             (lambda n=p.name: self._open_project(n))))
+        names = [getattr(p, "name", "") for p in getattr(snap, "projects", []) or []]
+        # 大脑里已有记录、但还没建目录的项目也要能直达（项目页列表读 DB，不只是扫描结果）。
+        names += [p.get("name", "") for p in
+                  getattr(getattr(w, "project_page", None), "db_projects", []) or []]
+        seen = set()
+        for name in names:
+            if not name or name in seen:
+                continue
+            seen.add(name)
+            acts.append(("FOLDER", f"项目：{name}", "proj 打开项目 工作记录",
+                         (lambda n=name: self._open_project(n)), "project"))
+            if len(seen) >= 60:
+                break
         # P3-1：MCP 工具检索（命令面板搜工具）——清单与 MCP server 同源（import 其 TOOLS 常量）
         try:
             import agenthub_mcp
             for t in agenthub_mcp.TOOLS:
                 acts.append(("CODE", f"工具：{t['name']}",
                              f"{t['name']} {t['description']}".lower(),
-                             (lambda n=t["name"], d=t["description"]: self._use_tool(n, d))))
+                             (lambda n=t["name"], d=t["description"]: self._use_tool(n, d)),
+                             "tool"))
         except Exception:  # noqa: BLE001 工具清单不可用时面板照常
             pass
         self._acts = acts
@@ -135,10 +147,15 @@ class CommandPalette(QWidget):
 
     def _filter(self, text: str):
         text = (text or "").strip().lower()
+        terms = [t for t in text.split() if t]
         self.listw.clear()
         n = 0
-        for icon, label, kw, fn in self._acts:
-            if text and text not in f"{label} {kw}".lower():
+        for icon, label, kw, fn, group in self._acts:
+            # 空输入只列页面与常用动作：项目最多 60 个、MCP 工具 69 个全倒出来会淹没入口。
+            if not terms and group not in ("page", "action"):
+                continue
+            hay = f"{label} {kw}".lower()
+            if terms and not all(t in hay for t in terms):
                 continue
             it = QListWidgetItem(label)
             try:
@@ -152,12 +169,23 @@ class CommandPalette(QWidget):
         if n:
             self.listw.setCurrentRow(0)
         else:
-            # 无结果空态（antigravity：不能白屏）
+            # 无结果空态（antigravity：不能白屏）；两行：说清没匹配 + 给可试关键词。
             it = QListWidgetItem("无匹配命令——换个关键词试试")
             it.setFlags(Qt.NoItemFlags)
             it.setSizeHint(QSize(0, 36))
+            it.setToolTip("输入页面/动作/项目/MCP 工具名")
             self.listw.addItem(it)
-        self.hint.setText((f"{n} 项 · " if n else "") + "↑↓ 选择 · Enter 执行 · Esc 关闭")
+            it2 = QListWidgetItem("试试「项目」「随记」「退回」「hub_search」")
+            it2.setFlags(Qt.NoItemFlags)
+            it2.setSizeHint(QSize(0, 36))
+            it2.setToolTip("这些是真实存在的页面、动作与工具名")
+            self.listw.addItem(it2)
+        if not n:
+            self.hint.setText("0 项 · 换个关键词，或 Esc 关闭")
+        elif terms:
+            self.hint.setText(f"{n} 项 · ↑↓ 选择 · Enter 执行 · Esc 关闭")
+        else:
+            self.hint.setText(f"{n} 项 · 可再输项目名/工具名 · ↑↓ 选择 · Enter 执行 · Esc 关闭")
 
     def _move(self, delta: int):
         """↑↓ 循环选择（antigravity 取模），并保证选中项可见。"""

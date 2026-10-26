@@ -111,6 +111,12 @@ def empty_state(icon_name: str, title: str, desc: str = "",
     lay = QVBoxLayout(box)
     lay.setContentsMargins(0, tokens.SPACE_XL, 0, tokens.SPACE_M)
     lay.setSpacing(tokens.SPACE_XS)
+    # R194：空态被放进可伸缩容器时，Qt 会把富余高度平摊给图标/标题/说明/按钮
+    # （每个 Preferred 纵向策略的控件都吃一份）——920×600 时间线实测：图标→标题
+    # 相隔 72px、标题→说明 119px、说明→按钮 75px，四行字被拉成互不相干的四块。
+    # 首尾各加一根吸收项：有富余就地垂直居中、内部间距恒为设计值；空间不足时
+    # 伸缩项先塌到 0，退化为原来的紧凑排布，不挤掉任何一行。
+    lay.addStretch(1)
     try:
         iw = IconWidget(ic(icon_name), box)
         iw.setFixedSize(26, 26)
@@ -120,15 +126,24 @@ def empty_state(icon_name: str, title: str, desc: str = "",
     t = StrongBodyLabel(title, box)
     t.setAlignment(Qt.AlignCenter)
     lay.addWidget(t)
+    d = None
     if desc:
         d = CaptionLabel(desc, box)
         d.setAlignment(Qt.AlignCenter)
         d.setWordWrap(True)
         lay.addWidget(d)
+    b = None
     if action and action_text:
         b = PushButton(action_text, box)
         b.clicked.connect(action)
         lay.addWidget(b, 0, Qt.AlignHCenter)
+    # R196：把内部控件暴露出来——list_empty_guard 是「建一次、反复复用」的，
+    # 而同一列表不同场景的文案不一样（项目页：空库 vs 过滤无命中）。没有句柄
+    # 就只能沿用第一次创建的文案，用户看到的是过期提示。
+    box.titleLabel = t
+    box.descLabel = d
+    box.actionBtn = b
+    lay.addStretch(1)
     return box
 
 
@@ -1030,7 +1045,8 @@ def op_failed(op: str, err, parent, hint: str = "可重试；若持续失败请�
     InfoBar.error(f"{op}失败", f"{err}（{hint}）", duration=5000, parent=parent)
 
 
-def list_empty_guard(listw, layout, title: str, desc: str = "", index=None):
+def list_empty_guard(listw, layout, title: str, desc: str = "", index=None,
+                     action_text: str = "", action=None):
     """给列表挂空态引导：为空时显示、非空时隐藏（懒创建，挂一次即可）。
 
     Round 5（2026-10-13）：v2.25 立了「空态组件化」标准，但后续新增/合并的页面没跟上——
@@ -1040,12 +1056,13 @@ def list_empty_guard(listw, layout, title: str, desc: str = "", index=None):
 
     用法：`list_empty_guard(self.listw, self.layout(), "暂无隔离条目", "…")`
     index：插到 layout 的第几位（默认列表后一位；列表不在该 layout 时用，如 QSplitter 场景）
+    action_text/action：可选的空态 CTA（如搜索页「搜索最近项目」），首次创建时绑定。
     """
     key = "_empty_hint_widget"
     hint = getattr(listw, key, None)
     empty = (listw.count() == 0)
     if hint is None:
-        hint = empty_state("INFO", title, desc)
+        hint = empty_state("INFO", title, desc, action_text=action_text, action=action)
         try:
             setattr(listw, key, hint)
         except Exception:  # noqa: BLE001  极少数 Qt 对象不允许挂属性：退化为只提示一次
@@ -1055,6 +1072,30 @@ def list_empty_guard(listw, layout, title: str, desc: str = "", index=None):
             index = (idx + 1) if idx >= 0 else (layout.count() if layout is not None else 0)
         if layout is not None:
             layout.insertWidget(index, hint)
+    # R196：复用时同步文案——空态是懒创建的，同一列表会在「空库 / 过滤无命中 /
+    # 无连接大脑」之间切换；原来只 setVisible，标题永远是第一次那句
+    # （项目页先空库、再过滤无命中，仍提示「还没有任何项目」）。
+    try:
+        if hint.titleLabel.text() != title:
+            hint.titleLabel.setText(title)
+        _d = getattr(hint, "descLabel", None)
+        if _d is not None:
+            if _d.text() != desc:
+                _d.setText(desc)
+            _d.setVisible(bool(desc))
+        _b = getattr(hint, "actionBtn", None)
+        if _b is not None and action_text:
+            if _b.text() != action_text:
+                _b.setText(action_text)
+            if action is not None and getattr(hint, "_e_action_fn", None) is not action:
+                try:
+                    _b.clicked.disconnect()
+                except Exception:  # noqa: BLE001 从未连过
+                    pass
+                _b.clicked.connect(action)
+                hint._e_action_fn = action
+    except Exception:  # noqa: BLE001 空态被销毁/换实现时不阻断页面
+        pass
     hint.setVisible(empty)
     return hint
 

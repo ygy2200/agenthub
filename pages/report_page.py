@@ -45,17 +45,17 @@ class ReportPage(QWidget):
     def reload_reports(self):
         self.histList.clear()
         d = Path(self.win.root) / "_hub" / "reports" if self.win.root else None
-        # Round 5：没有报告目录/还没生成过报告时给引导（原来是一片空白）
+        if d and d.is_dir():
+            for p in sorted(d.glob("反馈报告-*.html"), reverse=True):
+                self.histList.addItem(p.stem)  # 既有模式：addItem(str) 后按行号 setData
+                self.histList.item(self.histList.count() - 1).setData(Qt.UserRole, str(p))
+        tight_rows(self.histList)
+        # 必须等列表填充后再判空：此前先挂空态再 addItem，空态不会自己消失，
+        # 有历史报告时「还没有运营报告」和列表同时出现（R189 真实截图）。
         list_empty_guard(self.histList, self.histList.parentWidget().layout(),
                          "还没有运营报告",
-                         "点「生成报告」产出一份 HTML（含近期待办/停滞项目/错误登记摘要），"
+                         "点「生成并打开」产出一份 HTML（含近期待办/停滞项目/错误登记摘要），"
                          "生成后可双击打开")
-        if not d or not d.is_dir():
-            return
-        for p in sorted(d.glob("反馈报告-*.html"), reverse=True):
-            self.histList.addItem(p.stem)  # 既有模式：addItem(str) 后按行号 setData
-            self.histList.item(self.histList.count() - 1).setData(Qt.UserRole, str(p))
-        tight_rows(self.histList)
 
     def generate(self):
         if not self.win.root:

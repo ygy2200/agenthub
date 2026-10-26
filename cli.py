@@ -158,17 +158,25 @@ def cmd_release(root: str) -> int:
     return 0 if r["ok"] else 1
 
 
-def cmd_doctor(root: str) -> int:
-    """R8 一键自检：巡检聚合，逐条给可执行修复建议（有问题时退出码 1，供脚本判断）。"""
+def cmd_doctor(root: str, full: bool = False) -> int:
+    """R8 一键自检：巡检聚合，逐条给可执行修复建议（有问题时退出码 1，供脚本判断）。
+    R178：默认只给失败项相关的修复口径与 3 条明细，`--full` 才展开完整口径与全部明细。"""
     import ops  # noqa: PLC0415
     rep = ops.run_patrol(root)
     print(f"一键自检：{rep['checked']} 项，通过 {len(rep['passed'])}，"
           f"问题 {len(rep['issues'])}，耗时 {rep['elapsed_ms']}ms")
     for i in rep["issues"]:
         print(f"✗ {i['name']}：{i['summary']}")
-        print(f"  修复：{i['fix']}")
-        for d in i["detail"][:5]:
+        brief = i.get("fix_brief") or i["fix"]
+        print(f"  修复：{brief}")
+        if full and brief != i["fix"]:
+            print(f"  完整口径：{i['fix']}")
+        detail = i["detail"] if full else i["detail"][:3]
+        for d in detail:
             print(f"    · {d}")
+        rest = len(i["detail"]) - len(detail)
+        if rest > 0:
+            print(f"    · …另有 {rest} 条明细（加 --full 看全部）")
     if not rep["issues"]:
         print("全部通过。")
     if rep["skipped"]:
@@ -287,8 +295,11 @@ def _task_line(t: dict) -> str:
     pri = brain.DEFAULT_PRIORITY if pri is None else int(pri)
     who = f" @{t['owner']}" if t.get("owner") else ""
     proj = f"{t['project']}｜" if t.get("project") else ""
+    title = (t.get("title") or "").strip()
+    if len(title) > 60:
+        title = title[:60] + "…"
     return (f"#{t['id']} [{brain.TASK_CN.get(t['status'], t['status'])}][P{pri}]{who} "
-            f"{proj}{t['title'][:60]}{agenthub_mcp._task_flags(t)}")
+            f"{proj}{title}{agenthub_mcp._task_flags(t)}")
 
 
 def _age_span(hours) -> str:
@@ -489,7 +500,7 @@ def cmd_security(root: str, days: int = 7) -> int:
 
 
 def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5) -> int:
-    """前沿队列（headless）：可认领/进行中/可接管/等待依赖。"""
+    """前沿队列（headless）：可认领/进行中/可接管/等待依赖/退避/延后。"""
     import brain  # noqa: PLC0415
     res = brain.task_next(root, project=project, owner=agent, limit=limit)
     brain.task_annotate(root, res["ready"] + res["doing"] + res["takeover"] + res["waiting"]
@@ -513,8 +524,7 @@ def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5) -> i
                     reason = " —— 等 " + "、".join(
                         f"#{x['id']}（{'不存在' if x['status'] == 'missing' else brain.TASK_CN.get(x['status'], x['status'])}）"
                         for x in w[:3])
-                elif (t.get("blocked_by") or "").strip():
-                    reason = f" —— 阻塞：{t['blocked_by'][:30]}"
+                # blocked_by 已由 _task_flags 输出「阻塞：…」，不再重复一遍。
             print(f"  - {_task_line(t)}{reason}")
     if res.get("backoff"):
         print(f"退避中 {c.get('backoff', 0)} 条（失败重试，到点自动回到待办）：")
@@ -835,71 +845,94 @@ def main(argv=None) -> int:
             _stream.reconfigure(encoding="utf-8", errors="replace")
         except Exception:  # noqa: BLE001  老 Python/非标准流不支持 reconfigure 时静默跳过
             pass
-    ap = argparse.ArgumentParser(prog="agenthub", description="AgentHub 命令行（headless 接入/自查）")
+    # 语义检索懒加载模型时 transformers 会往 stderr 打进度条；CLI 输出要保持可读，
+    # 默认关掉（用户显式设了别的值则尊重）。
+    os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
+    os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    ap = argparse.ArgumentParser(
+        prog="agenthub",
+        description="AgentHub 命令行：接入自查、任务队列、日结审计（数据全部来自本地大脑）",
+        epilog=("常用示例：\n"
+                "  agenthub status                  # 看每个 agent 是否接入\n"
+                "  agenthub next --agent zcode      # 看下一步该做什么\n"
+                "  agenthub tasks --approvals       # 看待审批任务\n"
+                "  agenthub call hub_search query=关键词 limit=5\n"
+                "  agenthub serve --open            # 本机只读仪表盘\n"
+                "\n根目录：--root，或写入 ~/.agenthub/config.json 的 root"),
+        formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
-    sub = ap.add_subparsers(dest="cmd")
-    p_status = sub.add_parser("status", help="各 agent 接入状态")
-    p_status.add_argument("agent", nargs="?", default="")
-    p_role = sub.add_parser("role", help="R79：查看/授予 agent 角色（worker/manager）")
+    sub = ap.add_subparsers(dest="cmd", metavar="命令")
+    _add_cmd = sub.add_parser
+
+    def _cmd(name, help=""):
+        """子命令用同一句话做列表 help 与 `命令 --help` 的 description。"""
+        return _add_cmd(name, help=help, description=help)
+
+    p_status = _cmd("status", help="各 agent 接入状态")
+    p_status.add_argument("agent", nargs="?", default="", help="只看某个 agent；留空看全部")
+    p_role = _cmd("role", help="查看或授予 agent 角色（worker/manager）")
     p_role.add_argument("agent", nargs="?", default="")
     p_role.add_argument("--set", dest="role", choices=["worker", "manager"], default="",
                         help="设置角色（缺省只读）")
-    p_on = sub.add_parser("onboard", help="给某 agent 注入引导")
+    p_on = _cmd("onboard", help="给某 agent 注入引导")
     p_on.add_argument("agent")
-    sub.add_parser("refresh", help="刷新所有 agent 引导到当前版本")
-    sub.add_parser("discover", help="扫描常见位置，找未登记 agent")
-    sub.add_parser("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
-    sub.add_parser("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
-    p_bp = sub.add_parser("backup-prune", help="R7 备份盘点与清理（默认预演，--apply 才删）")
-    p_bd = sub.add_parser("backup-drill", help="R61 恢复演练（校验+试恢复，不写现场数据（仅审计流水留痕））")
+    _cmd("refresh", help="刷新所有 agent 引导到当前版本")
+    _cmd("discover", help="扫描常见位置，找未登记 agent")
+    _cmd("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
+    _cmd("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
+    p_bp = _cmd("backup-prune", help="备份盘点与清理（默认预演，--apply 才删）")
+    p_bd = _cmd("backup-drill", help="恢复演练（校验+试恢复，不写现场数据，仅审计流水留痕）")
     p_bd.add_argument("path", nargs="?", default="", help="备份文件路径，留空=最新整包")
-    sub.add_parser("doctor", help="R8 一键自检：巡检聚合 + 可执行修复建议")
+    p_doc = _cmd("doctor", help="一键自检：巡检聚合 + 可执行修复建议")
+    p_doc.add_argument("--full", action="store_true",
+                       help="展开完整修复口径与全部明细（默认只列失败项相关口径与前 3 条）")
     p_bp.add_argument("--keep-zip", type=int, default=3)
     p_bp.add_argument("--keep-snapshot", type=int, default=10)
     p_bp.add_argument("--keep-legacy", type=int, default=1)
     p_bp.add_argument("--keep-bak", type=int, default=2)
     p_bp.add_argument("--min-age-days", type=int, default=7)
     p_bp.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
-    p_bm = sub.add_parser("build-manifest", help="构建清单：start 快照源码哈希 / finish 记录 exe sha256（build.bat 自动调用）")
+    p_bm = _cmd("build-manifest", help="构建清单：start 快照源码哈希 / finish 记录 exe sha256（build.bat 自动调用）")
     p_bm.add_argument("phase", choices=["start", "finish"])
-    sub.add_parser("tools", help="X5：列出所有可调用的 MCP 工具")
-    p_call = sub.add_parser("call", help="X5：命令行直调 MCP 工具（call hub_health / call hub_search query=词 limit=5）")
+    _cmd("tools", help="列出所有可调用的 MCP 工具")
+    p_call = _cmd("call", help="命令行直调 MCP 工具（如 call hub_health）")
     p_call.add_argument("tool")
     p_call.add_argument("kv", nargs="*", help="key=value 形式的参数；写工具需加 confirm=true")
-    p_srv = sub.add_parser("serve", help="X2：启动本地 REST 服务 + Web 只读仪表盘（只绑 127.0.0.1）")
-    p_srv.add_argument("--port", type=int, default=8787)
+    p_srv = _cmd("serve", help="启动本地 REST 服务 + 只读仪表盘（只绑 127.0.0.1）")
+    p_srv.add_argument("--port", type=int, default=8787, help="监听端口，默认 8787")
     p_srv.add_argument("--allow-write", action="store_true",
                        help="开放写工具（会生成 token，调用时带 token=）")
     p_srv.add_argument("--open", action="store_true", help="启动后自动开浏览器")
-    p_tasks = sub.add_parser("tasks", help="R9 任务看板（截止/前置/租约/阻塞）；--stats 过程统计")
-    p_tasks.add_argument("--status", default="", help="pending/in_progress/blocked/done")
-    p_tasks.add_argument("--project", default="")
-    p_tasks.add_argument("--owner", default="")
-    p_tasks.add_argument("--limit", type=int, default=50)
-    p_tasks.add_argument("--stats", action="store_true", help="R53 任务过程统计（流量/周期/卡点/重试/质量）")
+    p_tasks = _cmd("tasks", help="任务看板（截止/前置/租约/阻塞）；--stats 过程统计")
+    p_tasks.add_argument("--status", default="",
+                         help="pending / in_progress / blocked / done / cancelled / dead")
+    p_tasks.add_argument("--project", default="", help="按项目过滤；留空看全部")
+    p_tasks.add_argument("--owner", default="", help="按负责人过滤；留空看全部")
+    p_tasks.add_argument("--limit", type=int, default=50, help="最多几条，默认 50")
+    p_tasks.add_argument("--stats", action="store_true", help="任务过程统计（流量/周期/卡点/重试/质量）")
     p_tasks.add_argument("--days", type=int, default=7, help="--stats 窗口天数，默认 7")
     p_tasks.add_argument("--approvals", action="store_true",
-                         help="R92 待审批队列（等最久的先看，含待批时长）")
-    p_digest = sub.add_parser("digest", help="R55 团队日结（流动/风险/按 agent 记分卡）")
+                         help="待审批队列（等最久的先看，含待批时长）")
+    p_digest = _cmd("digest", help="团队日结（流动/风险/按 agent 记分卡）")
     p_digest.add_argument("--days", type=int, default=1, help="窗口天数 1..365，默认 1")
-    p_handoffs = sub.add_parser("handoffs", help="R92 交接清单（open 默认；--all 含已认领/已作废）")
-    p_handoffs.add_argument("--project", default="")
+    p_handoffs = _cmd("handoffs", help="交接清单（默认看未认领；--all 含已认领/已作废）")
+    p_handoffs.add_argument("--project", default="", help="按项目过滤；留空看全部")
     p_handoffs.add_argument("--all", dest="include_all", action="store_true",
                             help="含已认领/已作废")
     p_handoffs.add_argument("--close", dest="close_id", type=int, default=0,
                             help="作废交接 id（仅 open；需 --reason）")
     p_handoffs.add_argument("--reason", default="", help="作废原因（--close 必填）")
     p_handoffs.add_argument("--agent", default="", help="操作人（缺省 cli）")
-    p_security = sub.add_parser("security", help="R92 越权拦截态势（默认近 7 天）")
+    p_security = _cmd("security", help="越权拦截态势（默认近 7 天）")
     p_security.add_argument("--days", type=int, default=7, help="窗口天数 1..365，默认 7")
-    p_next = sub.add_parser("next", help="R9 前沿队列（可认领/进行中/可接管/等待）")
-    p_next.add_argument("--project", default="")
+    p_next = _cmd("next", help="前沿队列（可认领/进行中/可接管/等待依赖/退避/延后）")
+    p_next.add_argument("--project", default="", help="按项目过滤；留空看全部")
     p_next.add_argument("--agent", default="", help="该 agent 名下的在办任务归入「进行中」")
-    p_next.add_argument("--limit", type=int, default=5)
-    p_claim = sub.add_parser("claim", help="R9 认领任务（原子；前置未完成会拒绝）")
+    p_next.add_argument("--limit", type=int, default=5, help="每组最多几条，默认 5")
+    p_claim = _cmd("claim", help="认领任务（原子；前置未完成会拒绝）")
     p_claim.add_argument("task_id", type=int)
     p_claim.add_argument("--agent", required=True)
-    p_update = sub.add_parser("update", help="R9 任务流转（与 hub_task_update 同一状态机）")
+    p_update = _cmd("update", help="任务流转（与 hub_task_update 同一状态机）")
     p_update.add_argument("task_id", type=int)
     p_update.add_argument("--status", default="")
     p_update.add_argument("--agent", default="", help="流转署名；in_progress 任务需持有者本人")
@@ -912,42 +945,42 @@ def main(argv=None) -> int:
     p_update.add_argument("--cancel-reason", dest="cancel_reason", default="",
                           help="取消原因（--status cancelled 时必填）")
     p_update.add_argument("--defer-until", dest="defer_until", default="",
-                          help="R44 延后到何时（YYYY-MM-DD/ISO，须未来）；传 - 提前唤醒")
+                          help="延后到何时（YYYY-MM-DD/ISO，须未来）；传 - 提前唤醒")
     p_update.add_argument("--defer-reason", dest="defer_reason", default="",
-                          help="R44 延后原因（--defer-until 非 - 时必填）")
+                          help="延后原因（--defer-until 非 - 时必填）")
     p_update.add_argument("--approval", choices=["on", "off"], default=None,
-                          help="R45 完成审批开关：on=done 前须他人批准；off=关闭并清空批准")
-    p_retry = sub.add_parser("retry", help="R42 失败重试（退避排队；耗尽进死信，再调复活）")
+                          help="完成审批开关：on=done 前须他人批准；off=关闭并清空批准")
+    p_retry = _cmd("retry", help="失败重试（退避排队；耗尽进死信，再调复活）")
     p_retry.add_argument("task_id", type=int)
     p_retry.add_argument("reason", help="失败原因/下次怎么改（必填）")
     p_retry.add_argument("--agent", default="", help="你的 agent 名（管理面可空）")
     p_retry.add_argument("--delay", type=int, default=None,
                          help="可选退避秒数（0=立即可认领），缺省按失败次数指数退避")
-    p_approve = sub.add_parser("approve", help="R45 完成审批（four-eyes，owner 不能自批）")
+    p_approve = _cmd("approve", help="完成审批（four-eyes，owner 不能自批）")
     p_approve.add_argument("task_id", type=int)
     p_approve.add_argument("--agent", default="", help="复核人 agent 名（管理面可空）")
     p_approve.add_argument("--note", default="", help="复核意见/验收依据")
-    p_reject = sub.add_parser("reject", help="R100 审批退回（原因必填；任务回待办返工）")
+    p_reject = _cmd("reject", help="审批退回（原因必填；任务回待办返工）")
     p_reject.add_argument("task_id", type=int)
     p_reject.add_argument("--reason", required=True, help="退回原因（必填）")
     p_reject.add_argument("--agent", default="", help="复核人 agent 名（管理面可空）")
-    p_freeze = sub.add_parser("freeze", help="R48 全局写入冻结（应急闸门；--off 解除）")
+    p_freeze = _cmd("freeze", help="全局写入冻结（应急闸门；--off 解除）")
     p_freeze.add_argument("--minutes", type=int, default=None,
                           help="冻结分钟数：0=手动解冻；缺省=只查看状态")
     p_freeze.add_argument("--reason", default="", help="冻结原因（冻结时必填）")
     p_freeze.add_argument("--off", action="store_true", help="解除冻结（幂等）")
     p_freeze.add_argument("--agent", default="", help="操作人（缺省 cli）")
-    p_audit = sub.add_parser("audit-export", help="R50 审计导出（journal+op_audit → JSONL/CSV）")
+    p_audit = _cmd("audit-export", help="审计导出（journal+op_audit → JSONL/CSV）")
     p_audit.add_argument("--format", default="jsonl", choices=["jsonl", "csv"],
                          help="导出格式，缺省 jsonl（首行 meta 含链校验快照）")
     p_audit.add_argument("--days", type=int, default=30, help="近 N 天，缺省 30；0=全部历史")
     p_audit.add_argument("--limit", type=int, default=20000, help="每类行上限，缺省 20000")
-    p_ck = sub.add_parser("checkpoint", help="R9 任务检查点（断点续跑）")
+    p_ck = _cmd("checkpoint", help="任务检查点（断点续跑）")
     p_ck.add_argument("task_id", type=int)
     p_ck.add_argument("content")
     p_ck.add_argument("--agent", required=True)
     p_ck.add_argument("--kind", default="manual")
-    p_locks = sub.add_parser("locks", help="R12 文件租约台账（--path 查占）")
+    p_locks = _cmd("locks", help="文件租约台账（--path 查占）")
     p_locks.add_argument("--project", default="")
     p_locks.add_argument("--owner", default="")
     p_locks.add_argument("--path", default="", help="按规范化后的同一路径查占")
@@ -957,7 +990,7 @@ def main(argv=None) -> int:
     p_locks.add_argument("--prune", action="store_true",
                          help="回收过期未释放租约（只标记释放，活跃永不触碰）")
     p_locks.add_argument("--agent", default="", help="prune 署名（缺省 system）")
-    p_lock = sub.add_parser("lock", help="R12 获取文件租约（同路径同主=续租）")
+    p_lock = _cmd("lock", help="获取文件租约（同路径同主=续租）")
     p_lock.add_argument("path")
     p_lock.add_argument("--agent", required=True)
     p_lock.add_argument("--task-id", dest="task_id", type=int, default=None,
@@ -965,7 +998,7 @@ def main(argv=None) -> int:
     p_lock.add_argument("--ttl-min", dest="ttl_min", type=int, default=30)
     p_lock.add_argument("--reason", default="")
     p_lock.add_argument("--project", default="")
-    p_unlock = sub.add_parser("unlock", help="R12 释放文件租约（只能释放自己的）")
+    p_unlock = _cmd("unlock", help="释放文件租约（只能释放自己的）")
     p_unlock.add_argument("lease_id", nargs="?", type=int)
     p_unlock.add_argument("--path", default="")
     p_unlock.add_argument("--agent", required=True)
@@ -984,7 +1017,7 @@ def main(argv=None) -> int:
         if args.cmd == "backup-drill":
             return cmd_backup_drill(_root(args.root), args.path)
         if args.cmd == "doctor":
-            return cmd_doctor(_root(args.root))
+            return cmd_doctor(_root(args.root), full=args.full)
         root = _root(args.root)
         if not root or not Path(root).is_dir():
             print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")

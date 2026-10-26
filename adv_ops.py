@@ -1136,7 +1136,7 @@ def main():
                      (old, old, t_live))
     stall = ops.run_check("tasks_health", "", st_root)
     check("tasks_health 报进展停滞",
-          "进展停滞 1" in stall["summary"] and "持有者失联 0" in stall["summary"],
+          "进展停滞 1" in stall["summary"] and "持有者失联" not in stall["summary"],
           str(stall)[:400])
     check("tasks_health 停滞明细点名",
           any("心跳在线活停" in d and "进展停滞" in d for d in stall["detail"]),
@@ -1153,7 +1153,7 @@ def main():
         conn.execute("UPDATE checkpoints SET ts=? WHERE task_id=?", (old, t_live))
     gone = ops.run_check("tasks_health", "", st_root)
     check("tasks_health 失联与停滞不重复计数",
-          "持有者失联 1" in gone["summary"] and "进展停滞 0" in gone["summary"],
+          "持有者失联 1" in gone["summary"] and "进展停滞" not in gone["summary"],
           str(gone)[:400])
 
     # ---- R30 待办饥饿：能开工却长期没人认领的 pending 要点名；等待/阻塞不误报

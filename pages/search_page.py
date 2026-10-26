@@ -7,13 +7,16 @@ import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请�
 class SearchPage(QWidget):
     KIND_CN = {"record": "记录", "memory": "记忆", "note": "随记", "task": "任务",
                "error": "错误", "file": "文件", "evfile": "全盘文件"}
+    EMPTY_TITLE = "输入关键词开始检索"
+    EMPTY_DESC = "试试项目名、错误现象或记忆里的关键词；回车执行，结果里可直接预览/打开/跳转。"
+    EMPTY_ACTION = "搜索最近项目"
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.win = win
         lay = QVBoxLayout(self)
         set_page_margins(lay)
-        lay.addWidget(_page_head("搜索", "全脑检索 + 全盘文件——回车执行，双击打开"))
+        lay.addWidget(_page_head("搜索", "全脑检索 + 全盘文件——回车执行，双击或 Enter 打开"))
         top = QHBoxLayout()
         self.edit = SearchLineEdit()
         self.edit.setPlaceholderText("全脑检索：记录 / 记忆 / 随记 / 任务 / 错误 / 文件名，回车执行…")
@@ -22,7 +25,7 @@ class SearchPage(QWidget):
         self.kindFilter = ComboBox()
         self.kindFilter.addItems(["全部", "记录", "记忆", "随记", "任务", "错误", "文件", "全盘文件"])
         self.kindFilter.setFixedWidth(120)
-        self.kindFilter.currentIndexChanged.connect(self.refill)
+        self.kindFilter.currentIndexChanged.connect(lambda _i: self.refill(auto_select=True))
         top.addWidget(self.kindFilter)
         lay.addLayout(top)
         lay.addSpacing(tokens.SPACE_S)
@@ -53,8 +56,7 @@ class SearchPage(QWidget):
         act.addWidget(self.btnCopy)
         rv.addLayout(act)
         self.preview = TextBrowser()
-        self.preview.setHtml(
-            f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选左侧结果查看全文与关键词预览（Ctrl+F 站内直达）</p>")
+        self.preview.setHtml(self._intro_html())
         rv.addWidget(self.preview, 1)
         split.addWidget(right)
         split.setStretchFactor(0, 5)
@@ -63,6 +65,7 @@ class SearchPage(QWidget):
         lay.addWidget(split, 1)
         self.lay = lay        # Round 5：run() 里定位空态要用（局部变量在方法外不可见）
         self.split = split
+        self.split.setVisible(False)  # R166：没有检索前不摆一条空列表+空预览（右栏大空白）
 
         self.hits = []       # 本地命中（kind, data）
         self.view_hits = []  # 当前过滤下显示的命中
@@ -70,14 +73,91 @@ class SearchPage(QWidget):
         self.ev_for = ""
         self._workers = []  # 持住运行中线程引用，防 GC 崩进程
         self.edit.returnPressed.connect(self.run)
+        self.edit.textChanged.connect(self._on_text_changed)
         self.result.currentRowChanged.connect(self.show_hit)
         self.result.itemDoubleClicked.connect(lambda _: self.open_current())
+        # R188 键盘路径：输入框 ↑/↓ 进结果列表、列表 Enter 打开、Esc 回输入框
+        self.result.itemActivated.connect(lambda _: self.open_current())
+        self.edit.installEventFilter(self)
+        self.result.installEventFilter(self)
+        # R166：未选中结果时右侧四个操作按钮不应全部亮着（点了静默无反应）
+        self._sync_actions(None)
         # Round 5：run() 只在用户回车时才跑，启动时也要有引导（助手幂等，run() 再调只会显隐）
-        list_empty_guard(self.result, lay,
-                         "输入关键词开始检索",
-                         "回车执行：全脑检索（记录 + 记忆 + 随记 + 任务 + 错误）+ 全盘文件；"
-                         "支持分类筛选与「全部」视图",
-                         index=lay.indexOf(split))
+        list_empty_guard(self.result, lay, self.EMPTY_TITLE, self.EMPTY_DESC,
+                         index=lay.indexOf(split),
+                         action_text=self.EMPTY_ACTION, action=self.search_recent_project)
+
+    # ---- 空态 / 清理
+    def eventFilter(self, obj, e):
+        if e.type() == QEvent.KeyPress:
+            if obj is self.edit and e.key() in (Qt.Key_Down, Qt.Key_Up):
+                if self._enter_results(1 if e.key() == Qt.Key_Down else -1):
+                    return True
+            elif obj is self.result and e.key() == Qt.Key_Escape:
+                self.edit.setFocus()
+                self.edit.selectAll()
+                return True
+        return super().eventFilter(obj, e)
+
+    def _enter_results(self, step: int) -> bool:
+        """输入框 ↑/↓：把焦点交给结果列表并移动选中（无选中时落到首/末条）。"""
+        n = self.result.count()
+        if n <= 0:
+            return False
+        row = self.result.currentRow()
+        if row < 0:
+            row = 0 if step > 0 else n - 1
+        else:
+            row = max(0, min(n - 1, row + step))
+        self.result.setCurrentRow(row)
+        self.result.setFocus()
+        return True
+
+    def _intro_html(self):
+        return (f"<p style='color:{tokens.C(tokens.TEXT_3)}'>输入关键词后回车："
+                "这里显示全文、关键词高亮与可执行操作。<br>"
+                "键盘：输入框 ↑/↓ 进结果列表，Enter 打开，Esc 回搜索框；"
+                "支持记录 / 记忆 / 随记 / 任务 / 错误 / 文件 / 全盘文件；"
+                "Ctrl+F 随时回到搜索框。</p>")
+
+    def search_recent_project(self):
+        """空态 CTA：用最近一条记录的项目名起搜，给第一次打开搜索页的人一个起点。"""
+        if not self.win.root:
+            InfoBar.warning("未选择大脑目录", "先在接入页选择数据目录", parent=self.win)
+            return
+        try:
+            rows = brain.list_records(self.win.root, limit=1)
+        except Exception as e:  # noqa: BLE001
+            op_failed("读取最近项目", e, parent=self)
+            return
+        if not rows:
+            InfoBar.info("暂无工作记录", "先用 hub_log_work 或项目页写一条，再来搜索",
+                         parent=self.win)
+            return
+        proj = (rows[0].get("project") or "").strip()
+        if not proj:
+            InfoBar.warning("最近记录没有项目名", "直接输入标题里的关键词试试", parent=self.win)
+            return
+        self.edit.setText(proj)
+        self.edit.setFocus()
+        self.run()
+
+    def _on_text_changed(self, text):
+        if not text.strip():
+            self._clear_results()
+
+    def _clear_results(self):
+        """清空搜索框 = 回到初始态：旧结果、旧预览、悬空操作一并收起。"""
+        self.ev_for = ""  # 让还在跑的全盘检索结果作废
+        self.ev = {"results": [], "error": ""}
+        self.hits, self.view_hits = [], []
+        self.result.clear()
+        self.split.setVisible(False)
+        self._sync_actions(None)
+        self.preview.setHtml(self._intro_html())
+        list_empty_guard(self.result, self.lay, self.EMPTY_TITLE, self.EMPTY_DESC,
+                         index=self.lay.indexOf(self.split),
+                         action_text=self.EMPTY_ACTION, action=self.search_recent_project)
 
     # ---- 数据
     def run(self):
@@ -96,6 +176,7 @@ class SearchPage(QWidget):
         """本地结果同步填充；Everything 的 es.exe 子进程启动慢，丢后台线程异步追加全盘段。"""
         self.preview.setHtml("")
         self.ev = {"results": [], "error": ""}
+        kw = self.edit.text().strip()
         if isinstance(res, Exception):
             self.hits = [("info", f"搜索失败：{res}")]
         else:
@@ -112,9 +193,8 @@ class SearchPage(QWidget):
                 hits.append(("error", e))
             for f in res.get("files", []):
                 hits.append(("file", f))
-            self.hits = hits or [("info", "无结果")]
-        self.refill()
-        kw = self.edit.text().strip()
+            self.hits = hits or [("info", f"未找到「{kw}」——本地六类 0 条")]
+        self.refill(auto_select=True)
         self.ev_for = kw
         w = FnWorker(lambda: core.everything_search(kw, 20), self)
         w.done.connect(self._on_everything)
@@ -128,24 +208,19 @@ class SearchPage(QWidget):
         self.ev = ev if isinstance(ev, dict) else {"results": [], "error": str(ev)}
         self.refill()
 
-    def refill(self):
-        """按类型过滤重建列表。本地在 self.hits，Everything 在 self.ev，显示子集在 self.view_hits。"""
+    def refill(self, *_args, auto_select=False):
+        """按类型过滤重建列表。本地在 self.hits，Everything 在 self.ev，显示子集在 self.view_hits。
+
+        auto_select=True：检索/切分类后自动选中首条（预览立刻有内容）；
+        Everything 异步补全时保持用户当前选中项，不打断阅读。
+        """
+        prev = self._sel_key()
         kind = self.kindFilter.currentIndex()  # 0全部 1记录 2记忆 3随记 4任务 5错误 6文件 7全盘
         key = {1: "record", 2: "memory", 3: "note", 4: "task", 5: "error",
                6: "file", 7: "evfile"}.get(kind)
         self.result.clear()
         self.view_hits = []
-        if key in (None, "evfile"):
-            # Everything 全盘段：es.exe 异步回来才有内容，失败也给一行原因
-            if key == "evfile" and self.ev.get("error"):
-                self.result.addItem(f"（全盘：{self.ev['error']}）")
-                self.view_hits.append(("info", None))
-            for pth in self.ev.get("results", []):
-                self.result.addItem(f"[全盘] {pth}")
-                self.view_hits.append(("evfile", pth))
-            if key is None and self.ev.get("error"):
-                self.result.addItem(f"── 全盘文件：{self.ev['error']} ──")
-                self.view_hits.append(("info", None))
+        # 本地六类在前、全盘文件在后：大脑里的命中比磁盘路径更相关
         for k, h in self.hits:
             if key and k != key:
                 continue
@@ -164,7 +239,7 @@ class SearchPage(QWidget):
             elif k == "memory":
                 src = (f"（图关联自{h['_cross'][2:]}）" if h.get("_cross")
                        else "（图关联）" if "graph" in (h.get("_channels") or {}) else "")
-                conf = f" ⚠️疑似互斥#{'/#'.join(str(i) for i in h['_conflict_with'])}" if h.get("_conflict_with") else ""
+                conf = f" ！疑似互斥#{'/#'.join(str(i) for i in h['_conflict_with'])}" if h.get("_conflict_with") else ""
                 self.result.addItem(f"[记忆#{h['id']}] {brain.KIND_CN.get(h['kind'], h['kind'])}：{h['content'][:100]}{src}{conf}")
                 self.view_hits.append((k, h))
             elif k == "note":
@@ -186,16 +261,63 @@ class SearchPage(QWidget):
             elif k == "file":
                 self.result.addItem(f"[文件] {h['project']}\\{h['name']}")
                 self.view_hits.append((k, h))
+        if key in (None, "evfile"):
+            # Everything 全盘段：es.exe 异步回来才有内容，失败也给一行原因
+            if key == "evfile" and self.ev.get("error"):
+                msg = f"全盘搜索失败：{self.ev['error']}"
+                self.result.addItem(f"（全盘：{self.ev['error']}）")
+                self.view_hits.append(("info", msg))
+            for pth in self.ev.get("results", []):
+                self.result.addItem(f"[全盘] {pth}")
+                self.view_hits.append(("evfile", pth))
+            if key is None and self.ev.get("error"):
+                msg = f"全盘文件：{self.ev['error']}"
+                self.result.addItem(f"── {msg} ──")
+                self.view_hits.append(("info", msg))
         if not self.view_hits and self.hits and self.hits[0][0] != "info":
-            self.result.addItem(f"该分类下无结果（全部 {len(self.hits)} 条）——切「全部」查看其他类型")
+            msg = f"该分类下无结果（全部 {len(self.hits)} 条）——切「全部」查看其他类型"
+            self.result.addItem(msg)
+            self.view_hits.append(("info", msg))
         tight_rows(self.result)
+        self.split.setVisible(bool(self.view_hits))
+        # 选中项按身份恢复（Everything 补全/切分类不丢）；新检索自动选首条
+        idx = self._find_key(prev) if prev else -1
+        if idx >= 0:
+            self.result.setCurrentRow(idx)
+        elif auto_select and self.view_hits:
+            first_real = next((i for i, (k, _h) in enumerate(self.view_hits)
+                               if k != "info"), 0)
+            self.result.setCurrentRow(first_real)
+        else:
+            self.result.setCurrentRow(-1)
+            self._sync_actions(None)
         # Round 5：还没检索/无结果时给引导（原来是一片空白）。
         # 结果列表在 QSplitter 里（不是 layout 子项），故显式指定插到分栏之前。
-        list_empty_guard(self.result, self.lay,
-                         "输入关键词开始检索",
-                         "回车执行：全脑检索（记录 + 记忆 + 随记 + 任务 + 错误）+ 全盘文件；"
-                         "支持分类筛选与「全部」视图",
-                         index=self.lay.indexOf(self.split))
+        list_empty_guard(self.result, self.lay, self.EMPTY_TITLE, self.EMPTY_DESC,
+                         index=self.lay.indexOf(self.split),
+                         action_text=self.EMPTY_ACTION, action=self.search_recent_project)
+
+    @staticmethod
+    def _key_of(kind, h):
+        if kind is None:
+            return None
+        if kind == "info":
+            return (kind, h or "")  # 提示行也保留选中，避免 Everything 补全时清掉说明
+        if kind == "evfile":
+            return (kind, h)
+        if kind == "file":
+            return (kind, h.get("path") or "")
+        return (kind, h.get("id"))
+
+    def _sel_key(self):
+        kind, h = self._current()
+        return self._key_of(kind, h)
+
+    def _find_key(self, key):
+        for i, (kind, h) in enumerate(self.view_hits):
+            if self._key_of(kind, h) == key:
+                return i
+        return -1
 
     def _current(self):
         row = self.result.currentRow()
@@ -211,8 +333,14 @@ class SearchPage(QWidget):
         self._highlight()
 
     def _preview_html(self, kind, h):
-        if kind in (None, "info"):
-            return f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选左侧条目查看详情</p>"
+        if kind is None:
+            return self._intro_html()
+        if kind == "info":
+            tips = ["- 用更短的关键词，或换同义词"]
+            if self.kindFilter.currentIndex() != 0:
+                tips.append("- 切到「全部」分类，看看其他类型")
+            tips.append("- 全盘文件由 Everything 异步补充，稍等再看")
+            return md_to_html(f"**{h or '暂无结果'}**\n\n**可以试试**\n" + "\n".join(tips))
         if kind == "evfile":
             return md_to_html(f"**全盘文件（Everything 检索）**\n\n`{h}`")
         if kind == "record":

@@ -44,20 +44,22 @@ class StatsPage(QWidget):
         self.monthBox = QVBoxLayout()
         self.healthLine = CaptionLabel("")
         self.healthLine.setWordWrap(True)
+        self.taskLine = CaptionLabel("")
+        self.taskLine.setWordWrap(True)
+        # 可行动摘要前置：920×600 最小窗下，先看到「哪里不对/任务是否在走」，
+        # 再看 agent/月度分布这类回溯性细节（分布区仍完整保留在下方滚动区）。
+        lay.addSpacing(16)
+        lay.addWidget(section_head("大脑体检（智能摘要）", "HEART"))
+        lay.addWidget(self.healthLine)
+        lay.addSpacing(16)
+        lay.addWidget(section_head("任务过程（近 7 天）", "HISTORY"))
+        lay.addWidget(self.taskLine)
         # 内容组不包卡：间距+小标题分组
         for box, t, icn in ((self.agentBox, "各 agent 记录分布", "PEOPLE"),
                             (self.monthBox, "近 6 个月活跃", "CALENDAR")):
             lay.addSpacing(16)
             lay.addWidget(section_head(t, icn))
             lay.addLayout(box)
-        lay.addSpacing(16)
-        lay.addWidget(section_head("大脑体检（智能摘要）", "HEART"))
-        lay.addWidget(self.healthLine)
-        lay.addSpacing(16)
-        lay.addWidget(section_head("任务过程（近 7 天，hub_tasks view=stats 同口径）", "HISTORY"))
-        self.taskLine = CaptionLabel("")
-        self.taskLine.setWordWrap(True)
-        lay.addWidget(self.taskLine)
         lay.addStretch(1)
 
     def set_db(self, s: dict):

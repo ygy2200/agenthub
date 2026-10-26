@@ -144,12 +144,12 @@ def test_security_page_shows_governance_health(qapp, hub_root):
         "治理巡检：" in sub.listw.item(i).text() for i in range(sub.listw.count())), 10), \
         "治理巡检未渲染"
     texts = [sub.listw.item(i).text() for i in range(sub.listw.count())]
-    assert any(t.startswith("✗ 治理巡检：") for t in texts), texts
+    assert any(t.startswith("× 治理巡检：") for t in texts), texts
     assert any("待批积压任务" in t and "hub_task_approve" in t for t in texts), texts
     assert any(t.startswith("越权拦截（近 7 天）：2 次") and "未锁身份 1" in t
                and "角色越权 1" in t for t in texts), texts
     assert any("按 agent：@worker-a 2 次" in t for t in texts), texts
-    assert "⚠ 安全面有异常" in sub.sumLabel.text(), sub.sumLabel.text()
+    assert "！安全面有异常" in sub.sumLabel.text(), sub.sumLabel.text()
 
 
 def test_governance_approvals_page_approves(qapp, hub_root, monkeypatch):
@@ -185,8 +185,8 @@ def test_governance_approvals_page_approves(qapp, hub_root, monkeypatch):
     old = [t for t in texts if "等批过久任务" in t]
     new = [t for t in texts if "刚进队列任务" in t]
     assert len(old) == 1 and len(new) == 1, texts
-    assert "等批 30h" in old[0] and "⚠待批过久" in old[0], old[0]
-    assert "⚠待批过久" not in new[0], new[0]
+    assert "等批 30h" in old[0] and "！待批过久" in old[0], old[0]
+    assert "！待批过久" not in new[0], new[0]
 
     class _Dialog:
         @staticmethod
@@ -240,7 +240,7 @@ def test_governance_handoffs_page_claims_and_closes(qapp, hub_root, monkeypatch)
     old = [t for t in texts if f"#{old_h} " in t]
     fresh = [t for t in texts if f"#{fresh_h} " in t]
     assert old and fresh, texts
-    assert "⚠陈旧" in old[0] and "⚠陈旧" not in fresh[0], texts
+    assert "！陈旧" in old[0] and "！陈旧" not in fresh[0], texts
     assert "陈旧 1" in sub.sumLabel.text(), sub.sumLabel.text()
 
     sub.listw.setCurrentRow(0)

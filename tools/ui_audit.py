@@ -8,6 +8,7 @@
 import re
 import subprocess
 import sys
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 import time
 from pathlib import Path
 
@@ -32,7 +33,7 @@ def parse_snapshot(out):
 
 
 def parse_errmsg(out):
-    m = re.search(r"错误文案 (\d+) 条，其中 (\d+) 条无动作词", out)
+    m = re.search(r"错误文案 (\d+) 条.*?其中 (\d+) 条无动作(?:词|提示)", out)
     return f"{m.group(1)} 条中 {m.group(2)} 条待人工核" if m else ""
 
 

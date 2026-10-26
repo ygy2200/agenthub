@@ -4,10 +4,15 @@
 hub_signal_send/signals/signal_read 的 GUI 呈现：发送区（选身份、选收件人、写内容）
 + 收件箱（未读置顶、可标已读）+ 已发送。桌面端也能参与 agent 间通信——
 不必开 MCP 会话。
+
+R167：列表只够放摘要，正文 56 字截断后没有地方看全文（真实 #1 正文 1169 字）；
+改左列表右全文预览，时间走 rel_time，已读按钮只在选中未读时可用，空库给引导。
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QListWidgetItem, QInputDialog  # noqa: F401
+import html as _html
+
+from PySide6.QtWidgets import QListWidgetItem, QSpacerItem
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401
@@ -17,11 +22,17 @@ import brain
 class SignalPage(QWidget):
     """信号中心：发送 + 收件箱 + 已发送（SegmentedWidget 切换）。"""
 
+    EMPTY_TITLE = "暂无信号"
+    EMPTY_DESC = "顶部选好身份与收件人，写一条消息回车发送；对方下次开工会在心跳里收到未读提醒。"
+    EMPTY_ACTION = "写第一条消息"
+
     def __init__(self, win, parent=None):
         super().__init__(parent)
         self.win = win
-        self._inbox_items: dict = {}   # id(item) -> signal row（收件箱）
-        self._sent_items: dict = {}
+        self._rows: list = []       # 当前 tab 的信号行（与列表行一一对应）
+        self._error = ""
+        self._last_sel = {"inbox": "", "sent": ""}  # 每个 tab 各记最后选中，切回来不丢位置
+        self._cur_me = None
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head(
@@ -62,20 +73,57 @@ class SignalPage(QWidget):
         lay.addWidget(sendBox)
 
         # —— 收件箱 / 已发送 ——
-        # 分段控件自带图标位，不额外加行；滚动保护由 listw 承担
+        segRow = QHBoxLayout()
         self.seg = SegmentedWidget(self)
         self.seg.addItem("inbox", "收件箱")
         self.seg.addItem("sent", "已发送")
+        self.seg.setCurrentItem("inbox")  # 两 tab 都不高亮时用户不知道当前在哪一页
+        # 空态时 split 隐藏，剩余高度会摊给竖向 Minimum 的 tab 栏（实测撑到 110px，
+        # 背景胶囊/文字/指示条分成三层）；锁到 qfw 自然高度（随字体 26~31px）。
+        self.seg.setFixedHeight(self.seg.sizeHint().height())
+        segRow.addWidget(self.seg)
+        segRow.addStretch(1)
+        self.sumLabel = CaptionLabel("", self)
+        # guard_overflow 会把 >16 字的 Caption 设成 Ignored（sizeHint=0），有 stretch 的行里
+        # 会按 0 宽分配再被最小宽度撑到右边界外（R167 实测计数被裁）。这里保住宽度。
+        self.sumLabel.setProperty("keepWidth", True)
+        self.sumLabel.setMaximumWidth(280)
+        self.sumLabel.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        segRow.addWidget(self.sumLabel)
+        lay.addLayout(segRow)
+
+        # 左列表右全文：原列表单行只放得下 56 字，长消息没有阅读入口
+        split = QSplitter(Qt.Horizontal)
         self.listw = ListWidget()
-        self.listw.setMinimumHeight(300)
-        lay.addWidget(self.seg)
-        lay.addWidget(self.listw, 1)
+        self.listw.setMinimumHeight(240)
+        split.addWidget(self.listw)
+
+        right = QWidget()
+        rv = QVBoxLayout(right)
+        rv.setContentsMargins(0, 0, 0, 0)
+        rv.setSpacing(tokens.SPACE_S)
+        act = QHBoxLayout()
+        self.readBtn = PushButton("标记已读")
+        self.readBtn.clicked.connect(self.mark_read)
+        act.addWidget(self.readBtn)
+        self.copyBtn = PushButton(ic("COPY", "INFO"), "复制内容")
+        self.copyBtn.clicked.connect(self.copy_current)
+        act.addWidget(self.copyBtn)
+        act.addStretch(1)
+        rv.addLayout(act)
+        self.preview = TextBrowser()
+        self.preview.setHtml(self._intro_html())
+        rv.addWidget(self.preview, 1)
+        split.addWidget(right)
+        split.setStretchFactor(0, 5)
+        split.setStretchFactor(1, 4)
+        split.setSizes([520, 420])
+        lay.addWidget(split, 1)
+        self.lay = lay
+        self.split = split
+        self.split.setVisible(False)
 
         row = QHBoxLayout()
-        self.readBtn = PushButton("标记已读")
-        self.readBtn.setToolTip("给选中的未读信号记回执（幂等）")
-        self.readBtn.clicked.connect(self.mark_read)
-        row.addWidget(self.readBtn)
         # R113：原文案 41 字被 920 窄窗裁成「刷新随全窗扫描（」——截断比省略更糟
         tip = CaptionLabel("F5 刷新 · @提醒随心跳送达")
         tip.setToolTip("刷新随全窗扫描（F5）；@提醒靠对方心跳的「[未读信号]」段送达")
@@ -86,15 +134,43 @@ class SignalPage(QWidget):
         row.addWidget(refreshBtn)
         lay.addLayout(row)
 
+        # 空态没有 split 占伸缩位：显式弹簧兜住多余高度，空态保持自然高度。
+        self._empty_gap = QSpacerItem(0, 0, QSizePolicy.Minimum, QSizePolicy.Expanding)
+        self._gap_added = False
+
+        self.listw.currentRowChanged.connect(lambda _r: self.show_detail())
         self.seg.currentItemChanged.connect(lambda _k: self.reload())
+        self.meCombo.currentIndexChanged.connect(lambda _i: self.reload())
         self.edit.returnPressed.connect(self.send)
+        self._sync_actions(None)
+        list_empty_guard(self.listw, lay, self.EMPTY_TITLE, self.EMPTY_DESC,
+                         index=lay.indexOf(split),
+                         action_text=self.EMPTY_ACTION, action=self._focus_editor)
 
     # ---------- 数据 ----------
+    def _focus_editor(self):
+        self.edit.setFocus()
+
+    def _intro_html(self):
+        return (f"<p style='color:{tokens.C(tokens.TEXT_3)}'>选中左侧一条信号，"
+                "这里显示完整正文与已读回执——长消息不会被截断。<br>"
+                "未读信号可用「标记已读」记回执；「复制内容」取全文。</p>")
+
+    def _tab_key(self):
+        return "sent" if self.seg.currentRouteKey() == "sent" else "inbox"
+
     def reload(self):
+        prev_sel = self._sel_id()
+        self.listw.blockSignals(True)
         self.listw.clear()
-        self._inbox_items.clear()
-        self._sent_items.clear()
+        self._rows = []
+        self._error = ""
         if not self.win.root:
+            self.listw.blockSignals(False)
+            self._finish_reload(prev_sel)
+            self.sumLabel.setText("未选择大脑目录")
+            self.preview.setHtml(md_to_html(
+                "**未选择大脑目录**\n\n先到「接入」页选择数据目录，再回来收发信号。"))
             return
         # 身份下拉：在册 agents（heartbeat/log_work 自动注册）+ 常见名兜底
         try:
@@ -106,6 +182,8 @@ class SignalPage(QWidget):
                 names.append(extra)
         keep_me = self.meCombo.currentText()
         keep_to = self.toCombo.currentText()
+        self.meCombo.blockSignals(True)
+        self.toCombo.blockSignals(True)
         self.meCombo.clear()
         self.meCombo.addItems(names)
         self.toCombo.clear()
@@ -115,57 +193,150 @@ class SignalPage(QWidget):
             self.meCombo.setCurrentText(keep_me)
         if keep_to in names or keep_to == "（广播：全员可见）":
             self.toCombo.setCurrentText(keep_to)
+        self.meCombo.blockSignals(False)
+        self.toCombo.blockSignals(False)
 
         me = self.meCombo.currentText()
-        if self.seg.currentItem() == "sent":
-            try:
-                rows = brain.signal_sent(self.win.root, me)
-            except Exception as e:  # noqa: BLE001
-                self.listw.addItem(f"读取失败：{e}")
-                return
-            if not rows:
-                self.listw.addItem("（还没有发出过信号）")
-                return
-            for s in rows:
-                to = f"→{s['to_agent']}" if s["to_agent"] else "→广播"
-                it = QListWidgetItem(
-                    f"#{s['id']} {s['ts'][5:16]} {to}（{self._kind_label(s['kind'])}）{s['content'][:60]}")
-                self._sent_items[id(it)] = s
-                self.listw.addItem(it)
-            return
+        if me != self._cur_me:  # 换身份=换收件箱，不沿用上一位的选中
+            self._last_sel = {"inbox": "", "sent": ""}
+            self._cur_me = me
+            prev_sel = ""
+        keep_id = self._last_sel.get(self._tab_key()) or prev_sel
+        sent = self.seg.currentRouteKey() == "sent"
         try:
-            rows = brain.signal_inbox(self.win.root, me)
+            rows = (brain.signal_sent(self.win.root, me) if sent
+                    else brain.signal_inbox(self.win.root, me))
         except Exception as e:  # noqa: BLE001
-            self.listw.addItem(f"读取失败：{e}")
+            self._error = f"读取失败：{e}"
+            self.listw.addItem(self._error)
+            self.listw.blockSignals(False)
+            self.sumLabel.setText("读取失败")
+            self.split.setVisible(True)
+            self.preview.setHtml(md_to_html(f"**{self._error}**\n\n可点右下「刷新」重试；"
+                                            "若持续失败，检查数据目录是否可读。"))
+            self._sync_actions(None)
+            list_empty_guard(self.listw, self.lay, self.EMPTY_TITLE, self.EMPTY_DESC,
+                             index=self.lay.indexOf(self.split),
+                             action_text=self.EMPTY_ACTION, action=self._focus_editor)
             return
-        if not rows:
-            self.listw.addItem("（收件箱空）")
-            return
-        n_un = sum(1 for r in rows if not r["_read"])
-        head = QListWidgetItem(f"── 共 {len(rows)} 条，未读 {n_un}（●未读 ·已读）")
-        head.setFlags(Qt.ItemFlag.NoItemFlags)
-        self.listw.addItem(head)
+        self._rows = rows
         for s in rows:
-            dot = "●" if not s["_read"] else "·"
             to = f"→{s['to_agent']}" if s["to_agent"] else "→广播"
-            proj = f" [{s['project']}]" if s["project"] else ""
-            it = QListWidgetItem(
-                f"{dot} #{s['id']} {s['ts'][5:16]} {s['from_agent']}{to}{proj}"
-                f"（{self._kind_label(s['kind'])}）{s['content'][:56]}")
-            self._inbox_items[id(it)] = s
+            one = " ".join((s.get("content") or "").split())
+            if sent:
+                txt = (f"#{s['id']} {rel_time(s['ts'])} {to}"
+                       f"（{self._kind_label(s['kind'])}）{one[:60]}")
+            else:
+                dot = "●" if not s["_read"] else "·"
+                proj = f" [{s['project']}]" if s["project"] else ""
+                stale = " ！陈旧" if s.get("_stale") else ""
+                txt = (f"{dot} #{s['id']} {rel_time(s['ts'])} {s['from_agent']}{to}{proj}"
+                       f"（{self._kind_label(s['kind'])}）{one[:56]}{stale}")
+            it = QListWidgetItem(txt)
+            it.setToolTip(s["content"])
             self.listw.addItem(it)
+        self.listw.blockSignals(False)
+        self._finish_reload(keep_id)
+
+    def _finish_reload(self, keep_id: str):
+        sent = self.seg.currentRouteKey() == "sent"
+        n = len(self._rows)
+        self._set_empty_gap(n == 0)
+        if sent:
+            self.sumLabel.setText(f"已发送 {n} 条")
+        else:
+            unread = sum(1 for r in self._rows if not r["_read"])
+            stale = sum(1 for r in self._rows if r.get("_stale"))
+            self.sumLabel.setText(f"共 {n} 条 · 未读 {unread}"
+                                  + (f"（陈旧 {stale}）" if stale else ""))
+        if n:
+            self.split.setVisible(True)
+            idx = next((i for i, r in enumerate(self._rows) if str(r["id"]) == keep_id), -1)
+            if idx < 0:
+                if sent:
+                    idx = 0
+                else:
+                    # 优先新鲜未读：陈旧未读先不抢焦点，但仍标「！陈旧」留在列表里
+                    idx = next((i for i, r in enumerate(self._rows)
+                                if not r["_read"] and not r.get("_stale")), -1)
+                    if idx < 0:
+                        idx = next((i for i, r in enumerate(self._rows)
+                                    if not r["_read"]), 0)
+            self.listw.setCurrentRow(idx)
+        else:
+            self.split.setVisible(False)
+            self.preview.setHtml(self._intro_html())
+            self._sync_actions(None)
+        list_empty_guard(self.listw, self.lay, self.EMPTY_TITLE, self.EMPTY_DESC,
+                         index=self.lay.indexOf(self.split),
+                         action_text=self.EMPTY_ACTION, action=self._focus_editor)
+
+    def _set_empty_gap(self, on: bool):
+        if on == self._gap_added:
+            return
+        if on:
+            self.lay.insertItem(self.lay.indexOf(self.split) + 1, self._empty_gap)
+        else:
+            self.lay.removeItem(self._empty_gap)
+        self._gap_added = on
 
     def _selected(self):
-        it = self.listw.currentItem()
-        if self.seg.currentItem() == "sent":
-            return self._sent_items.get(id(it)) if it else None
-        return self._inbox_items.get(id(it)) if it else None
+        row = self.listw.currentRow()
+        if 0 <= row < len(self._rows):
+            return self._rows[row]
+        return None
+
+    def _sel_id(self) -> str:
+        s = self._selected()
+        return str(s["id"]) if s else ""
+
+    def show_detail(self):
+        s = self._selected()
+        if not s:
+            self.preview.setHtml(md_to_html(f"**{self._error}**") if self._error
+                                 else self._intro_html())
+            self._sync_actions(None)
+            return
+        self._last_sel[self._tab_key()] = str(s["id"])
+        self.preview.setHtml(self._detail_html(s))
+        self._sync_actions(s)
+
+    def _detail_html(self, s) -> str:
+        sent = self.seg.currentRouteKey() == "sent"
+        to = f"→{s['to_agent']}" if s["to_agent"] else "→广播"
+        meta = f"{rel_time(s['ts'])} · {s['from_agent']}{to}"
+        if s.get("project"):
+            meta += f" · [{s['project']}]"
+        if sent:
+            if s.get("status") == "read" or s.get("read_at"):
+                who = s.get("read_by") or "?"
+                state = f"√ 已读回执 · {who} {rel_time(s.get('read_at') or '')}"
+            else:
+                state = "· 未读回执（对方下次开工会在心跳里看到提醒）"
+        elif s.get("_read"):
+            state = "· 已读"
+        else:
+            state = "● 未读"
+            if s.get("_stale"):
+                state += f" · ！陈旧（超过 {brain.SIGNAL_STALE_DAYS} 天未读）"
+        return (f"<h3>#{s['id']} {self._kind_label(s['kind'])}</h3>"
+                f"<p style='color:{tokens.C(tokens.TEXT_3)}'>{_html.escape(meta)}</p>"
+                f"<p style='color:{tokens.C(tokens.TEXT_2)}'>{_html.escape(state)}</p>"
+                f"<hr>" + md_to_html(s.get("content") or ""))
 
     # ---------- 操作 ----------
     @staticmethod
     def _kind_label(kind: str) -> str:
         kinds = dict([("msg", "消息"), ("alert", "告警"), ("ack_request", "需回执")])
         return kinds.get((kind or "").strip(), kind or "消息")
+
+    def _sync_actions(self, s):
+        sent = self.seg.currentRouteKey() == "sent"
+        can_read = bool(s) and not sent and not s.get("_read")
+        self.readBtn.setEnabled(can_read)
+        self.readBtn.setToolTip("给选中的未读信号记回执（幂等）" if can_read
+                                else "选中「收件箱」里一条未读信号后可标记")
+        self.copyBtn.setEnabled(bool(s))
 
     def send(self):
         if not self.win.root:
@@ -193,7 +364,7 @@ class SignalPage(QWidget):
 
     def mark_read(self):
         s = self._selected()
-        if not s or self.seg.currentItem() == "sent":
+        if not s or self.seg.currentRouteKey() == "sent":
             InfoBar.warning("先选中一条信号", "在「收件箱」里选中一条未读信号，再标已读", parent=self)
             return
         me = self.meCombo.currentText()
@@ -204,3 +375,10 @@ class SignalPage(QWidget):
             return
         InfoBar.success("已读回执", msg, parent=self)
         self.reload()
+
+    def copy_current(self):
+        s = self._selected()
+        if not s:
+            return
+        QApplication.clipboard().setText(s.get("content") or "")
+        InfoBar.success("已复制信号内容", f"#{s['id']}", duration=2000, parent=self)

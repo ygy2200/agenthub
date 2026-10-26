@@ -25,6 +25,7 @@ from __future__ import annotations
 
 import datetime
 import sys
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 import tempfile
 from pathlib import Path
 

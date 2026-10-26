@@ -11,12 +11,27 @@
 """
 from __future__ import annotations
 
-from PySide6.QtWidgets import QListWidgetItem, QInputDialog  # noqa: F401
+from PySide6.QtWidgets import QListWidgetItem, QInputDialog, QSizePolicy  # noqa: F401
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401
 import brain
 import ops
+
+
+# 列表/提示里只出现人话；原始枚举值留给数据层与 tooltip（R171）。
+_HANDOFF_STATUS = {"open": "待认领", "claimed": "已认领", "closed": "已作废"}
+_SCOPE_LABEL = {"project": "项目", "tag": "标签"}
+
+
+def _handoff_status_label(status) -> str:
+    raw = (status or "open").strip()
+    return _HANDOFF_STATUS.get(raw, raw)
+
+
+def _scope_label(scope_type) -> str:
+    raw = (scope_type or "project").strip()
+    return _SCOPE_LABEL.get(raw, raw)
 
 
 class _SubPage(QWidget):
@@ -42,17 +57,78 @@ class _SubPage(QWidget):
     def _build_buttons(self):
         pass
 
+    def _action_widgets(self):
+        """无根目录时需要禁用的操作控件（空态 CTA 不在此列）。"""
+        return []
+
     def _selected(self):
         it = self.listw.currentItem()
         return getattr(self, "_items", {}).get(id(it)) if it else None
 
     def reload(self):
         """统一入口：先填列表，再同步空态——保证提前 return 的分支也有引导。"""
+        if not self.win.root:
+            self._show_no_root()
+            return
+        self._hide_no_root()
         self._fill()
         self._finish()
 
+    def _show_no_root(self):
+        """未连接大脑时不能伪装成「暂无数据」——给明确状态和接入出口。"""
+        self.listw.clear()
+        self._items = {}
+        self.sumLabel.setText("还没有连接大脑——先在「接入」页完成连接或初始化")
+        hint = getattr(self, "_no_root_hint", None)
+        if hint is None:
+            hint = empty_state(
+                "INFO", "还没有连接大脑",
+                "治理数据都在大脑里；先完成接入或初始化，再回来查看待审批、交接与安全状态",
+                action_text="去接入页",
+                action=lambda: self.win.switchTo(self.win.connect_page))
+            self._no_root_hint = hint
+            hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            inner = hint.layout()
+            if inner is not None:
+                inner.insertStretch(0, 1)
+                inner.addStretch(1)
+            idx = self.layout().indexOf(self.listw)
+            self.layout().insertWidget(
+                (idx + 1) if idx >= 0 else self.layout().count(), hint)
+        hint.setVisible(True)
+        self.listw.setVisible(False)
+        for w in self._action_widgets():
+            w.setEnabled(False)
+        normal = getattr(self.listw, "_empty_hint_widget", None)
+        if normal is not None:
+            normal.setVisible(False)
+
+    def _hide_no_root(self):
+        hint = getattr(self, "_no_root_hint", None)
+        if hint is not None:
+            hint.setVisible(False)
+        for w in self._action_widgets():
+            w.setEnabled(True)
+        self.listw.setVisible(True)
+
     def _finish(self):
-        list_empty_guard(self.listw, self.layout(), self.EMPTY_TITLE, self.EMPTY_DESC)
+        hint = list_empty_guard(self.listw, self.layout(), self.EMPTY_TITLE, self.EMPTY_DESC)
+        empty = self.listw.count() == 0
+        if empty:
+            # 空列表仍占着 stretch，会把引导挤到页面底部；空态自己撑满并垂直居中。
+            hint.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+            inner = hint.layout()
+            if inner is not None and not hint.property("centered"):
+                inner.insertStretch(0, 1)
+                inner.addStretch(1)
+                hint.setProperty("centered", True)
+            # R196：摘要行在空态时是**同义重复**——「无待批任务——需复核的任务被认领后
+            # 才会入队」与居中空态说明说的是同一件事，一屏两遍像没加载完。空态已经承担
+            # 说明与下一步，摘要行直接收起；有数据时它才是「几条/最久多久」的信息位。
+            self.sumLabel.setVisible(False)
+        else:
+            self.sumLabel.setVisible(True)
+        self.listw.setVisible(not empty)
 
     def _fill(self):
         self.listw.clear()
@@ -69,20 +145,25 @@ class _ApprovalsSub(_SubPage):
 
     TITLE = "待审批"
     EMPTY_TITLE = "暂无待批任务"
-    EMPTY_DESC = "approval_required 任务认领后才进入队列；owner 不能自批，需他人或本管理面批准或退回"
+    EMPTY_DESC = "需复核的任务被认领后才进入队列；任务负责人不能自批，需他人或本管理面批准/退回"
 
     def _build_buttons(self):
         self.approveBtn = PushButton("批准完成")
         self.approveBtn.setToolTip(
-            "以桌面管理面（gui）署名批准选中任务；owner 不能自批，批准后持有者才能标 done")
+            "以桌面管理面（gui）署名批准选中任务；任务负责人不能自批，"
+            "批准后持有者才能标完成（对应工具 hub_task_approve）")
         self.approveBtn.clicked.connect(self.approve)
         self.rejectBtn = PushButton("退回返工")
         self.rejectBtn.setToolTip(
-            "退回选中任务返工，必须填写原因；任务回到待办并释放持有权，修改后需重新认领并复核")
+            "退回选中任务返工，必须填写原因；任务回到待办并释放持有权，"
+            "修改后需重新认领并复核（对应工具 hub_task_reject）")
         self.rejectBtn.clicked.connect(self.reject)
         self.btnRow.addWidget(self.approveBtn)
         self.btnRow.addWidget(self.rejectBtn)
         self.btnRow.addStretch(1)
+
+    def _action_widgets(self):
+        return [self.approveBtn, self.rejectBtn]
 
     def _fill(self):
         super()._fill()
@@ -103,7 +184,7 @@ class _ApprovalsSub(_SubPage):
             self.sumLabel.setText(
                 f"待批 {len(rows)} 条（待批过久 {aging}{tail}；按等批时长排序）")
         else:
-            self.sumLabel.setText("无待批任务——approval_required 任务认领后才进入队列")
+            self.sumLabel.setText("无待批任务——需复核的任务被认领后才会入队")
         for t in rows:
             who = f"@{t['owner']}" if (t.get("owner") or "").strip() else "@无主"
             proj = f"[{t['project']}] " if t.get("project") else ""
@@ -111,14 +192,14 @@ class _ApprovalsSub(_SubPage):
             wait_s = f"等批 {wait:g}h" if isinstance(wait, (int, float)) else "等批 —"
             age = t.get("_progress_age_h")
             age_s = f"｜最近进展 {age:g}h 前" if isinstance(age, (int, float)) else ""
-            flag = " ⚠待批过久" if t.get("_approval_aging") else ""
+            flag = " ！待批过久" if t.get("_approval_aging") else ""
             it = QListWidgetItem(
                 f"#{t['id']} {proj}{t['title'][:40]} {who}｜{wait_s}{flag}{age_s}")
             tips = [f"{t['title']}\n等批从认领起算；≥{brain.TASK_APPROVAL_AGING_H}h "
                     "标待批过久（只提示复核，不是硬 SLA）\n"
-                    "批准：本页「批准完成」或 hub_task_approve；退回：本页「退回返工」"
-                    "或 hub_task_reject（原因必填）\n"
-                    "owner 不能自批/自退"]
+                    "批准：本页「批准完成」（工具 hub_task_approve）；退回：本页「退回返工」"
+                    "（工具 hub_task_reject，原因必填）\n"
+                    "任务负责人不能自批/自退"]
             if t.get("_reject_count"):
                 tips.append(f"此前退回 {t['_reject_count']} 次"
                             f"（最近 {t.get('_rejected_by') or '管理面'}"
@@ -160,11 +241,11 @@ class _ApprovalsSub(_SubPage):
         reason, ok = QInputDialog.getText(
             self, "退回返工",
             f"任务 #{t['id']}「{t['title'][:40]}」\n"
-            "退回原因（必填，owner 按此修改后重新认领）：")
+            "退回原因（必填，任务负责人按此修改后重新认领）：")
         if not ok:
             return
         if not (reason or "").strip():
-            InfoBar.warning("原因必填", "退回必须写明哪里不合格，owner 才知道怎么改", parent=self)
+            InfoBar.warning("原因必填", "退回必须写明哪里不合格，任务负责人才知道怎么改", parent=self)
             return
         try:
             err, row = brain.task_reject(self.win.root, t["id"], "gui", reason)
@@ -176,7 +257,7 @@ class _ApprovalsSub(_SubPage):
             return
         InfoBar.success(
             "已退回", f"任务 #{row['id']} 已回到待办并释放持有权——"
-                     "owner 修改后重新认领，完成仍需复核", parent=self)
+                     "任务负责人修改后重新认领，完成仍需复核", parent=self)
         self.reload()
 
 
@@ -189,24 +270,29 @@ class _HandoffsSub(_SubPage):
 
     TITLE = "待认领交接"
     EMPTY_TITLE = "暂无待认领交接"
-    EMPTY_DESC = "交接由 hub_handoff(create) 产生；认领后接手人继续推进，陈旧交接可在此作废"
+    EMPTY_DESC = "交接由上一棒留下（做完什么、下一步、已排除什么）；认领后接手人继续推进，陈旧交接可作废"
 
     def _build_buttons(self):
         self.claimBtn = PushButton("认领交接")
         self.claimBtn.setToolTip(
-            "以桌面管理面（gui）认领选中交接；认领后接手人继续推进（状态变 claimed）")
+            "以桌面管理面（gui）认领选中交接；认领后接手人继续推进"
+            "（状态变「已认领」，对应工具 hub_handoff(action=claim)）")
         self.claimBtn.clicked.connect(self.claim)
         self.closeBtn = PushButton("作废交接")
         self.closeBtn.setToolTip(
-            "作废选中的 open 交接，必须填写原因；已认领交接不能作废（接手已发生）")
+            "作废选中的待认领交接，必须填写原因；已认领交接不能作废（接手已发生）"
+            "（对应工具 hub_handoff(action=close)）")
         self.closeBtn.clicked.connect(self.close)
         self.allChk = CheckBox("含已认领/已作废")
-        self.allChk.setToolTip("勾选后显示 claimed/closed 交接，用于复核接手人与作废原因")
+        self.allChk.setToolTip("勾选后显示已认领/已作废交接，用于复核接手人与作废原因")
         self.allChk.toggled.connect(lambda _on: self.reload())
         self.btnRow.addWidget(self.claimBtn)
         self.btnRow.addWidget(self.closeBtn)
         self.btnRow.addStretch(1)
         self.btnRow.addWidget(self.allChk)
+
+    def _action_widgets(self):
+        return [self.claimBtn, self.closeBtn, self.allChk]
 
     def _fill(self):
         super()._fill()
@@ -233,12 +319,11 @@ class _HandoffsSub(_SubPage):
             self.sumLabel.setText(
                 f"待认领交接 {len(open_rows)} 条（陈旧 {stale}{tail}；按创建时间倒序）")
         else:
-            self.sumLabel.setText("无待认领交接——换手前用 hub_handoff(create) 留下下一步")
+            self.sumLabel.setText("无待认领交接——换手时上一棒留下「做完什么/下一步/已排除什么」，接手人就能续上")
         for r in rows:
-            status = r.get("status") or "open"
-            badge = {"open": "待认领", "claimed": "已认领", "closed": "已作废"}.get(
-                status, status)
-            flag = " ⚠陈旧" if r.get("_stale") else ""
+            raw_status = (r.get("status") or "open").strip()
+            status = _handoff_status_label(raw_status)
+            flag = " ！陈旧" if r.get("_stale") else ""
             age = r.get("_age_h")
             age_s = f"创建于 {age:g}h 前" if isinstance(age, (int, float)) else "创建时间未知"
             who = f"来自 {r.get('agent')}" if r.get("agent") else "来源未署名"
@@ -246,13 +331,13 @@ class _HandoffsSub(_SubPage):
             nxt = (r.get("next_step") or "").strip()
             nxt_s = f"｜下一步 {nxt[:40]}" if nxt else ""
             it = QListWidgetItem(
-                f"#{r['id']} {proj}{who}｜{badge}{flag}｜{age_s}{nxt_s}")
+                f"#{r['id']} {proj}{who}｜{status}{flag}｜{age_s}{nxt_s}")
             tips = [f"完成：{(r.get('done') or '未填写')[:200]}",
                     f"下一步：{(r.get('next_step') or '未填写')[:200]}",
                     f"已排除：{(r.get('excluded') or '未填写')[:200]}"]
-            if status == "claimed":
+            if raw_status == "claimed":
                 tips.append(f"接手人：{r.get('claimed_by') or '未署名'}（{r.get('claimed_at') or '时间未知'}）")
-            elif status == "closed":
+            elif raw_status == "closed":
                 tips.append(f"作废：{r.get('closed_by') or '未署名'}（{r.get('closed_at') or '时间未知'}）"
                             f"｜原因：{r.get('close_note') or '未填写'}")
             tips.append(f"创建于 {r.get('created') or '时间未知'}；≥{brain.HANDOFF_STALE_DAYS} 天未认领标陈旧")
@@ -268,7 +353,8 @@ class _HandoffsSub(_SubPage):
             return
         if r.get("status") != "open":
             InfoBar.warning("只能认领待认领交接",
-                            f"#{r['id']} 当前为 {r.get('status')}，不可重复认领", parent=self)
+                            f"#{r['id']} 当前为「{_handoff_status_label(r.get('status'))}」，不可重复认领",
+                            parent=self)
             return
         try:
             msg = brain.claim_handoff(self.win.root, r["id"], "gui")
@@ -289,7 +375,8 @@ class _HandoffsSub(_SubPage):
             return
         if r.get("status") != "open":
             InfoBar.warning("只能作废待认领交接",
-                            f"#{r['id']} 当前为 {r.get('status')}；已认领交接不能作废", parent=self)
+                            f"#{r['id']} 当前为「{_handoff_status_label(r.get('status'))}」；"
+                            "已认领交接不能作废", parent=self)
             return
         note, ok = QInputDialog.getText(
             self, "作废交接",
@@ -317,7 +404,7 @@ class _QuarantineSub(_SubPage):
 
     TITLE = "隔离区"
     EMPTY_TITLE = "隔离区是空的"
-    EMPTY_DESC = "没有条目被隔离——隔离用于把错误/冲突条目移出检索与推送视野，由 hub_quarantine 或写入时的冲突拦截产生"
+    EMPTY_DESC = "没有内容被隔离——隔离会把错误/冲突条目移出检索与推送，但仍保留、可解除；写入拦截或手动隔离都会进这里"
 
     def _build_buttons(self):
         self.relBtn = PushButton("解除隔离")
@@ -325,6 +412,9 @@ class _QuarantineSub(_SubPage):
         self.relBtn.clicked.connect(self.release)
         self.btnRow.addWidget(self.relBtn)
         self.btnRow.addStretch(1)
+
+    def _action_widgets(self):
+        return [self.relBtn]
 
     def _fill(self):
         super()._fill()
@@ -336,7 +426,7 @@ class _QuarantineSub(_SubPage):
             self.sumLabel.setText(f"读取失败：{e}")
             return
         self.sumLabel.setText(f"隔离区 {len(rows)} 条（退出检索与推送，未删除）"
-                              if rows else "隔离区空——可疑内容用 hub_quarantine 隔离")
+                              if rows else "隔离区空——可疑或冲突的内容会在写入拦截或手动隔离时进入这里")
         for r in rows:
             text = (f"{'记录' if r['src'] == 'record' else '记忆'} #{r['id']} "
                     f"{r.get('title') or r.get('content', '')[:50]}")
@@ -364,14 +454,18 @@ class _ConsolidateSub(_SubPage):
 
     TITLE = "整合提案"
     EMPTY_TITLE = "暂无整合提案"
-    EMPTY_DESC = "没有疑似重复的记忆组——库里条目足够多、出现高度相似内容时，hub_consolidate 才会给出提案"
+    EMPTY_DESC = "没有疑似重复的记忆组——库里出现高度相似的内容时，这里会给出合并/矛盾提案，执行前需你确认"
 
     def _build_buttons(self):
         self.applyBtn = PushButton("执行整合")
-        self.applyBtn.setToolTip("输入整合后的完整内容，写为新记忆，原条目退出推送（可追溯）")
+        self.applyBtn.setToolTip("输入整合后的完整内容，写为新记忆，原条目退出推送（可追溯）"
+                                 "（对应工具 hub_consolidate(action=apply)）")
         self.applyBtn.clicked.connect(self.apply)
         self.btnRow.addWidget(self.applyBtn)
         self.btnRow.addStretch(1)
+
+    def _action_widgets(self):
+        return [self.applyBtn]
 
     def _fill(self):
         super()._fill()
@@ -384,9 +478,11 @@ class _ConsolidateSub(_SubPage):
             return
         self.sumLabel.setText(f"整合提案 {len(rows)} 组（执行需确认）" if rows
                               else "无整合提案——没有疑似重复/矛盾的记忆组")
-        for i, p in enumerate(rows):
+        for p in rows:
+            ids = " + ".join(f"#{x}" for x in p["ids"])
             it = QListWidgetItem(
-                f"ids={p['ids']} 相似度 {p['sim']}｜{p['verdict']}｜{p['contents'][0][:40]}")
+                f"{ids}｜相似度 {p['sim']}｜{p['verdict']}｜{p['contents'][0][:40]}")
+            it.setToolTip("两条原文：\n" + "\n---\n".join(c[:400] for c in p["contents"]))
             self._items[id(it)] = p
             self.listw.addItem(it)
 
@@ -417,9 +513,10 @@ class _DecisionSub(_SubPage):
 
     TITLE = "待验证决策"
     EMPTY_TITLE = "暂无待验证决策"
-    EMPTY_DESC = "写决策记录时带 review_date，到期才会进这个队列——决策写了没人回顾等于白写"
+    EMPTY_DESC = "写决策时填了回顾日期，到期才会进这个队列——决策写了没人回顾等于白写"
 
     def _build_buttons(self):
+        self.verdictBtns = []
         self.btnRow.addWidget(StrongBodyLabel("记回顾："))
         for label, verdict, tip in (("对", "right", "当时决策正确"),
                                     ("错", "wrong", "当时决策错误"),
@@ -428,7 +525,11 @@ class _DecisionSub(_SubPage):
             b.setToolTip(tip)
             b.clicked.connect(lambda _c=False, v=verdict: self.review(v))
             self.btnRow.addWidget(b)
+            self.verdictBtns.append(b)
         self.btnRow.addStretch(1)
+
+    def _action_widgets(self):
+        return self.verdictBtns
 
     def _fill(self):
         super()._fill()
@@ -440,7 +541,7 @@ class _DecisionSub(_SubPage):
             self.sumLabel.setText(f"读取失败：{e}")
             return
         self.sumLabel.setText(f"到期待验证 {len(rows)} 条" if rows
-                              else "无到期待验证的决策（写决策时带 review_date 即可入队）")
+                              else "无到期待回顾的决策（写决策时填回顾日期，到期才会入队）")
         for d in rows:
             it = QListWidgetItem(
                 f"#{d['id']} {d['review_date']} 到期｜{d['title'][:36]}"
@@ -470,20 +571,24 @@ class _ViewSub(_SubPage):
 
     TITLE = "关注管理"
     EMPTY_TITLE = "还没有关注任何项目/标签"
-    EMPTY_DESC = "关注后，心跳开工推送会带上它们的进展（多 agent 各看各的地盘）；用 hub_view 或本页上方输入关注"
+    EMPTY_DESC = "关注后，心跳开工推送会带上它们的进展（多 agent 各看各的地盘）；在上方输入项目名即可关注"
 
     def _build_buttons(self):
         self.followEdit = LineEdit()
         self.followEdit.setPlaceholderText("项目名，回车关注")
         self.btnRow.addWidget(self.followEdit)
-        followBtn = PushButton("关注")
-        followBtn.clicked.connect(self.follow)
-        self.btnRow.addWidget(followBtn)
+        self.followBtn = PushButton("关注")
+        self.followBtn.setToolTip("关注项挂在桌面管理面名下；心跳开工推送按各 agent 的关注清单读取")
+        self.followBtn.clicked.connect(self.follow)
+        self.btnRow.addWidget(self.followBtn)
         self.unBtn = PushButton("取消关注")
         self.unBtn.clicked.connect(self.unfollow)
         self.btnRow.addWidget(self.unBtn)
         self.btnRow.addStretch(1)
         self.followEdit.returnPressed.connect(self.follow)
+
+    def _action_widgets(self):
+        return [self.followEdit, self.followBtn, self.unBtn]
 
     def _fill(self):
         super()._fill()
@@ -495,10 +600,13 @@ class _ViewSub(_SubPage):
         except Exception as e:  # noqa: BLE001
             self.sumLabel.setText(f"读取失败：{e}")
             return
-        self.sumLabel.setText(f"关注 {len(rows)} 个项目（{me} 视角）——关注项目近 7 天有进展，"
-                              "心跳开工推送会速览" if rows else "还没有关注任何项目")
+        self.sumLabel.setText(f"关注 {len(rows)} 个项目（桌面管理面）——关注项目近 7 天有进展，"
+                              "心跳开工推送会速览" if rows else "还没有关注任何项目——在上方输入项目名即可关注")
         for v in rows:
-            it = QListWidgetItem(f"[{v['scope_type']}] {v['scope_value']}")
+            scope = _scope_label(v["scope_type"])
+            it = QListWidgetItem(f"[{scope}] {v['scope_value']}")
+            it.setToolTip(f"关注对象：{scope}「{v['scope_value']}」\n"
+                          "选中后点「取消关注」可移出心跳速览")
             self._items[id(it)] = v
             self.listw.addItem(it)
 
@@ -587,6 +695,9 @@ class _SecuritySub(_SubPage):
             self.btnRow.addWidget(b)
         self.btnRow.addStretch(1)
 
+    def _action_widgets(self):
+        return [self.freezeBtn, self.thawBtn, self.exportBtn, self.refreshBtn]
+
     def _fill(self):
         super()._fill()
         if not self.win.root:
@@ -601,7 +712,7 @@ class _SecuritySub(_SubPage):
                 self.listw.addItem(f"  封存起点 {chain['chain_at'][:19]}"
                                    f"（此前历史只能证明封存后未改）")
             for b in chain.get("broken", [])[:5]:
-                self.listw.addItem(f"  ⚠ #{b['id']}：{b['why']}")
+                self.listw.addItem(f"  ！#{b['id']}：{b['why']}")
         except Exception as e:  # noqa: BLE001 单块失败不拖垮整页
             self.listw.addItem(f"审计链：校验失败（{type(e).__name__}: {str(e)[:80]}）")
         try:
@@ -639,7 +750,7 @@ class _SecuritySub(_SubPage):
         try:
             h = ops.run_check("security_health", "", root)
             health_ok = h["ok"]
-            self.listw.addItem(("✓ " if h["ok"] else "✗ ") + "安全体检：" + h["summary"])
+            self.listw.addItem(("√ " if h["ok"] else "× ") + "安全体检：" + h["summary"])
             for d in h.get("detail", [])[:8]:
                 self.listw.addItem("  " + d)
         except Exception as e:  # noqa: BLE001
@@ -650,7 +761,7 @@ class _SecuritySub(_SubPage):
         try:
             g = ops.run_check("governance_health", "", root)
             gov_ok = g["ok"]
-            self.listw.addItem(("✓ " if g["ok"] else "✗ ") + "治理巡检：" + g["summary"])
+            self.listw.addItem(("√ " if g["ok"] else "× ") + "治理巡检：" + g["summary"])
             for d in g.get("detail", [])[:8]:
                 self.listw.addItem("  " + d)
         except Exception as e:  # noqa: BLE001
@@ -662,7 +773,7 @@ class _SecuritySub(_SubPage):
         try:
             d = ops.run_check("mcp_drift", "", root)
             drift_ok = d["ok"]
-            self.listw.addItem(("✓ " if d["ok"] else "✗ ") + "接入参数：" + d["summary"])
+            self.listw.addItem(("√ " if d["ok"] else "× ") + "接入参数：" + d["summary"])
             for ln in d.get("detail", [])[:6]:
                 self.listw.addItem("  " + ln)
         except Exception as e:  # noqa: BLE001
@@ -672,15 +783,15 @@ class _SecuritySub(_SubPage):
         try:
             u = ops.run_check("usage_health", "", root)
             usage_ok = u["ok"]
-            self.listw.addItem(("✓ " if u["ok"] else "✗ ") + "用量异常：" + u["summary"])
+            self.listw.addItem(("√ " if u["ok"] else "× ") + "用量异常：" + u["summary"])
             for ln in u.get("detail", [])[:6]:
                 self.listw.addItem("  " + ln)
         except Exception as e:  # noqa: BLE001
             usage_ok = False
             self.listw.addItem(f"用量异常：执行失败（{type(e).__name__}: {str(e)[:80]})")
         self.sumLabel.setText(
-            ("✓ 安全面正常" if (chain_ok and health_ok and gov_ok and drift_ok and usage_ok)
-             else "⚠ 安全面有异常，见下方逐条")
+            ("√ 安全面正常" if (chain_ok and health_ok and gov_ok and drift_ok and usage_ok)
+             else "！安全面有异常，见下方逐条")
             + "——审计链只读校验，冻结/解冻动作会记入审计链")
 
     def freeze(self):
@@ -726,7 +837,7 @@ class _SecuritySub(_SubPage):
         if meta.get("truncated"):
             note += "；已触达上限被截断，缩小 days 或调大 limit 再导"
         if chain and not (meta.get("chain") or {}).get("ok", True):
-            note += f"；⚠ 链异常：{chain}"
+            note += f"；！链异常：{chain}"
         InfoBar.success("审计已导出", note, parent=self)
 
 

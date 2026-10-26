@@ -41,7 +41,9 @@ class ComponentsPage(QWidget):
 
         lay.addWidget(StrongBodyLabel("文本层级（Title / Subtitle / Strong / Body / Caption）"))
         lay.addWidget(PageTitleLabel("页面标题 PageTitle 24（本项目页头）"))
-        lay.addWidget(TitleLabel("qfw 原生 Title 28（不直接用作页头，仅作对照）"))
+        rawTitle = TitleLabel("qfw 原生 Title 28（不直接用作页头，仅作对照）")
+        rawTitle.setWordWrap(True)  # 28px 单行最小宽 812，920 窗内容宽 823-边距会横滚 9px
+        lay.addWidget(rawTitle)
         lay.addWidget(SubtitleLabel("副标题 Subtitle 20"))
         lay.addWidget(StrongBodyLabel("强调正文 StrongBody 14"))
         lay.addWidget(BodyLabel("正文 Body 14——常规信息承载层级"))
@@ -49,13 +51,13 @@ class ComponentsPage(QWidget):
 
         lay.addSpacing(16)
         lay.addWidget(StrongBodyLabel("徽章（agent / 心情）"))
-        brow = QHBoxLayout()
+        # 13 枚徽章在 920 窗宽下约 900px，QHBoxLayout 只能横向挤出滚动条（R189 截图右缘被切）；
+        # FlowLayout 按可用宽度换行，窄窗也不会撑破页面。
+        brow = FlowLayout()
         for a in ("zcode", "workbuddy", "claude", "hermes", "dsh", "codex", "其他", ""):
             brow.addWidget(badge(a, ""))
-        brow.addSpacing(12)
         for m in ("兴奋", "笃定", "疑问", "灵感", "平静"):
             brow.addWidget(mood_badge(m))
-        brow.addStretch(1)
         lay.addLayout(brow)
 
         lay.addSpacing(16)

@@ -65,10 +65,20 @@ def _junit_counts(xml_path: Path):
 
 
 def _run_pytest(target: Path, xml_path: Path, timeout_s: int):
-    """跑一个目标；超时则杀掉。返回 (rc, timed_out)。"""
+    """跑一个目标；超时则杀掉。返回 (rc, timed_out)。
+
+    R200：显式给每个目标独立的 `--basetemp`。pytest 默认把 basetemp 放在
+    `<TEMP>/pytest-of-<user>/pytest-<n>`，每次启动会轮换删除旧目录——一次 50+ 个
+    文件的批量删除会被宿主沙箱拦下（`SAFE_DELETE_BULK_CONFIRM_REQUIRED`），
+    pytest 异常退出 → junit 缺失 → 整层判 FAIL。实测 37 个 GUI 目标里 16 个这样
+    「假红」（同一目标单独跑 2 passed）。指定 basetemp 后 pytest 不再轮换删除，
+    失败才是真失败。
+    """
+    base = ROOT / "_pytest_tmp" / ("bt-" + xml_path.stem)
     proc = subprocess.Popen(
         [sys.executable, "-m", "pytest", "-q", "--no-header",
-         "-p", "no:cacheprovider", f"--junitxml={xml_path}", str(target)],
+         "-p", "no:cacheprovider", f"--basetemp={base}",
+         f"--junitxml={xml_path}", str(target)],
         cwd=ROOT, env=ENV)
     try:
         return proc.wait(timeout=timeout_s), False

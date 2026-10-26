@@ -58,9 +58,11 @@ class SettingsPage(QWidget):
         self.motionBox.stateChanged.connect(self._on_motion_toggle)
         g0.addWidget(self.motionBox)
 
-        g0.addWidget(CaptionLabel("深色为默认（色值经 WCAG 对比度验算，全部达标）；"
-                                  "「跟随系统」会随 Windows 深浅色切换自动响应。密实度控制列表行高"
-                                  "与间距缩放，切换后立即重排。"))
+        themeNote = CaptionLabel("深色为默认（色值经 WCAG 对比度验算，全部达标）；"
+                                 "「跟随系统」会随 Windows 深浅色切换自动响应。密实度控制列表行高"
+                                 "与间距缩放，切换后立即重排。")
+        themeNote.setWordWrap(True)  # 920 窗宽下约 860px，不换行会被卡片右缘硬切（R189）
+        g0.addWidget(themeNote)
         lay.addWidget(c0)
         self._sync_theme_btns()
         self._sync_density_btns()
@@ -71,8 +73,10 @@ class SettingsPage(QWidget):
         gN.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
                                 tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
         gN.addWidget(section_head("导航显示", "MENU"))
-        gN.addWidget(CaptionLabel(
-            "取消勾选的页面从侧边栏收起（总览/设置固定显示）；隐藏的页面仍可用 Ctrl+K 命令面板或 Ctrl+数字 打开；重启后生效。"))
+        navNote = CaptionLabel(
+            "取消勾选的页面从侧边栏收起（总览/设置固定显示）；隐藏的页面仍可用 Ctrl+K 命令面板或 Ctrl+数字 打开；重启后生效。")
+        navNote.setWordWrap(True)
+        gN.addWidget(navNote)
         self._navChecks = {}
         _hiddenNow = set(core.load_config().get("nav_hidden", []) or [])
         for _nm in NAV_CUSTOMIZABLE:

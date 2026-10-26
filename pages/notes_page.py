@@ -43,6 +43,8 @@ class NotesPage(QWidget):
 
         # 心情色带热力图：一格一天，颜色=当日心情/有无记录（近半年，悬停看详情）
         lay.addSpacing(8)
+        heatWrap = QHBoxLayout()
+        heatWrap.setSpacing(tokens.SPACE_S)
         self.heatRow = QHBoxLayout()
         self.heatRow.setSpacing(0)
         self._heat_cells = []
@@ -51,7 +53,12 @@ class NotesPage(QWidget):
             cell.setFixedSize(3, 18)  # 3px 含 1px 背景缝（R124：边框色分离，守卫合规）
             self.heatRow.addWidget(cell)
             self._heat_cells.append(cell)
-        lay.addLayout(self.heatRow)
+        heatWrap.addLayout(self.heatRow)
+        self.heatHint = CaptionLabel("心情热力 · 近 180 天")
+        self.heatHint.setToolTip("一格一天；颜色=当天心情/有无随记，悬停看当天详情")
+        heatWrap.addWidget(self.heatHint)
+        heatWrap.addStretch(1)
+        lay.addLayout(heatWrap)
 
         # 轻捕获：零决策输入区（无标题无模板，写完即存）
         lay.addSpacing(16)
@@ -375,6 +382,11 @@ class NotesPage(QWidget):
             return
         dim_gray = tokens.C(tokens.STROKE)
         gap = tokens.C("bg_page")  # R124：1px 背景色缝分离相邻色块（间距守卫合规）
+        days_with = sum(1 for _, cnt, _ in data if cnt)
+        mood_days = sum(1 for _, _, mood in data if mood)
+        self.heatHint.setText(
+            f"近 {len(data)} 天 · 有记 {days_with} 天"
+            + (f" · 带心情 {mood_days} 天" if mood_days else ""))
         for cell, (d, cnt, mood) in zip(self._heat_cells, data):
             if cnt and mood:
                 color = MOOD_COLOR.get(mood, tokens.C(tokens.SUCCESS))
@@ -405,9 +417,13 @@ class NotesPage(QWidget):
         try:
             notes = brain.list_notes(root, limit=200)
         except Exception as e:
-            # R143：读失败时列表给错误项而非静默空白
-            self.noteList.clear()
-            self.noteList.addItem(f"（随记读取失败：{type(e).__name__}: {str(e)[:80]}）")
+            # 读失败时给页面级错误态而非静默空白（原引用不存在的 noteList，异常路径自身会崩）
+            clear_layout(self.tlBox)
+            self.tlBox.addWidget(empty_state(
+                "INFO", "随记读取失败",
+                f"{type(e).__name__}: {str(e)[:120]}——先做一次数据体检（设置页/命令行 doctor），"
+                "或重开软件后重试"))
+            self.statLabel.setText("—")
             return
         try:
             self.statLabel.setText(f"累计 {brain.notes_count(root)} 条 · "

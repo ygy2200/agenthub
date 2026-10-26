@@ -2533,7 +2533,8 @@ FILE_LEASE_TTL_FLOOR = 1
 FILE_LEASE_TTL_CAP = 480
 CRYSTAL_PREFIX = "结晶 #"  # M2：完成链结晶记录的标题前缀（幂等识别用）
 # M10：前沿队列四段中文名（hub_next / GUI 工作台 / 心跳开工推送同源，防文案漂移）
-TASK_GROUP_CN = {"ready": "可认领", "doing": "进行中", "takeover": "可接管", "waiting": "等待依赖"}
+TASK_GROUP_CN = {"ready": "可认领", "doing": "进行中", "takeover": "可接管",
+                 "waiting": "等待依赖", "backoff": "退避中", "deferred": "已延后"}
 
 # R36：agent 管控状态。draining 是「收尾」——不接新活，在办任务照常续；
 # paused/offline 连认领也拦。控制状态由人决定，心跳不覆盖。

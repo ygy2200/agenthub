@@ -22,7 +22,20 @@ class HubPage(QWidget):
         super().__init__(parent)
         self.win = win
         self.agents: list = []
-        lay = QVBoxLayout(self)
+        # R195：整页可滚动（与大脑页同款）。本页信息密度最高——页头 + 卡片区 + 资产视图
+        # + 编辑条 + 预览，920×600 + 雅黑字体下各块最小高度合计 565 > 页高 551，QVBoxLayout
+        # 压不下去时不是裁字而是「把后面的块叠到前面的块上」（实测资产视图标题压进卡片区）。
+        # 内容装进 ScrollArea 后，高度不够就整页滚，永不重叠。
+        self.content = QWidget()
+        self.pageScroll = ScrollArea()
+        self.pageScroll.setWidgetResizable(True)
+        self.pageScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.pageScroll.setWidget(self.content)
+        self.pageScroll.enableTransparentBackground()
+        _outer = QVBoxLayout(self)
+        _outer.setContentsMargins(0, 0, 0, 0)
+        _outer.addWidget(self.pageScroll)
+        lay = QVBoxLayout(self.content)
         set_page_margins(lay)
 
         top = QHBoxLayout()
@@ -46,9 +59,19 @@ class HubPage(QWidget):
 
         # FlowLayout（P2/P4）：窄窗自动换行——固定列宽 + QHBoxLayout 在 920px 窗口下
         # 会把 6 个 agent 列挤出可视区（布局压测实测"横向溢出"）。
-        self.cardsRow = FlowLayout()
+        # R193：卡片区放进限高滚动容器——920x600 下 7 张卡需 3 行 210px，父布局只给
+        # 161px，FlowLayout 的第三行会画出布局矩形、压住下面的资产视图（真实截图）。
+        self.cardsHost = QWidget()
+        self.cardsRow = FlowLayout(self.cardsHost)
+        self.cardsRow.setContentsMargins(0, 0, 0, 0)
+        self.cardsScroll = ScrollArea()
+        self.cardsScroll.setWidget(self.cardsHost)
+        self.cardsScroll.setWidgetResizable(True)
+        self.cardsScroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.cardsScroll.enableTransparentBackground()
+        self.cardsScroll.setMinimumHeight(74)
         lay.addWidget(section_head("agent 阵容", "PEOPLE"))
-        lay.addLayout(self.cardsRow)
+        lay.addWidget(self.cardsScroll)
 
         viewRow = QHBoxLayout()
         # 区块标题走 section_head（2026-10-15 第三轮补图标）。注意必须**持有返回的
@@ -208,7 +231,9 @@ class HubPage(QWidget):
                 f"新鲜度 {fr['state']}（{age if age is not None else '?'} 天，依据 {fr.get('basis') or '-'}）"
                 + (f"\n最后复核 {m.get('confirmed')}" if m.get("confirmed") else "\n从未显式复核"))
         if not self._mem_rows:
-            self.memList.addItem("（大脑记忆为空——用下方「新建记忆」或让 agent 调 hub_memory_write）")
+            # R197：列表行只说人话，工具名进 tooltip
+            self.memList.addItem("（大脑记忆为空——用下方「新建记忆」，或让 agent 记一条）")
+            self.memList.item(0).setToolTip("对应工具：hub_memory_write")
             self.memList.item(0).setData(Qt.UserRole, "")
         elif not self.memList.count():
             self.memList.addItem("（无匹配记忆）")
@@ -227,7 +252,8 @@ class HubPage(QWidget):
             self.envList.item(self.envList.count() - 1).setData(
                 Qt.UserRole, f"env:{r['category']}|{r['key']}")
         if not rows:
-            self.envList.addItem("（环境档案为空——点上方「采集本机配置」自动建档，或让 agent 调 hub_env_set）")
+            self.envList.addItem("（环境档案为空——点上方「采集本机配置」自动建档，或让 agent 报一次环境）")
+            self.envList.item(0).setToolTip("对应工具：hub_env_set")
             self.envList.item(0).setData(Qt.UserRole, "")
 
     def scan_env(self):
@@ -277,8 +303,12 @@ class HubPage(QWidget):
             home.setToolTip(a.home or "未检测到（可手动添加目录）")
             home.setMaximumWidth(AGENT_CARD_W - tokens.SPACE_M)
             col.addWidget(home)
-            col.addWidget(CaptionLabel(f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
-                                       f"记忆 {len(a.memories)} · 配置 {len(a.configs)}"))
+            stats = (f"技能 {len(a.skills)} · MCP {len(a.mcps)} · "
+                     f"记忆 {len(a.memories)} · 配置 {len(a.configs)}")
+            statsLb = ElidedLabel(stats)
+            statsLb.setToolTip(stats)
+            statsLb.setMaximumWidth(AGENT_CARD_W)
+            col.addWidget(statsLb)
             reg = getattr(self, "_reg", {}).get(a.name.lower())
             if reg:
                 # R129：ISO 直出在定宽卡片里被裁（实测 Qoder「2026-10-24T」戛然而止）——
@@ -288,13 +318,90 @@ class HubPage(QWidget):
                     d, _, hm = ls.partition("T")
                     ls = (d[5:] + " " + hm[:5]) if d[:4].isdigit() and d[:4] == str(
                         __import__("datetime").date.today().year) else d + " " + hm[:5]
-                col.addWidget(CaptionLabel(
-                    f"{'● 在线' if reg['online'] else '○ 离线'} · 记录 {reg['records']} 条 · "
-                    f"最近活跃 {ls or '—'}"))
+                # R169：「最近活跃」四个字让 3 位记录数的状态行宽 243px > 卡片 240px，
+                # 末尾时间被硬裁（真实截图 ZCode 只到「18:2」）。可见文案缩为「最近」，
+                # 完整语义进 tooltip；ElidedLabel 兜底超长计数，保证永远不出硬裁。
+                short = (f"{'● 在线' if reg['online'] else '○ 离线'} · "
+                         f"记录 {reg['records']} 条 · 最近 {ls or '—'}")
+                status = ElidedLabel(short)
+                status.setToolTip(
+                    f"{'在线' if reg['online'] else '离线'} · 记录 {reg['records']} 条 · "
+                    f"最近活跃 {ls or '—'}")
+                status.setMaximumWidth(AGENT_CARD_W)
+                col.addWidget(status)
+            else:
+                # 探测到目录但注册表没有心跳：显式标注，避免卡片少一行看起来像渲染缺失
+                miss = ElidedLabel("○ 未接入 · 无心跳记录")
+                miss.setToolTip("已探测到目录，但大脑注册表没有该 agent 的心跳记录；"
+                                "agent 调用一次 hub_heartbeat 后即可显示在线状态与最近活跃")
+                miss.setMaximumWidth(AGENT_CARD_W)
+                col.addWidget(miss)
             wrap = QWidget()
             wrap.setLayout(col)
             wrap.setFixedWidth(AGENT_CARD_W)   # 卡片定宽：文字不再被压没
             self.cardsRow.addWidget(wrap)
+        # 此刻 viewport 宽度/卡片布局尚未完成，等一轮事件循环再定高（否则恒取最小值 74）
+        QTimer.singleShot(0, self._fit_cards_height)
+
+    def showEvent(self, e):
+        super().showEvent(e)
+        QTimer.singleShot(0, self._fit_cards_height)
+
+    def resizeEvent(self, e):
+        super().resizeEvent(e)
+        self._fit_cards_height()
+
+    def _fit_cards_height(self):
+        """卡片区最多两**整行**高，多出的行在区内滚动。
+
+        R193 的两行上限是绝对像素（2*row_h+12）；R195 复盘发现两个新问题：
+          ①152px 落在两行之间，第二行卡片被拦腰砍断，看起来像渲染坏了——上限必须
+            对齐整行（行高随字体变：默认 62、微软雅黑 79，间距走 tokens.gap）；
+          ②「上限 170 > 页面能给的余量」时 Qt 压不下去，只能把资产视图叠上来——
+            根因是页面没有滚动容器，已在 __init__ 里整页滚动化（与大脑页同款）。
+        现在预算只决定「矮窗时退到一行」，避免卡片区霸屏；页面高度不够时整体滚动。
+        """
+        if not hasattr(self, "cardsScroll"):
+            return
+        vw = self.cardsScroll.viewport().width()
+        if vw <= 0:
+            return
+        row_h = 0
+        for i in range(self.cardsRow.count()):
+            w = self.cardsRow.itemAt(i).widget()
+            if w is not None:
+                row_h = max(row_h, w.sizeHint().height())
+        row_h = row_h or 62
+        gap = getattr(self.cardsRow, "_v", 12)
+        need = self.cardsRow.heightForWidth(vw)
+        rows_total = max(1, int(round((need + gap) / float(row_h + gap))))
+        rows = min(rows_total, 2)
+        if rows > 1:
+            two = 2 * row_h + gap
+            budget = self._cards_budget()
+            if budget > 0 and two > budget:
+                rows = 1
+        self.cardsScroll.setFixedHeight(rows * row_h + (rows - 1) * gap)
+
+    def _cards_budget(self):
+        """本页扣掉其他所有块后，卡片区可用的纵向像素（0 = 还量不出来）。"""
+        host = getattr(self, "content", self)
+        lay = host.layout()
+        # 预算必须对着**视口**算，不能对着内容自己的高度算——卡片区高度是内容高度的一部分，
+        # 拿内容高度当基准会形成「卡片越高→内容越高→预算越大→卡片更高」的自激循环（实测
+        # 600 高下卡片区顶到 170、内容 816，整页白滚 265px）。
+        avail_h = self.pageScroll.viewport().height() if hasattr(self, "pageScroll") else host.height()
+        if lay is None or avail_h <= 0:
+            return 0
+        m = lay.contentsMargins()
+        used = m.top() + m.bottom()
+        for i in range(lay.count()):
+            it = lay.itemAt(i)
+            if it.widget() is self.cardsScroll:
+                continue
+            used += it.minimumSize().height()
+        used += lay.spacing() * max(0, lay.count() - 1)
+        return avail_h - used
 
     def fill_skills(self):
         kw = self.skillFilter.text().strip().lower()
@@ -346,7 +453,8 @@ class HubPage(QWidget):
         if isinstance(path, str) and path.startswith("env:"):
             self.editBtn.setEnabled(False)
             self.histBtn.setEnabled(False)
-            self.editBtn.setText("环境配置项（agent 经 hub_env_set 更新）")
+            self.editBtn.setText("环境配置项（由 agent 上报更新）")
+            self.editBtn.setToolTip("环境档案由 agent 经 hub_env_set 写入，桌面端只读")
             cat, key = path[4:].split("|", 1)
             rows = brain.env_list(self.win.root, cat, key, 1)
             if rows:

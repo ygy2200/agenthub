@@ -1,22 +1,52 @@
 # -*- coding: utf-8 -*-
 """真实库走查：连真实 root 启动窗口逐页截图（只读，不种子不改库）。
-用法：python tools/real_walkthrough.py [root] [dark|light] [输出目录后缀]"""
+用法：python tools/real_walkthrough.py [root] [dark|light] [输出后缀] [--size 920x600] [--pages stats,notes]
+默认 1280×820 全页；--size 可指定最小窗口 920x600 复核首屏。"""
 import os
 import sys
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests" / "gui"))
 
-THEME = sys.argv[2] if len(sys.argv) > 2 else "dark"
-SUFFIX = sys.argv[3] if len(sys.argv) > 3 else ""
+def _split_args(argv: list) -> tuple:
+    """位置参数（root/主题/后缀）与 `--k v` / `--k=v` 选项分离；选项值不混进位置参数。"""
+    opts, pos, i = {}, [], 0
+    while i < len(argv):
+        a = argv[i]
+        if a.startswith("--"):
+            if "=" in a:
+                k, v = a.split("=", 1)
+                opts[k] = v
+            elif i + 1 < len(argv):
+                opts[a] = argv[i + 1]
+                i += 1
+            else:
+                opts[a] = ""
+        else:
+            pos.append(a)
+        i += 1
+    return pos, opts
+
+
+POS, OPTS = _split_args(sys.argv[1:])
+THEME = POS[1] if len(POS) > 1 else "dark"
+SUFFIX = POS[2] if len(POS) > 2 else ""
 OUT = ROOT / "output" / f"real-shots{SUFFIX}"
 
 
 def main():
     os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
-    real_root = sys.argv[1] if len(sys.argv) > 1 else r"D:gent资料\zcode项目记录"
+    real_root = POS[0] if POS else r"D:\agent资料\zcode项目记录"
+    size = OPTS.get("--size", "1280x820")
+    want = {s.strip() for s in OPTS.get("--pages", "").split(",") if s.strip()}
+    try:
+        win_w, win_h = (int(x) for x in size.lower().split("x"))
+    except ValueError:
+        print(f"错误：--size 需为 宽x高（收到 {size}）")
+        return 2
     from PySide6.QtWidgets import QApplication
     import actions
     import core
@@ -35,12 +65,14 @@ def main():
     core.get_root = lambda: real_root
     w = ui.AgentHubWindow()
     try:
-        w.resize(1280, 820)
+        w.resize(win_w, win_h)
         w.show()
         pump(app, lambda: getattr(w.project_page, "snap", None) is not None, 30)
         pump(app, lambda: bool(getattr(w.hub_page, "agents", None)), 8.0)
         OUT.mkdir(parents=True, exist_ok=True)
         for attr, title, *_ in actions.PAGES:
+            if want and attr not in want:
+                continue
             page = getattr(w, attr, None)
             if page is None:
                 continue
@@ -49,7 +81,7 @@ def main():
             pm = page.grab()
             if not pm.isNull():
                 pm.save(str(OUT / f"{attr}.png"))
-        print(f"[{THEME}] 已截图 -> {OUT}")
+        print(f"[{THEME}] {win_w}x{win_h} 已截图 -> {OUT}")
     finally:
         core.get_root = orig
         w.close()

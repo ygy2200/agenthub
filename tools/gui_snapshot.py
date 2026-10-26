@@ -32,6 +32,7 @@ import json
 import os
 import re
 import sys
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 from collections import Counter
 from pathlib import Path
 
@@ -69,7 +70,8 @@ _DYNAMIC = (
     (re.compile(r"记忆\s*\d+"), "记忆 <N>"),
     # 接入页状态行（R33 去部署化后）：真实反映 ready/stale/missing/no-python 四态，
     # 陈旧态还会列出当时漂移的文件名——整句都是运行态投影而非 UI 结构，整句打码。
-    (re.compile(r"^(?:⚠\s*)?(?:未找到可用的 python\.exe|MCP server|服务端就绪).*"),
+    # R170：页面用全角「！」开头，旧规则只认 ⚠ / 裸文本，导致发布前后状态一变就误报。
+    (re.compile(r"^(?:⚠|！)?\s*(?:未找到可用的 python\.exe|MCP server|服务端就绪).*"),
      "<DEPLOY_STATUS>"),
     # playbook/signal 的 agent 下拉选中项是**裸 agent 名**（R104）：注册表顺序虽已
     # 确定化（core.agent_known_names 排序），但增删 adapter 仍会改默认选中项——

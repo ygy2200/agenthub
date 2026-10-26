@@ -4,6 +4,84 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+
+
+class _CardGrid(QLayout):
+    """指标卡等宽网格：4/190px 宽、同列等宽，按可用宽度 4→2→1 列。
+
+    FlowLayout 只按卡片 sizeHint 决定换行，920 视口下会排成 3+1、右侧留空一截；
+    这里按行等分可用宽度（列宽一致、右缘对齐），并保持 minimumSize 只有单卡宽，
+    不把 4 列的最小宽度强加给整页（否则窄窗会出现横向滚动）。
+    """
+
+    def __init__(self, parent=None, gap=None, min_w=190):
+        super().__init__(parent)
+        self._items: list = []
+        self._gap = tokens.gap(tokens.GAP_CARD) if gap is None else gap
+        self._min_w = min_w
+        self.setContentsMargins(0, 0, 0, 0)
+
+    def addItem(self, item):
+        self._items.append(item)
+
+    def count(self):
+        return len(self._items)
+
+    def itemAt(self, i):
+        return self._items[i] if 0 <= i < len(self._items) else None
+
+    def takeAt(self, i):
+        return self._items.pop(i) if 0 <= i < len(self._items) else None
+
+    def expandingDirections(self):
+        return Qt.Orientation(0)
+
+    def hasHeightForWidth(self):
+        return True
+
+    def heightForWidth(self, width):
+        return self._grid(QRect(0, 0, width, 0), True)
+
+    def setGeometry(self, rect):
+        super().setGeometry(rect)
+        self._grid(rect, False)
+
+    def sizeHint(self):
+        return self.minimumSize()
+
+    def minimumSize(self):
+        size = QSize()
+        for it in self._items:
+            size = size.expandedTo(it.minimumSize())
+        return size
+
+    def columns(self, width: int) -> int:
+        if width >= 4 * self._min_w + 3 * self._gap:
+            return 4
+        if width >= 2 * self._min_w + self._gap:
+            return 2
+        return 1
+
+    def _grid(self, rect, test_only: bool) -> int:
+        items = [it for it in self._items
+                 if it.widget() is not None and it.widget().isVisible()]
+        if not items:
+            return 0
+        cols = self.columns(rect.width())
+        cw = max(self._min_w, (rect.width() - self._gap * (cols - 1)) // cols)
+        y, row_h = rect.y(), 0
+        for i, it in enumerate(items):
+            r, c = divmod(i, cols)
+            if c == 0 and r:
+                y += row_h + self._gap
+                row_h = 0
+            h = it.sizeHint().height()
+            if not test_only:
+                it.setGeometry(QRect(rect.x() + c * (cw + self._gap), y, cw, h))
+            row_h = max(row_h, h)
+        return y + row_h - rect.y()
+
+
 class OverviewPage(QWidget):
     """总览首页：打开软件第一眼看到全局——今天谁在干活、有多少待处理、agent 阵容。"""
 
@@ -56,15 +134,16 @@ class OverviewPage(QWidget):
         self.noteInput.textChanged.connect(
             lambda: self.noteBtn.setEnabled(bool(self.noteInput.text().strip())))
 
-        # 数字卡区：FlowLayout —— 窄窗自动 4→2→1 列换行（原 QHBoxLayout 只会等比压扁）
-        row = FlowLayout()
+        # 数字卡区：等宽网格 —— 920 视口 4 卡同排，更窄时 2/1 列（FlowLayout 会排成 3+1）
         self.cardProj = NumberCard("项目总数", icon_name="FOLDER")
         self.cardRec = NumberCard("工作记录条数", icon_name="HISTORY")
         self.cardToday = NumberCard("今日动态", icon_name="CALENDAR")
         self.cardTodo = NumberCard("待处理（Inbox+对账）", icon_name="FLAG")
+        self.cardGrid = _CardGrid()
         for c in (self.cardProj, self.cardRec, self.cardToday, self.cardTodo):
-            row.addWidget(c)
-        lay.addLayout(row)
+            c.setMinimumWidth(190)  # 823px 内容宽下四卡各约 196px（实测 195px 标题仍完整）
+            self.cardGrid.addWidget(c)
+        lay.addLayout(self.cardGrid)
         # 数字卡点击直达对应页（CardWidget 自带 clicked）
         self.cardProj.clicked.connect(lambda: self.win.switchTo(self.win.project_page))
         self.cardRec.clicked.connect(lambda: self.win.switchTo(self.win.timeline_page))
@@ -96,13 +175,12 @@ class OverviewPage(QWidget):
         rightCol.addLayout(self.sessionBox)
         rightCol.addSpacing(16)
         rightCol.addWidget(section_head("快捷入口", "MENU"))
-        quickRow = QHBoxLayout()
+        quickRow = FlowLayout()  # 窄窗自动换行：4 个按钮并排会把右栏最小宽度顶到 400+
         for text, target in (("打开时间线", "timeline"), ("打开 Agent 中心", "hub"),
                              ("检查对账问题", "audit"), ("搜索全部记录", "search")):
             b = PushButton(text)
             b.clicked.connect(lambda _, t=target: self.goto(t))
             quickRow.addWidget(b)
-        quickRow.addStretch(1)
         rightCol.addLayout(quickRow)
         rightCol.addStretch(1)
         cols.addLayout(rightCol, 2)
@@ -225,9 +303,11 @@ class OverviewPage(QWidget):
                     main += f"（{seen}）"
             else:
                 main = f"{'●' if a.detected else '○'} {a.name}（未接入大脑）"
-            line = CaptionLabel(main)
+            # 920×600 实测：不省略的整行会顶高右栏最小宽度（942px > 视口 871），
+            # 全页横向溢出、最近动态标题被挤到 0 宽。截断交给布局、全文进 tooltip。
+            line = ElidedLabel(main)
             line.setToolTip(" / ".join(b for b in tip_bits if b))
-            self.agentBox.addWidget(line)
+            self.agentBox.addWidget(flex_label(line))
 
     def set_sessions(self, sessions):
         while self.sessionBox.count():
@@ -236,7 +316,7 @@ class OverviewPage(QWidget):
                 it.widget().deleteLater()
         if not sessions:
             self.sessionBox.addWidget(empty_state(
-                "PEOPLE", "近 24 小时暂无会话", "agent 开工调 hub_heartbeat 后显示"))
+                "PEOPLE", "近 24 小时暂无会话", "agent 开工报到后显示"))
             return
         for s in sessions[:6]:
             when = rel_time(s.get("ts", ""))

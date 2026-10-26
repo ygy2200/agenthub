@@ -15,7 +15,9 @@ import uikit  # noqa: F401  （运行期重绑名动态取）
 import brain
 
 
-_GROUP_ORDER = ("ready", "doing", "takeover", "waiting")  # 段序；中文名用 brain.TASK_GROUP_CN（同源）
+# 段序；中文名用 brain.TASK_GROUP_CN（同源）。
+# R176：原只渲染前四段，退避/延后中的任务在 GUI 里凭空消失；六段都要可见。
+_GROUP_ORDER = ("ready", "doing", "takeover", "waiting", "backoff", "deferred")
 
 
 class TodayPage(QWidget):
@@ -28,13 +30,15 @@ class TodayPage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head(
-            "工作台", "今天该干什么——可认领的任务按优先级排队，进行中 / 可接管 / 等待依赖一屏看全；"
+            "工作台", "今天该干什么——可认领按优先级排队，进行中 / 可接管 / 等待依赖 / 退避 / 延后分段列清；"
                       "标记完成走管理通道（自动归档为成果记录）"))
 
         top = QHBoxLayout()
         self.sumLabel = CaptionLabel("")
-        top.addWidget(self.sumLabel)
-        top.addStretch(1)
+        self.sumLabel.setWordWrap(True)
+        # 占满整行：空标签构造时的 sizeHint 很小，若只按 Preferred 加进 HBox，
+        # 六段摘要会被截成前两段（R176 真实窗口实测）。
+        top.addWidget(self.sumLabel, 1)
         refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新")
         refreshBtn.clicked.connect(self.reload)
         top.addWidget(refreshBtn)
@@ -46,6 +50,8 @@ class TodayPage(QWidget):
 
         self.listw = ListWidget()
         self.listw.setMinimumHeight(320)
+        self.listw.setTextElideMode(Qt.ElideRight)
+        self.listw.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         lay.addWidget(section_head("待办清单", "DATE_TIME"))
         lay.addWidget(self.listw, 1)
 
@@ -53,8 +59,13 @@ class TodayPage(QWidget):
         self.doneBtn = PushButton("标记完成")
         self.doneBtn.setToolTip("把选中的「进行中」任务标记完成（管理通道，空 agent）——完成自动结晶")
         self.doneBtn.clicked.connect(self.mark_done)
+        self.listw.currentItemChanged.connect(lambda *_: self._sync_actions())
         row.addWidget(self.doneBtn)
-        row.addWidget(CaptionLabel("认领 / 新建 / 改优先级：hub_next · hub_claim · hub_task_add（MCP 侧）"))
+        # R197：界面上只留人话，精确工具名进 tooltip（R171 同款口径）——「hub_next ·
+        # hub_claim · hub_task_add」对用户是天书，对 agent 才是命令。
+        cap = CaptionLabel("认领、新建、改优先级请让 agent 做（桌面端不代理 agent 身份）")
+        cap.setToolTip("对应工具：hub_next（看下一步）· hub_claim（认领）· hub_task_add（新建）")
+        row.addWidget(cap)
         row.addStretch(1)
         lay.addLayout(row)
 
@@ -64,8 +75,18 @@ class TodayPage(QWidget):
         self._fill()
         list_empty_guard(self.listw, self.layout(),
                          "前沿队列为空",
-                         "没有待办/在办任务——用 hub_task_add 新建，"
-                         "或从记录里的「待办」句式让 hub_list_todos 提取")
+                         "还没有任务——让 agent 说一句「新建任务 …」即可建；"
+                         "它也会从工作记录的「待办」句子里自动提取")
+        self._sync_actions()
+
+    def _sync_actions(self):
+        """R198：只有选中「进行中」的任务才让「标记完成」可点。
+
+        原来按钮恒亮，空队列下点它只弹一句「先选中一个任务」——按钮亮着却什么也做不了，
+        用户会以为标记完成坏了。与 R166/R192/R193 同一口径：动作跟随选中态。
+        """
+        t = self._selected_task()
+        self.doneBtn.setEnabled(bool(t) and t.get("status") == "in_progress")
 
     def _fill(self):
         self.listw.clear()
@@ -93,25 +114,76 @@ class TodayPage(QWidget):
         except Exception as e:  # noqa: BLE001  日结失败不该拖垮工作台
             self.digestLine.setText(f"近 24h 日结读取失败：{e}")
         c = nxt["counts"]
-        self.sumLabel.setText(" · ".join(f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER))
+        # 主四段恒显示（0 也显示，便于确认「真的没有」）；退避/延后只在有量时追加，
+        # 避免常态下摘要在窄窗换行。R176 前这两组完全不出现在 GUI。
+        parts = [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[:4]]
+        parts += [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[4:] if c.get(k)]
+        self.sumLabel.setText(" · ".join(parts))
         for key in _GROUP_ORDER:
-            items = nxt[key]
+            items = nxt.get(key) or []
             if not items:
                 continue
             head = QListWidgetItem(f"── {brain.TASK_GROUP_CN[key]}（{len(items)}）")
             head.setFlags(Qt.ItemFlag.NoItemFlags)  # 分组标题不可选
+            f = head.font()
+            f.setBold(True)
+            head.setFont(f)
             self.listw.addItem(head)
             for t in items:
-                proj = f"{t['project']}｜" if t["project"] else ""
-                who = f"  @{t['owner']}" if t["owner"] else ""
-                due = f"  截止:{t['due']}" if t.get("due") else ""
-                extra = ""
+                title = (t.get("title") or "").strip() or "(无标题)"
+                proj = f"{t['project']}｜" if t.get("project") else ""
+                meta = []
+                if t.get("owner"):
+                    meta.append(f"@{t['owner']}")
+                if t.get("due"):
+                    meta.append(f"截止:{t['due']}")
                 if key == "waiting" and t.get("_wait"):
-                    extra = "  等待:" + ",".join(f"#{w}" for w in t["_wait"])
+                    meta.append("等待:" + ",".join(f"#{w}" for w in self._wait_ids(t["_wait"])))
+                if key == "takeover" and t.get("_takeover"):
+                    meta.append(f"原因:{t['_takeover']}")
+                if key == "backoff":
+                    if t.get("_retry_wait_min"):
+                        meta.append(f"{t['_retry_wait_min']} 分钟后可再试")
+                    if t.get("attempts"):
+                        meta.append(f"第 {t['attempts']} 次失败")
+                if key == "deferred" and t.get("_defer_wait_h"):
+                    meta.append(f"{t['_defer_wait_h']:g} 小时后到点")
                 it = QListWidgetItem(
-                    f"  #{t['id']} [P{t['_priority']}] {proj}{t['title'][:60]}{who}{due}{extra}")
+                    f"  #{t['id']} [P{t['_priority']}] {proj}{title}"
+                    + (("  " + "  ".join(meta)) if meta else ""))
+                it.setToolTip(self._task_tip(t, key, title))
                 self._item2task[id(it)] = t
                 self.listw.addItem(it)
+
+    @staticmethod
+    def _wait_ids(wait) -> list:
+        """依赖等待可能是 id 列表，也可能是任务行 dict 列表（brain 两种历史形态）。"""
+        return [str(w.get("id") if isinstance(w, dict) else w) for w in (wait or [])]
+
+    @staticmethod
+    def _task_tip(t: dict, key: str, title: str) -> str:
+        """行内被省略/只放摘要的信息，在 tooltip 里给全：失败原因、退避到点、依赖等。"""
+        lines = [f"#{t['id']} [P{t['_priority']}] {title}",
+                 f"状态：{brain.TASK_CN.get(t.get('status', ''), t.get('status', ''))}"
+                 f"（{brain.TASK_GROUP_CN.get(key, key)}）"]
+        if t.get("project"):
+            lines.append(f"项目：{t['project']}")
+        if t.get("owner"):
+            lines.append(f"负责人：{t['owner']}")
+        if t.get("due"):
+            lines.append(f"截止：{t['due']}")
+        if key == "waiting" and t.get("_wait"):
+            lines.append("等待依赖：" + "、".join(f"#{w}" for w in TodayPage._wait_ids(t["_wait"])))
+        if key == "takeover" and t.get("_takeover"):
+            lines.append(f"可接管原因：{t['_takeover']}")
+        if key == "backoff":
+            lines.append(f"退避剩余：{t.get('_retry_wait_min') or 0} 分钟"
+                         + (f"（到 {t['next_retry_at']}）" if t.get("next_retry_at") else ""))
+        if key == "deferred" and t.get("defer_until"):
+            lines.append(f"延后到：{t['defer_until']}")
+        if t.get("last_error"):
+            lines.append(f"上次失败：{t['last_error']}")
+        return "\n".join(lines)
 
     def _selected_task(self):
         it = self.listw.currentItem()

@@ -161,9 +161,14 @@ def run_patrol(root: str, checks=None) -> dict:
         if r.get("ok"):
             passed.append(name)
         else:
-            issues.append({"name": name, "summary": r.get("summary") or "未通过",
-                           "fix": CHECK_FIXES.get(name, "看 hub_ops_run 的 detail 逐项处理"),
-                           "detail": (r.get("detail") or [])[:5]})
+            issue = {"name": name, "summary": r.get("summary") or "未通过",
+                     "fix": CHECK_FIXES.get(name, "看 hub_ops_run 的 detail 逐项处理"),
+                     "detail": (r.get("detail") or [])[:5]}
+            # R178：检查项若能按失败类别给出更短口径，就随问题一起带上；
+            # doctor 默认显示它，--full 才回退到上面的完整口径。
+            if r.get("fix"):
+                issue["fix_brief"] = r["fix"]
+            issues.append(issue)
             # R59：坏库上继续跑只会产出一屏次生失败（每项都「查询失败」），
             # 把后续项标成跳过并说明原因，让根因保持在第一条。
             if name == "db_integrity" and r.get("fatal"):
@@ -1163,8 +1168,7 @@ def _ghost_memory(root: str) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"检测失败（{type(e).__name__}）：{e}", "detail": []}
     auto_n = brain.auto_record_count(root)
-    auto_note = (f"；另有 {auto_n} 条自动捕获记录按事件流跳过（会话锚/流程日志重复属正常节奏）"
-                 if auto_n else "")
+    auto_note = f"；另有 {auto_n} 条自动捕获记录跳过" if auto_n else ""
     total = len(mem_pairs) + len(rec_pairs)
     if not total:
         return {"ok": True,
@@ -1188,11 +1192,13 @@ def _ghost_memory(root: str) -> dict:
         detail.append(line + _suggest_line(s))
     if len(detail) < total:
         detail.append(f"…（还有 {total - len(detail)} 组，调 limit 或直接查库看全）")
-    tail = f"；其中 {low_conf} 组的建议仅供参考（新版并不更可信，请人工看一眼）" if low_conf else ""
+    if auto_n:
+        detail.append(f"…另有 {auto_n} 条自动捕获记录按事件流跳过"
+                      "（会话锚/流程日志重复属正常节奏）")
+    tail = f"；{low_conf} 组建议仅供参考" if low_conf else ""
     return {"ok": False,
             "summary": f"{total} 组疑似幽灵（记忆 {len(mem_pairs)} + 记录 {len(rec_pairs)}，"
-                       "多版本共存未裁决，摆出来供判断）"
-                       f"{tail}{auto_note}；每组已附谁退谁留的确定性建议，裁决仍由人做",
+                       f"待人工裁决）{tail}{auto_note}",
             "detail": detail[:8]}
 
 
@@ -2280,15 +2286,18 @@ def _usage_health(root: str) -> dict:
         return {"ok": False, "summary": f"用量查询失败：{type(e).__name__}: {str(e)[:80]}",
                 "detail": []}
     issues, detail = [], []
+    hour_bad, loop_bad, idle = [], [], []
     for r in hour_rows:
         if int(r["n"]) > hourly_alarm:
             who = r["agent"] or "(空归属)"
             issues.append(who)
+            hour_bad.append(who)
             detail.append(f"{who}: ⚠ 近 1h 调用 {r['n']} 次（>{hourly_alarm}，失控嫌疑——"
                           "核对是否在循环重试；速率限制在 2000 次/60s 兜底）")
     for r in loop_rows:
         who = r["agent"] or "(空归属)"
         issues.append(who)
+        loop_bad.append(who)
         detail.append(f"{who}: ⚠ 工具 {r['tool']} 10 分钟 {r['n']} 次（>{loop_alarm}，"
                       "循环调用嫌疑——先 hub_usage_timeline(tool=...) 看是否同一参数反复打）")
     if has_history:
@@ -2309,8 +2318,26 @@ def _usage_health(root: str) -> dict:
     elif admin_blank:
         detail.append(f"信息：管理面不署名 {admin_blank} 次（设计内，非缺口）")
     if issues:
-        summary = f"用量异常 {len(set(issues))} 家（失控/循环/闲置）"
-        return {"ok": False, "summary": summary, "detail": detail[:12]}
+        cats = []
+        if hour_bad:
+            cats.append(f"失控 {len(hour_bad)}")
+        if loop_bad:
+            cats.append(f"循环 {len(loop_bad)}")
+        if idle:
+            cats.append(f"接入闲置 {len(idle)}")
+        fix_parts = []
+        if hour_bad:
+            fix_parts.append("失控：hub_usage_timeline(agent=...) 核对是否循环重试，"
+                             "必要时收紧 AGENTHUB_RATE_*")
+        if loop_bad:
+            fix_parts.append("循环：hub_usage_timeline(tool=...) 看是否同一参数反复打，"
+                             "修触发方的 retry 上限")
+        if idle:
+            fix_parts.append("接入闲置：不需要就下线接入；还需要就让该会话跑一次真实调用")
+        return {"ok": False,
+                "summary": f"用量异常 {len(set(issues))} 个 agent（{' / '.join(cats)}）",
+                "fix": "；".join(fix_parts),
+                "detail": detail[:12]}
     return {"ok": True, "summary": "用量正常（无失控/循环/闲置信号）", "detail": detail[:8]}
 
 
@@ -2536,6 +2563,32 @@ def _stalled(root: str) -> dict:
     return {"ok": True, "summary": "无停滞项目（活跃项目均有近期活动）", "detail": []}
 
 
+TASK_PROBLEM_LABELS = (
+    ("stale", "过期租约"), ("unleased", "租约缺失"), ("ownerless", "无主"),
+    ("idle", "持有者失联"), ("paused_owner", "持有者被管控"), ("stalled", "进展停滞"),
+    ("starving", "待办饥饿"), ("evidence", "交付物证据不全"), ("drift", "完成声明未关单"),
+    ("dead", "死信"), ("unregistered", "持有者未登记"), ("dangling", "前置缺失"),
+    ("cycles", "依赖成环"), ("residual", "残留阻塞"), ("overdue", "逾期"),
+)
+TASK_FIX_ACTIONS = {
+    "stale": "过期租约：hub_claim 接管，不再做则改派/释放",
+    "unleased": "租约缺失：hub_task_update 补齐租约，或 hub_claim 接管",
+    "ownerless": "无主：hub_claim 认领，或 hub_task_update 改派",
+    "idle": "持有者失联：确认后 hub_claim 接管，不做则改派/释放",
+    "paused_owner": "持有者被管控：决定等恢复 / 改派 / 取消",
+    "stalled": "进展停滞：看检查点与最后进展，改派或释放",
+    "starving": "待办饥饿：hub_next 认领，或改优先级/关单",
+    "evidence": "交付物证据不全：补交付，或用 hub_task_update(deliverables=...) 修正",
+    "drift": "完成声明未关单：核对后 hub_task_update(status=\"done\") 关单",
+    "dead": "死信：看 last_error 后 hub_task_retry 复活，或 hub_task_update(status=\"cancelled\") 放弃",
+    "unregistered": "持有者未登记：先 hub_agent 登记，或改派",
+    "dangling": "前置缺失：补前置任务或修正 depends_on",
+    "cycles": "依赖成环：改 depends_on 打破循环",
+    "residual": "残留阻塞：清理阻塞标记",
+    "overdue": "逾期：重排截止日",
+}
+
+
 def _tasks_health(root: str) -> dict:
     """R5 任务治理巡检（2026-10-21）：在办任务的租约/归属/持有者活跃/截止日。
     「认领了没人续、人走了任务还挂着」会让谁在干什么失真；只报不动手——
@@ -2695,22 +2748,16 @@ def _tasks_health(root: str) -> dict:
     detail.extend(ev_bad[:3])
     detail.extend(drift_bad[:3])
     detail.extend(dead_bad[:3])
+    total = len(problems) + len(ev_bad) + len(drift_bad) + len(dead_bad)
+    # R178：只列非零项，别把 15 个计数（含 12 个 0）铺成一行；修复口径也只给失败类别。
+    nonzero = [(key, label, counts[key]) for key, label in TASK_PROBLEM_LABELS
+               if counts.get(key)]
+    summary = f"任务治理：{total} 项需关注"
+    if nonzero:
+        summary += "（" + " / ".join(f"{label} {n}" for _, label, n in nonzero) + "）"
     return {"ok": False,
-            "summary": (f"任务治理：{len(problems) + len(ev_bad) + len(drift_bad) + len(dead_bad)} 项需关注（过期租约 {counts['stale']} / "
-                        f"租约缺失 {counts['unleased']} / "
-                        f"无主 {counts['ownerless']} / 持有者失联 {counts['idle']} / 持有者被管控 {counts['paused_owner']} / "
-                        f"进展停滞 {counts['stalled']} / "
-                        f"待办饥饿 {counts['starving']} / "
-                        f"交付物证据不全 {counts['evidence']} / "
-                        f"完成声明未关单 {counts['drift']} / "
-                        f"死信 {counts['dead']} / "
-                        f"未登记 {counts['unregistered']} / "
-                        f"前置缺失 {counts['dangling']} / 依赖成环 {counts['cycles']} / "
-                        f"残留阻塞 {counts['residual']} / "
-                        f"逾期 {counts['overdue']}）——接管 hub_claim，改派 hub_task_update，"
-                        "长期没人做的待办用 hub_next 认领或关单；交付物证据不全：补交付或用 hub_task_update(deliverables=...) 修正声明；"
-                        "完成声明未关单：核对后 hub_task_update(status=\"done\") 关单；"
-                        "死信：查 last_error 后 hub_task_retry 复活或 hub_task_update(status=\"cancelled\") 放弃"),
+            "summary": summary,
+            "fix": "；".join(TASK_FIX_ACTIONS[key] for key, _, _ in nonzero),
             "detail": detail}
 
 
@@ -2749,23 +2796,27 @@ def _governance_health(root: str) -> dict:
     longest = max(wait_known, default=0.0)
     identity = int(sec.get("identity") or 0)
     role = int(sec.get("role") or 0)
-    problems, detail = [], []
+    problems, detail, fix_parts = [], [], []
     if aging:
         problems.append(f"待批过久 {len(aging)}")
+        fix_parts.append("待批过久：逐个 hub_task_approve（owner 不能自批，换他人/管理面）")
         for t in aging[:3]:
             detail.append(f"任务 #{t['id']}「{(t.get('title') or '')[:24]}」等批 "
                           f"{t['_approval_wait_h']:.1f}h（@{t.get('owner') or '无主'}）"
                           "— hub_task_approve")
     if stale:
         problems.append(f"陈旧交接 {len(stale)}")
+        fix_parts.append(f"陈旧交接：>{stale_days:g} 天判陈旧；有人接就 hub_handoff action=claim，不要了就 action=close")
         for h in stale[:3]:
             detail.append(f"交接 #{h['id']}「{(h.get('project') or '')[:20]}」已等 "
                           f"{h['_age_days']:g} 天 — hub_handoff claim/close")
     if identity:
         problems.append(f"未锁身份拦截 {identity}")
+        fix_parts.append("未锁身份：对应 agent 的 MCP 启动参数补 --agent，改配置后重启会话")
         detail.append("未锁身份拦截：agent 启动参数缺 --agent，归属不可信——核对接入配置后重启会话")
     if role >= GOVERNANCE_ROLE_DENY_ALERT:
         problems.append(f"角色越权 {role}")
+        fix_parts.append("角色越权：核对 hub_role，非职责范围就别再试，误拦则调角色配置")
     if identity or role >= GOVERNANCE_ROLE_DENY_ALERT:
         for slot in sec.get("by_tool", [])[:3]:
             detail.append(f"近 {sec['days']} 天 {slot['tool']} 被拦 {slot['count']} 次"
@@ -2779,9 +2830,8 @@ def _governance_health(root: str) -> dict:
             note += f"（角色越权 {role} 次，未达告警阈值 {GOVERNANCE_ROLE_DENY_ALERT}）"
         return {"ok": True, "summary": f"治理面健康：{note}", "detail": detail[:8]}
     return {"ok": False,
-            "summary": (f"治理面发现 {len(problems)} 类积压（{' / '.join(problems)}）——"
-                        f"审批 hub_task_approve；交接 hub_handoff claim/close（>{stale_days:g} 天判陈旧）；"
-                        "身份漂移核对各 agent 的 --agent 启动参数"),
+            "summary": f"治理面发现 {len(problems)} 类积压（{' / '.join(problems)}）",
+            "fix": "；".join(fix_parts),
             "detail": detail[:8]}
 
 

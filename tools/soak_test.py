@@ -3,6 +3,7 @@
 import ctypes
 import os
 import sys
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent

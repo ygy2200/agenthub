@@ -2,6 +2,7 @@
 """R145 性能走查：真实库下各页 reload 计时（>2s 即体验问题）。"""
 import os
 import sys
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 import time
 from pathlib import Path
 

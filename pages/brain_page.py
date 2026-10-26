@@ -40,6 +40,24 @@ class BrainPage(QWidget):
             row.addWidget(box)
         lay.addLayout(row)
 
+        # 分区跳转条（R187）：长页 920×600 首屏只到「使用分布」，任务/待办/事件/置顶
+        # 要盲滚才找得到；给一键锚点+各段条数，任务看板不必滚屏找。
+        self._body = body
+        self._section_heads: dict = {}
+        self._jump_links: dict = {}
+        self._jump_names = {"top": "唤起排行", "use": "使用分布", "task": "任务看板",
+                            "todo": "待办看板", "event": "事件流", "pin": "置顶记忆"}
+        jumpRow = FlowLayout()
+        jumpRow.addWidget(CaptionLabel("跳到"))
+        for key, text in self._jump_names.items():
+            lb = ClickBodyLabel(text)
+            lb.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};font-size:12px;")
+            lb.setToolTip(f"跳到「{text}」")
+            lb.clicked.connect(lambda k=key: self._jump_to(k))
+            jumpRow.addWidget(lb)
+            self._jump_links[key] = lb
+        lay.addLayout(jumpRow)
+
         # 随记已独立成页（NotesPage——人的模块容器），大脑页回归 agent 数据
 
         self.topBox = QVBoxLayout()
@@ -48,17 +66,35 @@ class BrainPage(QWidget):
         self.todoBox = QVBoxLayout()
         self.eventBox = QVBoxLayout()
         self.pinBox = QVBoxLayout()
+        self.topBox.setSpacing(tokens.SPACE_S)
+        self._top_expanded = False
+        # 唤起排行默认收 5 条：920×600 实测 10 条占约 250px，把「使用分布/任务看板」
+        # 整段推到首屏之外；前 5 条足以判断推送质量，需要时一键展开全部。
+        lay.addSpacing(16)
+        _topHead = QHBoxLayout()
+        _topHeadWidget = section_head("记忆唤起排行（开工推送反射弧记数）", "VIEW")
+        self._section_heads["top"] = _topHeadWidget
+        _topHead.addWidget(_topHeadWidget, 1)  # stretch 给标题：guard_overflow 把它设 Ignored 后，
+        # 无 stretch 的行只会按 0 宽分配（实测标题只剩 6 个字）；stretch 让它吃满剩余宽度。
+        self.topToggle = ClickBodyLabel("")
+        self.topToggle.setStyleSheet(f"color:{tokens.C(tokens.ACCENT)};font-size:12px;")
+        self.topToggle.setToolTip("默认显示前 5 条；展开后可看完整 top10")
+        self.topToggle.clicked.connect(self._toggle_top)
+        _topHead.addWidget(self.topToggle)
+        lay.addLayout(_topHead)
+        lay.addLayout(self.topBox)
         # 内容组不包卡：间距+小标题分组（Fluent Layout——分组靠 spacing，不需要每块加框）
-        for box, t, icn in ((self.topBox, "记忆唤起 top10（开工推送反射弧记数）", "VIEW"),
-                            (self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）", "PEOPLE"),
-                            (self.taskBox, "任务看板（agent 经公用大脑建任务、认领，进行中→阻塞→待办→完成）", "CERTIFICATE"),
-                            (self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）", "CHECKBOX"),
-                            (self.eventBox, "事件流（agent 经 hub_event_write 写进展，"
-                                            "hub_events 增量订阅）", "MESSAGE"),
-                            (self.pinBox, "置顶记忆（置顶位只放工作知识）", "PIN")):
+        for key, box, t, icn in (("use", self.useBox, "大脑使用分布（主动检索 + 推送接收，按 agent）", "PEOPLE"),
+                                 ("task", self.taskBox, "任务看板（agent 经公用大脑建任务、认领，进行中→阻塞→待办→完成）", "CERTIFICATE"),
+                                 ("todo", self.todoBox, "待办看板（记录里提取的欠账，处理后勾销闭环）", "CHECKBOX"),
+                                 ("event", self.eventBox, "事件流（agent 经 hub_event_write 写进展，"
+                                                          "hub_events 增量订阅）", "MESSAGE"),
+                                 ("pin", self.pinBox, "置顶记忆（置顶位只放工作知识）", "PIN")):
             box.setSpacing(tokens.SPACE_S)  # 行距：无间距时唤起/置顶行挤成一片
             lay.addSpacing(16)  # 组间距 > 行距，拉开层级
-            lay.addWidget(section_head(t, icn))
+            head = section_head(t, icn)
+            self._section_heads[key] = head
+            lay.addWidget(head)
             lay.addLayout(box)
         lay.addStretch(1)
         self.scroll.setWidget(body)
@@ -118,12 +154,16 @@ class BrainPage(QWidget):
         # 唤起排行（验收①：推送 top 应是工作知识而非元信息）
         clear(self.topBox)
         tops = h.get("top_pushed", [])
-        for m in tops:
+        shown = tops if self._top_expanded else tops[:5]
+        for m in shown:
             self.topBox.addWidget(self._mem_row(f"#{m['id']} ×{m['use_count']}", m))
+        self.topToggle.setVisible(len(tops) > 5)
+        self.topToggle.setText(
+            "收起" if self._top_expanded else f"展开全部 {len(tops)} 条")
         if not tops:
             self.topBox.addWidget(empty_state(
                 "HISTORY", "还没有记忆被唤起",
-                "agent 开工心跳（hub_heartbeat）时自动推送相关记忆，此处累计记数"))
+                "agent 每次开工报到时会自动推送相关记忆；这里累计被推送的次数"))
 
         # 使用分布（验收①：searches 有跨 agent 真实数据）
         clear(self.useBox)
@@ -263,7 +303,7 @@ class BrainPage(QWidget):
         if not tasks:
             self.taskBox.addWidget(empty_state(
                 "ACCEPT", "暂无任务",
-                "agent 经 hub_task_add 建任务、hub_claim 认领；认领后此处显示持有者与阻塞状态"))
+                "agent 建任务并认领后，这里显示持有者与阻塞状态"))
 
         # 待办看板（验收③：欠账可见 + 勾销闭环）
         clear(self.todoBox)
@@ -292,7 +332,7 @@ class BrainPage(QWidget):
         if not events:
             self.eventBox.addWidget(empty_state(
                 "HISTORY", "暂无事件",
-                "agent 用 hub_event_write 写进展，其他 agent 用 hub_events 增量订阅"))
+                "agent 写下进展后，其他 agent 可以按增量订阅这些事件"))
 
         # 置顶记忆（验收④：置顶位工作知识占比）
         clear(self.pinBox)
@@ -307,6 +347,26 @@ class BrainPage(QWidget):
                 "PIN", "暂无置顶",
                 "agent 写记忆时可带 pinned=true 进置顶位——每次读记忆优先展示"))
 
+        counts = {"top": len(tops), "use": len(merged), "task": len(tasks),
+                  "todo": len(h["todos"]), "event": len(events), "pin": len(pins)}
+        for key, lb in self._jump_links.items():
+            name = self._jump_names[key]
+            n = counts.get(key, 0)
+            lb.setText(f"{name} {n}" if n else name)
+            lb.setToolTip(f"跳到「{name}」" + (f"（当前显示 {n} 条）" if n else ""))
+
+    def _jump_to(self, key: str) -> None:
+        head = self._section_heads.get(key)
+        if head is None:
+            return
+        bar = self.scroll.verticalScrollBar()
+        y = head.mapTo(self._body, QPoint(0, 0)).y() - tokens.SPACE_M
+        bar.setValue(max(bar.minimum(), min(bar.maximum(), y)))
+
+    def _toggle_top(self):
+        self._top_expanded = not self._top_expanded
+        self.reload(force=True)
+
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:
         """唤起/置顶行：类型徽章 + 编号·次数 + 正文单行截断，全文进 tooltip。
@@ -317,10 +377,12 @@ class BrainPage(QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(tokens.SPACE_S)
         h.addWidget(kind_badge(m["kind"]))
-        body = BodyLabel(f"{head}  {m['content'][:72]}")
+        # 920×600 实测：固定取 72 字仍会超出可用宽度，QLabel 直接硬切（无省略号，
+        # 行尾停在半个词上）。改用按实际宽度省略的标签，全文仍进 tooltip。
+        body = ClickBodyLabel(f"{head}  {m['content'][:72]}")
         body.setWordWrap(False)
         body.setToolTip(f"{head}\n{m['content']}")
-        h.addWidget(body, 1)
+        h.addWidget(flex_label(body), 1)
         return w
 
     def _done_todo(self, rid, todo):

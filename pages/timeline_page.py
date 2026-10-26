@@ -209,6 +209,23 @@ class TimelinePage(QWidget):
         finally:
             self.container.setUpdatesEnabled(True)
 
+    def _filters_active(self) -> bool:
+        a = self.agentFilter.currentText()
+        pj = self.projFilter.currentText()
+        return bool((a and a != "全部") or (pj and pj != "全部"))
+
+    def _empty_hint(self):
+        """首次空=教，筛选空=恢复路径。原实现两处都写「放宽筛选」——
+        空库（全部/全部、0 条）说自己「没有符合条件」会让新用户去翻不存在的筛选。"""
+        if self.all_entries or self._filters_active():
+            return empty_state("SEARCH", "没有符合条件的记录",
+                               "试试放宽筛选：切换 agent / 项目下拉，或清空过滤条件")
+        return empty_state("HISTORY", "还没有工作记录",
+                           "agent 记一笔工作后，这里按时间倒序出现；"
+                           "也可以到「接入」页让 agent 自动记录",
+                           action_text="去接入页",
+                           action=lambda: self.win.switchTo(self.win.connect_page))
+
     def rebuild(self):
         self._clear_box()
         self._clear_tail()
@@ -231,9 +248,7 @@ class TimelinePage(QWidget):
         self._append_rows(batch)
         self.rendered += len(batch)
         if not entries:
-            self.box.addWidget(empty_state(
-                "SEARCH", "没有符合条件的记录",
-                "试试放宽筛选：切换 agent / 项目下拉，或清空过滤条件"))
+            self.box.addWidget(self._empty_hint())
             return
         # 尾部：加载更多按钮 + 统计说明（直接放 box，居中对齐，增量时先移除旧尾部）
         self._clear_tail()
@@ -300,9 +315,7 @@ class TimelinePage(QWidget):
             if st["offset"] > 0:
                 st["offset"] = st["total"]  # 防御：翻到空页直接视为到底，防自动加载死循环
             else:
-                self.box.addWidget(empty_state(
-                    "SEARCH", "没有符合条件的记录",
-                    "试试放宽筛选：切换 agent / 项目下拉，或清空过滤条件"))
+                self.box.addWidget(self._empty_hint())
             self._vtail()
             return
         # 分片装入：loading 保持 True 直到装完（期间不触发下一页拉取，防级联）
