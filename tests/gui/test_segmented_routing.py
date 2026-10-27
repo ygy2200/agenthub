@@ -41,11 +41,30 @@ def test_playbook_segments_switch_to_their_own_content(qapp, hub_root):
         assert pb.seg.currentRouteKey() == "flows", "默认段应是「流程」"
         assert pb._flows, "流程段应加载内置流程模板（而不是图谱页）"
         assert pb.listw.isVisible(), "有流程时列表应可见"
-        assert not pb.runBtn.isEnabled(), "未选中流程时「跑一次」应置灰"
+        # R198 起有数据默认选中首条（与搜索/时间线「命中即选中」一致），按钮随选中可用
+        assert pb.listw.currentItem() is not None, "有流程时应默认选中第一条"
+        assert pb.cur_flow, "默认选中应同步 cur_flow"
+        assert pb.runBtn.isEnabled(), "默认选中后「跑一次」应可用"
+
+        # 但「无选中 → 置灰」的守卫仍在：清空当前项后不能还能误点「跑一次」
+        first = pb.listw.currentItem()
+        pb.listw.setCurrentItem(None)
+        pb._sync_actions()
+        assert not pb.runBtn.isEnabled(), "无选中流程时「跑一次」应置灰"
+        pb.listw.setCurrentItem(first)
+        settle(qapp, max_s=0.3)
 
         pb.seg.setCurrentItem("steps")
         settle(qapp, max_s=0.5)
         assert pb.seg.currentRouteKey() == "steps"
+        assert pb.listw.isVisible() and pb.listw.count() >= 2, "选中流程后步骤段应列出分步"
+        assert pb.cur_flow in pb.listw.item(0).text()
+
+        # 流程被删/清空（cur_flow 为空）时，步骤段应给空态引导而不是空列表
+        pb.cur_flow = ""
+        pb.listw.setCurrentItem(None)
+        pb.reload()
+        settle(qapp, max_s=0.5)
         assert not pb.listw.isVisible(), "未选流程时步骤段应显示空态而不是空列表"
         assert "先在「流程」段选中一条流程" in _empty_text(pb), "步骤段空态未引导下一步"
         assert not pb.runBtn.isEnabled(), "步骤段不应能点「跑一次」"

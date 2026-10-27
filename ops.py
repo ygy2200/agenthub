@@ -2305,7 +2305,8 @@ def _usage_health(root: str) -> dict:
                       and a not in _brain._NON_AGENT)
         if idle:
             detail.append(f"接入闲置：{'、'.join(idle)}（MCP 已配置但近 7 天零调用——"
-                          "确认还需要吗：不用就下线接入，避免配置漂移无人发现）")
+                          "确认还需要吗：不用就 python cli.py offboard <agent> --apply 下线接入"
+                          "（默认预演），避免配置漂移无人发现）")
             issues.extend(idle)
     bits = []
     if gap:
@@ -2333,7 +2334,8 @@ def _usage_health(root: str) -> dict:
             fix_parts.append("循环：hub_usage_timeline(tool=...) 看是否同一参数反复打，"
                              "修触发方的 retry 上限")
         if idle:
-            fix_parts.append("接入闲置：不需要就下线接入；还需要就让该会话跑一次真实调用")
+            fix_parts.append("接入闲置：不需要就 python cli.py offboard <agent> --apply 下线接入"
+                             "（两处都先备份）；还需要就让该会话跑一次真实调用")
         return {"ok": False,
                 "summary": f"用量异常 {len(set(issues))} 个 agent（{' / '.join(cats)}）",
                 "fix": "；".join(fix_parts),

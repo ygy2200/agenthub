@@ -1,0 +1,42 @@
+name: CI
+
+on:
+  push:
+    branches: [main, master]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  docs-and-unit:
+    name: 文档契约 + 单元层
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装依赖
+        run: pip install PySide6 PySide6-Fluent-Widgets pytest
+      - name: 工具示例 × schema 漂移审计
+        run: python tools/audit_tool_docs.py
+      - name: 单元层
+        run: python -m pytest tests/unit -q
+
+  full:
+    name: 三层门禁（手动触发）
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: windows-latest
+    env:
+      PYTHONUTF8: "1"
+      QT_QPA_PLATFORM: offscreen
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: 安装依赖
+        run: pip install PySide6 PySide6-Fluent-Widgets pytest
+      - name: unit / gui / e2e
+        run: python tests/run_all.py

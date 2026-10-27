@@ -483,6 +483,29 @@ def _setup_app_font(app):
 
 
 _THEME_LISTENER = None  # 系统主题监听（auto 模式联动用；进程级保引用，防 GC 回收 QThread）
+_SINGLE_INSTANCE = None  # R205 单实例管道（QLocalServer 必须留引用，否则被 GC 后新实例又能起）
+
+
+def _claim_single_instance(app) -> bool:
+    """R205：同一时间只跑一个 GUI 实例（双开会抢热键/托盘/DB 写入并互相踩刷新）。
+
+    已有一个实例 → 让它把窗口抬到最前并返回 False；否则占用本用户名下的管道。
+    """
+    from PySide6.QtNetwork import QLocalServer, QLocalSocket
+    name = "agenthub-gui-" + (os.environ.get("USERNAME") or "user")
+    probe = QLocalSocket()
+    probe.connectToServer(name)
+    if probe.waitForConnected(300):
+        probe.write(b"show")
+        probe.flush()
+        probe.waitForBytesWritten(300)
+        probe.disconnectFromServer()
+        return False
+    QLocalServer.removeServer(name)  # 上个实例崩溃/硬杀留下的死管道
+    global _SINGLE_INSTANCE
+    _SINGLE_INSTANCE = QLocalServer(app)
+    _SINGLE_INSTANCE.listen(name)  # 拿不到锁也照常启动：可用性优先，最坏退回旧行为
+    return True
 
 
 def run_gui():
@@ -493,9 +516,24 @@ def run_gui():
     QGuiApplication.setHighDpiScaleFactorRoundingPolicy(
         Qt.HighDpiScaleFactorRoundingPolicy.PassThrough)
     app = QApplication(sys.argv)
+    if not _claim_single_instance(app):
+        # R215：第二实例静默退出（_claim 已通过管道请既有窗口抬到最前）。
+        # 不要弹模态框——实测会让第二个进程卡在对话框等用户点确定。
+        return
     _setup_app_font(app)
     w = AgentHubWindow()
     w.show()
+
+    def _raise_existing() -> None:
+        while _SINGLE_INSTANCE and _SINGLE_INSTANCE.hasPendingConnections():
+            conn = _SINGLE_INSTANCE.nextPendingConnection()
+            if conn:
+                conn.disconnectFromServer()
+        w.showNormal()
+        w.raise_()
+        w.activateWindow()
+
+    _SINGLE_INSTANCE.newConnection.connect(_raise_existing)
     _THEME_LISTENER = tokens.start_system_listener()  # 系统深浅切换联动（仅 auto 模式响应）
     _unreg = _register_note_hotkey(w)
     if _unreg:

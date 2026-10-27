@@ -4,6 +4,7 @@
 用法：
   python cli.py status [agent]     # 各 agent 接入状态（引导版本 / MCP / 通道）
   python cli.py onboard <agent>    # 给某 agent 注入引导（按名匹配）
+  python cli.py offboard <agent>   # 下线接入：移除引导块 + 摘掉 MCP 条目（默认预演，--apply 才写）
   python cli.py refresh            # 把所有 agent 的引导刷新到当前版本
   python cli.py discover           # 扫描常见位置，找「有配置但未登记」的 agent
 
@@ -90,6 +91,54 @@ def cmd_onboard(root: str, agent: str) -> int:
         print(f"  ✓ {d}")
     if done:
         print(f"\n接入完成。重启 {a['agent']} 后首次心跳即证明生效；复核：python cli.py status")
+    return 0
+
+
+def cmd_offboard(root: str, agent: str, apply: bool = False,
+                 keep_guide: bool = False, keep_mcp: bool = False) -> int:
+    """下线接入：移除引导块 + 摘掉 MCP 条目（默认预演，--apply 才写；两处都先备份）。"""
+    a = core.find_adapter(root, agent)
+    if not a:
+        print(f"未登记的 agent：{agent}")
+        print("  先 `python cli.py status` 看已登记名单；或把它加进 config.agents.json")
+        return 1
+    bp = _boot_of(a)
+    spec = core._mcp_spec_of(a)
+    guide_on = bool(bp) and core.bootstrap_status(bp)
+    mcp_on = bool(spec) and core.mcp_has_agenthub(spec[0], (a.get("mcp") or {}).get("layout", ""))
+    todo = []
+    if guide_on and not keep_guide:
+        todo.append(("引导块", f"{bp}（当前 v{core.bootstrap_version(bp) or '?'}）"))
+    if mcp_on and not keep_mcp:
+        todo.append(("MCP 条目", spec[0]))
+    if not todo:
+        why = "；".join(
+            [f"引导{'未注入' if not guide_on else '按 --keep-guide 保留'}" if bp else "无引导目标",
+             f"MCP{'未接入' if not mcp_on else '按 --keep-mcp 保留'}" if spec else "无 MCP 配置"])
+        print(f"{a['agent']}：没有可下线的项（{why}）")
+        return 0
+
+    if not apply:
+        print(f"下线预演（未写入；加 --apply 执行）：{a['agent']}")
+        for kind, where in todo:
+            print(f"  · 移除{kind} -> {where}")
+        print(f"  两处都会先备份，失败自动还原。执行：python cli.py offboard {agent} --apply")
+        return 0
+
+    fail = 0
+    for kind, where in todo:
+        err = (core.remove_bootstrap(bp, root, agent="user") if kind == "引导块"
+               else core.remove_mcp_entry(spec[0], (a.get("mcp") or {}).get("layout", "")))
+        if err not in ("", "未注入", "未接入", "文件不存在"):
+            print(f"  ✗ {kind} 移除失败：{err}")
+            fail += 1
+        else:
+            print(f"  ✓ 已移除{kind} -> {where}")
+    core.journal(root, "cli", "offboard", a["agent"], "",
+                 "keep_guide" if keep_guide else ("keep_mcp" if keep_mcp else ""))
+    if fail:
+        return 1
+    print(f"\n下线完成：{a['agent']}（重启该 agent 后生效；需要时重新接入：python cli.py onboard {agent}）")
     return 0
 
 
@@ -232,7 +281,7 @@ def cmd_build_manifest(src: Path, phase: str) -> int:
 def cmd_call(root: str, tool: str, kv: list) -> int:
     """X5 CLI 客户端：命令行直调任意 MCP 工具——
     agenthub call hub_health
-    agenthub call hub_search query=SQLite 记忆 limit=5
+    agenthub call hub_search keyword=SQLite 记忆 limit=5
     agenthub call hub_signals agent=zcode unread_only=true
     值自动转型：true/false→bool、整数→int、其余→str；写工具需显式传 confirm=true。"""
     import agenthub_mcp  # noqa: PLC0415  延迟导入：CLI 发布路径不该被 MCP 模块拖慢
@@ -856,7 +905,7 @@ def main(argv=None) -> int:
                 "  agenthub status                  # 看每个 agent 是否接入\n"
                 "  agenthub next --agent zcode      # 看下一步该做什么\n"
                 "  agenthub tasks --approvals       # 看待审批任务\n"
-                "  agenthub call hub_search query=关键词 limit=5\n"
+                "  agenthub call hub_search keyword=关键词 limit=5\n"
                 "  agenthub serve --open            # 本机只读仪表盘\n"
                 "\n根目录：--root，或写入 ~/.agenthub/config.json 的 root"),
         formatter_class=argparse.RawDescriptionHelpFormatter)
@@ -876,6 +925,11 @@ def main(argv=None) -> int:
                         help="设置角色（缺省只读）")
     p_on = _cmd("onboard", help="给某 agent 注入引导")
     p_on.add_argument("agent")
+    p_off = _cmd("offboard", help="下线某 agent 的接入（移除引导+MCP；默认预演，--apply 才写）")
+    p_off.add_argument("agent")
+    p_off.add_argument("--apply", action="store_true", help="真正写入（默认只预演）")
+    p_off.add_argument("--keep-guide", action="store_true", help="保留引导块，只摘 MCP")
+    p_off.add_argument("--keep-mcp", action="store_true", help="保留 MCP 条目，只摘引导")
     _cmd("refresh", help="刷新所有 agent 引导到当前版本")
     _cmd("discover", help="扫描常见位置，找未登记 agent")
     _cmd("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
@@ -1028,6 +1082,9 @@ def main(argv=None) -> int:
             return cmd_role(root, args.agent, args.role)
         if args.cmd == "onboard":
             return cmd_onboard(root, args.agent)
+        if args.cmd == "offboard":
+            return cmd_offboard(root, args.agent, apply=args.apply,
+                                keep_guide=args.keep_guide, keep_mcp=args.keep_mcp)
         if args.cmd == "refresh":
             return cmd_refresh(root)
         if args.cmd == "discover":

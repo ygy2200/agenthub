@@ -42,10 +42,10 @@ def main():
         [sys.executable, str(ROOT / "tools" / "gui_snapshot.py")], parse_snapshot)
     run("错误文案可行动性",
         [sys.executable, str(ROOT / "tools" / "audit_errmsg.py")], parse_errmsg)
-    run("性能计时（真实库逐页 reload）",
+    run("性能计时（真实库逐页首开最长阻塞）",
         [sys.executable, str(ROOT / "tools" / "perf_walkthrough.py")],
-        lambda out: "；".join(f"{t} {s:.2f}s" for t, s in re.findall(
-            r"  (\S+): ([\d.]+)s", out) if float(s) > 1) or "全部 <1s")
+        lambda out: "；".join(f"{t} {ms}ms" for t, ms in re.findall(
+            r"  (\S+): 最长阻塞 ([\d.]+)ms", out) if float(ms) > 1000) or "全部 <1s")
     run("老化快测（全页 20 轮内存）",
         [sys.executable, str(ROOT / "tools" / "soak_test.py"), "20"],
         lambda out: _soak_last(out))

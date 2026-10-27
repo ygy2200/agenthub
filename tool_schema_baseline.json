@@ -811,6 +811,7 @@
    "todo": "string"
   },
   "required": [
+   "record_id",
    "todo"
   ]
  },
