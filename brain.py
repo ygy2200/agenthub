@@ -6211,22 +6211,105 @@ def _fold_near_dupes(rows: list, threshold: float = 0.0) -> list:
     return kept
 
 
+_GRAPH_SQL_CHUNK = 400
+
+
+def _graph_edges_touching(conn, nodes: set, want: str = "") -> list:
+    """只取与 nodes 相连的边（按边 id 升序）；want 非空时只留对端为 want 类型的边。
+
+    与 _graph_adj 的全表扫描相比，走 UNIQUE(from_kind,from_id,…) / idx_rel_to 逐节点
+    取边，读的行数从「整张 relations」降到「这几层的边」（两列都在索引里，覆盖读）。
+    from_id 按整数绑定：schema 是 INTEGER，且三个写入方（graph_build / sync_links /
+    relation_add）都 int() 归一——真实库 2725 行 typeof(from_id) 全为 integer。
+    to_ref 按字符串绑定（tag/project 名本就是文本），'7' 这类由列亲和性折成 7 走索引。
+    """
+    by_kind: dict = {}
+    for kind, ref in nodes:
+        by_kind.setdefault(kind, set()).add(str(ref))
+    found: dict = {}
+    for kind, refs in by_kind.items():
+        fids = sorted({int(x) for x in refs if x.lstrip("-").isdigit()})
+        trefs = sorted(refs)
+        for i in range(0, max(len(fids), len(trefs)), _GRAPH_SQL_CHUNK):
+            fpart = fids[i:i + _GRAPH_SQL_CHUNK]
+            if fpart:
+                sql = ("SELECT id,from_kind,from_id,to_kind,to_ref,kind FROM relations "
+                       "WHERE from_kind=? AND from_id IN (" + ",".join("?" * len(fpart)) + ")")
+                args: list = [kind, *fpart]
+                if want:
+                    sql += " AND to_kind=?"
+                    args.append(want)
+                for e in conn.execute(sql, args):
+                    found[e["id"]] = e
+            tpart = trefs[i:i + _GRAPH_SQL_CHUNK]
+            if tpart:
+                sql = ("SELECT id,from_kind,from_id,to_kind,to_ref,kind FROM relations "
+                       "WHERE to_kind=? AND to_ref IN (" + ",".join("?" * len(tpart)) + ")")
+                args = [kind, *tpart]
+                if want:
+                    sql += " AND from_kind=?"
+                    args.append(want)
+                for e in conn.execute(sql, args):
+                    found[e["id"]] = e
+    return [found[k] for k in sorted(found)]
+
+
+def _graph_local_adj(conn, seeds: set, want: str) -> dict:
+    """图扩展真正会读到的局部邻接表（种子 + 1.._GRAPH_HOPS-1 层节点的边）。
+
+    等价性依据（R249：真实库 98 个种子集与全表 _graph_adj 逐位比对 0 差异）：
+      · 遍历只读 adj[n]（n 在前 _GRAPH_HOPS-1 层内），这里把这些层的边全取来；
+      · 每节点邻居按边 id 升序追加，与 _graph_adj 全表扫描的 rowid 序逐项一致，
+        分数累加顺序相同 → 分数与截断排序可位级对齐；
+      · 最后一层只留对端为 want 类型的边：这层不再向外走，非目标类型的邻居只进 seen
+        不计分，去掉它们不改变任何目标节点的「首次命中」顺序与分数。
+    """
+    adj: dict = {}
+    fetched: set = set()
+    visited = set(seeds)
+    frontier = set(seeds)
+    for hop in range(_GRAPH_HOPS):
+        if not frontier:
+            break
+        nxt = set()
+        rows = _graph_edges_touching(conn, frontier,
+                                     want if hop == _GRAPH_HOPS - 1 else "")
+        for e in rows:
+            if e["id"] in fetched:
+                continue
+            fetched.add(e["id"])
+            a = (e["from_kind"], str(e["from_id"]))
+            b = (e["to_kind"], str(e["to_ref"]))
+            adj.setdefault(a, []).append((b, e["kind"]))
+            adj.setdefault(b, []).append((a, e["kind"]))
+        for n in frontier:
+            for nb, _ek in adj.get(n, []):
+                if nb not in visited:
+                    visited.add(nb)
+                    nxt.add(nb)
+        frontier = nxt
+    return adj
+
+
 def _graph_expand(root: str, entity: str, seeds: list, limit: int = 30) -> list:
     """图扩展召回：从种子做 1~2 跳遍历，返回 [(eid, score)]（分数越高越「图上近」）。
 
     entity: "record" / "memory"（与 relations 表的 kind 口径一致）。
     计分：2.0/跳数 + 显式边（双链 mention / 手工 link）0.5 加成——
     显式边说明「有人认定它们有关」，比结构边（同项目/同标签）更能说明问题。
+    取边走 _graph_local_adj（R249）：以前每次检索都全表重建邻接表 ~7.8ms，
+    现在只取遍历会读到的两层 ~1.9-2.7ms，结果逐位不变。
     """
     if not seeds or _RRF_W_GRAPH <= 0:
         return []
+    seeds = {(entity, str(s)) for s in seeds}
     try:
         with db_conn(root) as conn:
-            adj = _graph_adj(conn)
+            adj = _graph_local_adj(conn, seeds, entity)
     except sqlite3.Error:
         return []
     scores: dict = {}
-    for seed in {(entity, str(s)) for s in seeds}:
+    for seed in seeds:
         seen = {seed}
         frontier = [seed]
         for depth in range(1, _GRAPH_HOPS + 1):
@@ -6257,13 +6340,14 @@ def _graph_expand_cross(root: str, src: str, dst: str, seeds: list, limit: int =
     """
     if not seeds:
         return []
+    seeds = {(src, str(s)) for s in seeds}
     try:
         with db_conn(root) as conn:
-            adj = _graph_adj(conn)
+            adj = _graph_local_adj(conn, seeds, dst)
     except sqlite3.Error:
         return []
     scores: dict = {}
-    for seed in {(src, str(s)) for s in seeds}:
+    for seed in seeds:
         seen = {seed}
         frontier = [seed]
         for depth in range(1, _GRAPH_HOPS + 1):
