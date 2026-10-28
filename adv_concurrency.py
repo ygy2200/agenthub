@@ -136,7 +136,7 @@ def t_wal_exit_cleanup():
 # 压测形态：N 个子进程（默认 6，对应 6 个接入）各跑混合操作——ensure_schema（每个
 # MCP 请求都跑它）+ 写记录 + 写记忆 + 检索 + 心跳写，全部结束后断言零丢失零失败。
 _WORKER_OPS = 40          # 每进程操作轮数（12 轮一把过不算压测；40 轮×6 进程=240 混合操作）
-_WORKER_PROCS = 6         # 进程数（对应 6 个 agent 接入）
+_WORKER_PROCS = 8         # 进程数（R259：6 → 8，对应当前真实接入面——7 家 agent + 管理通道）
 
 
 def _stress_worker(root: str, tag: str) -> int:
@@ -188,10 +188,25 @@ def t_multiprocess_stress():
     assert n_rec == expect, f"记录丢失：预期 {expect} 实到 {n_rec}"
     assert n_mem == expect, f"记忆丢失：预期 {expect} 实到 {n_mem}"
     assert integ == "ok", f"库完整性异常：{integ}"
-    # ④ WAL 有界（检查点机制在跨进程写入下仍有效；阈值放宽到 64MB，真实库量级 KB~MB）
+    # ④ WAL 有界（R259 收紧：64MB → 16MB）+ 退出 checkpoint 后必须真的回落
+    #
+    # 旧阈值 64MB 形同虚设：真实库 WAL 实测 0.00MB（19MB 主库、-shm 0.03MB），
+    # 而 SQLite 默认 wal_autocheckpoint 是 1000 pages（page_size 4096 → ≈4MB），
+    # 也就是说 WAL 要涨到自动检查点的 16 倍才报红——那时"无界增长"已经发生很久了。
+    # 守卫太松和守卫太严一样坏：前者漏报，后者狼来了（R253/R255 的教训）。
+    # 16MB = 默认自动检查点阈值的 4 倍，留足并发窗口又不至于失明。
     wal = Path(str(brain.db_path(root)) + "-wal")
     wal_sz = wal.stat().st_size if wal.exists() else 0
-    assert wal_sz < 64 * 1024 * 1024, f"WAL 无界增长（{wal_sz/1024/1024:.1f}MB）——khive#580 形态"
+    assert wal_sz < 16 * 1024 * 1024, (
+        f"WAL 无界增长（{wal_sz / 1024 / 1024:.1f}MB）——khive#580 形态；"
+        f"默认 autocheckpoint ≈4MB，这里是它的 4 倍上限")
+
+    # ⑤ 退出钩子必须把 WAL 收回去（ruvnet/ruflo#3397：常驻句柄从不释放 → 别的进程写不进去）
+    brain._close_sentinels()                    # 走真实退出路径，不是测试专用捷径
+    wal_after = wal.stat().st_size if wal.exists() else 0
+    assert wal_after < 4 * 1024 * 1024, (
+        f"退出 checkpoint 没把 WAL 收回去（{wal_after / 1024 / 1024:.1f}MB）——"
+        f"TRUNCATE checkpoint 应把它压到接近 0")
 
 
 def _lease_worker(root: str, tag: str, start_at: str) -> int:
@@ -365,7 +380,7 @@ def main():
     case("8 线程并发写 80 条 + 并发只读（不丢写 / 无 locked / 无 readonly）",
          t_concurrent_write_read)
     case("退出收尾（checkpoint 后无 -wal/-shm 残留，库仍可写）", t_wal_exit_cleanup)
-    case("D2·多进程压测（6 子进程同库混合读写：零失败/零丢失/完整性/WAL 有界）",
+    case(f"D2·多进程压测（{_WORKER_PROCS} 子进程同库混合读写：零失败/零丢失/完整性/WAL 有界+退出回收）",
          t_multiprocess_stress)
     case("R11/R13·多进程抢同一文件锁（恰好一个赢家/台账一把/fence=1/审计一条）",
          t_lease_mutex_across_processes)
