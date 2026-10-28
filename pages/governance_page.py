@@ -84,7 +84,9 @@ class _SubPage(QWidget):
             self._show_no_root()
             return
         self._hide_no_root()
-        self._fill()
+        # R242：一次刷新就是一个去重域——段内多处要同一份审计链校验时只算一次。
+        with ops.refresh_scope():
+            self._fill()
         self._finish()
 
     def _show_no_root(self):
@@ -718,7 +720,7 @@ class _SecuritySub(_SubPage):
         root = self.win.root
         chain_ok = health_ok = False
         try:
-            chain = brain.journal_verify(root)
+            chain = ops.verify_cached(root, brain)
             chain_ok = chain["ok"]
             self.listw.addItem(f"审计链：{chain['summary']}")
             if chain.get("chain_at"):
@@ -955,4 +957,6 @@ class GovernancePage(QWidget):
     def reload(self):
         """页面级刷新（窗口 apply / 切页兑现）：全段作废，但只兑现可见的那一段。"""
         self._pending = set(self._KEYS)
-        self._load_current()
+        # R242：页级刷新也开域——若将来兑现多段，各段共付的那次审计链校验仍只算一次。
+        with ops.refresh_scope():
+            self._load_current()

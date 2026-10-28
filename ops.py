@@ -10,6 +10,8 @@
 from __future__ import annotations
 
 import ast
+import contextlib
+import contextvars
 import datetime
 import hashlib
 import json
@@ -744,6 +746,79 @@ def _db_health(root: str) -> dict:
     return {"ok": ok, "summary": summary, "detail": lines[:8]}
 
 
+# ---- 刷新域内的取数去重与库状态缓存（R242）----
+#
+# 治理页 security 段一次可见刷新 325ms，量出来两块白付：① 同一条审计链校验跑两遍
+# （`_SecuritySub._fill` 一次、`_security_health` 里再一次，68ms）；② 明文凭据扫描
+# 136ms，逐行扫 5500 条记录，而绝大多数的重复刷新之间库根本没变。
+# 处理原则不同：verify 只在**一次刷新内**收敛（域外每次真验，MCP/CLI 行为不变）；
+# 明文扫描与库文件（db + -wal 的 mtime/size）绑定——库一变就必然重扫，没变就不必再扫。
+_REFRESH: contextvars.ContextVar[dict | None] = contextvars.ContextVar(
+    "ops_refresh", default=None)
+
+
+@contextlib.contextmanager
+def refresh_scope():
+    """一次界面刷新内的取数去重域。可重入：页面级刷新套段级刷新时共用一个域。"""
+    if _REFRESH.get() is not None:
+        yield _REFRESH.get()
+        return
+    token = _REFRESH.set({})
+    try:
+        yield _REFRESH.get()
+    finally:
+        _REFRESH.reset(token)
+
+
+def verify_cached(root: str, brain_mod=None) -> dict:
+    """审计链校验：刷新域内同一 root 只验一次；域外（CLI/MCP）照旧每次真验。"""
+    b = brain_mod or _import_brain()
+    scope = _REFRESH.get()
+    if scope is None:
+        return b.journal_verify(root)
+    key = ("verify", str(root))
+    if key not in scope:
+        scope[key] = b.journal_verify(root)
+    return scope[key]
+
+
+_SECRET_SCAN_CACHE: dict = {}
+_SECRET_SCAN_MAX = 4
+
+
+def _scan_signature(root: str, brain_mod) -> tuple:
+    """被扫四张表的行签名（条数 / 最大 id / 内容总长）。
+
+    不用库文件 mtime 做缓存键：security 段每刷一次都会写 4 条 journal 落痕
+    （`run_check` 记账），mtime 于是每次都变——R242 实测那样缓存一分没省，
+    热态仍是 254ms。签名只认被扫的表，与「本页自己写流水」解耦。
+    已知盲区：就地改成等长正文（改长度会换键）。
+    """
+    out = []
+    with brain_mod.db_conn(root) as conn:
+        for _kind, table, where, _cap, expr, _proj in _SECRET_SCAN_TABLES:
+            sql = (f"SELECT COUNT(*), COALESCE(MAX(id), 0), "
+                   f"COALESCE(SUM(LENGTH({expr})), 0) FROM {table}"
+                   + (f" WHERE {where}" if where else ""))
+            try:
+                out.append(tuple(conn.execute(sql).fetchone()))
+            except Exception:  # noqa: BLE001 老库缺表不影响其余面
+                out.append(())
+    return tuple(out)
+
+
+def _scan_plaintext_secrets_cached(root: str, brain_mod) -> tuple:
+    key = (str(root), _scan_signature(root, brain_mod))
+    hit = _SECRET_SCAN_CACHE.get(key)
+    if hit is not None:
+        return hit
+    res = _scan_plaintext_secrets(root, brain_mod)
+    while len(_SECRET_SCAN_CACHE) >= _SECRET_SCAN_MAX:
+        _SECRET_SCAN_CACHE.pop(next(iter(_SECRET_SCAN_CACHE)))
+    _SECRET_SCAN_CACHE[key] = res
+    return res
+
+
 def _audit_chain(root: str) -> dict:
     """审计链体检（R47，只读）：流水是否可证未被改。
 
@@ -756,7 +831,7 @@ def _audit_chain(root: str) -> dict:
         brain = _import_brain()
         if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
             return _db_missing()
-        v = brain.journal_verify(root)
+        v = verify_cached(root, brain)
     except Exception as e:  # noqa: BLE001
         return {"ok": False,
                 "summary": f"审计链检查失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
@@ -814,20 +889,25 @@ def _secret_label(text: str) -> str:
     return ""
 
 
+# (类型, 表, 过滤条件, 扫描上限, 内容表达式, 有无 project 列)
+_SECRET_SCAN_TABLES = (
+    ("记录", "records", "COALESCE(status,'active')!='deleted'", 3000, "content", True),
+    ("记忆", "memories", "COALESCE(status,'active')!='deleted'", 1500, "content", True),
+    ("随记", "notes", "", 500, "content", False),
+    ("错误", "errors", "", 500,
+     "title || char(10) || detail || char(10) || undo", True),
+)
+
+
 def _scan_plaintext_secrets(root: str, brain) -> tuple:
     """扫描共用大脑里的明文凭据。返回 (命中位置列表, 扫描条数)；命中不含密钥原文。"""
     hits, scanned = [], 0
-    queries = (
-        ("记录", "SELECT id, project, content FROM records "
-                 "WHERE COALESCE(status,'active')!='deleted' ORDER BY id DESC LIMIT ?", 3000),
-        ("记忆", "SELECT id, project, content FROM memories "
-                 "WHERE COALESCE(status,'active')!='deleted' ORDER BY id DESC LIMIT ?", 1500),
-        ("随记", "SELECT id, '' AS project, content FROM notes ORDER BY id DESC LIMIT ?", 500),
-        ("错误", "SELECT id, project, title || char(10) || detail || char(10) || undo AS content "
-                 "FROM errors ORDER BY id DESC LIMIT ?", 500),
-    )
     with brain.db_conn(root) as conn:
-        for kind, sql, cap in queries:
+        for kind, table, where, cap, expr, has_proj in _SECRET_SCAN_TABLES:
+            proj = "project" if has_proj else "'' AS project"
+            sql = (f"SELECT id, {proj}, {expr} AS content FROM {table}"
+                   + (f" WHERE {where}" if where else "")
+                   + " ORDER BY id DESC LIMIT ?")
             try:
                 rows = list(conn.execute(sql, (cap,)))
             except Exception:  # noqa: BLE001 老库缺表不影响其余面
@@ -853,10 +933,10 @@ def _security_health(root: str) -> dict:
         brain = _import_brain()
         if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
             return _db_missing()
-        v = brain.journal_verify(root)
+        v = verify_cached(root, brain)
         fr = brain.freeze_get(root)
         ctrl = brain.agent_control_map(root)
-        hits, scanned = _scan_plaintext_secrets(root, brain)
+        hits, scanned = _scan_plaintext_secrets_cached(root, brain)
         with brain.db_conn(root) as conn:
             task_rows = [dict(r) for r in conn.execute(
                 "SELECT id, owner FROM tasks WHERE status='in_progress'")]
