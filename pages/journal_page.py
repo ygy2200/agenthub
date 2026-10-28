@@ -132,9 +132,11 @@ class JournalPage(QWidget):
         self.errList.clear()
         for e in self.errors:
             st = "未关闭" if e["status"] == "open" else "已修复"
+            rep = int(e.get("repeat_count") or 1)
+            rep_tag = f"  ×{rep}（最近 {_fmt_ts(e['last_ts'])}）" if rep > 1 else ""
             self.errList.addItem(
                 f"#{e['id']} [{st}] {_fmt_ts(e['ts'])}  {e['agent']}"
-                f" · {e['project'] or '无项目'}：{e['title']}"
+                f" · {e['project'] or '无项目'}：{e['title']}{rep_tag}"
                 + (f"  ｜回滚：{e['undo'][:60]}" if e["undo"] else ""))
         if not self.errors:
             self.errList.addItem("（无错误登记）")
@@ -178,11 +180,17 @@ class JournalPage(QWidget):
                 f"<p style='color:{tokens.C(tokens.TEXT_3)}'>点选上方错误查看详情与回滚方式</p>")
             return
         st = "未关闭" if e["status"] == "open" else "已修复"
+        rep = int(e.get("repeat_count") or 1)
         body = f"## {e['title']}\n\n**状态** {st} · **登记** {e['agent']} {_fmt_ts(e['ts'])}"
+        if rep > 1:
+            body += f" · **共发生 {rep} 次**（最近 {_fmt_ts(e.get('last_ts') or e['ts'])}）"
         if e["project"]:
             body += f" · **项目** {e['project']}"
         if e["detail"]:
             body += f"\n\n{e['detail']}"
+        last_detail = str(e.get("last_detail") or "")
+        if rep > 1 and last_detail and last_detail != str(e.get("detail") or ""):
+            body += f"\n\n**最近一次现场**\n\n{last_detail}"
         if e["undo"]:
             body += f"\n\n**回滚方式**\n\n`{e['undo']}`"
         self.errPreview.setHtml(md_to_html(body))

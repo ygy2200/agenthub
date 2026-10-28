@@ -330,7 +330,9 @@ CREATE INDEX IF NOT EXISTS idx_journal_ts ON journal(ts);
 CREATE TABLE IF NOT EXISTS errors (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, project TEXT, title TEXT, detail TEXT,
-    undo TEXT, status TEXT DEFAULT "open"
+    undo TEXT, status TEXT DEFAULT "open",
+    repeat_count INTEGER DEFAULT 1, last_ts TEXT DEFAULT '',
+    last_detail TEXT DEFAULT ''
 );
 CREATE TABLE IF NOT EXISTS searches (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1267,6 +1269,12 @@ def _migrate_columns(root: str) -> None:
                          "THEN 'decision' ELSE 'work_log' END "
                          "WHERE record_type IS NULL OR record_type=''")
         # M1（2026-10-12）任务工作图：priority(0急~3低,默认2) / deps(前置任务 id,逗号分隔) / due(截止日)
+        # R261 错误重复计数：同一 (agent, 项目, 标题) 的 open 错误再发生时累加而不是新增行
+        ecols = {r["name"] for r in conn.execute("PRAGMA table_info(errors)")}
+        for col, ddl in (("repeat_count", "INTEGER DEFAULT 1"), ("last_ts", "TEXT DEFAULT ''"),
+                         ("last_detail", "TEXT DEFAULT ''")):
+            if col not in ecols:
+                conn.execute(f"ALTER TABLE errors ADD COLUMN {col} {ddl}")
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
         for col, ddl in (("priority", "INTEGER DEFAULT 2"),
                          ("deps", "TEXT DEFAULT ''"),
@@ -8254,14 +8262,50 @@ def security_snapshot(root: str, days: int = SECURITY_WINDOW_DAYS) -> dict:
 
 
 def error_add(root: str, agent: str, title: str, detail: str = "",
-              project: str = "", undo: str = "") -> str:
+              project: str = "", undo: str = "", return_info: bool = False):
+    """登记一条错误；同一 (agent, 项目, 标题) 且仍 open 的错误**合并计数**而不是新增行。
+
+    R261：本机 19 条错误里 6 条是同一句「MCP 工具 hub_ops_run 执行异常」——既看不出
+    「它到底发生了多少次」（这恰恰是最重要的信号：偶发 1 次和连环 6 次是两种病），
+    又把列表刷成噪音。改法：同签名 open 错误 → repeat_count+1 + last_ts 刷新，
+    detail/undo 保留**首次**那份（首次现场最完整）；status 已 fixed 后再发生仍新增行
+    （复发是独立事件，不该被历史计数吃掉）。
+    R262：合并时**另存 last_detail**（最近一次现场）——只留首次会丢掉「错误变形成什么样」，
+    首次和最近各存一份才既有起点又有走向；`return_info=True` 返回 {id, merged, repeat_count}
+    让调用方能把「这是第几次」回给登记人（否则合并对使用者完全不可见）。
+    并发：查-改串行在同一把写锁里（BEGIN IMMEDIATE），否则两个进程各插一条（R15 同型竞态）。
+    """
     if not title or not title.strip():
         return "title 必填"
+    title = title.strip()[:200]
     with db_conn(root) as conn:
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
-        conn.execute("INSERT INTO errors(ts,agent,project,title,detail,undo,status) VALUES(?,?,?,?,?,?,'open')",
-                     (_now(), agent or "unknown", project, title.strip()[:200], (detail or "")[:4000], undo))
+        # _upsert_agent 通常已经开了隐式事务（它要写 agents 行）；只有它什么都没写时才补
+        # 一个显式写锁——否则 "cannot start a transaction within a transaction"。
+        if not conn.in_transaction:
+            conn.execute("BEGIN IMMEDIATE")
+        dup = conn.execute(
+            "SELECT id FROM errors WHERE status='open' AND agent=? AND title=? "
+            "AND COALESCE(project,'')=?", (agent or "unknown", title, project or "")).fetchone()
+        if dup:
+            detail = (detail or "")[:4000]
+            conn.execute(
+                "UPDATE errors SET repeat_count=COALESCE(repeat_count,1)+1, last_ts=?, "
+                "last_detail=CASE WHEN ?<>'' THEN ? ELSE COALESCE(last_detail,'') END WHERE id=?",
+                (_now(), detail, detail, dup["id"]))
+            n = conn.execute("SELECT repeat_count FROM errors WHERE id=?",
+                             (dup["id"],)).fetchone()["repeat_count"]
+            if return_info:
+                return {"id": dup["id"], "merged": True, "repeat_count": int(n or 2)}
+            return ""
+        cur = conn.execute("INSERT INTO errors(ts,agent,project,title,detail,undo,status,"
+                           "repeat_count,last_ts,last_detail) VALUES(?,?,?,?,?,?,'open',1,?,?)",
+                           (_now(), agent or "unknown", project or "", title,
+                            (detail or "")[:4000], undo or "", _now(), (detail or "")[:4000]))
+        new_id = cur.lastrowid
+    if return_info:
+        return {"id": new_id, "merged": False, "repeat_count": 1}
     return ""
 
 
