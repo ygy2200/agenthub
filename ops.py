@@ -1610,6 +1610,27 @@ def _app_version(root: Path) -> str:
     return m.group(1) if m else ""
 
 
+def _git_state(root: str | Path) -> tuple[str, bool | None]:
+    """(HEAD 短 sha, 构建/检查时工作树是否脏)。git 不可用或不在仓库里返回 ("", None)。
+
+    `dirty` 必须记进构建清单：只看 git_head 抓不到「用未提交源码打的包」——
+    v2.41.98 的清单 git_head=7a97381 而源码是 R216–R239，HEAD 也是 7a97381，
+    事后比 HEAD 只会一路绿。脏不脏只有在打包那一刻知道，所以那一刻就记下来。
+    """
+    try:
+        head = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
+                              capture_output=True, text=True, timeout=5)
+        if head.returncode != 0:
+            return "", None
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                            capture_output=True, text=True, timeout=30)
+        if st.returncode != 0:
+            return head.stdout.strip(), None
+        return head.stdout.strip(), bool(st.stdout.strip())
+    except (OSError, subprocess.SubprocessError):
+        return "", None
+
+
 def build_manifest(root: str | Path, phase: str = "start") -> dict:
     """构建清单两阶段。start 必须在 PyInstaller 之前跑（快照输入哈希），
     finish 在打包后跑（记录产物 sha256）。build.bat 自动调用，也可手工补跑。"""
@@ -1618,6 +1639,7 @@ def build_manifest(root: str | Path, phase: str = "start") -> dict:
     dist.mkdir(parents=True, exist_ok=True)
     path = dist / BUILD_MANIFEST
     if phase == "start":
+        head, dirty = _git_state(root)
         data = {
             "schema": 1,
             "version": _app_version(root),
@@ -1626,13 +1648,9 @@ def build_manifest(root: str | Path, phase: str = "start") -> dict:
             "python": sys.version.split()[0],
             "source": _release_sources(root),
             "exe": None,
+            "git_head": head,
+            "dirty": dirty,
         }
-        try:
-            git = subprocess.run(["git", "rev-parse", "--short", "HEAD"], cwd=root,
-                                 capture_output=True, text=True, timeout=3)
-            data["git_head"] = git.stdout.strip() if git.returncode == 0 else ""
-        except (OSError, subprocess.SubprocessError):
-            data["git_head"] = ""
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"ok": True, "manifest": str(path),
                 "summary": f"构建清单已快照 {len(data['source'])} 个输入（v{data['version']}）"}
@@ -1699,6 +1717,18 @@ def _release(target: Path, home: Path | None = None) -> dict:
             return {"ok": False, "summary": f"源码在打包后已变（{len(changed)} 个）—— 需重打包（build.bat）",
                     "detail": detail}
         detail.append(f"清单版本  v{manifest.get('version') or '?'}（当前 v{_app_version(target)}）")
+        head_now, _ = _git_state(target)
+        prov = str(manifest.get("git_head") or "")
+        dirty = manifest.get("dirty")
+        state = {True: "工作树脏", False: "工作树干净", None: "构建时状态未记录（旧清单）"}[dirty]
+        line = f"构建溯源  {prov or '未记录'}（{state}）"
+        if head_now and prov and head_now != prov:
+            line += f"，HEAD 现为 {head_now}"
+        detail.append(line)
+        if dirty is True:
+            return {"ok": False,
+                    "summary": "exe 由未提交的工作树构建（清单 dirty=true）—— 提交后重建再发布",
+                    "detail": detail}
         if not desktop.is_file():
             detail.append("桌面副本  不存在")
             return {"ok": False, "summary": "桌面副本不存在 —— 重跑 build.bat（含拷贝）", "detail": detail}
@@ -1730,6 +1760,63 @@ def _release(target: Path, home: Path | None = None) -> dict:
     if not desktop.is_file():
         return {"ok": False, "summary": "桌面副本不存在 —— 重跑 build.bat（含拷贝）", "detail": detail}
     return {"ok": True, "summary": "发布一致（无构建清单，mtime 判断，可能误报）", "detail": detail}
+
+
+def publish_provenance(target: str | Path, version: str, exe: str | Path | None = None) -> dict:
+    """对外发布前的溯源闸门（R241）：要发出去的 exe 必须是「本版本的、已提交的」构建。
+
+    四件硬条件：清单可读、清单版本 == 要发的版本、构建时工作树不脏、清单提交 == 当前 HEAD；
+    再复用 `_release` 的四路哈希（exe/源码/桌面副本）。给了 exe（要上传的那份）还要它
+    与清单产物同哈希——「别把旧构建挂到新标签下」。返回 problems 逐条可操作，
+    ok = 无 problems。义务放在「对外发布」这一步，不逼每次本地构建都先提交。
+    """
+    target = Path(target).resolve()
+    problems, lines = [], []
+    mpath = target / "dist" / BUILD_MANIFEST
+    manifest = {}
+    if mpath.is_file():
+        try:
+            manifest = json.loads(mpath.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            manifest = {}
+    if not manifest:
+        problems.append("没有可读的构建清单 dist/AgentHub.build.json —— exe 来源不明，先用 build.bat 构建")
+    else:
+        mv = str(manifest.get("version") or "")
+        lines.append(f"清单版本  v{mv or '?'}（要发布 v{version}）")
+        if mv != version:
+            problems.append(f"清单版本 v{mv or '?'} ≠ 要发布的 v{version} —— 用当前源码重建（build.bat）")
+        dirty = manifest.get("dirty")
+        if dirty is True:
+            problems.append("构建时工作树是脏的（清单 dirty=true）—— 提交源码后重建")
+        elif dirty is None:
+            problems.append("清单没记构建时是否脏（旧版清单）—— 用新版 build.bat 重建一次")
+        gh = str(manifest.get("git_head") or "")
+        head_now, _ = _git_state(target)
+        lines.append(f"构建提交  {gh or '未记录'}（HEAD {head_now or '未知'}）")
+        if not gh:
+            problems.append("清单没记构建提交 —— 用新版 build.bat 重建一次")
+        elif not head_now:
+            problems.append("读不到当前 HEAD（不在 git 仓库里？）—— 发布必须在源码仓库内进行")
+        elif head_now != gh:
+            problems.append(f"清单提交 {gh} ≠ 当前 HEAD {head_now} —— 先提交、再构建，并在该提交上发布")
+    rel = _release(target)
+    lines.append("发布一致  " + rel["summary"])
+    if not rel["ok"]:
+        problems.append("发布一致性未过：" + rel["summary"])
+    if exe is not None:
+        exe = Path(exe)
+        want = str((manifest.get("exe") or {}).get("sha256") or "")
+        if not exe.is_file():
+            problems.append(f"要上传的 exe 不存在：{exe} —— 别把没打出来的包挂到标签下")
+        else:
+            got = _file_hash(exe, "sha256")
+            lines.append(f"上传产物  {got[:12]}…（清单 {want[:12] + '…' if want else '未记录'}）")
+            if want and got != want:
+                problems.append(f"要上传的 exe sha256 {got[:12]}… ≠ 清单产物 {want[:12]}…"
+                                " —— 别把旧构建挂到新标签下")
+    return {"ok": not problems, "problems": problems,
+            "lines": lines, "detail": lines + list(rel.get("detail") or [])[:4]}
 
 
 _PROXY_PROBE_HOST = ("127.0.0.1", 7890)

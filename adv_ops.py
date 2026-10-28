@@ -1670,6 +1670,60 @@ def main():
           (not lrep["ok"]) and "泄漏" in lrep["summary"]
           and any(f"#{old_id}" in d for d in lrep["detail"]), str(lrep))
 
+    # ---- R241 发布溯源：脏构建 / 先构建后提交，都必须在发布前被挡
+    import hashlib as _hashlib
+    prov_root = tmp / "src_r241"
+    (prov_root / "dist").mkdir(parents=True)
+    (prov_root / "ui.py").write_text("# ui", encoding="utf-8")
+    prov_exe = prov_root / "dist" / "AgentHub.exe"
+    prov_exe.write_bytes(b"r241 fake exe")
+    prov_sha = _hashlib.sha256(b"r241 fake exe").hexdigest()
+
+    def _write_prov_manifest(dirty, head="abc1234"):
+        (prov_root / "dist" / "AgentHub.build.json").write_text(json.dumps({
+            "version": "2.41.100", "started": "x", "finished": "y",
+            "source": {"ui.py": ops._file_hash(prov_root / "ui.py", "md5")},
+            "exe": {"sha256": prov_sha}, "git_head": head, "dirty": dirty,
+        }), encoding="utf-8")
+
+    real_git_state = ops._git_state
+    try:
+        _write_prov_manifest(True)
+        ops._git_state = lambda root: ("abc1234", True)
+        rel241 = ops._release(prov_root, home=tmp)
+        prov241 = ops.publish_provenance(prov_root, "2.41.100", exe=prov_exe)
+        check("_release 拒绝「用未提交源码打的包」",
+              (not rel241["ok"]) and "未提交" in rel241["summary"], rel241["summary"])
+        check("publish_provenance 拒绝脏构建",
+              (not prov241["ok"]) and any("dirty" in p for p in prov241["problems"]),
+              str(prov241["problems"])[:200])
+
+        (tmp / "Desktop").mkdir(exist_ok=True)
+        (tmp / "Desktop" / "AgentHub.exe").write_bytes(prov_exe.read_bytes())
+        _write_prov_manifest(False, head="7a97381")
+        ops._git_state = lambda root: ("9ded518", False)
+        prov242 = ops.publish_provenance(prov_root, "2.41.100", exe=prov_exe)
+        check("publish_provenance 拒绝「清单提交≠当前 HEAD」（先构建后提交）",
+              (not prov242["ok"])
+              and any("先提交、再构建" in p for p in prov242["problems"]),
+              str(prov242["problems"])[:200])
+    finally:
+        ops._git_state = real_git_state
+
+    man_root = tmp / "src_r241_manifest"
+    man_root.mkdir()
+    real_sources = ops._release_sources
+    ops._release_sources = lambda root: {}
+    ops._git_state = lambda root: ("abc1234", True)
+    try:
+        ops.build_manifest(man_root, "start")
+    finally:
+        ops._release_sources = real_sources
+        ops._git_state = real_git_state
+    man = json.loads((man_root / "dist" / "AgentHub.build.json").read_text(encoding="utf-8"))
+    check("构建清单在 start 阶段就落盘 git_head 与 dirty",
+          man.get("dirty") is True and man.get("git_head") == "abc1234", str(man.get("dirty")))
+
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")
