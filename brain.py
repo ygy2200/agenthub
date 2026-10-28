@@ -2750,6 +2750,23 @@ def task_list(root: str, status: str = "", owner: str = "", project: str = "",
         return [dict(r) for r in conn.execute(q, args)]
 
 
+def task_count(root: str, status: str = "", owner: str = "", project: str = "") -> int:
+    """任务总数（R271）：与 task_list 同过滤口径——列表有 LIMIT，
+    抬头写「任务 N 条」不能是「取到的条数」。"""
+    q, args = "SELECT COUNT(*) AS n FROM tasks WHERE 1=1", []
+    if status:
+        q += " AND status=?"
+        args.append(status)
+    if owner:
+        q += " AND owner=?"
+        args.append(_norm_agent(owner) or owner)
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    with db_conn(root) as conn:
+        return int(conn.execute(q, args).fetchone()["n"] or 0)
+
+
 def task_approvals(root: str, project: str = "", limit: int = 50) -> list:
     """R86 待审批队列：在办、要求审批且尚未批准的任务，按认领时间升序（等最久的先看）。"""
     q = ("SELECT * FROM tasks WHERE status='in_progress' AND approval_required=1 "
@@ -8314,6 +8331,16 @@ def error_add(root: str, agent: str, title: str, detail: str = "",
     if return_info:
         return {"id": new_id, "merged": False, "repeat_count": 1}
     return ""
+
+
+def error_count(root: str, status: str = "") -> int:
+    """错误总数（R267）：error_list 有 LIMIT，列表抬头不能把取到的条数当总数。"""
+    q, args = "SELECT COUNT(*) AS n FROM errors", []
+    if status in ("open", "fixed"):
+        q += " WHERE status=?"
+        args.append(status)
+    with db_conn(root) as conn:
+        return int(conn.execute(q, args).fetchone()["n"] or 0)
 
 
 def error_list(root: str, status: str = "", limit: int = 100) -> list:
