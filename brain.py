@@ -28,7 +28,13 @@ import core
 
 DB_NAME = "brain.db"
 BACKUP_DIR = "brain-backups"
-BACKUP_KEEP = 30
+# 在线库快照（backup_brain → _hub/brain-backups/）的轮转上限。
+# R255：30 → 10，且与 BACKUP_FAMILIES["snapshot"] **共用这一个常量**。此前是两个数：
+# backup_brain 留 30 份、backup_prune 的策略表认为只该留 10 份 —— 于是本机 30 份快照里
+# 永远有 20 份被判「可清理」，backup_health 常年报「可清理 1374MB」；真清到 10 份也没用，
+# window.py 每次退出自动备份，几轮就长回 30 份（清了又长，永远清不掉＝等于不可清）。
+# 10 份 × 每份约 18MB ≈ 180MB，覆盖最近 10 次退出，回滚需求够用。
+BACKUP_KEEP = 10
 KINDS = ("fact", "preference", "lesson", "project", "note")
 
 # ---------------------------------------------------------------- 新鲜度策略（R4）
@@ -9904,7 +9910,7 @@ def status_snapshot(root: str) -> dict:
 BACKUP_FAMILIES = {
     "zip": ("backup", "brain-*.zip", 3, "库+文件树整包（唯一可整盘还原的备份）"),
     "legacy_db": ("backup", "brain-*.db", 1, "旧版仅库备份（不含源文件）"),
-    "snapshot": (BACKUP_DIR, "brain-*.db", 10, "在线库快照（backup_brain 自动轮转）"),
+    "snapshot": (BACKUP_DIR, "brain-*.db", BACKUP_KEEP, "在线库快照（backup_brain 自动轮转）"),
     "manual_bak": (".", "brain.db.bak-*", 2, "手工改动前的库快照"),
 }
 
@@ -10025,8 +10031,9 @@ def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:
         dconn.close()
         sconn.close()
         baks = sorted(bdir.glob("brain-*.db"))
-        for old in baks[:-keep] if len(baks) > keep else []:
-            old.unlink()
+        if len(baks) > keep:
+            for old in (baks if keep <= 0 else baks[:-keep]):   # keep=0 的负零切片陷阱
+                old.unlink()
         return str(dst)
     except (sqlite3.Error, OSError) as e:
         return f"备份失败：{e}"
