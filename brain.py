@@ -6723,6 +6723,31 @@ def _ensure_emb() -> bool:
 
 _QUERY_VEC_CACHE: dict = {}   # R8：query 向量缓存（2026-10-17）——records/memories 两路各编一次同一 query 浪费一半语义耗时；agent 重复搜索同样命中。进程级，封顶 64 条防无界增长。
 
+# ── R252（v2.41.111）：向量矩阵进程内缓存 ──────────────────────────────────
+# R251 把「一次检索拉回 1576 行带 content 的 r.*」收成「窄取 eid+vec」，但窄取本身仍是
+# 每次 13.9ms（3.2MB BLOB + JOIN 存活谓词 + 1576 个 Row 对象），余弦只 1.3ms ——
+# 同一进程连续检索读到的是同一批向量，把它缓存成矩阵就能把这段变成 0 次查询。
+# 失效判据用**库文件指纹**（brain.db 与 brain.db-wal 的 (mtime_ns, size)）：
+# 本库所有写入都过 WAL，任何跨进程提交必然改变 -wal 的 size/mtime；checkpoint 会同时
+# 动 db 文件 → 只会「多失效一次」（重查一次，无害），不会「该失效却没失效」。
+# 命中多付两次 os.stat（实测 ~0.03ms），比省下的 1 次 COUNT(*)（1.1ms）还便宜一个量级。
+# 只缓存非空结果；空表仍走 COUNT 短路（表被清空时缓存自然随指纹失效）。
+_SEM_MAT_CACHE: dict = {}     # (root, entity) -> (fp, kept_ids, M, dim, row_norms)
+_SEM_MAT_CACHE_MAX_BYTES = 64 * 1024 * 1024   # 单库矩阵上限（512 维 ≈ 6.5 万条）
+
+
+def _db_file_fp(root: str) -> tuple:
+    """库文件指纹：db 与 -wal 的 (mtime_ns, size)。任一缺失记 None（不抛）。"""
+    p = str(db_path(root))
+    out = []
+    for suffix in ("", "-wal"):
+        try:
+            st = os.stat(p + suffix)
+            out.append((st.st_mtime_ns, st.st_size))
+        except OSError:
+            out.append(None)
+    return tuple(out)
+
 
 def _encode(texts: list) -> object | None:
     """批量编码（L2 归一化，余弦=点积）。无模型 / 异常 → None。
@@ -6786,15 +6811,29 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     普通记忆行读 use_count/last_hit；被取代/过期/软删的行一概不得借语义路复活。
     R251：先窄取 `e.eid, e.vec` 算余弦，只对过阈值候选（真实库每次 7–11 条）回表取全列——
     原实现把 1575 行带 content 的 `r.*` 与向量一起拉回、99% 过不了 0.58 又丢掉（实测 22.9→12.7ms，
-    另省 1575 行 dict 构建），余弦本身只要 0.15ms。回表仍带存活谓词，两查之间被取代的行只会消失。"""
+    另省 1575 行 dict 构建），余弦本身只要 0.15ms。回表仍带存活谓词，两查之间被取代的行只会消失。
+    R252：窄取结果按库文件指纹缓存成矩阵（见 _SEM_MAT_CACHE）——稳态命中时只剩
+    余弦 + 回表，把 14.6ms 里最大的 13.9ms 抹掉；指纹变化（任何跨进程写入/checkpoint）
+    即重建，语义与「每次现查」等价。"""
     if not query or not _SEM_CJK_RE.search(query):
         return []
     try:
-        with db_conn(root) as c:
-            if c.execute("SELECT COUNT(*) FROM embeddings WHERE entity=?", (entity,)).fetchone()[0] == 0:
-                return []   # 空表短路：无索引时不加载模型（避免无谓开销）
+        import numpy as np
     except Exception:
         return []
+    key = (root, entity)
+    fp = _db_file_fp(root)
+    cached = _SEM_MAT_CACHE.get(key)
+    if cached is not None and cached[0] != fp:
+        _SEM_MAT_CACHE.pop(key, None)     # 库变了：旧矩阵立刻作废，不参与本轮
+        cached = None
+    if cached is None:                    # 有缓存说明表非空，省掉每次 1.1ms 的 COUNT(*)
+        try:
+            with db_conn(root) as c:
+                if c.execute("SELECT COUNT(*) FROM embeddings WHERE entity=?", (entity,)).fetchone()[0] == 0:
+                    return []   # 空表短路：无索引时不加载模型（避免无谓开销）
+        except Exception:
+            return []
     if not _ensure_emb():
         return []
     qvec = _encode([query])
@@ -6804,27 +6843,31 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     live = _rec_live_sql("r.") if entity == "records" else _live_sql("r.")
     live_plain = _rec_live_sql() if entity == "records" else _live_sql()
     try:
-        import numpy as np
-        with db_conn(root) as c:
-            rows = c.execute(
-                f"SELECT e.eid, e.vec FROM embeddings e JOIN {tbl} r ON e.eid=r.id "
-                f"WHERE e.entity=? AND {live}", (entity,)).fetchall()
-        if not rows:
-            return []
         q = qvec[0].astype("float32")
         qn = np.linalg.norm(q) + 1e-9
-        # 批量矩阵点积：把所有 vec 堆成 (N,D) 矩阵，一次 (M@q) 替代逐行 np.dot + 逐行 norm
-        # （原 O(N) Python 循环 → 单次 BLAS；search_all 对 records+memories 各跑一遍，放大为 2×O(N)）。
-        vecs, kept = [], []
-        for row in rows:
-            v = np.frombuffer(row["vec"], dtype="float32")
-            if v.shape[0] != q.shape[0]:
-                continue
-            vecs.append(v); kept.append(row["eid"])
-        if not vecs:
-            return []
-        M = np.stack(vecs)                                    # (N, D)
-        norms = np.linalg.norm(M, axis=1) + 1e-9
+        if cached is not None and cached[3] == q.shape[0]:
+            kept, M, norms = cached[1], cached[2], cached[4]   # 命中：0 次查询
+        else:
+            with db_conn(root) as c:
+                rows = c.execute(
+                    f"SELECT e.eid, e.vec FROM embeddings e JOIN {tbl} r ON e.eid=r.id "
+                    f"WHERE e.entity=? AND {live}", (entity,)).fetchall()
+            if not rows:
+                return []
+            # 批量矩阵点积：把所有 vec 堆成 (N,D) 矩阵，一次 (M@q) 替代逐行 np.dot + 逐行 norm
+            # （原 O(N) Python 循环 → 单次 BLAS；search_all 对 records+memories 各跑一遍，放大为 2×O(N)）。
+            vecs, kept = [], []
+            for row in rows:
+                v = np.frombuffer(row["vec"], dtype="float32")
+                if v.shape[0] != q.shape[0]:
+                    continue
+                vecs.append(v); kept.append(row["eid"])
+            if not vecs:
+                return []
+            M = np.stack(vecs)                                # (N, D)
+            norms = np.linalg.norm(M, axis=1) + 1e-9
+            if M.nbytes <= _SEM_MAT_CACHE_MAX_BYTES:          # 只在可控内存内缓存
+                _SEM_MAT_CACHE[key] = (fp, kept, M, q.shape[0], norms)
         sims = (M @ q) / (qn * norms)                        # 向量化余弦，与逐行公式数学等价
         scored = [(eid, float(sim)) for eid, sim in zip(kept, sims)
                   if sim >= _SEM_MIN_SIM]                    # 门槛：弱相关不进融合（噪声治理）
