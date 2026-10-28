@@ -2001,9 +2001,13 @@ def _bm25_score(q_set: list, docs: list) -> list:
     docs: [(row, Counter(tokens), dl)] → [(score, row)] 按分降序、同分 id 升序。"""
     n = len(docs)
     avgdl = sum(dl for _, _, dl in docs) / max(1, n)
+    # df 只统计 query 词：原实现对每篇文档的全部词表做 df.update（真实库记忆 5.5ms、
+    # 记录 25ms，占打分 99%），而 df 只在 w∈q_set 时才被读——等价改写（R250 实测 0 差异）。
     df: Counter = Counter()
     for _, tf, _dl in docs:
-        df.update(tf.keys())
+        for w in q_set:
+            if w in tf:
+                df[w] += 1
     scored: list = []
     for r, tf, dl in docs:
         s = 0.0
@@ -2023,11 +2027,15 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
     """内存 BM25 通道（07 计划 P4.2）：active 全量拉行 → _tokenize 内存统计 → BM25 打分。
     数据量数千行毫秒级；>1 万行再议持久化倒排（不为未来规模做工程）。
     只读不计唤起（count_hits 语义由调用方负责）。query 内部自行分词——
-    空格拆词对中文整串无效，正是本通道要治的病。返回 [{**row, "_bm25": 分数}]。"""
+    空格拆词对中文整串无效，正是本通道要治的病。返回 [{**row, "_bm25": 分数}]。
+
+    R250：窄列取行（id+分词三列）打分，只对命中的 top-k 回表取全列——输出字段与
+    顺序不变（真实库逐字段对拍 0 差异），记忆省 0.7ms、记录省 2.9ms。回表仍带
+    _live_sql：若某行在两次查询之间被取代/过期，它从结果里消失，等同早一瞬取数。"""
     q_set = list(dict.fromkeys(_tokenize(query)))
     if not q_set:
         return []
-    sql = "SELECT * FROM memories WHERE " + _live_sql() + ""
+    sql = "SELECT id,content,tags,project FROM memories WHERE " + _live_sql() + ""
     args: list = []
     if kind in KINDS:
         sql += " AND kind=?"
@@ -2049,7 +2057,15 @@ def _bm25_rank(root: str, query: str, kind: str = "", limit: int = 20) -> list:
             if use_cache:
                 _TOK_CACHE.put_mem_bm25(root, r["id"], ent)
         docs.append((r, ent[0], ent[1]))
-    return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
+    ranked = _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]
+    if not ranked:
+        return []
+    ids = [r["id"] for _s, r in ranked]
+    with db_conn(root) as conn:
+        full = {r["id"]: dict(r) for r in conn.execute(
+            "SELECT * FROM memories WHERE " + _live_sql()
+            + " AND id IN (" + ",".join("?" * len(ids)) + ")", ids)}
+    return [dict(full[r["id"]], _bm25=round(s, 4)) for s, r in ranked if r["id"] in full]
 
 
 class _TokenCache:
@@ -2155,12 +2171,14 @@ _TOK_CACHE = _TokenCache()
 
 def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
     """records 表的 BM25 通道（P4.3b）：匹配面 title+content+project（与 _records_query 一致）。
-    记录正文长（数百字）且无 updated 列——recency 不适用（β 全局关闭中）。返回带 _bm25 分。"""
+    记录正文长（数百字）且无 updated 列——recency 不适用（β 全局关闭中）。返回带 _bm25 分。
+    R250：窄列取行 + top-k 回表，做法与理由同 _bm25_rank（记录 1594 行省 2.9ms）。"""
     q_set = list(dict.fromkeys(_tokenize(query)))
     if not q_set:
         return []
     with db_conn(root) as conn:
-        rows = conn.execute("SELECT * FROM records WHERE " + _rec_live_sql()).fetchall()
+        rows = conn.execute("SELECT id,title,content,project FROM records WHERE "
+                            + _rec_live_sql()).fetchall()
     if not rows:
         return []
     use_cache = _TOK_CACHE_MAX <= 0 or len(rows) <= _TOK_CACHE_MAX   # 理由同 _bm25_rank
@@ -2174,7 +2192,15 @@ def _records_bm25_rank(root: str, query: str, limit: int = 30) -> list:
             if use_cache:
                 _TOK_CACHE.put_records_bm25(root, r["id"], ent)
         docs.append((r, ent[0], ent[1]))
-    return [dict(r, _bm25=round(s, 4)) for s, r in _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]]
+    ranked = _bm25_score(q_set, docs)[:max(0, min(int(limit), 100))]
+    if not ranked:
+        return []
+    ids = [r["id"] for _s, r in ranked]
+    with db_conn(root) as conn:
+        full = {r["id"]: dict(r) for r in conn.execute(
+            "SELECT * FROM records WHERE " + _rec_live_sql()
+            + " AND id IN (" + ",".join("?" * len(ids)) + ")", ids)}
+    return [dict(full[r["id"]], _bm25=round(s, 4)) for s, r in ranked if r["id"] in full]
 
 
 def _records_query(root: str, words: list, limit: int) -> list:
