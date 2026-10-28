@@ -10,8 +10,13 @@ r"""R245·陈旧体检的泄漏探针跳过覆盖度闸门：闸门只删不添�
 融合层不能跳：`_apply_graph_channel` 是**会加行**的第四通道，跳了可能漏真泄漏。
 
 本文件钉住：① gate=False 的结果是 gate=True 的超集；② 结构过滤（_live_sql）
-不归闸门管，已取代行在 gate=False 下仍不出现；③ 探针确实传 gate=False 且条数
-仍是 min(5, 已取代数)；④ gate=False 不再碰 `_token_stats`；⑤ 真泄漏仍报红。
+不归闸门管，已取代行在 gate=False 下仍不出现；③ 探针确实传 gate=False；
+④ gate=False 不再碰 `_token_stats`；⑤ 真泄漏仍报红。
+
+R248 修订：探针从 5 条抽样改为「全量结构判定 + 1 条金丝雀」（覆盖度论证见
+`test_stale_structural_r248.py`），所以③④原来的「条数 = min(5, 已取代数)」与
+「7 条时仍发 5 次」改成「只发 1 次、且这条取最新那条已取代行」——**不是删断言，
+是把断言钉到新口径上**：仍不许为了快把门拆掉（0 次），也不许回到逐条抽样（>1 次）。
 """
 import brain
 import ops
@@ -55,7 +60,7 @@ def test_gate_off_still_hides_superseded(hub_root):
 
 
 def test_stale_health_probes_pass_gate_off(hub_root):
-    """探针必须显式跳过闸门，且条数仍是 min(5, 已取代数)——别顺手删探针换速度。"""
+    """金丝雀必须显式跳过闸门，且必须是**最新那条**已取代行（R248 起只有 1 次检索）。"""
     brain.init_db(hub_root)
     for i in range(3):
         _supersede_pair(hub_root, i)
@@ -72,8 +77,10 @@ def test_stale_health_probes_pass_gate_off(hub_root):
     finally:
         brain.search_memories = real
     assert r["ok"] is True, r
-    assert len(calls) == 3, f"3 条已取代应发 3 次探针：{calls}"
-    assert all(sem is False and g is False for _, sem, g in calls), calls
+    assert len(calls) == 1, f"R248 起只该有 1 次金丝雀检索，实得 {len(calls)}：{calls}"
+    q, sem, g = calls[0]
+    assert sem is False and g is False, calls
+    assert q.startswith("旧事实第2号"), f"金丝雀应取最新那条已取代行：{q!r}"
 
 
 def test_gate_off_skips_token_stats(hub_root):
@@ -115,8 +122,8 @@ def test_leak_still_reported_with_gate_off(hub_root, monkeypatch):
     assert any(str(old) in d for d in r["detail"]), r["detail"]
 
 
-def test_stale_health_probe_cap_is_five(hub_root):
-    """抽查上限 5 条不变（不为凑数改口径）。"""
+def test_probe_count_is_one_not_capped_sampling(hub_root):
+    """R248：7 条已取代行也只跑 1 次金丝雀——既不许删门（0 次），也不许回到逐条抽样（5 次）。"""
     brain.init_db(hub_root)
     for i in range(7):
         _supersede_pair(hub_root, i)
@@ -128,4 +135,4 @@ def test_stale_health_probe_cap_is_five(hub_root):
     finally:
         brain.search_memories = real
     assert r["ok"] is True, r
-    assert len(n) == 5, f"探针条数应为 min(5, 7)=5，实得 {len(n)}"
+    assert len(n) == 1, f"金丝雀只该 1 次，实得 {len(n)}（覆盖度由结构判定承担）"

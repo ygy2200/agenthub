@@ -1465,16 +1465,24 @@ def _stale_health(root: str) -> dict:
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
     if not root:
         return {"ok": False, "summary": "大脑库根目录未配置", "detail": []}
-    # ① 泄漏抽查（最多 5 条已取代记忆，用内容前缀做查询探针）。R230：探针走 semantic=False
-    #    ——体检是低频只读动作，此前语义路要为一次抽查加载编码模型（真实库实测 stale_health
-    #    9.1s / 全检 11.8s）。语义路的过滤覆盖改由同批的结构性计数守：任何一条带向量的
-    #    已取代行只要被 live 谓词放行就报——比抽样查询更强，不靠相似度碰巧命中。
-    #    R245：探针再传 gate=False——覆盖度闸门只删不添（_token_stats 的 LIKE 全表扫占单次
-    #    检索 59%，5 次探针 = 整项 97%）；跳过闸门让探针看到候选超集，检测严格更强。
+    # ① 泄漏检测（R248 重构：5 条关键词抽样检索 → **全量结构判定 + 1 条端到端金丝雀**）。
+    #    根据：四路候选**都**只来自 `WHERE <_live_sql>`（词法 _memories_query、BM25 _bm25_rank、
+    #    图路 _rows_by_ids、语义 JOIN ... WHERE _live_sql("r.")），融合之后只有折叠/重排/标注、
+    #    不再新增行 —— 所以「通过 live 谓词的已取代行 = 0」**等价于**「四路都吐不出已取代行」，
+    #    且覆盖全部已取代行而不是 5 条抽样（R230 已对语义路用了同一套论证）。
+    #    金丝雀留最新那条：它验的是**接线**（管线端到端仍应用 _live_sql）；「某一路绕开谓词」
+    #    这类回归一绕全绕，抽样条数没有统计意义，一条足够。原来 5 条要付 5 次全量融合
+    #    （真实库实测 142.5ms，占整项 92%；单条 28.5 = BM25 全量拉行 11 + 图邻接全量 11）。
+    #    R230：探针走 semantic=False（体检不为一次抽查加载编码模型）。
+    #    R245：探针传 gate=False——覆盖度闸门只删不添，跳过只会让探针看到候选超集。
     try:
         with brain.db_conn(root) as conn:
-            sup = [dict(r) for r in conn.execute(
-                "SELECT id, content FROM memories WHERE superseded_by IS NOT NULL AND superseded_by != 0 LIMIT 5")]
+            leaks = [int(r["id"]) for r in conn.execute(
+                "SELECT id FROM memories WHERE superseded_by IS NOT NULL AND superseded_by != 0 "
+                "AND " + brain._live_sql())]
+            canary = conn.execute(
+                "SELECT id, content FROM memories WHERE superseded_by IS NOT NULL "
+                "AND superseded_by != 0 ORDER BY id DESC LIMIT 1").fetchone()
             sem_leak = 0
             if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
                             "AND name='embeddings'").fetchone():
@@ -1482,15 +1490,13 @@ def _stale_health(root: str) -> dict:
                     "SELECT COUNT(*) FROM embeddings e JOIN memories r ON e.eid=r.id "
                     "WHERE e.entity='memories' AND r.superseded_by IS NOT NULL "
                     "AND r.superseded_by != 0 AND " + brain._live_sql("r.")).fetchone()[0]
-        leaks = []
-        for mcode in sup:
-            kw = (mcode["content"] or "").strip()[:12]
-            if not kw:
-                continue
-            ids = [r["id"] for r in brain.search_memories(root, kw, "", 5, count_hits=False,
-                                                          semantic=False, gate=False)]
-            if mcode["id"] in ids:
-                leaks.append(mcode["id"])
+        if canary:
+            kw = (canary["content"] or "").strip()[:12]
+            if kw:
+                ids = [r["id"] for r in brain.search_memories(root, kw, "", 5, count_hits=False,
+                                                              semantic=False, gate=False)]
+                if canary["id"] in ids and int(canary["id"]) not in leaks:
+                    leaks.append(int(canary["id"]))
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"泄漏检测失败（{type(e).__name__}）：{e}", "detail": []}
     # ② 新鲜度分布（读时计算，全量现行记忆——过期不删除的精神下，被 superseded/
