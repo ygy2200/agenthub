@@ -10032,8 +10032,13 @@ def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:
         sconn.close()
         baks = sorted(bdir.glob("brain-*.db"))
         if len(baks) > keep:
+            # R256：逐份删、失败跳过——裸 unlink 遇到一份被锁（备份刚写完被杀软扫、或
+            # 有人正拿它做恢复演练）就会中断整轮轮转，症状是快照数降不下来且无声。
             for old in (baks if keep <= 0 else baks[:-keep]):   # keep=0 的负零切片陷阱
-                old.unlink()
+                try:
+                    old.unlink()
+                except OSError:
+                    pass
         return str(dst)
     except (sqlite3.Error, OSError) as e:
         return f"备份失败：{e}"

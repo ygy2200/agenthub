@@ -14,6 +14,7 @@ import json
 import os
 import re
 import shutil
+import sys
 import time
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1437,17 +1438,41 @@ BACKUP_KEEP = 8   # 每个文件的备份保留上限（只清 agenthub 自己�
 # 一律不碰——那不是我们的文件，删它等于替用户做决定。
 
 
-def _prune_backups(p: Path, keep: int = BACKUP_KEEP) -> None:
-    """同前缀备份超过 keep 份时删最旧，防止编辑/覆写高频时备份无限堆积。
-    按文件名内时间戳字典序排新旧（同秒高频覆写时 mtime 精度不可靠）。"""
+def _prune_backups(p: Path, keep: int = BACKUP_KEEP) -> int:
+    """同前缀备份超过 keep 份时删最旧，返回实际删掉的份数。
+    按文件名内时间戳字典序排新旧（同秒高频覆写时 mtime 精度不可靠）。
+
+    R256（本机实测的真缺陷）：旧实现把 `old.unlink()` 裸放在循环里、外层一个
+    `except OSError: pass` 兜底——**只要有一份删不掉（被同步盘/杀软/别的进程短暂持有），
+    整个裁剪当场中断**，后面的全部不删，而且异常被吞得一点痕都没有。症状极隐蔽：
+    策略看着在跑、就是降不下来。证据链——R253/R254 上线后跑 `release.bat` 刷新 7 个
+    agent 的引导，dsh/hermes 都从 30 份收敛到 8 份，唯独 `~/.claude/CLAUDE.md` 停在
+    24 份；同一份文件我手动再调一次 `_prune_backups`，24 → 8 一次到位。也就是说那一次
+    refresh 里有若干份临时删不掉，把剩下的 16 份一起拖住了。
+    现在逐份删、失败即跳过并继续，最后把删不掉的份数与原因留痕到 stderr（不刷屏）。
+    """
     try:
         baks = sorted(p.parent.glob(p.name + ".bak-agenthub-*"))
-        if len(baks) > keep:
-            # keep<=0 时 baks[:-0] 会是 baks[:0]（空）——负零切片陷阱，单独分支
-            for old in (baks if keep <= 0 else baks[:-keep]):
-                old.unlink()
     except OSError:
-        pass
+        return 0
+    if len(baks) <= keep:
+        return 0
+    doomed = baks if keep <= 0 else baks[:-keep]   # keep<=0：baks[:-0] 是空列表（负零切片）
+    deleted, failed = 0, []
+    for old in doomed:
+        try:
+            old.unlink()
+            deleted += 1
+        except OSError as e:                       # 一份删不掉不许影响其余
+            failed.append(f"{old.name}（{e.__class__.__name__}）")
+    if failed:
+        try:
+            print(f"[agenthub][prune] {p.name}：{len(failed)} 份备份删不掉，已跳过其余继续 —— "
+                  + "、".join(failed[:3]) + ("…" if len(failed) > 3 else ""),
+                  file=sys.stderr, flush=True)
+        except Exception:  # noqa: BLE001 留痕本身失败也不许抛
+            pass
+    return deleted
 
 
 # 会被 agenthub 外科编辑的外部配置所在目录（单一事实源：ops 整洁体检与本文件的
