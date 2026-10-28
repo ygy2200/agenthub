@@ -7419,6 +7419,13 @@ def list_projects(root: str, limit: int = 50) -> list:
             (max(1, min(limit, 200)),))]
 
 
+def project_count(root: str) -> int:
+    """项目总数（R265）：list_projects 有 LIMIT，渲染不能把「取到的条数」当总数——
+    R260 的 get_project 同型缺陷换了个位置：超过上限时用户会以为「就这么多」。"""
+    with db_conn(root) as conn:
+        return int(conn.execute("SELECT COUNT(*) AS n FROM projects").fetchone()["n"] or 0)
+
+
 def get_project(root: str, name: str, limit: int = 5) -> dict | None:
     """项目概况 + 最近 limit 条记录。
 

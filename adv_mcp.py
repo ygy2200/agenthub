@@ -2545,34 +2545,83 @@ def t_readme_changelog_sync(root):
 def t_tool_annotations(root):
     """C1 回归：MCP 工具 annotations（host 靠它决定确认 UX——省略会让 host 退回
     「每次都问用户」的保守默认，用户烦了就把 server 关掉）。
-    验证：①非写工具必有 readOnlyHint；②HIGH_BLAST_TOOLS 全部带 destructiveHint；
-    ③只读与破坏性互斥、只读标幂等无意义；④派生集合关系成立（不出现第二份清单）；
-    ⑤端到端 tools/list 输出里确实带 annotations（不只存在于内存对象）。"""
+    验证：①非写非代理工具必有 readOnlyHint；②写工具必须**显式**声明 destructiveHint
+    （规范默认 true——省略会让追加型写在 host 眼里全是破坏性）；③HIGH_BLAST_TOOLS /
+    代理工具必须 true、其余写工具必须 false；④只读与破坏性互斥、只读标幂等无意义；
+    ⑤端到端 tools/list 输出里确实带 annotations（不只存在于内存对象）。
+    R263：代理工具 hub_call_tool 能转调任意写工具，此前被误标 readOnlyHint=true。"""
     for t in m.TOOLS:
         ann = t.get("annotations") or {}
         name = t["name"]
-        if name not in m.WRITE_TOOLS:
+        if name in m.WRITE_TOOLS or name in m.PROXY_TOOLS:
+            assert not ann.get("readOnlyHint"), f"写/代理工具 {name} 不该标 readOnlyHint"
+            assert "destructiveHint" in ann, f"写工具 {name} 必须显式声明 destructiveHint"
+            want = name in m.HIGH_BLAST_TOOLS or name in m.PROXY_TOOLS
+            assert ann.get("destructiveHint") is want, \
+                f"{name} destructiveHint 应为 {want}（规范默认 true，追加型写须显式 false）"
+        else:
             assert ann.get("readOnlyHint") is True, f"只读工具 {name} 缺 readOnlyHint"
             assert not ann.get("destructiveHint"), f"{name} 只读却标破坏性"
             assert not ann.get("idempotentHint"), f"{name} 是只读，标幂等无意义"
-        else:
-            assert not ann.get("readOnlyHint"), f"写工具 {name} 不该标 readOnlyHint"
     for name in m.HIGH_BLAST_TOOLS:
         ann = next(x for x in m.TOOLS if x["name"] == name).get("annotations") or {}
         assert ann.get("destructiveHint") is True, f"高危工具 {name} 缺 destructiveHint"
     assert m.HIGH_BLAST_TOOLS <= m.WRITE_TOOLS, "高危集合必须是写工具子集"
+    assert m.PROXY_TOOLS.isdisjoint(m.WRITE_TOOLS), "代理工具集合与写工具集合不该重叠"
     assert m.IDEMPOTENT_TOOLS <= m.WRITE_TOOLS, "幂等标注只应对写工具有意义"
     tools = resp_ok(m.handle_message(rpc("tools/list"), str(root)))["tools"]
     assert tools, "tools/list 返回空"
-    ro = [t for t in tools if t["name"] not in m.WRITE_TOOLS]
+    ro = [t for t in tools if t["name"] not in m.WRITE_TOOLS and t["name"] not in m.PROXY_TOOLS]
     assert ro and all((t.get("annotations") or {}).get("readOnlyHint") for t in ro), \
         "端到端输出里只读工具没带 readOnlyHint"
     hb = [t for t in tools if t["name"] in m.HIGH_BLAST_TOOLS]
     assert hb and all((t.get("annotations") or {}).get("destructiveHint") for t in hb), \
         "端到端输出里高危工具没带 destructiveHint"
+    proxy = next(t for t in tools if t["name"] == "hub_call_tool")
+    assert not (proxy.get("annotations") or {}).get("readOnlyHint"), \
+        "端到端输出里代理工具被标成只读"
+    add = next(t for t in tools if t["name"] == "hub_log_work")
+    assert (add.get("annotations") or {}).get("destructiveHint") is False, \
+        "端到端输出里追加型写没显式标 destructiveHint=false"
 
 
 _SCHEMA_BASELINE = Path(__file__).parent / "tool_schema_baseline.json"
+
+
+def t_call_tool_gates(root):
+    """R264：hub_call_tool 不得成为写闸门的旁路。
+
+    直调写工具传 confirm=false 会拿回「未执行」；经代理转调此前却直接执行
+    （严格模式的 HIGH_BLAST 同理）。dry_run 也只回占位文案、看不到将写什么。
+    验证：①confirm=false 不落库；②严格模式 HIGH_BLAST 不落库；③dry_run 回显参数
+    且不落库；④正常转调照常生效（闸门不是一刀切）。
+    """
+    def errs():
+        return len(m.brain.error_list(str(root)))
+    before = errs()
+    out = m.call_tool("hub_call_tool", {
+        "name": "hub_report_error",
+        "arguments": {"title": "R264 代理闸门", "agent": "qa", "confirm": False}}, str(root))
+    assert "未执行" in out and "confirm=true" in out, out
+    assert errs() == before, "confirm=false 经代理仍落库了"
+    out = m.call_tool("hub_call_tool", {
+        "name": "hub_report_error",
+        "arguments": {"title": "R264 dry_run", "agent": "qa", "dry_run": True}}, str(root))
+    assert "dry_run" in out and "R264 dry_run" in out, out
+    assert errs() == before, "dry_run 经代理仍落库了"
+    old = m._strict_confirm
+    m._strict_confirm = lambda: True
+    try:
+        out = m.call_tool("hub_call_tool", {
+            "name": "hub_undo", "arguments": {"agent": "qa"}}, str(root))
+        assert "未执行" in out and "高破坏半径" in out, out
+    finally:
+        m._strict_confirm = old
+    out = m.call_tool("hub_call_tool", {
+        "name": "hub_report_error",
+        "arguments": {"title": "R264 正常转调", "agent": "qa"}}, str(root))
+    assert "已登记" in out, out
+    assert errs() == before + 1, "正常转调没落库"
 
 
 def t_tool_schema_compat(root):
@@ -5699,6 +5748,8 @@ def main():
          lambda: t_readme_changelog_sync(root))
     case("C1·MCP 工具 annotations（只读放行/高危 destructiveHint/幂等/端到端输出带注解）",
          lambda: t_tool_annotations(root))
+    case("R264·代理不是旁路（confirm=false/严格模式 HIGH_BLAST/dry_run 回显都不落库）",
+         lambda: t_call_tool_gates(root))
     case("C2·工具 schema 兼容（只允许加法式变更；删参数/改类型/新增必填一律拦）",
          lambda: t_tool_schema_compat(root))
     case("C6·速率限制/循环保护（默认放行/单工具超限即拦/被拦不计额/窗口恢复/off开关/agent级配额/反向验证）",
