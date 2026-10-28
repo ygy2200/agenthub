@@ -9879,14 +9879,22 @@ _TODO_RE = re.compile(
     r"[：:]([^\n]{4,120})")
 
 
+_WORD_RE = re.compile(r"\w+")
+
+
 def _tokens(text: str) -> set:
-    """中文 bigram + 拉丁词的轻量分词（零依赖），供相似度计算。"""
-    text = re.sub(r"[^\w一-鿿]+", " ", (text or "").lower())
+    """中文 bigram + 拉丁词的轻量分词（零依赖），供相似度计算。
+
+    R246：归一化由 `re.sub(r"[^\\w一-鿿]+", " ", lower).split()` 换成
+    `_WORD_RE.findall(lower)`——两者都是「按 \\w 的极大连续段切分」，非单词串只当
+    分隔符（连续多个与单个等价），对任意输入逐段全等；但 findall 一趟扫完、只分配
+    命中片段，省掉整串替换再二次扫描。真实库 1493 记录 + 392 记忆 118 万字符
+    202→166ms。原字符类里的 `一-鿿` 本就冗余（`\\w` 已含 CJK）。
+    后半段仍是 R235 的判定：小写化后 `isascii() and isalnum()` 与 `[a-z0-9]+`
+    全匹配的集合完全相同，但省掉每段一次正则调用。
+    """
     toks: set = set()
-    for seg in text.split():
-        # R235：小写化后 `isascii() and isalnum()` 与 `[a-z0-9]+` 全匹配的判定集合
-        # 完全相同（ASCII 字母数字），但省掉每个词段一次正则调用——真实库 924 条
-        # 文本 187ms→143ms，逐条输出与旧实现比对零差异。
+    for seg in _WORD_RE.findall((text or "").lower()):
         if seg.isascii() and seg.isalnum():
             toks.add(seg)
         else:
@@ -10135,7 +10143,20 @@ def _why(a: dict, b: dict, quals: list) -> str:
 
 
 _SIM_CACHE_MAX = 8
-_SIM_CACHE: dict = {}   # (root, threshold, cap) → (语料快照 tuple, 冻结结果 tuple)
+# root → (语料快照, threshold_used, cap_used, complete, frozen)
+#   frozen: tuple of (a, b, sim_raw, verdict, content_a, content_b)，顺序即
+#   `_similar_scan` 的返回顺序（未触 cap 时已按 -sim 排好）。
+# R246：键从 R244 的「(root, threshold, cap) 精确匹配」放宽为「按语料快照 + 可派生」——
+# 一次**未触 cap** 的扫描是所有更高阈值/更小上限请求的超集，阈值筛选与上限截断都只是
+# 取子集，结果逐字等价；触过 cap 的扫描只能同参复用（截断发生在扫描序上，事后截断
+# 不等价）。真实库一次巡检里 dup_mem（cap=10）与 ghost_memory（cap=50）都问
+# threshold=0.55，此前各扫一遍 110ms + 74ms。
+_SIM_CACHE: dict = {}
+
+_REC_CACHE_MAX = 4
+# (root, days, project) → (语料快照, threshold_used, cap_used, complete, frozen)
+#   记录侧同款复用（R246）。快照含 title+content，565 行约 0.6MB；上限压到 4 份。
+_REC_CACHE: dict = {}
 
 
 def _similar_corpus(conn) -> list:
@@ -10189,6 +10210,7 @@ def _similar_scan(root: str, corpus: list, threshold: float, cap: int) -> list:
             sim = inter / (sa + sb - inter)
             if sim >= threshold:
                 out.append({"a": toks[i][0], "b": toks[j][0], "sim": round(sim, 2),
+                            "_raw": sim,
                             "verdict": _verdict(toks[i][2], toks[j][2], toks[i][1] == toks[j][1]),
                             "content_a": toks[i][2][:80], "content_b": toks[j][2][:80]})
             if len(out) >= cap:
@@ -10197,30 +10219,60 @@ def _similar_scan(root: str, corpus: list, threshold: float, cap: int) -> list:
     return out
 
 
+def _sim_freeze(out: list) -> tuple:
+    """扫描结果 → 不可变缓存条目；保留未取整的 sim 供跨阈值筛选。"""
+    return tuple((p["a"], p["b"], p["_raw"], p["verdict"], p["content_a"], p["content_b"])
+                 for p in out)
+
+
+def _sim_thaw(frozen) -> list:
+    """缓存条目 → 调用方拿到的 dict（每次新建，调用方可就地补字段而不脏缓存）。"""
+    return [{"a": p[0], "b": p[1], "sim": round(p[2], 2), "verdict": p[3],
+             "content_a": p[4], "content_b": p[5]} for p in frozen]
+
+
+def _sim_cache_take(ent, corpus, threshold: float, cap: int):
+    """从缓存条目派生本次请求的结果；不可安全派生时返回 None（由调用方真扫）。"""
+    if ent is None or ent[0] != corpus:
+        return None
+    _corpus, thr0, cap0, complete, frozen = ent
+    if threshold == thr0 and cap == cap0:
+        return frozen                      # 同参：完整与否都逐字等价
+    if not complete or thr0 > threshold:
+        return None                        # 触过 cap，或缓存阈值更高 → 都不够用
+    picked = [p for p in frozen if p[2] >= threshold]
+    if len(picked) >= cap:
+        return None                        # 本次会截断在扫描序上，事后截断不等价
+    return tuple(picked[:cap])
+
+
 def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
     """巩固：两两 Jaccard 相似度检测疑似重复/矛盾记忆（bigram 分词，<=500 条时全算）。
     返回 [{a, b, sim, verdict, content_a, content_b}]——verdict 为裁决辅助建议，最终由 agent/用户裁决。
 
-    R244：结果按「语料快照 + (threshold, limit)」在进程内复用。真实库全量扫描 120ms
-    （分词 36 + 位集 21 + 对比 63），而一次会话里同一份语料被五处各扫一遍：治理页
-    consolidate 段（10）、安全段 dup_mem 巡检（10）、统计页 health_report（20）、
-    metacognition dup_pairs（20）、ghost_memory（50）。命中 2ms。
-    命中时返回**副本**：调用方（ghost_memory_candidates）会就地往条目里补 `suggestion`，
-    共享同一批 dict 会让缓存被写脏。
+    R244：结果按「语料快照」在进程内复用（分词另走 `_TOK_CACHE` 的 sim 命名空间）。
+    真实库全量扫描 120ms（分词 36 + 位集 21 + 对比 63），而一次会话里同一份语料被
+    五处各扫一遍：治理页 consolidate 段（10）、安全段 dup_mem 巡检（10）、统计页
+    health_report（20）、metacognition dup_pairs（20）、ghost_memory（50）。
+    R246：复用不再要求 (threshold, cap) 精确相同——一次未触上限的扫描即可服务更高
+    阈值/更小上限的请求（见 `_sim_cache_take`），于是这五处只付一次全量扫描；
+    真实库一次巡检里原本两次同语料扫描（110 + 74ms）现在第二次 ~5ms。
+    返回的始终是新 dict：调用方（ghost_memory_candidates）会就地补 `suggestion`。
     """
     cap = max(1, min(int(limit), 50))
-    key = (root, float(threshold), cap)
+    threshold = float(threshold)
     with db_conn(root) as conn:
         corpus = _similar_corpus(conn)
-        hit = _SIM_CACHE.get(key)
-        if hit is not None and hit[0] == corpus:
-            return [dict(p) for p in hit[1]]
+        frozen = _sim_cache_take(_SIM_CACHE.get(root), corpus, threshold, cap)
+        if frozen is not None:
+            return _sim_thaw(frozen)
     out = _similar_scan(root, corpus, threshold, cap)
-    _SIM_CACHE[key] = (corpus, tuple(dict(p) for p in out))
-    if len(_SIM_CACHE) > _SIM_CACHE_MAX:
-        for k in list(_SIM_CACHE)[: len(_SIM_CACHE) - _SIM_CACHE_MAX]:
-            _SIM_CACHE.pop(k, None)
-    return out
+    frozen = _sim_freeze(out)
+    _SIM_CACHE.pop(root, None)
+    _SIM_CACHE[root] = (corpus, threshold, cap, len(out) < cap, frozen)
+    while len(_SIM_CACHE) > _SIM_CACHE_MAX:
+        _SIM_CACHE.pop(next(iter(_SIM_CACHE)))
+    return _sim_thaw(frozen)
 
 
 def ghost_memory_candidates(root: str, threshold: float = 0.55, limit: int = 10) -> list:
@@ -10292,28 +10344,61 @@ def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
        知识侧的 ghost 只该盯人工/agent 写的 hub 记录，否则每天的都是同一批正常日志）。
     返回 [{a, b, sim, project, verdict, agent_a, agent_b, date_a, date_b,
           title_a, title_b, content_a, content_b}]，按 sim 降序。
+
+    R246：结果按「语料快照 + 可派生」在进程内复用（规则同 `similar_memories`）——
+    同进程里反复巡检（GUI 再点一次自检、MCP 常驻进程多轮 hub_ops_run）时，第二次
+    起只付读行 8ms + 快照比对，不再重付分词 115 + 位集 57 + 对比 76ms。
+    ⑦ **record_type 参与 verdict**（R246 修）：原实现嘴上比 `record_type` 但 SELECT
+    里没有这一列，`.get(..., "")` 两边同为 "" → 恒判「同类」，跨类型记录对被一律
+    标成「疑似重复」。现在真读该列，跨类型对如实返回「相关」。
     """
     _AUTO_HOOK_MARK = "（auto-hook）"
-
-    def _sub_tokens(title: str, content: str) -> set:
-        """剥【…】段头后分词——记录的内容脚手架（四段式）不参与相似度，只比实质。"""
-        return _tokens(re.sub(r"【[^】]*】", " ", f"{title} {content}"))
+    cap = max(1, min(int(limit), 50))
+    threshold = float(threshold)
 
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, project, agent, date, title, content FROM records WHERE "
+            "SELECT id, project, agent, date, title, content, record_type FROM records WHERE "
             + _live_sql() + " AND date >= date('now', ?) AND source NOT LIKE 'migrated:%' "
             "AND source != 'auto' "
             "ORDER BY id", (f"-{int(days)} days",))]
     if project:
         rows = [r for r in rows if r["project"] == project]
     rows = [r for r in rows if _AUTO_HOOK_MARK not in (r["title"] or "")]
+
+    snapshot = tuple((r["id"], r["project"], r["agent"], r["date"], r["title"],
+                      r["content"], r["record_type"]) for r in rows)
+    key = (root, int(days), project)
+    frozen = _sim_cache_take(_REC_CACHE.get(key), snapshot, threshold, cap)
+    if frozen is not None:
+        return _rec_thaw(frozen)
+
     by_proj: dict = {}
     for r in rows:
         by_proj.setdefault(r["project"], []).append(r)
+    groups = [[(r, _record_tokens(r["title"], r["content"])) for r in items]
+              for items in by_proj.values()]
+    out = _records_scan(groups, threshold, cap)
+    frozen = _rec_freeze(out)
+    _REC_CACHE.pop(key, None)
+    _REC_CACHE[key] = (snapshot, threshold, cap, len(out) < cap, frozen)
+    while len(_REC_CACHE) > _REC_CACHE_MAX:
+        _REC_CACHE.pop(next(iter(_REC_CACHE)))
+    return _rec_thaw(frozen)
+
+
+def _record_tokens(title: str, content: str) -> set:
+    """剥【…】段头后分词——记录的内容脚手架（四段式）不参与相似度，只比实质。"""
+    return _tokens(re.sub(r"【[^】]*】", " ", f"{title} {content}"))
+
+
+def _records_scan(groups: list, threshold: float, cap: int) -> list:
+    """无缓存的两两扫描本体（groups = 按项目分好组的 [(row, token_set), ...]）。
+
+    R246 从 `similar_records` 拆出：拆出来才能按语料快照整次复用，也便于等值比对。
+    """
     out = []
-    for _proj, items in by_proj.items():
-        toks = [(r, _sub_tokens(r["title"], r["content"])) for r in items]
+    for toks in groups:
         bits, sizes = _bits_index([t[1] for t in toks])
         for i in range(len(toks)):
             ra = toks[i][0]
@@ -10336,19 +10421,33 @@ def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
                 sim = inter / (sa + sb - inter)   # |A∪B|=|A|+|B|-|A∩B|，免建并集
                 if sim >= threshold:
                     out.append({"a": ra["id"], "b": rb["id"], "sim": round(sim, 2),
+                                "_raw": sim,
                                 "project": ra["project"],
                                 "verdict": _verdict(f"{ra['title']} {ra['content']}",
                                                     f"{rb['title']} {rb['content']}",
-                                                    ra.get("record_type", "") == rb.get("record_type", "")),
+                                                    ra["record_type"] == rb["record_type"]),
                                 "agent_a": ra["agent"], "agent_b": rb["agent"],
                                 "date_a": ra["date"], "date_b": rb["date"],
                                 "title_a": ra["title"][:60], "title_b": rb["title"][:60],
                                 "content_a": ra["content"][:80], "content_b": rb["content"][:80]})
-                if len(out) >= max(1, min(int(limit), 50)):
+                if len(out) >= cap:
                     out.sort(key=lambda x: -x["sim"])
                     return out
     out.sort(key=lambda x: -x["sim"])
     return out
+
+
+def _rec_freeze(out: list) -> tuple:
+    return tuple((p["a"], p["b"], p["_raw"], p["project"], p["verdict"], p["agent_a"],
+                  p["agent_b"], p["date_a"], p["date_b"], p["title_a"], p["title_b"],
+                  p["content_a"], p["content_b"]) for p in out)
+
+
+def _rec_thaw(frozen) -> list:
+    return [{"a": p[0], "b": p[1], "sim": round(p[2], 2), "project": p[3], "verdict": p[4],
+             "agent_a": p[5], "agent_b": p[6], "date_a": p[7], "date_b": p[8],
+             "title_a": p[9], "title_b": p[10], "content_a": p[11], "content_b": p[12]}
+            for p in frozen]
 
 
 def auto_record_count(root: str, days: int = 90) -> int:
