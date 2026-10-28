@@ -465,12 +465,15 @@ def cmd_config_prune(root: str, keep: int, apply: bool) -> int:
 
 
 def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: int,
-                     keep_bak: int, min_age_days: int, apply: bool) -> int:
-    """R7 备份盘点与清理：默认只预演；--apply 才按保留策略真删（写 journal）。"""
+                     keep_bak: int, min_age_days: int, apply: bool,
+                     verify_first: bool = True) -> int:
+    """R7 备份盘点与清理：默认只预演；--apply 才按保留策略真删（写 journal）。
+    R258：--apply 前先验留下来的还原点，校验失败一律拒绝删除（--no-verify 可跳过）。"""
     import brain  # noqa: PLC0415
     r = brain.backup_prune(root, keep_zip=keep_zip, keep_snapshot=keep_snapshot,
                            keep_legacy=keep_legacy, keep_bak=keep_bak,
-                           min_age_days=min_age_days, apply=apply)
+                           min_age_days=min_age_days, apply=apply,
+                           verify_first=verify_first)
     inv = r["inventory"]
     print(f"备份 {inv['total_count']} 份 / {inv['total_bytes'] / 1048576:.1f}MB"
           f"（最近 {(inv['newest'] or {}).get('mtime', '—')}）")
@@ -480,6 +483,14 @@ def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: 
                   f"{fam['label']}（默认留 {fam['keep_default']}）")
     rows = r["deleted"] if apply else r["candidates"]
     freed = r["reclaimed_bytes"] if apply else r["candidate_bytes"]
+    ver = r.get("verify")
+    if ver:
+        print(("  ✓ 清理前校验通过：" if ver["ok"] else "  ✗ 清理前校验失败：")
+              + str(ver["summary"])[:200])
+    if r.get("blocked"):
+        print(f"拒绝执行：{r['blocked']}")
+        print("（确认那份备份已坏、仍要清理时加 --no-verify）")
+        return 1
     if rows:
         print(f"{'已删除' if apply else '可清理'} {len(rows)} 份 / {freed / 1048576:.1f}MB：")
         for c in rows[:20]:
@@ -1205,6 +1216,8 @@ def main(argv=None) -> int:
     p_bp.add_argument("--keep-bak", type=int, default=2)
     p_bp.add_argument("--min-age-days", type=int, default=7)
     p_bp.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
+    p_bp.add_argument("--no-verify", action="store_false", dest="verify_first",
+                      help="跳过「删前先验证留下的还原点」（默认会验，失败即拒绝删除）")
     p_bm = _cmd("build-manifest", help="构建清单：start 快照源码哈希 / finish 记录 exe sha256（build.bat 自动调用）")
     p_bm.add_argument("phase", choices=["start", "finish"])
     _cmd("tools", help="列出所有可调用的 MCP 工具")
@@ -1328,7 +1341,7 @@ def main(argv=None) -> int:
         if args.cmd == "backup-prune":
             return cmd_backup_prune(_root(args.root), args.keep_zip, args.keep_snapshot,
                                     args.keep_legacy, args.keep_bak, args.min_age_days,
-                                    args.apply)
+                                    args.apply, args.verify_first)
         if args.cmd == "backup-drill":
             return cmd_backup_drill(_root(args.root), args.path)
         if args.cmd == "doctor":

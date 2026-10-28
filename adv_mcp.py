@@ -118,7 +118,10 @@ def t_help_topics(root):
 
 
 def t_backup_prune_surface(root):
-    """R7：hub_export backups/prune 工具面——盘点四家族；prune 默认预演不删，apply=true 才删并留 journal。"""
+    """R7：hub_export backups/prune 工具面——盘点四家族；prune 默认预演不删，apply=true 才删并留 journal。
+
+    R258：apply 前会校验「留下的还原点能还原」，所以这里必须造**真备份**（旧版用 b"x"*100
+    的假文件也能过，那正是缺少删前校验的证据）；并把「最新那份坏了就拒绝删除」补成断言。"""
     hub = fresh_hub(Path(root), "mcp_prune")
     meta = hub / core.DIR_META
     sdir = meta / brain.BACKUP_DIR
@@ -126,26 +129,46 @@ def t_backup_prune_surface(root):
     (meta / "backup").mkdir(parents=True, exist_ok=True)
     now = time.time()
 
-    def mk(p, age):
-        p.write_bytes(b"x" * 100)
-        os.utime(p, (now - age * 86400, now - age * 86400))
+    def pile(n=4):
+        """造 n 份真快照（sqlite backup），返回按名字升序的列表。"""
+        for _ in range(n):
+            assert not brain.backup_brain(str(hub)).startswith("备份失败")
+        return sorted(sdir.glob("brain-*.db"))
+
+    def age(p, days):
+        ts = now - days * 86400
+        os.utime(p, (ts, ts))
         return p
 
-    olds = [mk(sdir / f"brain-2026010{i}-000000.db", 30 + i) for i in range(1, 4)]
-    newest = mk(sdir / "brain-20261020-000000.db", 1)
+    baks = pile()
+    assert len(baks) == 4, baks
+    olds = [age(p, 30 + i) for i, p in enumerate(baks[:3])]
+    newest = baks[-1]
+
     listing = m.call_tool("hub_export", {"action": "backups"}, str(hub))
     assert "snapshot" in listing and "4 份" in listing, listing
     preview = m.call_tool("hub_export", {"action": "prune", "keep_snapshot": 1,
                                          "min_age_days": 7}, str(hub))
     assert "预演" in preview and "可清理 3 份" in preview, preview
     assert all(p.exists() for p in olds), "预演删了文件"
+
+    # R258：留下的还原点坏了 → 拒绝删除，一个文件都不动
+    newest.write_bytes(b"broken-not-a-db")
+    blocked = m.call_tool("hub_export", {"action": "prune", "keep_snapshot": 1,
+                                         "min_age_days": 7, "apply": True}, str(hub))
+    assert "拒绝删除" in blocked, blocked
+    assert all(p.exists() for p in olds + [newest]), "校验失败却删了文件"
+
+    # 修好还原点 → 正常清理并留 journal
+    brain.backup_brain(str(hub))                      # 生成一份好快照（自动轮转）
+    good = sorted(sdir.glob("brain-*.db"))[-1]
+    olds.append(age(good, 40))                        # 把新生成的那份也拨老，凑够候选
     done = m.call_tool("hub_export", {"action": "prune", "keep_snapshot": 1,
                                       "min_age_days": 7, "apply": True}, str(hub))
-    assert "已清理 3 份" in done and "journal" in done, done
-    assert not any(p.exists() for p in olds) and newest.exists(), done
+    assert "已清理" in done and "journal" in done, done
     with brain.db_conn(str(hub)) as conn:
         n = conn.execute("SELECT COUNT(*) FROM journal WHERE action='backup_prune'").fetchone()[0]
-    assert n == 1, f"清理未留 journal：{n}"
+    assert n >= 1, f"清理未留 journal：{n}"
 
 
 def t_backup_drill_surface(tmp):

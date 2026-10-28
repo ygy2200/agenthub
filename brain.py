@@ -9993,10 +9993,17 @@ def _backup_prune_safe(p: Path, hub: Path) -> bool:
 
 def backup_prune(root: str, keep_zip: int = 3, keep_snapshot: int = 10,
                  keep_legacy: int = 1, keep_bak: int = 2, min_age_days: int = 7,
-                 apply: bool = False) -> dict:
+                 apply: bool = False, verify_first: bool = True) -> dict:
     """R7 按家族保留策略清理备份：默认**只预演**（apply=False），apply=True 才真删。
     两道保护：① 每家族至少保留最新 N 份；② 未满 min_age_days 的一律不动（防刚备份完就被清）。
-    只删 BACKUP_FAMILIES 模式命中的文件，主库/WAL/SHM 无论如何不碰；删除写 journal 可追溯。"""
+    只删 BACKUP_FAMILIES 模式命中的文件，主库/WAL/SHM 无论如何不碰；删除写 journal 可追溯。
+
+    R258 第三道保护（verify_first）：真删之前**先证明留下的那份还能还原**——验最新整包
+    （没整包就验最新快照），校验失败一律拒绝删除。动机：本机体检报「可清理 1750MB」，
+    但一直没人按——不是不想清，是不知道清完还能不能回去。不可逆动作前面先放一道可验证
+    的证据，比在文档里写十遍「确认后再删」有用。校验只读（zip CRC + quick_check + 计数），
+    不写现场数据。想跳过（例如已知那份坏了、就是要清）传 verify_first=False。
+    """
     inv = backup_inventory(root)
     hub = Path(inv["hub"]).resolve()
     keeps = {"zip": keep_zip, "snapshot": keep_snapshot,
@@ -10014,6 +10021,22 @@ def backup_prune(root: str, keep_zip: int = 3, keep_snapshot: int = 10,
            "inventory": inv}
     if not apply:
         return out
+    if verify_first and cands:
+        # 留下的还原点按「整包 > 快照 > 旧库备份 > 手工快照」挑一份来验
+        target = None
+        for key in ("zip", "snapshot", "legacy_db", "manual_bak"):
+            fam = inv["families"].get(key) or {}
+            if fam.get("items"):
+                target = fam["items"][0]
+                break
+        if target:
+            err, summary = backup_verify(root, target["path"])
+            out["verify"] = {"path": target["path"], "ok": not err,
+                             "summary": summary if not err else err}
+            if err:
+                out["ok"] = False
+                out["blocked"] = f"清理前校验失败，已拒绝删除：{err}"
+                return out
     reclaimed = 0
     for c in cands:
         p = Path(c["path"])
