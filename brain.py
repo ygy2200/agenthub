@@ -6729,6 +6729,34 @@ def _ensure_emb() -> bool:
 
 _QUERY_VEC_CACHE: dict = {}   # R8：query 向量缓存（2026-10-17）——records/memories 两路各编一次同一 query 浪费一半语义耗时；agent 重复搜索同样命中。进程级，封顶 64 条防无界增长。
 
+# R257：语义模型的**后台预加载**（读路径不等它）
+_EMB_BG_THREAD = None
+_EMB_BG_LOCK = threading.Lock()
+
+
+def _emb_ready_now() -> bool:
+    """读路径专用：不等待模型加载，未就绪就起后台线程慢慢装。
+
+    实测（`output/_r257_slow_query.txt`）：`_ensure_emb()` 首次调用 **9190ms**（torch +
+    transformers 导入 + 权重加载），而单次检索 p50 只 74.5ms —— 相差 123 倍。表现就是
+    「GUI 搜索框里第一次输入中文，卡 9 秒」，用户感知是死机而不是「第一次稍慢」。
+    语义路本来就是可选第三路、全程 fail-open，不该让可选能力锁住主链路：这里起一个
+    daemon 线程去装，本次直接返回 False（调用方走词法两路 + 图路，结果依然可用），
+    装完 `_EMB_READY=True`，下一次检索自动带上语义路。
+
+    **写路径仍然走阻塞版 `_ensure_emb()`**（add_memory/add_record/改正文）：向量必须
+    当场落库，否则新写入的数据在语义路上长期缺席，比慢 9 秒更糟。
+    """
+    global _EMB_BG_THREAD
+    if _EMB_READY is not None:
+        return _EMB_READY
+    with _EMB_BG_LOCK:
+        if _EMB_BG_THREAD is None:
+            t = threading.Thread(target=_ensure_emb, name="agenthub-emb-warm", daemon=True)
+            _EMB_BG_THREAD = t
+            t.start()
+    return False
+
 # ── R252（v2.41.111）：向量矩阵进程内缓存 ──────────────────────────────────
 # R251 把「一次检索拉回 1576 行带 content 的 r.*」收成「窄取 eid+vec」，但窄取本身仍是
 # 每次 13.9ms（3.2MB BLOB + JOIN 存活谓词 + 1576 个 Row 对象），余弦只 1.3ms ——
@@ -6840,7 +6868,7 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
                     return []   # 空表短路：无索引时不加载模型（避免无谓开销）
         except Exception:
             return []
-    if not _ensure_emb():
+    if not _emb_ready_now():              # R257：读路径不等 9.2s 的模型加载
         return []
     qvec = _encode([query])
     if qvec is None:

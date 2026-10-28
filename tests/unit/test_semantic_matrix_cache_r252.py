@@ -44,6 +44,8 @@ def _fake_encode(monkeypatch):
         return np.stack([Q] * len(texts))
 
     monkeypatch.setattr(brain, "_ensure_emb", lambda: True)
+    # R257 起读路径走 _emb_ready_now（不等模型加载）：显式声明已就绪，避免顺序依赖
+    monkeypatch.setattr(brain, "_emb_ready_now", lambda: True)
     monkeypatch.setattr(brain, "_encode", enc)
 
 
