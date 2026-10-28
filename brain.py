@@ -2115,7 +2115,10 @@ class _TokenCache:
         return self._sim.get((root, mid))
 
     def put_sim(self, root: str, mid: int, toks: set) -> None:
+        # R244：此前只有 mem_bm25 走 _trim，sim 命名空间无上限。similar_memories 全库扫描
+        # 会一次性写入每条现行记忆，常驻进程里同样需要总量兜底（理由见 _trim）。
         self._sim[(root, mid)] = toks
+        self._trim(self._sim)
 
     # ---- 失效（单一入口）：记忆文本改了，BM25 与相似度两个命名空间一起作废
     def invalidate(self, root: str, mid: int) -> None:
@@ -7186,6 +7189,9 @@ def memory_rollback(root: str, mid: int, rev_id: int, agent: str = "") -> str:
         after = _snapshot(conn, mid)
         _revision(conn, mid, "rollback", before, after, agent)
         if text_changed:
+            # R244：回滚改回的是旧正文，分词缓存里留着的是回滚前的词集——不失效的话
+            # 相似度与 BM25 两个命名空间会拿着已被撤掉的文本继续算（edit_memory 一直有这一步，回滚漏了）
+            _TOK_CACHE.invalidate(root, mid)
             _ensure_emb_for(root, "memories", mid, after.get("content", ""), after.get("tags", ""),
                             cur["project"] or "", conn=conn)
     return ""
@@ -10122,13 +10128,37 @@ def _why(a: dict, b: dict, quals: list) -> str:
     return "各项质量信号均更高"
 
 
-def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
-    """巩固：两两 Jaccard 相似度检测疑似重复/矛盾记忆（bigram 分词，<=500 条时全算）。
-    返回 [{a, b, sim, verdict, content_a, content_b}]——verdict 为裁决辅助建议，最终由 agent/用户裁决。"""
-    with db_conn(root) as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT id, kind, content FROM memories WHERE " + _live_sql() + " ORDER BY id")]
-    toks = [(r["id"], r["kind"], r["content"], _tokens(r["content"])) for r in rows]
+_SIM_CACHE_MAX = 8
+_SIM_CACHE: dict = {}   # (root, threshold, cap) → (语料快照 tuple, 冻结结果 tuple)
+
+
+def _similar_corpus(conn) -> list:
+    """现行记忆的语料快照 [(id, kind, content)]，按 id 升序。
+
+    R244：它就是「语料有没有变」的**定义本身**——缓存命中前逐行逐字比一遍，不靠
+    COUNT/MAX(updated) 之类的间接签名去猜。真实库 388 行读一遍 ~2ms，比猜错便宜。
+    为什么不用库文件 mtime：同库每次刷新都写 journal，mtime 必然变，缓存永不命中
+    （R242 第一版实锤）。为什么不用 `updated` 时间戳：它是秒级，同一秒内的等长改写
+    连 MAX(updated) 和 SUM(LENGTH(content)) 都不变——那种漏会让旧配对一直摆在屏幕上。
+    """
+    return [tuple(r) for r in conn.execute(
+        "SELECT id, kind, content FROM memories WHERE " + _live_sql() + " ORDER BY id")]
+
+
+def _similar_scan(root: str, corpus: list, threshold: float, cap: int) -> list:
+    """无缓存的两两扫描本体（供 similar_memories 调用；单独拆出便于等值比对）。"""
+    # 分词走统一缓存层的 sim 命名空间（与 similar_lessons_for 同一命名空间、同一值语义：
+    # (root, memory_id) → _tokens(content)）。全库扫描一次就把每行的词集放进缓存，后续
+    # 换 threshold/limit 重扫只需位集与对比。语料装不下缓存时不写（同 _bm25_rank 的理由）。
+    use_cache = _TOK_CACHE_MAX <= 0 or len(corpus) <= _TOK_CACHE_MAX
+    toks = []
+    for mid, kind, content in corpus:
+        t = _TOK_CACHE.get_sim(root, mid) if use_cache else None
+        if t is None:
+            t = _tokens(content)
+            if use_cache:
+                _TOK_CACHE.put_sim(root, mid, t)
+        toks.append((mid, kind, content, t))
     bits, sizes = _bits_index([t[3] for t in toks])
     out = []
     for i in range(len(toks)):
@@ -10155,9 +10185,35 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
                 out.append({"a": toks[i][0], "b": toks[j][0], "sim": round(sim, 2),
                             "verdict": _verdict(toks[i][2], toks[j][2], toks[i][1] == toks[j][1]),
                             "content_a": toks[i][2][:80], "content_b": toks[j][2][:80]})
-            if len(out) >= max(1, min(limit, 50)):
+            if len(out) >= cap:
                 return out
     out.sort(key=lambda x: -x["sim"])
+    return out
+
+
+def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> list:
+    """巩固：两两 Jaccard 相似度检测疑似重复/矛盾记忆（bigram 分词，<=500 条时全算）。
+    返回 [{a, b, sim, verdict, content_a, content_b}]——verdict 为裁决辅助建议，最终由 agent/用户裁决。
+
+    R244：结果按「语料快照 + (threshold, limit)」在进程内复用。真实库全量扫描 120ms
+    （分词 36 + 位集 21 + 对比 63），而一次会话里同一份语料被五处各扫一遍：治理页
+    consolidate 段（10）、安全段 dup_mem 巡检（10）、统计页 health_report（20）、
+    metacognition dup_pairs（20）、ghost_memory（50）。命中 2ms。
+    命中时返回**副本**：调用方（ghost_memory_candidates）会就地往条目里补 `suggestion`，
+    共享同一批 dict 会让缓存被写脏。
+    """
+    cap = max(1, min(int(limit), 50))
+    key = (root, float(threshold), cap)
+    with db_conn(root) as conn:
+        corpus = _similar_corpus(conn)
+        hit = _SIM_CACHE.get(key)
+        if hit is not None and hit[0] == corpus:
+            return [dict(p) for p in hit[1]]
+    out = _similar_scan(root, corpus, threshold, cap)
+    _SIM_CACHE[key] = (corpus, tuple(dict(p) for p in out))
+    if len(_SIM_CACHE) > _SIM_CACHE_MAX:
+        for k in list(_SIM_CACHE)[: len(_SIM_CACHE) - _SIM_CACHE_MAX]:
+            _SIM_CACHE.pop(k, None)
     return out
 
 
