@@ -8,6 +8,8 @@
   D 启动后立即退出（show 后 0ms close）
 offscreen 运行；退出码非 0 或 stderr 出现 Traceback 即判失败。
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import os
 import sys
 import tempfile

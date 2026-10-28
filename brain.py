@@ -1850,30 +1850,45 @@ _CJK_ALL_RE = re.compile(r"[一-鿿]+")  # 任意长度中文段（_retry_bigram
 _BM25_K1, _BM25_B = 1.5, 0.75  # BM25 经典参数，进常量便于评测集调参（07 计划 P4.2）
 
 
-def _token_df(root: str, tokens: list) -> dict:
-    """query token 在 records+memories 的文档频率（content LIKE 计次，只算活跃行）。
+def _token_stats(root: str, tokens: list) -> tuple:
+    """一次连接内算完 (每个 token 的活跃行文档频率, 活跃语料行数)。
 
-    供覆盖度闸门算 IDF 加权覆盖：常见 bigram（存在/在的）df 高 → idf 低，
-    纯计数覆盖治不了「蹭两个常见词冒充强命中」（R4 实测：废话查询靠
-    不存+存在+在的 三个常见词凑满覆盖度）。fail-open：读不了库返回 {}，
-    闸门退化为纯计数（见 _coverage_gate）。
+    R236：每表**一次扫描**用 SUM(content LIKE ?) 条件聚合出全部 token 的 df。旧写法每
+    token 发两条 COUNT 全表扫（query 16 个 token = 32 次扫），真实库单次检索的 df 段
+    34–82ms、占一次 search_memories 的一半——体检的 5 条泄漏探针因此把 stale_health 顶成
+    耗时榜首。同口径下逐 token 与旧写法严格相等（tests/unit/test_token_df_r236.py 守住）。
+    口径修正：旧实现只写了「只算活跃行」的承诺、SQL 却没带 live 谓词——被 superseded/作废
+    的行会虚增 df、压低 idf，让「常见词蹭命中」更容易过关。
+    fail-open：读不了库返回 ({}, 0)，闸门退化为纯计数（见 _coverage_gate）。
     """
-    df: dict = {}
+    tokens = list(dict.fromkeys(tokens or []))   # 必须先先去重：批量写法是累加，重复词会翻倍
+    df: dict = {t: 0 for t in tokens}
     if not tokens:
-        return df
+        return df, 0
     try:
         with db_conn(root) as conn:
-            for t in tokens:
-                like = f"%{_like_escape(t)}%"
-                n = 0
-                for tbl in ("records", "memories"):
-                    n += conn.execute(
-                        f"SELECT COUNT(*) FROM {tbl} WHERE content LIKE ? ESCAPE '\\'",
-                        (like,)).fetchone()[0]
-                df[t] = n
+            for tbl, live in (("records", _rec_live_sql()), ("memories", _live_sql())):
+                for i in range(0, len(tokens), 64):    # 参数个数与表达式深度留余量
+                    chunk = tokens[i:i + 64]
+                    cols = ", ".join("SUM(content LIKE ? ESCAPE '\\')" for _ in chunk)
+                    args = tuple(f"%{_like_escape(t)}%" for t in chunk)
+                    row = conn.execute(f"SELECT {cols} FROM {tbl} WHERE {live}", args).fetchone()
+                    for t, v in zip(chunk, row or ()):
+                        df[t] = df.get(t, 0) + int(v or 0)
+            n_total = (conn.execute("SELECT COUNT(*) FROM records WHERE " + _rec_live_sql()).fetchone()[0]
+                       + conn.execute("SELECT COUNT(*) FROM memories WHERE " + _live_sql()).fetchone()[0])
     except Exception:  # noqa: BLE001 闸门是精度优化，读不了库就不加权
-        return {}
-    return df
+        return {}, 0
+    return df, n_total
+
+
+def _token_df(root: str, tokens: list) -> dict:
+    """query token 在 records+memories 活跃行的文档频率（口径与实现见 _token_stats）。
+
+    常见 bigram（存在/在的）df 高 → idf 低，纯计数覆盖治不了「蹭两个常见词冒充强命中」
+    （R4 实测：废话查询靠 不存+存在+在的 三个常见词凑满覆盖度）。
+    """
+    return _token_stats(root, tokens)[0]
 
 
 def _cjk_run(query: str, text: str) -> int:
@@ -1924,17 +1939,10 @@ def _coverage_gate(root: str, rows: list, kw: str, min_match: int = 2) -> list:
     q_tokens = list(dict.fromkeys(_tokenize(kw, max_tokens=16)))
     if len(q_tokens) < 3:
         return rows
-    df = _token_df(root, q_tokens)
+    df, n_total = _token_stats(root, q_tokens)
     idf: dict = {}
     total_mass = 1.0
     if df:
-        n_total = 0
-        try:
-            with db_conn(root) as conn:
-                n_total = (conn.execute("SELECT COUNT(*) FROM records WHERE " + _rec_live_sql()).fetchone()[0]
-                           + conn.execute("SELECT COUNT(*) FROM memories WHERE " + _live_sql()).fetchone()[0])
-        except Exception:  # noqa: BLE001
-            n_total = 0
         n_total = max(1, n_total)
         idf = {t: math.log(1.0 + (n_total - df.get(t, 0) + 0.5) / (df.get(t, 0) + 0.5)) for t in q_tokens}
         total_mass = sum(idf.values()) or 1.0
@@ -2458,7 +2466,7 @@ def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:
     文本口径与写入钩子 _ensure_emb_for、tools/build_embeddings.py 三处一致。
     fail-open：语义依赖缺失/模型装载失败 → 返回 {"error": ...}，不影响其余功能。"""
     out = {"records": 0, "memories": 0, "scanned": 0, "dim": None, "model": _EMB_MODEL_NAME}
-    if not _HAS_ST:
+    if _st_cls() is None:
         return {"error": "未安装 sentence-transformers（语义路未启用，其余功能不受影响）"}
     if not _ensure_emb():
         return {"error": "语义模型加载失败（stderr 有留痕；本地缓存缺失时需联网首装）"}
@@ -6501,7 +6509,8 @@ _EMB = None          # 懒加载的 SentenceTransformer 实例（进程级缓存
 _EMB_DIM = None
 _EMB_READY = None    # None=未尝试 / True / False
 _EMB_LOCK = threading.Lock()  # 模型懒加载互斥：防并发写路径重复加载（8线程压测曾现）
-_HAS_ST = False
+_ST_IMPORTED = None  # None=未尝试 / True=可用 / False=不可用
+_ST_CLS = None
 # 语义候选准入门槛（2026-10-11 实测标定，见 _semantic_rank）：
 # ① 查询须含中文——bge-small-zh 对 ASCII 标识符/路径/通配符查询的相似度不可信，且这类查询
 #    多为字面查找（"50_off"/"100%"/"max_size"/"a.png"），放模糊召回会破坏 LIKE 精确契约
@@ -6518,11 +6527,23 @@ _HAS_ST = False
 #    无 top5 回归。仍是「剪噪声底」而非分离器——不要再用单个阈值追求语义精度。
 _SEM_MIN_SIM = 0.58
 _SEM_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
-try:
-    from sentence_transformers import SentenceTransformer  # 可选依赖（本机可无）
-    _HAS_ST = True
-except Exception:
-    _HAS_ST = False
+
+
+def _st_cls():
+    """懒加载 sentence_transformers（首次真正走语义路时才 import）。
+
+    R217：原先在模块顶层 import——本机装了它就等于 GUI/MCP 启动连带拉
+    transformers+torch（实测启动多 2–5s、RSS 多几百 MB），对不用语义路的
+    调用纯属惩罚。改为用时再 import；失败一次即缓存失败，仍 fail-open。"""
+    global _ST_IMPORTED, _ST_CLS
+    if _ST_IMPORTED is None:
+        try:
+            from sentence_transformers import SentenceTransformer
+            _ST_CLS = SentenceTransformer
+            _ST_IMPORTED = True
+        except Exception:  # noqa: BLE001 可选依赖缺失/装坏都不得影响主功能
+            _ST_IMPORTED = False
+    return _ST_CLS
 
 
 def _init_emb_table(root: str, conn=None) -> None:
@@ -6560,7 +6581,8 @@ def _ensure_emb() -> bool:
     with _EMB_LOCK:
         if _EMB_READY is not None:
             return _EMB_READY
-        if not _HAS_ST:
+        cls = _st_cls()
+        if cls is None:
             _EMB_READY = False
             return False
         try:
@@ -6568,9 +6590,9 @@ def _ensure_emb() -> bool:
                 # 本地缓存优先（2026-10-11 线上实测教训）：网络不可达且代理关闭时，HF 联网检查
                 # 会重试 ~5 分钟（实测 304s）最终失败 → fail-open 变成"语义路永久静默报废"。
                 # 缓存已在 → local_files_only 纯本地秒载；缓存缺失 → 抛错后走联网下载（首次装配）。
-                _EMB = SentenceTransformer(_EMB_MODEL_NAME, local_files_only=True)
+                _EMB = cls(_EMB_MODEL_NAME, local_files_only=True)
             except Exception:
-                _EMB = SentenceTransformer(_EMB_MODEL_NAME)
+                _EMB = cls(_EMB_MODEL_NAME)
             try:
                 _EMB_DIM = _EMB.get_embedding_dimension()
             except Exception:
@@ -6633,7 +6655,7 @@ def _store_emb(root: str, entity: str, eid: int, vec, conn=None) -> None:
 def _ensure_emb_for(root: str, entity: str, eid: int, *texts, conn=None) -> None:
     """写入钩子：内容变更后同步语义索引。fail-open（编码失败忽略，该条降级无语义分）。
     conn 传入时复用外层已开连接（add_record/add_memory 写事务内写入，消除并发锁竞争）。"""
-    if not _HAS_ST:
+    if _st_cls() is None:
         return
     blob = " ".join((t or "") for t in texts).strip()
     if not blob:
@@ -6705,14 +6727,17 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
         return []
 
 
-def _memories_search_fused(root: str, query: str, words: list, kind: str, limit: int) -> list:
+def _memories_search_fused(root: str, query: str, words: list, kind: str, limit: int,
+                           semantic: bool = True) -> list:
     """P4.3 双路融合：LIKE/计分路（_memories_query）+ BM25 路（_bm25_rank）各自 rank →
     RRF(f)=Σ1/(k+rank) 融合（rank 天然免归一化，这是选 RRF 的理由）。
     pinned 不参与检索排序（评测三轮数据定案：硬前置 0.387 / 等权通道 0.449 / 纯相关 0.905
     ——pinned 弱相关条目会压过强相关结果；其曝光职责在心跳推送/hub_status/置顶徽章）。
     融合分乘 (1+β·recency)（P4.4）：同为命中时最近用到的排前；_channels 记录的是各路
     融合前 rank（boost 属融合后调整，分层可解释）。结果带 _channels={路: rank} 可解释（铁律 3）。
-    两路全零命中返回 []——bigram 重试由调用方按原语义触发。"""
+    两路全零命中返回 []——bigram 重试由调用方按原语义触发。
+    semantic=False 跳过语义第三路（R230）：体检泄漏抽查用——不为一次抽查加载编码模型；
+    语义路的过滤器覆盖由调用方以结构性计数单独守。"""
     like_rows = _memories_query(root, words, kind, limit=100)  # 候选池加深，融合后截 limit
     bm25_rows = _bm25_rank(root, query, kind, limit=100)
     if not like_rows and not bm25_rows:
@@ -6726,7 +6751,7 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
     for rank, r in enumerate(bm25_rows):
         scores[r["id"]] = scores.get(r["id"], 0.0) + _RRF_W_BM25 / (_RRF_K + rank + 1)
         channels.setdefault(r["id"], {})["bm25"] = rank + 1
-    sem_rows = _semantic_rank(root, query, "memories") if _RRF_W_SEMANTIC > 0 else []  # P0-3 语义第三路
+    sem_rows = _semantic_rank(root, query, "memories") if semantic and _RRF_W_SEMANTIC > 0 else []  # P0-3 语义第三路
     for eid, s, _ in sem_rows:
         scores[eid] = scores.get(eid, 0.0) + _RRF_W_SEMANTIC * s
         channels.setdefault(eid, {})["semantic"] = round(s, 4)
@@ -6758,16 +6783,17 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
 
 
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
-                    count_hits: bool = True) -> list:
+                    count_hits: bool = True, semantic: bool = True) -> list:
     """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
     0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（与 search_records 同因）。
 
     count_hits：带 query 的实际检索命中才计唤起（use_count+1）——主动检索是最高价值的
     唤起信号，此前只统计被动推送，衰减/有用率的输入数据系统性失真（0.2 修复）。
-    空 query 列清单不计；写入查重等内部调用须显式传 False。"""
+    空 query 列清单不计；写入查重等内部调用须显式传 False。
+    semantic=False：跳过语义第三路（R230 体检探针专用，避免为抽查加载编码模型）。"""
     words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
     if _RRF_ENABLED:
-        rows = _memories_search_fused(root, query or "", words, kind, limit)
+        rows = _memories_search_fused(root, query or "", words, kind, limit, semantic)
     else:
         rows = _memories_query(root, words, kind, limit)  # 回滚开关：走旧单路
     rows = _coverage_gate(root, rows, query or "")
@@ -9828,7 +9854,6 @@ def backup_brain(root: str, keep: int = BACKUP_KEEP) -> str:
 _TODO_RE = re.compile(
     r"(待办事项|待办|后续|下次|下一步|TODO|待确认|待验证|待实测|需要再|记得|提醒用户|尚未完成|遗留问题|待人工|待续)"
     r"[：:]([^\n]{4,120})")
-_WORD_RE = re.compile(r"[a-z0-9]+")
 
 
 def _tokens(text: str) -> set:
@@ -9836,11 +9861,39 @@ def _tokens(text: str) -> set:
     text = re.sub(r"[^\w一-鿿]+", " ", (text or "").lower())
     toks: set = set()
     for seg in text.split():
-        if _WORD_RE.fullmatch(seg):
+        # R235：小写化后 `isascii() and isalnum()` 与 `[a-z0-9]+` 全匹配的判定集合
+        # 完全相同（ASCII 字母数字），但省掉每个词段一次正则调用——真实库 924 条
+        # 文本 187ms→143ms，逐条输出与旧实现比对零差异。
+        if seg.isascii() and seg.isalnum():
             toks.add(seg)
         else:
             toks.update(seg[i:i + 2] for i in range(len(seg) - 1))
     return toks
+
+
+def _bits_index(token_sets: list):
+    """把 token 集合编码成整型位集，返回 (bits, sizes)。
+
+    R235：|A∩B| 从 `len(ta & tb)` 换成 `(a & b).bit_count()`——每个 token 独占
+    一位、无哈希无近似，交集大小逐对严格相等；Python 大整数按字并行，真实库
+    6.8 万对 448ms→77ms（含 sizes 预算，内层不再重复计数）。词表按本次调用现场
+    构建：同一语料内映射一致即可，不依赖跨调用稳定性。
+    """
+    vocab = {}
+    for toks in token_sets:
+        for t in toks:
+            if t not in vocab:
+                vocab[t] = len(vocab)
+    nbytes = (len(vocab) + 7) >> 3
+    bits, sizes = [], []
+    for toks in token_sets:
+        buf = bytearray(nbytes)
+        for t in toks:
+            i = vocab[t]
+            buf[i >> 3] |= 1 << (i & 7)
+        bits.append(int.from_bytes(buf, "little"))
+        sizes.append(len(toks))
+    return bits, sizes
 
 
 def extract_todos(root: str, limit: int = 20) -> list:
@@ -10065,25 +10118,26 @@ def similar_memories(root: str, threshold: float = 0.55, limit: int = 10) -> lis
         rows = [dict(r) for r in conn.execute(
             "SELECT id, kind, content FROM memories WHERE " + _live_sql() + " ORDER BY id")]
     toks = [(r["id"], r["kind"], r["content"], _tokens(r["content"])) for r in rows]
+    bits, sizes = _bits_index([t[3] for t in toks])
     out = []
     for i in range(len(toks)):
-        ta = toks[i][3]
-        if not ta:
+        sa = sizes[i]
+        if not sa:
             continue              # 空词集：与任何 j 的 sim 恒为 0，整行跳过（等价，省一层）
-        sa = len(ta)
+        ba = bits[i]
         for j in range(i + 1, len(toks)):
-            tb = toks[j][3]
-            if not tb:
+            sb = sizes[j]
+            if not sb:
                 continue
-            sb = len(tb)
             # Jaccard 上界短路（B5）：|A∩B| <= min(|A|,|B|) 且 |A∪B| >= max(|A|,|B|)
-            # → sim <= min/max。上界够不到阈值就不必做 set 交/并——那是 O(N²) 里最贵的一步，
+            # → sim <= min/max。上界够不到阈值就不必做位集交——那是 O(N²) 里最贵的一步，
             # 也是 hub_metacognition（dup_pairs）在大库上的主开销。只跳「数学上不可能达阈值」
             # 的对，结果集合与迭代顺序完全不变（可回归比对）。
             lo, hi = (sa, sb) if sa < sb else (sb, sa)
             if lo / hi < threshold:
                 continue
-            inter = len(ta & tb)
+            # R235：位集交集的 popcount 与 len(set 交) 逐对严格相等（每 token 独占一位）
+            inter = (ba & bits[j]).bit_count()
             # |A∪B| = |A|+|B|-|A∩B|：不必构造并集（省一次 O(|A|+|B|) 建集，纯等价代数替换）
             sim = inter / (sa + sb - inter)
             if sim >= threshold:
@@ -10187,22 +10241,25 @@ def similar_records(root: str, threshold: float = 0.55, limit: int = 10,
     out = []
     for _proj, items in by_proj.items():
         toks = [(r, _sub_tokens(r["title"], r["content"])) for r in items]
+        bits, sizes = _bits_index([t[1] for t in toks])
         for i in range(len(toks)):
-            ra, ta = toks[i]
-            if not ta:
+            ra = toks[i][0]
+            sa = sizes[i]
+            if not sa:
                 continue
-            sa = len(ta)
+            ba = bits[i]
             for j in range(i + 1, len(toks)):
-                rb, tb = toks[j]
-                if not tb:
+                rb = toks[j][0]
+                sb = sizes[j]
+                if not sb:
                     continue
-                sb = len(tb)
                 # Jaccard 上界短路（与 similar_memories 同款，B5）：数学上不可能达阈值
-                # 就不做 set 交/并——records 体量大，这一步是 O(N²) 里最贵的操作。
+                # 就不做集合交——records 体量大，这一步是 O(N²) 里最贵的操作。
                 lo, hi = (sa, sb) if sa < sb else (sb, sa)
                 if lo / hi < threshold:
                     continue
-                inter = len(ta & tb)
+                # R235：位集 popcount 与 len(set 交) 逐对严格相等（每 token 独占一位）
+                inter = (ba & bits[j]).bit_count()
                 sim = inter / (sa + sb - inter)   # |A∪B|=|A|+|B|-|A∩B|，免建并集
                 if sim >= threshold:
                     out.append({"a": ra["id"], "b": rb["id"], "sim": round(sim, 2),

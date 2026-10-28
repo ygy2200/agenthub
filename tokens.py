@@ -379,18 +379,83 @@ def save_theme_choice(mode: str) -> None:
     core.save_config(cfg)
 
 
+def _install_qss_cache() -> None:
+    """qfw 的 qss 读取改为一次读入内存（幂等，模块导入时装）。
+
+    每个注册控件切主题都要重读一遍 qrc 里的 qss（setStyleSheet 逐控件渲染），
+    同一文件被读几十上百次；缓存后每个 (路径) 只走一次 QFile。
+    附带动机：PySide 在长进程里偶发 `QFile.open → SystemError: bad argument to
+    internal function`（GUI 全量套件必现、单跑不复现），缓存把该调用点从热路径
+    移开；qss 内容是静态资源，按路径缓存无失效问题（深浅主题路径不同）。
+    """
+    try:
+        import qfluentwidgets.common.style_sheet as ss
+    except Exception:  # noqa: BLE001
+        return
+    if getattr(ss, "_agenthub_qss_cached", False):
+        return
+    orig = ss.getStyleSheetFromFile
+
+    def cached(file):
+        key = str(file)
+        if key not in _QSS_CACHE:
+            _QSS_CACHE[key] = orig(file)
+        return _QSS_CACHE[key]
+
+    ss.getStyleSheetFromFile = cached
+    ss._agenthub_qss_cached = True
+
+
+_QSS_CACHE = {}
+_install_qss_cache()
+
+
+def _prune_dead_style_sources() -> None:
+    """清掉 qfw 样式管理器里 C++ 已销毁但条目还在的控件。
+
+    qfw 靠 widget.destroyed → deregister 自清，但回调里对已析构的 Shiboken 包装
+    做 hash（`widget not in widgets`）会抛 SystemError，条目因此留下；之后
+    updateStyleSheet 遍历时对死控件调 visibleRegion() 又是 SystemError，而它只捕
+    RuntimeError——一个控件被 deleteLater 销毁，就能让整次切主题抛错。
+    shiboken6.isValid 对死包装是安全的，WeakKeyDictionary 可直接摘底层弱引用。
+    """
+    try:
+        import shiboken6
+        from qfluentwidgets.common.style_sheet import styleSheetManager
+    except Exception:  # noqa: BLE001 qfw 换版本时不该让换主题整体失败
+        return
+    try:
+        dead = [w for w in list(styleSheetManager.widgets) if not shiboken6.isValid(w)]
+    except Exception:  # noqa: BLE001
+        return
+    if not dead:
+        return
+    data = getattr(styleSheetManager.widgets, "data", None)
+    for w in dead:
+        try:
+            styleSheetManager.deregister(w)
+        except Exception:  # noqa: BLE001 死包装 hash 会抛，退回直接摘弱引用
+            if isinstance(data, dict):
+                for ref in [r for r in list(data) if r() is w]:
+                    data.pop(ref, None)
+
+
 def apply_theme(mode: str) -> None:
     """应用主题。**强制两段式**，覆盖 qfw setTheme 的"值相同即短路"（设计学习集 §3.3）：
       ① qconfig.theme = target  —— 无条件同步运行时 _theme
-      ② setTheme(target, save=False) —— 刷新样式表 + emit themeChangedFinished
+      ② setTheme(target, save=False, lazy=True) —— 刷新样式表 + emit themeChangedFinished
          （FluentWindow 内建监听该信号刷新 Mica，无需手动联动）
+    lazy=True（R223）：qfw 只刷**可见**控件，隐藏页标 dirty-qss，等首次绘制时由
+    DirtyStyleSheetWatcher 补刷。真实窗口实测 518 个注册控件里 469 个是隐藏的，
+    跟着全量刷等于把 83% 的样式计算花在用户看不见的地方。
     save=False：不写 %APPDATA%\\qfluentwidgets\\config.json（全机 qfw 应用共享，防污染）。"""
     mode = (mode or DEFAULT_MODE).strip().lower()
     if mode not in THEME_MODES:
         mode = DEFAULT_MODE
     target = {"dark": Theme.DARK, "light": Theme.LIGHT, "auto": Theme.AUTO}[mode]
+    _prune_dead_style_sources()         # 先清死控件：一个删除残留就足以让 setTheme 抛 SystemError
     qconfig.theme = target              # ① _theme 同步（AUTO 时内部做系统检测）
-    setTheme(target, save=False)        # ② 样式刷新 + 信号（Mica 随之更新）
+    setTheme(target, save=False, lazy=True)   # ② 样式刷新 + 信号（Mica 随之更新）
     apply_accent()                      # ③ 主色与主题解耦：qfw 控件不跟系统 accent 跑
 
 
@@ -404,14 +469,25 @@ def apply_accent() -> None:
     且换台机器（系统 accent 不同）界面就长得不一样，视觉回归基线无从建立。
 
     save=False：不写 %APPDATA%\\qfluentwidgets\\config.json（理由同 apply_theme）。
-    幂等：每次切主题/启动都调一次，qfw 内部按值短路，无副作用。
+
+    R223：原注释写"qfw 内部按值短路"，实测**不短路**——每次调用都重新走一遍
+    updateStyleSheet，真实窗口 360ms。ACCENT_FILL 是常量，本进程第一次成功设置后
+    再调用必然同值，于是记一个进程内的"已应用"标记直接返回（省掉 1/5 的换肤时间）。
     """
+    global _ACCENT_APPLIED
+    if _ACCENT_APPLIED == ACCENT_FILL:
+        return
     try:
         setThemeColor(ACCENT_FILL, save=False, lazy=True)
+        _ACCENT_APPLIED = ACCENT_FILL
     except TypeError:      # 老版本 qfw 无 lazy 参数
         setThemeColor(ACCENT_FILL, save=False)
+        _ACCENT_APPLIED = ACCENT_FILL
     except Exception:  # noqa: BLE001 取不到接口就沿用系统色，不影响启动
         pass
+
+
+_ACCENT_APPLIED = None
 
 
 def start_system_listener(parent=None):

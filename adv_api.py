@@ -5,6 +5,12 @@
   仪表盘可打开 / 工具清单非空 / 常用路由返回内容 / 未知路由 404 /
   **写工具默认 403**（守卫）/ 开 --allow-write 且带 token 才通 / 不带 token 仍 403。
 """
+
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tools"))
+import _console  # noqa: F401,E402  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import io
 import os
 import sys

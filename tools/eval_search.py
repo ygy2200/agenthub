@@ -18,6 +18,8 @@ MRR / Hit@1/3/5（强断言）与 weak 达成、逐查询耗时 p50/max。
 """
 from __future__ import annotations
 
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import json
 import statistics
 import sys

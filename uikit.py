@@ -56,12 +56,33 @@ def apply_page_background(page) -> None:
     4 页漏登记、同一缺陷复发 → 本函数取代原来的手写 16 页名单，从结构上杜绝名单漂移）。
 
     页面是自家 QWidget（非 qfw 样式托管），QSS 不会被 qfw 覆盖（实测）。
+
+    R224：记录已刷的色值，同色重复调用直接返回——对页面根 setStyleSheet 会触发
+    整页 re-polish（18 页实测约 17ms/页），而换肤时绝大多数页面并不可见，
+    这笔钱只该在页面真正要显示时花（见窗口 `_apply_page_bgs` / `switchTo`）。
     """
     try:
+        color = tokens.resolve('bg_page')
+        if getattr(page, "_bg_color", None) == color and page.styleSheet():
+            return
         page.setAttribute(Qt.WA_StyledBackground, True)
-        page.setStyleSheet(
-            f"{type(page).__name__}{{background:{tokens.resolve('bg_page')};}}")
+        page.setStyleSheet(f"{type(page).__name__}{{background:{color};}}")
+        page._bg_color = color
     except Exception:  # noqa: BLE001 单页上色失败不阻断启动
+        pass
+
+
+def invalidate_page_background(page) -> None:
+    """把页面底色标记为「待按当前主题重刷」（R224）。
+
+    换肤时对**不可见**页面只标脏：它们此刻不参与绘制，刷了也看不见，还要付
+    整页 re-polish。真正显示前由 `apply_page_background` 补齐（switchTo 里调）。
+    注意只清标记、不清 stylesheet——页面在补刷之前仍带着上一版不透明底色，
+    绝不会退化成"透明页 + Mica 透出"的白底不可见。
+    """
+    try:
+        page._bg_color = None
+    except Exception:  # noqa: BLE001
         pass
 
 
@@ -902,18 +923,49 @@ def bind_style(widget, apply_fn) -> None:
 
 
 def refresh_token_styles() -> None:
-    """主题/token 变化后重刷所有登记过的样式（window 挂在 themeChangedFinished 上）。"""
+    """主题/token 变化后重刷所有登记过的样式（window 挂在 themeChangedFinished 上）。
+
+    R223：只认 `ref() is None` 会漏掉「Python 包装还在、C++ 对象已销毁」的条目——
+    这类条目的 apply 永远抛 RuntimeError，被下面的 except 吞掉后仍留在表里，
+    于是每次换肤都要在死对象上白跑一遍，登记表只增不减（实测真实库窗口 107 条
+    登记里有已删除控件）。改用 shiboken6.isValid 判活，顺手清掉。
+    """
+    try:
+        import shiboken6
+    except ImportError:  # pragma: no cover 只用 PySide6 的环境不会走到
+        shiboken6 = None
     alive = []
     for ref, fn in list(_STYLE_BOUND):
         w = ref()
-        if w is None:
+        if w is None or (shiboken6 is not None and not shiboken6.isValid(w)):
             continue
         try:
             fn(w)
-        except Exception:  # noqa: BLE001 单个控件刷新失败不影响其余
+        except RuntimeError:  # 死包装：本轮清理掉，别留到下次换肤
             continue
+        except Exception:  # noqa: BLE001 单个控件刷新失败不影响其余
+            pass
         alive.append((ref, fn))
     _STYLE_BOUND[:] = alive
+
+
+def defer(parent, fn, msec: int = 0) -> QTimer:
+    """延后执行 fn，并把这次延后**记在 parent 的寿命上**：parent 先销毁则定时器随之销毁，
+    回调不会在已删除的控件上跑。取代 `QTimer.singleShot(msec, self.某方法)`。
+
+    静态 `singleShot` 的定时器不属于任何对象：页面/窗口 deleteLater 之后它照样在事件
+    循环里到期，回调撞上「Python 包装还在、C++ 对象已删」→ `libshiboken: Internal C++
+    object already deleted` 落在事件循环里（R239 全量 GUI 门禁实测：遍历全部页面的
+    test_typography_guard 报 5 passed + 1 teardown error，单跑该文件不复现——要的是
+    切页节奏与拆窗的相对时序）。R199 已给接入页定过这条规矩（connect_page 注释）、
+    window.py 也把它写进注释，本轮用 defer 把它变成写得出的一行，并由
+    tests/gui/test_deferred_timer_lifetime_r239.py 静态扫全部应用代码钉死。
+    """
+    t = QTimer(parent)
+    t.setSingleShot(True)
+    t.timeout.connect(fn)
+    t.start(msec)
+    return t
 
 
 def _chip(maker) -> QLabel:

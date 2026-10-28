@@ -6,6 +6,11 @@ from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
 import brain  # noqa: F401  R132：总览阵容行读注册表在线状态
 
+try:  # R239：判活——「Python 包装还在、C++ 对象已删」的控件不能碰（与 tokens.py 同源写法）
+    import shiboken6
+except ImportError:  # pragma: no cover 只用 PySide6 的环境不会走到
+    shiboken6 = None
+
 
 def memory_badge(fr: dict) -> str:
     """列表徽标：只标需要行动的陈旧/过期；fresh 不加视觉噪音。"""
@@ -153,7 +158,7 @@ class HubPage(QWidget):
         lay.addWidget(self.preview)
 
         self._workers = []
-        QTimer.singleShot(300, self.rescan)
+        defer(self, self.rescan, 300)   # R239：挂本页寿命，拆窗后不再在死控件上重扫
 
     # ---- 数据
     def _on_view_changed(self, idx):
@@ -341,11 +346,11 @@ class HubPage(QWidget):
             wrap.setFixedWidth(AGENT_CARD_W)   # 卡片定宽：文字不再被压没
             self.cardsRow.addWidget(wrap)
         # 此刻 viewport 宽度/卡片布局尚未完成，等一轮事件循环再定高（否则恒取最小值 74）
-        QTimer.singleShot(0, self._fit_cards_height)
+        defer(self, self._fit_cards_height)
 
     def showEvent(self, e):
         super().showEvent(e)
-        QTimer.singleShot(0, self._fit_cards_height)
+        defer(self, self._fit_cards_height)
 
     def resizeEvent(self, e):
         super().resizeEvent(e)
@@ -362,6 +367,10 @@ class HubPage(QWidget):
         现在预算只决定「矮窗时退到一行」，避免卡片区霸屏；页面高度不够时整体滚动。
         """
         if not hasattr(self, "cardsScroll"):
+            return
+        if shiboken6 is not None and not shiboken6.isValid(self.cardsScroll):
+            # 页面已随窗口销毁（defer 保证正常路径到不了这里）：留一道幂等闸，
+            # 任何仍在事件循环里排着的调用落到死控件上也只是静默返回。
             return
         vw = self.cardsScroll.viewport().width()
         if vw <= 0:

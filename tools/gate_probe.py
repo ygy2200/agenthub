@@ -27,6 +27,8 @@ source='auto' 的大脑记录（见 ops.rules_components 的 auto_records 通道
 """
 from __future__ import annotations
 
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import json
 import subprocess
 import sys

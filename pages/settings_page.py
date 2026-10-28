@@ -4,6 +4,10 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+import ops
+import brain
+
+
 class SettingsPage(QWidget):
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -122,6 +126,36 @@ class SettingsPage(QWidget):
                                    "历史 md/jsonl 已增量迁移入库并保留为只读存档。"))
         lay.addWidget(c1b)
 
+        # 系统自检（R225）：把只存在于命令行的 `cli.py doctor` 搬进界面。
+        # 为什么放设置页：它属于「维护」而不是日常浏览；帮助页原先写着"维护者用：不开界面
+        # 也能自检"，等于承认界面里没有入口——用户遇到问题只能在文档和终端之间来回跳。
+        c1d = CardWidget()
+        g1d = QVBoxLayout(c1d)
+        g1d.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
+                                tokens.PAD_CARD_WIDE, tokens.PAD_CARD)
+        g1d.addWidget(section_head("系统自检（一键看清哪里不对劲）", "HEART"))
+        g1d.addWidget(CaptionLabel(
+            "跑完一整套检查：数据库完整性 / 环境 / 备份 / 规则与采集 / 接入参数漂移 / "
+            "治理积压 / 待办与停滞项目…失败项直接给可执行修复口径。等价于命令行 python cli.py doctor。"))
+        patrolRow = QHBoxLayout()
+        self._patrol_busy = False
+        self._patrol_report = None
+        self.patrolBtn = PrimaryPushButton(ic("SYNC", "INFO"), "运行自检")
+        self.patrolBtn.clicked.connect(self.run_patrol_check)
+        self.patrolCopyBtn = PushButton(ic("COPY", "INFO"), "复制报告")
+        self.patrolCopyBtn.setEnabled(False)
+        self.patrolCopyBtn.clicked.connect(self.copy_patrol)
+        self.patrolState = CaptionLabel("尚未运行")
+        patrolRow.addWidget(self.patrolBtn)
+        patrolRow.addWidget(self.patrolCopyBtn)
+        patrolRow.addWidget(self.patrolState, 1)
+        g1d.addLayout(patrolRow)
+        self.patrolView = TextBrowser()
+        self.patrolView.setMinimumHeight(180)
+        self.patrolView.setVisible(False)      # 没跑过就不占版面
+        g1d.addWidget(self.patrolView)
+        lay.addWidget(c1d)
+
         c1c = CardWidget()
         g1c = QVBoxLayout(c1c)
         g1c.setContentsMargins(tokens.PAD_CARD_WIDE, tokens.PAD_CARD,
@@ -202,7 +236,7 @@ class SettingsPage(QWidget):
         self._sync_theme_btns()
         InfoBar.success("外观已切换", f"主题：{tokens.MODE_CN.get(mode, mode)}",
                         duration=1500, parent=self.win)
-        QTimer.singleShot(80, self.win.refresh)
+        defer(self, self.win.refresh, 80)
 
     def showEvent(self, e):
         self.reload()
@@ -248,7 +282,13 @@ class SettingsPage(QWidget):
         if err:
             InfoBar.error("初始化失败", err, duration=4000, parent=self.win)
             return
-        InfoBar.success("已初始化", "00_Inbox / 99_Archive / _hub（规则·共享记忆·操作流水·错误登记）",
+        # R228：库跟结构一起建——按钮叫「初始化目录结构」、提示说「已初始化」，
+        # 就不该把建库留给下次载入根目录（CLI 的 init 也是这两步一起做）。
+        err = brain.init_db(self.win.root)
+        if err:
+            InfoBar.error("大脑建库失败", err, duration=5000, parent=self.win)
+            return
+        InfoBar.success("已初始化", "00_Inbox / 99_Archive / _hub（规则·共享记忆·操作流水·错误登记）+ 大脑库",
                         duration=3000, parent=self.win)
         self.win.refresh()
 
@@ -260,4 +300,134 @@ class SettingsPage(QWidget):
             InfoBar.error("保存失败", err, duration=3000, parent=self.win)
         else:
             InfoBar.success("已保存", "", duration=1500, parent=self.win)
+
+    # ---------------------------------------------------------------- 系统自检
+
+    def run_patrol_check(self):
+        """一键自检（R225）：后台跑 ops.run_patrol，结果回主线程渲染。
+
+        必须走后台：巡检里 db_integrity 要真读一遍库、stalled/inbox 要扫目录，
+        真实库可达数秒；同步跑会把窗口冻住，用户以为软件卡死——而"卡住的体检"
+        恰好是用户最需要它的时候。
+        """
+        if self._patrol_busy:
+            return
+        root = self.win.root or ""
+        if not root:
+            InfoBar.warning("还没有设置根目录",
+                            "先在上面「根目录」卡片里选一个目录，再运行自检",
+                            duration=3000, parent=self.win)
+            return
+        self._patrol_busy = True
+        self.patrolBtn.setEnabled(False)
+        self.patrolState.setText("正在检查…")
+        self._patrol_prog = {"done": 0, "total": 0, "name": ""}
+        if getattr(self, "_patrol_timer", None) is None:
+            self._patrol_timer = QTimer(self)
+            self._patrol_timer.setInterval(150)
+            self._patrol_timer.timeout.connect(self._patrol_tick)
+        self._patrol_timer.start()
+        w = FnWorker(lambda: ops.run_patrol(root, progress=self._on_patrol_progress), self)
+        w.done.connect(self._on_patrol_done)
+        if getattr(self, "_workers", None) is None:
+            self._workers = []
+        self._workers.append(w)
+        w.start()
+
+    def _on_patrol_progress(self, done, total, name):
+        """后台线程回调：**只写数据不碰控件**——Qt 控件只能在主线程改，主线程侧由
+        `_patrol_tick` 轮询这个字典（比跨线程信号简单，且不会漏掉最后一帧）。"""
+        prog = getattr(self, "_patrol_prog", None)
+        if prog is not None:
+            prog["done"], prog["total"], prog["name"] = done, total, name
+
+    def _patrol_tick(self):
+        prog = getattr(self, "_patrol_prog", None) or {}
+        if prog.get("total"):
+            self.patrolState.setText(
+                f"正在检查 {prog['done']}/{prog['total']}：{prog['name']}…")
+
+    def _on_patrol_done(self, rep):
+        self._patrol_busy = False
+        self.patrolBtn.setEnabled(True)
+        timer = getattr(self, "_patrol_timer", None)
+        if timer is not None:
+            timer.stop()
+        self.patrolView.setVisible(True)
+        if isinstance(rep, Exception):
+            self.patrolState.setText("自检执行失败")
+            self.patrolView.setPlainText(
+                f"自检执行失败（体检器自身异常，不是数据问题）：\n"
+                f"{type(rep).__name__}: {rep}")
+            return
+        self._patrol_report = rep
+        self.patrolCopyBtn.setEnabled(True)
+        self.patrolView.setPlainText(self._patrol_text(rep))
+        self.patrolState.setText(self._patrol_headline(rep))
+
+    @staticmethod
+    def _patrol_headline(rep) -> str:
+        """一行结论（口径与 cli.py doctor 保持一致，避免两处说法打架）。"""
+        n_decide = rep.get("decide_count", 0)
+        n_fix = len(rep.get("issues", [])) - n_decide
+        if n_decide and n_fix:
+            split = f"（可直接修复 {n_fix} · 需你拍板 {n_decide}）"
+        elif n_decide:
+            split = f"（均需你拍板 {n_decide}）"
+        else:
+            split = ""
+        same = rep.get("same_cause_skipped", 0)
+        if same:
+            head = (f"{rep.get('checked', 0)}/{rep.get('total', rep.get('checked', 0))} 项"
+                    f"（同因跳过 {same}）")
+        else:
+            head = f"{rep.get('checked', 0)} 项"
+        return (f"自检 {head}，通过 {len(rep.get('passed', []))}，"
+                f"问题 {len(rep.get('issues', []))}{split} · {rep.get('elapsed_ms', 0)}ms")
+
+    @staticmethod
+    def _patrol_text(rep) -> str:
+        lines = ["", "通过："]
+        lines += [f"  ✓ {n}" for n in rep.get("passed", [])] or ["  （无）"]
+        issues = rep.get("issues", [])
+        lines += ["", f"问题 {len(issues)} 项："]
+        if not issues:
+            lines.append("  （无）")
+        for i in issues:
+            tags = []
+            if i.get("scope") == "machine":
+                tags.append("机器级")
+            if i.get("kind") == "decide":
+                tags.append("要拍板")
+            tag = f"（{' · '.join(tags)}）" if tags else ""
+            lines.append(f"  ✗ {i.get('name', '')}{tag}：{i.get('summary', '')}")
+            fix = i.get("fix_brief") or i.get("fix") or ""
+            if fix:
+                lines.append(f"     修复：{fix}")
+            n_same = i.get("skipped_same_cause") or 0
+            if n_same:
+                lines.append(f"     注：另有 {n_same} 项依赖大脑库的检查因同一原因跳过"
+                             f"（建库/指对根目录后自动恢复）")
+            for d in (i.get("detail") or [])[:5]:
+                lines.append(f"       · {d}")
+        n_machine = sum(1 for i in issues if i.get("scope") == "machine")
+        if n_machine:
+            lines.append(f"  注：{n_machine} 项为机器级状态（运行进程 / 全局 agent 配置），"
+                         f"与当前根目录无关，换根目录也会照实报。")
+        skipped = rep.get("skipped", [])
+        if skipped:
+            lines += ["", "跳过："]
+            lines += [f"  … {s}" for s in ops.format_skipped(skipped)]
+        slow = sorted(rep.get("timings") or [], key=lambda x: -x.get("ms", 0))[:3]
+        if slow and slow[0].get("ms", 0) >= 1000:
+            lines += ["", "耗时 Top3：" + " · ".join(
+                f"{t.get('name', '')} {t.get('ms', 0) / 1000:.1f}s" for t in slow)]
+        return "\n".join(lines)
+
+    def copy_patrol(self):
+        rep = self._patrol_report
+        if not rep:
+            return
+        QApplication.clipboard().setText(self._patrol_headline(rep) + self._patrol_text(rep))
+        InfoBar.success("已复制自检报告", "可直接粘贴到工单/对话里", duration=2000, parent=self.win)
 

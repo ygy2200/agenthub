@@ -32,13 +32,17 @@ import json
 import os
 import re
 import sys
-import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 from collections import Counter
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
-sys.path.insert(0, str(ROOT))
-sys.path.insert(0, str(ROOT / "tests" / "gui"))
+# 脚本直接运行时 tools/ 已在 sys.path；但 `import tools.gui_snapshot`（pytest 里）
+# 不会自动加入——`import _console` 会因此 ImportError，测试把整个守卫 skip 掉，
+# 守卫静默失效（R217 实测：快照早已漂移，全量测试却一直“通过”）。
+for _p in (str(ROOT), str(ROOT / "tools"), str(ROOT / "tests" / "gui")):
+    if _p not in sys.path:
+        sys.path.insert(0, _p)
+import _console  # noqa: E402,F401  # 控制台 UTF-8 守卫（R179）
 
 # 基线**必须入库**（放 tests/ 下）：它是测试资产，跟着代码一起版本化。
 # 曾经放在 output/ 下，但 output/ 被 .gitignore 忽略——那样别人 clone 下来没有基线，
@@ -66,6 +70,10 @@ _DYNAMIC = (
     # agent 概览行的技能/MCP/记忆数是本机安装状态的投影，不是 UI 结构；
     # 装一个技能就变一次会让结构基线天天误报（R9 实测 165→186 即触发）。
     (re.compile(r"技能\s*\d+"), "技能 <N>"),
+    # 接入页「MCP 6/7 已接入 · 引导 7/7 已注入」的分母也是安装状态投影；
+    # 只打码分子会留下分母，装一个 agent 就误报（R217 实测 /6 → /7）。
+    (re.compile(r"MCP\s*\d+/\d+"), "MCP <N>/<N>"),
+    (re.compile(r"引导\s*\d+/\d+"), "引导 <N>/<N>"),
     (re.compile(r"MCP\s*\d+"), "MCP <N>"),
     (re.compile(r"记忆\s*\d+"), "记忆 <N>"),
     # 接入页状态行（R33 去部署化后）：真实反映 ready/stale/missing/no-python 四态，
@@ -142,6 +150,12 @@ def capture(update_shots: bool = False) -> dict:
     # 一加新用例就开始互相干扰——这类 bug 极难定位）。
     _orig_get_root = core.get_root
     core.get_root = lambda: root
+    # R232：诊断工具**永远不写用户配置**。此前 `w.close()` 走真实 closeEvent，把快照窗口的
+    # 尺寸/导航态写进 ~/.agenthub/config.json——测试跑一遍，用户下次打开应用窗口就变成
+    # 1283×823 且导航展开（R231 门禁红正是被这条副作用连带触发）。双保险：窗口静默关闭，
+    # 配置写入在工具生命周期内一律丢弃。
+    _orig_save_config = core.save_config
+    core.save_config = lambda *a, **k: None
     tokens.apply_theme(THEME)
 
     # agent 探测扫的是本机真实目录，结果随安装状态漂移（技能/MCP 数量变化就会改文案）。
@@ -154,12 +168,35 @@ def capture(update_shots: bool = False) -> dict:
     ]
     agentscore.detect_agents = lambda extra=None: _seed_agents
 
+    # 接入页整页是**本机安装状态的投影**：读真实 adapter 注册表、逐 agent 的 MCP 配置
+    # 与引导文件、真实部署状态。装一个 agent / 注入一次引导就会改摘要与卡片按钮，
+    # 结构基线不能跟着机器状态漂（R217 实测：本机 6→7 个 adapter 后整批文案误报）。
+    # 固定为可复现的三态种子：已接入+已引导 / 未接入但已引导 / 需手动配置。
+    _seed_adapters = [
+        {"agent": "Seed Agent A", "mcp": {"path": "~/.seed-a/mcp.json", "layout": "standard"},
+         "instr_path": "~/.seed-a/AGENTS.md"},
+        {"agent": "Seed Agent B", "mcp": {"path": "~/.seed-b/mcp.json", "layout": "standard"},
+         "instr_path": "~/.seed-b/AGENTS.md"},
+        {"agent": "Seed Manual", "mcp": None, "instr_path": ""},
+    ]
+    _orig = (core.load_agent_adapters, core.mcp_has_agenthub,
+             core.bootstrap_status, core.deploy_status)
+    core.load_agent_adapters = lambda root=None: _seed_adapters
+    core.mcp_has_agenthub = lambda path, layout="standard": "seed-a" in path
+    core.bootstrap_status = lambda path: bool(path) and "seed-a" in path
+    core.deploy_status = lambda: {"python": "<python>", "server": "<server>",
+                                  "state": "ready", "diff": [], "absent": []}
+
     out = {"_meta": {"theme": THEME, "size": [WIN_W, WIN_H], "font": font_src}, "pages": {}}
     w = ui.AgentHubWindow()
+    w._skip_close_hooks = True   # 不备份、不存配置、不武装 2s 硬退定时器（R232）
     try:
         w.resize(WIN_W, WIN_H)
         w.show()
         pump(app, lambda: getattr(w.project_page, "snap", None) is not None, 30)
+        # 接入页首刷挂在 400ms 单次定时器上：不等它就会在定时器触发前采集，
+        # 卡片/摘要/按钮整批表现为「文案消失」——时快时慢的假回归（R217 根因）。
+        pump(app, lambda: bool(w.connect_page.sumLabel.text()), 5.0)
         # 总览的 agent 行来自 300ms 定时器 + 后台探测：不等它就会采到半空页面，
         # 表现为时有时无的「文案消失」（R10 实测：新增 3 个 agent 后探测变慢即触发）。
         pump(app, lambda: bool(getattr(w.hub_page, "agents", None)), 8.0)
@@ -173,6 +210,20 @@ def capture(update_shots: bool = False) -> dict:
             # 固定 120ms 在机器负载高时采到半加载页面（playbook/signal 的 agent 下拉
             # 文案时有时无）——改为等事件队列真正安静，最多 1.5s。
             settle(app, max_s=1.5)
+            # R241：`_DB_ASYNC` 的页（统计）取数在**后台线程**，`settle` 只看事件队列
+            # 安静，线程还没回来就采到忙态——基线里的 agent 名/比率整批「文案消失」，
+            # 负载高时必红（本轮实测：单跑工具两次全绿，同一份代码在 pytest 进程里带
+            # 负载跑就红）。与 R217 修接入页同理：等**内容落地**，不等固定时长。
+            if attr in getattr(w, "_DB_ASYNC", ()):
+                pump(app, lambda a=attr: a not in w._db_pending and a not in w._db_dirty, 8.0)
+                settle(app, max_s=1.5)
+            # R240：分段懒加载的页面（治理中心）只兑现屏幕上那一段，直接采集会让基线
+            # 退化成「只守首屏」——八分之七的文案从此不再被守卫。先按用户切段路径把全部
+            # 段兑现，再采集：基线守的仍是整页契约，产品侧该省的成本一点没少。
+            rev = getattr(page, "reveal_all_segments", None)
+            if callable(rev):
+                rev()
+                settle(app, max_s=1.5)
             widgets = page.findChildren(QWidget)
             texts = []
             for wd in widgets:
@@ -203,7 +254,10 @@ def capture(update_shots: bool = False) -> dict:
                     pm.save(str(SHOTS / f"{attr}.png"))
     finally:
         core.get_root = _orig_get_root
+        core.save_config = _orig_save_config
         agentscore.detect_agents = _orig_detect
+        (core.load_agent_adapters, core.mcp_has_agenthub,
+         core.bootstrap_status, core.deploy_status) = _orig
         w.close()
     return out
 

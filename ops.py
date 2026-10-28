@@ -113,6 +113,69 @@ CHECK_FIXES = {
     "agent_onboard": "按清单逐项补：注册表/引导注入/MCP 配置/规则闸门/技能索引",
 }
 
+# R226：库不存在 ≠ 库损坏。这几处原来只给 summary，修复口径回落到 CHECK_FIXES 的
+# 「停写留证、按手册恢复备份」——对着一个指错根目录/还没建库的人讲这套，既吓人又无用
+# （空目录跑 doctor 时 4 项检查都念同一段恢复流程）。按失败类别自带短口径，随结果上浮。
+_DB_MISSING_SUMMARY = "大脑库不存在（根目录未配置或还没建库）"
+_DB_MISSING_FIX = ("先分清是哪种：①根目录指错了——用 --root 指到真实根目录重跑；"
+                   "②这是新目录——命令行跑 python cli.py init --root <目录>，"
+                   "或打开 AgentHub → 设置页「根目录」卡片 → 初始化目录结构，"
+                   "建库后重跑自检（MCP 侧可用 hub_bootstrap_status 看接入状态）")
+
+
+def _db_missing() -> dict:
+    # R233：带上 cause，run_patrol 据此折叠同因问题——库不存在是**一个**根因，
+    # 不该在报告里变成十几条各带一份修复手册的「问题」。
+    return {"ok": False, "summary": _DB_MISSING_SUMMARY, "detail": [],
+            "fix": _DB_MISSING_FIX, "cause": "db_missing"}
+
+
+# R233：依赖大脑库的巡检项。一旦确认库不存在，后续这些项跑了也只会报
+# `unable to open database file`（空目录实测：14 条同因问题里 10 条长这样，
+# 每条还各带一段与病因无关的修复手册）。跳过它们、把根因归成一条。
+DB_BACKED_CHECKS = frozenset({
+    "db_integrity", "db_health", "audit_chain", "security_health",
+    "usage_health", "stale_health", "ghost_memory", "dup_mem", "record_quality",
+    "date_health", "tasks_health", "governance_health", "lease_health", "stalled",
+})
+_CAUSE_DB_SKIP_WHY = "大脑库不存在（同因跳过，建库/指对根目录后重跑）"
+
+
+def format_skipped(skipped, max_names: int = 4) -> list:
+    """跳过清单按原因聚合（R233）：同因 13 条各占一行只会把报告撑长、掩住根因。"""
+    order, groups = [], {}
+    for s in skipped:
+        why = s.get("why", "")
+        if why not in groups:
+            groups[why] = []
+            order.append(why)
+        groups[why].append(s.get("name", ""))
+    out = []
+    for why in order:
+        names = groups[why]
+        if len(names) <= max_names:
+            out.append("、".join(f"{n}（{why}）" for n in names))
+        else:
+            out.append(f"{'、'.join(names[:max_names])} 等 {len(names)} 项（{why}）")
+    return out
+
+# R218：体检失败分两种——「照修复建议做掉」和「要人先拍板」。真实库实测 5 条红灯里
+# 4 条是后者（闲置 agent 留不留、重复记录合并哪条、饥饿待办认领还是关单）。混在一个
+# 「问题 N」里，用户分不清哪些能立刻清零，容易整体拖着不处理。
+DECISION_CHECKS = frozenset({
+    "rules_health",   # 某 agent 的引导闸门缺不缺，取决于还要不要接它
+    "usage_health",   # 闲置 agent：留用还是下线
+    "ghost_memory",   # 疑似重复的记录/记忆：合并哪条
+    "dup_mem",        # 重复记忆合并
+    "tasks_health",   # 待办饥饿/过期任务：认领、改派还是关单
+    "stalled",        # 停滞项目：归档还是继续
+})
+
+# R228：机器级检查——结论取决于本机运行进程与全局 agent 配置，换任何 --root 都照实报。
+# 在空目录/新库诊断里，它们和「本目录的问题」混在一起，容易被误读成新库坏了
+# （R227 实测：空目录 3 条红灯里 2 条是机器级）。巡检结果带 scope 供 CLI/GUI 标注。
+MACHINE_CHECKS = frozenset({"runtime_health", "rules_health"})
+
 
 def patrol_freshness_note() -> str:
     """R66：巡检结论的进程新鲜度标注——本进程代码旧于磁盘时返回一句警告，否则空串。
@@ -137,37 +200,88 @@ def patrol_freshness_note() -> str:
     return ""
 
 
-def run_patrol(root: str, checks=None) -> dict:
+def run_patrol(root: str, checks=None, progress=None) -> dict:
     """R8 一键自检：串行跑 PATROL_CHECKS，聚合成「通过/问题+修复建议」。
-    单项炸了只记该为问题（检查实现故障不等于大脑故障），不拖垮整轮。"""
+    单项炸了只记该为问题（检查实现故障不等于大脑故障），不拖垮整轮。
+
+    R225：`progress(done, total, name)` 在**每项结束后**回调一次。全量巡检在 R225 时真实库
+    实测约 13.5 秒（R236/R237 已压到 1.6 秒左右），
+    界面光显示"正在检查"会让人以为卡死；有了它才能显示「7/20 usage_health」这种活信号。
+    回调跑在调用方线程（GUI 侧在后台线程），且回调自身出错不影响体检结果。
+
+    R233：同因折叠。库不存在是**一个**根因，不该在报告里变成十几条各带修复手册的
+    「问题」（空目录实测 17 条问题里 14 条同因）。命中 cause=db_missing 后，后续
+    DB_BACKED_CHECKS 直接跳过、结果里计 `same_cause_skipped`；同一 cause 的重复
+    问题折叠进首个问题的 `also`。
+    """
     names = tuple(checks or PATROL_CHECKS)
     issues, passed, skipped = [], [], []
+    timings = []
     t0 = time.time()
+    done = 0
+    missing_db = False
+    primary_by_cause, folded = {}, {}
+
+    def _tick(name):
+        nonlocal done
+        done += 1
+        if progress is None:
+            return
+        try:
+            progress(done, len(names), name)
+        except Exception:  # noqa: BLE001 进度回调故障不该让体检失败
+            pass
+
     for idx, name in enumerate(names):
         if name not in CHECKS:
             skipped.append({"name": name, "why": "未注册的检查项"})
+            _tick(name)
             continue
         _, needs_target = CHECKS[name]
         if needs_target:
             skipped.append({"name": name, "why": "需要 target 目录，体检不代跑"})
+            _tick(name)
+            continue
+        if missing_db and name in DB_BACKED_CHECKS:
+            skipped.append({"name": name, "why": _CAUSE_DB_SKIP_WHY})
+            _tick(name)
             continue
         try:
+            t_item = time.time()
             r = run_check(name, "", root)
         except Exception as e:  # noqa: BLE001  单项炸不拖垮整轮
+            timings.append({"name": name, "ms": round((time.time() - t_item) * 1000)})
             issues.append({"name": name, "summary": f"检查自身异常：{e}",
                            "fix": "修 ops 检查实现（这是体检器故障，不是大脑数据故障）",
-                           "detail": []})
+                           "kind": "fix", "detail": []})
+            _tick(name)
             continue
+        # R229：单项耗时——没有逐项账本就没法回答「慢在哪」（R237 起由 `doctor --slow` 常开）
+        timings.append({"name": name, "ms": round((time.time() - t_item) * 1000)})
         if r.get("ok"):
             passed.append(name)
         else:
+            cause = r.get("cause")
+            if cause and cause in primary_by_cause:
+                # 同因重复问题折叠进首条，不各占一节（R233）
+                folded.setdefault(cause, []).append(name)
+                _tick(name)
+                continue
             issue = {"name": name, "summary": r.get("summary") or "未通过",
                      "fix": CHECK_FIXES.get(name, "看 hub_ops_run 的 detail 逐项处理"),
+                     "kind": "decide" if name in DECISION_CHECKS else "fix",
                      "detail": (r.get("detail") or [])[:5]}
+            if name in MACHINE_CHECKS:
+                issue["scope"] = "machine"
             # R178：检查项若能按失败类别给出更短口径，就随问题一起带上；
             # doctor 默认显示它，--full 才回退到上面的完整口径。
             if r.get("fix"):
                 issue["fix_brief"] = r["fix"]
+            if cause:
+                issue["cause"] = cause
+                primary_by_cause[cause] = issue
+                if cause == "db_missing":
+                    missing_db = True
             issues.append(issue)
             # R59：坏库上继续跑只会产出一屏次生失败（每项都「查询失败」），
             # 把后续项标成跳过并说明原因，让根因保持在第一条。
@@ -176,8 +290,20 @@ def run_patrol(root: str, checks=None) -> dict:
                     skipped.append({"name": rest,
                                     "why": "数据库损坏，跳过（先按 db_integrity 修复建议恢复）"})
                 break
+        _tick(name)
+    same_cause_skipped = sum(1 for s in skipped if s.get("why") == _CAUSE_DB_SKIP_WHY)
+    for cause, extra in folded.items():
+        primary_by_cause[cause]["also"] = extra
+    db_primary = primary_by_cause.get("db_missing")
+    if db_primary is not None and same_cause_skipped:
+        db_primary["skipped_same_cause"] = same_cause_skipped
+    decide = [i["name"] for i in issues if i.get("kind") == "decide"]
     return {"ok": not issues, "checked": len(names) - len(skipped),
+            "total": len(names),
             "issues": issues, "passed": passed, "skipped": skipped,
+            "same_cause_skipped": same_cause_skipped,
+            "decide_count": len(decide), "fix_count": len(issues) - len(decide),
+            "timings": timings,
             "elapsed_ms": round((time.time() - t0) * 1000)}
 
 
@@ -540,7 +666,7 @@ def _db_integrity(root: str) -> dict:
     import brain  # noqa: PLC0415
     p = Path(root) / brain.core.DIR_META / brain.DB_NAME if root else None
     if not root or p is None or not p.is_file():
-        return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+        return _db_missing()
     try:
         with brain.db_conn(root) as conn:
             bad = brain._db_quick_check(conn)
@@ -577,7 +703,7 @@ def _db_health(root: str) -> dict:
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
     p = Path(root) / brain.core.DIR_META / brain.DB_NAME if root else None
     if not root or p is None or not p.is_file():
-        return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+        return _db_missing()
     lines: list = []
     ok = True
     try:
@@ -629,7 +755,7 @@ def _audit_chain(root: str) -> dict:
     try:
         brain = _import_brain()
         if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
-            return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+            return _db_missing()
         v = brain.journal_verify(root)
     except Exception as e:  # noqa: BLE001
         return {"ok": False,
@@ -726,7 +852,7 @@ def _security_health(root: str) -> dict:
     try:
         brain = _import_brain()
         if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
-            return {"ok": False, "summary": "大脑库不存在（根目录未配置或还没建库）", "detail": []}
+            return _db_missing()
         v = brain.journal_verify(root)
         fr = brain.freeze_get(root)
         ctrl = brain.agent_control_map(root)
@@ -1228,17 +1354,28 @@ def _stale_health(root: str) -> dict:
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
     if not root:
         return {"ok": False, "summary": "大脑库根目录未配置", "detail": []}
-    # ① 泄漏抽查（最多 5 条已取代记忆，用内容前缀做查询探针）
+    # ① 泄漏抽查（最多 5 条已取代记忆，用内容前缀做查询探针）。R230：探针走 semantic=False
+    #    ——体检是低频只读动作，此前语义路要为一次抽查加载编码模型（真实库实测 stale_health
+    #    9.1s / 全检 11.8s）。语义路的过滤覆盖改由同批的结构性计数守：任何一条带向量的
+    #    已取代行只要被 live 谓词放行就报——比抽样查询更强，不靠相似度碰巧命中。
     try:
         with brain.db_conn(root) as conn:
             sup = [dict(r) for r in conn.execute(
                 "SELECT id, content FROM memories WHERE superseded_by IS NOT NULL AND superseded_by != 0 LIMIT 5")]
+            sem_leak = 0
+            if conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' "
+                            "AND name='embeddings'").fetchone():
+                sem_leak = conn.execute(
+                    "SELECT COUNT(*) FROM embeddings e JOIN memories r ON e.eid=r.id "
+                    "WHERE e.entity='memories' AND r.superseded_by IS NOT NULL "
+                    "AND r.superseded_by != 0 AND " + brain._live_sql("r.")).fetchone()[0]
         leaks = []
         for mcode in sup:
             kw = (mcode["content"] or "").strip()[:12]
             if not kw:
                 continue
-            ids = [r["id"] for r in brain.search_memories(root, kw, "", 5, count_hits=False)]
+            ids = [r["id"] for r in brain.search_memories(root, kw, "", 5, count_hits=False,
+                                                          semantic=False)]
             if mcode["id"] in ids:
                 leaks.append(mcode["id"])
     except Exception as e:  # noqa: BLE001
@@ -1261,10 +1398,13 @@ def _stale_health(root: str) -> dict:
         worst.sort(key=lambda t: -t[0])
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"新鲜度计算失败（{type(e).__name__}）：{e}", "detail": []}
-    if leaks:
+    if leaks or sem_leak:
+        detail = [f"泄漏记忆 #{i}（检索管线回归，查 _live_sql/语义路过滤）" for i in leaks][:8]
+        if sem_leak:
+            detail.append(f"语义路可达 {sem_leak} 条带向量的已取代记忆（JOIN 的 live 过滤失效）")
         return {"ok": False,
-                "summary": f"⚠ supersede 泄漏 {len(leaks)} 条（已取代的旧事实仍被检索返回——硬不变量破坏）",
-                "detail": [f"泄漏记忆 #{i}（检索管线回归，查 _live_sql/语义路过滤）" for i in leaks][:8]}
+                "summary": f"⚠ supersede 泄漏 {len(leaks) + sem_leak} 条（已取代的旧事实仍可被检索/AI 取回——硬不变量破坏）",
+                "detail": detail}
     total = len(rows)
     stale_n = dist["stale"] + dist["expired"]
     detail = [f"{st.upper()} #{r['id']}（{brain.KIND_CN.get(r['kind'], r['kind'])}，"
@@ -1592,16 +1732,23 @@ def _release(target: Path, home: Path | None = None) -> dict:
     return {"ok": True, "summary": "发布一致（无构建清单，mtime 判断，可能误报）", "detail": detail}
 
 
+_PROXY_PROBE_HOST = ("127.0.0.1", 7890)
+# R234：本机回环连接要么内核立刻 RST，要么端口在监听——100ms 足够；原来 1s 是
+# 「没开 FlClash」时每次体检都白等满一秒（真实库实测 env 1012ms 里 1016ms 是这一句；
+# FlClash 关闭时本机 firewall 会丢 SYN，只能等超时，所以这个上限就是每次体检的固定成本）。
+_PROXY_PROBE_TIMEOUT = 0.1
+
+
 def _env(root: str = "") -> dict:
     rows = [f"Python {sys.version.split()[0]} @ {sys.executable}"]
     es = Path.home() / ".agenthub" / "bin" / "es.exe"
     rows.append(f"Everything es.exe：{'有' if es.is_file() else '缺（全盘搜索不可用，voidtools.com/ES）'}")
     try:
-        s = socket.create_connection(("127.0.0.1", 7890), timeout=1)
+        s = socket.create_connection(_PROXY_PROBE_HOST, timeout=_PROXY_PROBE_TIMEOUT)
         s.close()
-        rows.append("代理 127.0.0.1:7890：在监听")
+        rows.append(f"代理 {_PROXY_PROBE_HOST[0]}:{_PROXY_PROBE_HOST[1]}：在监听")
     except OSError:
-        rows.append("代理 127.0.0.1:7890：不通（FlClash 未运行？出网类操作先开代理）")
+        rows.append(f"代理 {_PROXY_PROBE_HOST[0]}:{_PROXY_PROBE_HOST[1]}：不通（FlClash 未运行？出网类操作先开代理）")
     rows += _disk_and_brain(root)
     return {"ok": True, "summary": f"环境 {len(rows)} 项（开工预检，详情见 detail）", "detail": rows[:8]}
 

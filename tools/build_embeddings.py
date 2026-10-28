@@ -6,6 +6,8 @@
 用法：
     D:/python311/python.exe tools/build_embeddings.py
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import time
 import sys
 import os
@@ -26,7 +28,7 @@ def _mtext(r: dict) -> str:
 
 def main() -> None:
     root = core.get_root()
-    if not brain._HAS_ST:
+    if brain._st_cls() is None:
         print("sentence-transformers 未安装；语义路将降级（skip 建索引）")
         return
     brain._init_emb_table(root)

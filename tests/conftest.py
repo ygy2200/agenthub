@@ -18,12 +18,21 @@ os.environ.setdefault("HF_HUB_OFFLINE", "1")
 
 @pytest.fixture
 def hub_root(tmp_path, monkeypatch):
-    """独立临时大脑根。patch core.get_root/save_config，防测试触碰真实库与用户配置。"""
+    """独立临时大脑根。patch core.get_root/save_config/load_config，防测试触碰真实库与用户配置。
+
+    R232：此前只挡了写（save_config）和根目录，**读**仍走 ~/.agenthub/config.json——
+    用户把导航展开（nav_collapsed=false）后，920 窗的内容区从 823 掉到 749，总览四卡
+    折成 2×2、动态标题 148px，`test_status_pages_density` 两条用例直接红；而代码一行
+    没改，同一套件上轮还是绿的。布局类断言必须由测试钉住初始状态，不能跟着用户偏好漂。
+    """
     import core
     root = tmp_path / "hub-root"
     root.mkdir()
     monkeypatch.setattr(core, "get_root", lambda: str(root))
     monkeypatch.setattr(core, "save_config", lambda *a, **k: None)
+    fixed = {"root": str(root), "theme_mode": "dark", "nav_collapsed": True,
+             "ui_motion": "off", "ui_density": "basic"}
+    monkeypatch.setattr(core, "load_config", lambda: dict(fixed))
     return str(root)
 
 
@@ -37,6 +46,13 @@ def _flush_qt_deletes():
     有时 4 passed、有时崩）。flush + gc 把析构时机钉在用例边界，代价可忽略。
     """
     yield
+    try:
+        gw = sys.modules.get("helpers")  # tests/gui/helpers.py（只有 GUI 用例会导入）
+        if gw is not None:
+            from PySide6.QtWidgets import QApplication as _QA
+            gw.cleanup_windows(_QA.instance())
+    except Exception:  # noqa: BLE001 清理失败不该影响用例结论
+        pass
     try:
         from PySide6.QtWidgets import QApplication
         from PySide6.QtCore import QCoreApplication, QEvent

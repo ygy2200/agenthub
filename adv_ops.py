@@ -5,6 +5,12 @@
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tools"))
+import _console  # noqa: F401,E402  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import datetime
 import json
 import sys
@@ -994,6 +1000,31 @@ def main():
     check("run_patrol 全通过时 ok=True", rep_ok["ok"] is True and not rep_ok["issues"])
     check("run_patrol 报告耗时", isinstance(rep["elapsed_ms"], int) and rep["elapsed_ms"] >= 0)
 
+    # ---- 进度回调（R225）：GUI 一键体检靠它显示「7/20 usage_health」，否则真实库
+    # 13.5 秒里界面只有一句"正在检查"，用户会以为卡死
+    names4 = ("env", "db_health", "not_a_check", "regression")
+    steps = []
+    try:
+        ops.run_check = fake_run_check
+        ops.run_patrol(str(tmp), names4,
+                       progress=lambda d, t, n: steps.append((d, t, n)))
+    finally:
+        ops.run_check = _orig_run_check
+    check("进度回调每项一次（含跳过项）", [s[0] for s in steps] == [1, 2, 3, 4], str(steps))
+    check("进度回调 total 固定为项数", all(s[1] == len(names4) for s in steps), str(steps))
+    check("进度回调按顺序报检查名", [s[2] for s in steps] == list(names4), str(steps))
+
+    def bad_progress(d, t, n):
+        raise RuntimeError("进度回调自己坏了")
+    try:
+        ops.run_check = fake_run_check
+        rep_bp = ops.run_patrol(str(tmp), ("env", "db_health"), progress=bad_progress)
+    finally:
+        ops.run_check = _orig_run_check
+    check("进度回调故障不影响体检结果",
+          len(rep_bp["issues"]) == 2 and len(rep_bp["passed"]) == 0,
+          str(rep_bp)[:200])
+
     # ---- CHECKS 注册表自洽
     for n, (desc, need_t) in ops.CHECKS.items():
         check(f"注册表 {n} 描述非空", bool(desc.strip()))
@@ -1428,6 +1459,216 @@ def main():
           (not rep["ok"]) and [i["name"] for i in rep["issues"]] == ["db_integrity"]
           and len(rep["skipped"]) == 2
           and all("数据库损坏" in s["why"] for s in rep["skipped"]), str(rep))
+
+    # ---- R226 库不存在 ≠ 库损坏：空目录（指错根/还没建库）不该被念「停写留证、恢复备份」
+    e_root = tmp / "hub_empty_root"
+    e_root.mkdir()
+    er = ops.run_check("db_integrity", root=str(e_root))
+    check("db_integrity 库不存在时给「指对目录/建库」口径而非损坏恢复",
+          (not er["ok"]) and "不存在" in er["summary"] and not er.get("fatal")
+          and "真实根目录" in er.get("fix", "") and "留证" not in er.get("fix", ""), str(er))
+    erep = ops.run_patrol(str(e_root), checks=["db_integrity", "db_health"])
+    check("巡检把「库不存在」的短口径带到 fix_brief，同因库检查只报一条（R233）",
+          [i["name"] for i in erep["issues"]] == ["db_integrity"]
+          and "真实根目录" in (erep["issues"][0].get("fix_brief") or "")
+          and [s["name"] for s in erep["skipped"]] == ["db_health"]
+          and "同因" in erep["skipped"][0]["why"]
+          and erep["issues"][0].get("skipped_same_cause") == 1,
+          str(erep["issues"]))
+
+    # ---- R228 机器级检查标注：运行进程/全局 agent 配置的结论与 --root 无关，
+    # 空目录诊断里不能被误读成「这个库的问题」
+    real_run_check = ops.run_check
+    ops.run_check = lambda name, target="", root="": {
+        "ok": False, "summary": "x", "detail": []}
+    try:
+        srep = ops.run_patrol("ignored", checks=["runtime_health", "rules_health", "db_integrity"])
+    finally:
+        ops.run_check = real_run_check
+    by = {i["name"]: i for i in srep["issues"]}
+    check("巡检给机器级检查带 scope=machine，目录级检查不带",
+          by["runtime_health"].get("scope") == "machine"
+          and by["rules_health"].get("scope") == "machine"
+          and "scope" not in by["db_integrity"], str(srep["issues"]))
+    check("MACHINE_CHECKS 与巡检标注同源",
+          ops.MACHINE_CHECKS == frozenset({"runtime_health", "rules_health"}),
+          str(getattr(ops, "MACHINE_CHECKS", None)))
+    check("巡检给每个实际跑过的检查记单项耗时（跳过的项不记）",
+          [t["name"] for t in srep["timings"]]
+          == ["runtime_health", "rules_health", "db_integrity"]
+          and all(t["ms"] >= 0 for t in srep["timings"]), str(srep.get("timings")))
+
+    # ---- R233 同因折叠：空目录 17 条问题里 14 条同一个根因（库不存在），报告应只剩
+    # 一条根因 + 一份同因跳过清单，而不是十几条各带一段修复手册
+    r233 = tmp / "hub_same_cause_r233"
+    r233.mkdir()
+    fr233 = ops.run_patrol(str(r233))
+    check("R233 空目录依赖库的问题只报一条，其余计同因跳过",
+          [i["name"] for i in fr233["issues"] if i["name"] in ops.DB_BACKED_CHECKS]
+          == ["db_integrity"]
+          and fr233["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1
+          and {s["name"] for s in fr233["skipped"]}
+          == set(ops.DB_BACKED_CHECKS) - {"db_integrity"}, str(fr233["issues"])[:300])
+    blob = " ".join(str(i.get("summary", "")) + " " + " ".join(
+        str(d) for d in (i.get("detail") or [])) for i in fr233["issues"])
+    check("R233 报告不再出现裸 sqlite 错误文案",
+          "unable to open database file" not in blob, blob[:300])
+    check("R233 总项数/已跑/跳过对得上，且根因条目带同因计数",
+          fr233["total"] == len(ops.PATROL_CHECKS)
+          and fr233["checked"] + len(fr233["skipped"]) == fr233["total"]
+          and next(i for i in fr233["issues"]
+                   if i["name"] == "db_integrity").get("skipped_same_cause")
+          == len(ops.DB_BACKED_CHECKS) - 1, str(fr233)[:300])
+    check("R233 跳过清单按原因聚合（13 条同因不占 13 行）",
+          len(ops.format_skipped(fr233["skipped"])) == 1, str(fr233["skipped"])[:300])
+
+    # ---- R234 env 代理探测超时上限：FlClash 关闭时本机 firewall 丢 SYN，1s 超时让
+    # 每次体检固定白等一秒（真实库实测 env 1012ms 里 1016ms 就是这一句）
+    check("R234 代理探测超时有上限（不再固定等 1 秒）",
+          0 < getattr(ops, "_PROXY_PROBE_TIMEOUT", 1) <= 0.3
+          and any("7890" in str(d) for d in ops._env("")["detail"]),
+          str(getattr(ops, "_PROXY_PROBE_TIMEOUT", None)))
+
+    # ---- R235 相似度扫描提速的等价契约：位集 popcount 替集合交、isalnum 替正则全匹配，
+    # 都是「纯代数替换」——真实库 6.8 万对 448ms→77ms 换来的硬要求是结果一个都不许变。
+    # 哪天有人把它改成哈希/采样/近似，这里必须立刻红。
+    import brain as _b235
+    import re as _re235
+    r235 = tmp / "hub_similar_r235"
+    r235.mkdir()
+    _b235.init_db(str(r235))
+    for n in range(14):
+        _b235.add_memory(str(r235), f"巡检第 {n} 轮：三层门禁跑完，部署一致性核对通过，exe 重建",
+                         kind="project", agent="t")
+    _b235.add_memory(str(r235), "液压传动考试复习要点整理成 Word 文档", kind="note", agent="t")
+    _body = ("【目的】提速相似度扫描\n【做了什么】改分词与位集交集\n"
+             "【验证结果】逐对等价\n【如何回滚】回退 brain.py")
+    for n in range(8):
+        _b235.add_record(str(r235), "甲-项目", "t", "2026-10-27", f"R{n} 收口", _body)
+    _b235.add_record(str(r235), "乙-项目", "t", "2026-10-27", "R8 收口", _body)
+    _b235.add_record(str(r235), "甲-项目", "t", "2026-10-27", "会话锚（auto-hook）", _body)
+    _b235.add_record(str(r235), "甲-项目", "t", "2026-10-27", "自动捕获", _body, source="auto")
+
+    _REF_WORD = _re235.compile(r"[a-z0-9]+")
+
+    def _ref_tokens(t):
+        t = _re235.sub(r"[^\w一-鿿]+", " ", (t or "").lower())
+        s = set()
+        for seg in t.split():
+            if _REF_WORD.fullmatch(seg):
+                s.add(seg)
+            else:
+                s.update(seg[i:i + 2] for i in range(len(seg) - 1))
+        return s
+
+    def _pairwise(ts, thr, lim):
+        out = []
+        for i in range(len(ts)):
+            if not ts[i]:
+                continue
+            sa = len(ts[i])
+            for j in range(i + 1, len(ts)):
+                if not ts[j]:
+                    continue
+                sb = len(ts[j])
+                lo, hi = (sa, sb) if sa < sb else (sb, sa)
+                if lo / hi < thr:
+                    continue
+                inter = len(ts[i] & ts[j])   # 参照实现就用集合交
+                sim = inter / (sa + sb - inter)
+                if sim >= thr:
+                    out.append((i, j, round(sim, 2)))
+                if len(out) >= max(1, min(int(lim), 50)):
+                    return out
+        out.sort(key=lambda x: -x[2])
+        return out
+
+    def _ref_mem(thr, lim):
+        with _b235.db_conn(str(r235)) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, content FROM memories WHERE " + _b235._live_sql() + " ORDER BY id")]
+        by_id = {r["id"]: k for k, r in enumerate(rows)}
+        return [(rows[a]["id"], rows[b]["id"], s)
+                for a, b, s in _pairwise([_ref_tokens(r["content"]) for r in rows], thr, lim)]
+
+    def _ref_rec(thr, lim):
+        with _b235.db_conn(str(r235)) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT id, project, title, content FROM records WHERE "
+                + _b235._live_sql() + " AND date >= date('now', ?) AND source NOT LIKE 'migrated:%' "
+                "AND source != 'auto' ORDER BY id", ("-90 days",))]
+        rows = [r for r in rows if "（auto-hook）" not in (r["title"] or "")]
+        by = {}
+        for r in rows:
+            by.setdefault(r["project"], []).append(r)
+        hits = []
+        for items in by.values():
+            ts = [_ref_tokens(_re235.sub(r"【[^】]*】", " ", f"{x['title']} {x['content']}"))
+                  for x in items]
+            for a, b, s in _pairwise(ts, thr, lim):
+                hits.append((items[a]["id"], items[b]["id"], s))
+            if len(hits) >= max(1, min(int(lim), 50)):
+                hits.sort(key=lambda x: -x[2])
+                return hits
+        hits.sort(key=lambda x: -x[2])
+        return hits
+
+    bad235 = []
+    for thr in (0.3, 0.55, 0.8, 1.0):
+        for lim in (1, 3, 20):
+            got = [(p["a"], p["b"], p["sim"]) for p in _b235.similar_memories(str(r235), thr, lim)]
+            if got != _ref_mem(thr, lim):
+                bad235.append(("mem", thr, lim, got[:2], _ref_mem(thr, lim)[:2]))
+            got = [(p["a"], p["b"], p["sim"]) for p in _b235.similar_records(str(r235), thr, lim)]
+            if got != _ref_rec(thr, lim):
+                bad235.append(("rec", thr, lim, got[:2], _ref_rec(thr, lim)[:2]))
+    check("R235 位集相似度扫描与集合交参考逐对一致（4 阈值 × 3 limit × 记忆/记录两路）",
+          not bad235, str(bad235)[:400])
+    check("R235 分词快路径与正则全匹配版逐条同解",
+          all(_b235._tokens(c) == _ref_tokens(c) for c in
+              ("修了 FlClash 的规则，7890 端口", "snake_case 与 camelCase 混排", "【目的】【做了什么】",
+               "纯英文 words only", "中文连写无标点", "", None, "_", "🎉 emoji 混排")))
+    _tok = [{"a", "b", "c"}, set(), {f"t{k}" for k in range(200)}, {"a", "b", "c"}]
+    _bits, _sizes = _b235._bits_index(_tok)
+    check("R235 位集 popcount 严格等于集合交（含空集与跨字节词表）",
+          _sizes == [len(t) for t in _tok]
+          and all((a & b).bit_count() == len(x & y)
+                  for i, a in enumerate(_bits) for j, b in enumerate(_bits)
+                  for x, y in [(_tok[i], _tok[j])]),
+          str({"sizes": _sizes})[:120])
+
+    # ---- R230 陈旧健康探针不再加载语义模型：泄漏抽查走 semantic=False，
+    # 语义路改由结构性计数守；管线真泄漏时仍须报（不能为了快把门拆了）
+    import brain
+    r230 = tmp / "hub_stale_r230"
+    r230.mkdir()
+    brain.init_db(str(r230))
+    old_id = brain.add_memory(str(r230), "旧结论：部署目录在 D:/old/path", kind="fact", agent="t")
+    brain.add_memory(str(r230), "新结论：部署目录在 D:/new/path", kind="fact", agent="t",
+                     supersedes=old_id)
+    sem_calls = []
+    real_sem = brain._semantic_rank
+    brain._semantic_rank = lambda *a, **k: sem_calls.append(a) or []
+    try:
+        shr = ops.run_check("stale_health", "", str(r230))
+    finally:
+        brain._semantic_rank = real_sem
+    check("stale_health 泄漏抽查不再触达语义路（体检不加载编码模型）",
+          shr["ok"] and not sem_calls, str({"ok": shr["ok"], "sem_calls": len(sem_calls)}))
+    real_search = brain.search_memories
+
+    def leaky_search(root, query="", kind="", limit=20, count_hits=True, semantic=True):
+        rows = real_search(root, query, kind, limit, count_hits, semantic)
+        return rows if any(r["id"] == old_id for r in rows) else rows + [{"id": old_id}]
+
+    brain.search_memories = leaky_search
+    try:
+        lrep = ops.run_check("stale_health", "", str(r230))
+    finally:
+        brain.search_memories = real_search
+    check("stale_health 在管线回吐已取代条目时仍报泄漏",
+          (not lrep["ok"]) and "泄漏" in lrep["summary"]
+          and any(f"#{old_id}" in d for d in lrep["detail"]), str(lrep))
 
     print()
     if FAILED:

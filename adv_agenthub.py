@@ -6,6 +6,12 @@ Inbox 越权分拣、超长文件、根目录缺失。全绿输出 ALL PASS。
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tools"))
+import _console  # noqa: F401,E402  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import json
 import os
 import re

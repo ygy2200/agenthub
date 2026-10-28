@@ -40,6 +40,7 @@ class _SubPage(QWidget):
     TITLE = ""
     EMPTY_TITLE = "暂无数据"
     EMPTY_DESC = ""
+    page = None  # 由 GovernancePage 回填：本段单独刷新时要告诉父页「兄弟段该重读了」
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -65,8 +66,20 @@ class _SubPage(QWidget):
         it = self.listw.currentItem()
         return getattr(self, "_items", {}).get(id(it)) if it else None
 
-    def reload(self):
-        """统一入口：先填列表，再同步空态——保证提前 return 的分支也有引导。"""
+    def reload(self, dirty_siblings: bool = True):
+        """统一入口：先填列表，再同步空态——保证提前 return 的分支也有引导。
+
+        R240：本段被单独刷新（多是治理动作后的 `self.reload()`）时，先通知父页把
+        **其余段**标回待重读——页面级刷新从此只兑现可见段，兄弟段不会再被顺手刷。
+
+        R241：`dirty_siblings` 只该在**写过库**之后为 True。读（切段补读、筛选开关）不改
+        数据，把兄弟段标脏等于每次来回切段都重读一遍——security 段 336ms 会反复付，
+        懒加载退化成「只缓存当前段」（R240 就是这么写的，被 `reveal_all_segments` 的
+        守卫用例撞出来：兑现八段之后待读名单还是 7 段）。默认仍留 True：宁可多读一次，
+        也不给看旧数——忘传只多付一次读，反过来会显示旧数据。
+        """
+        if self.page is not None and dirty_siblings:
+            self.page.note_sub_reload(self)
         if not self.win.root:
             self._show_no_root()
             return
@@ -285,7 +298,7 @@ class _HandoffsSub(_SubPage):
         self.closeBtn.clicked.connect(self.close)
         self.allChk = CheckBox("含已认领/已作废")
         self.allChk.setToolTip("勾选后显示已认领/已作废交接，用于复核接手人与作废原因")
-        self.allChk.toggled.connect(lambda _on: self.reload())
+        self.allChk.toggled.connect(lambda _on: self.reload(dirty_siblings=False))
         self.btnRow.addWidget(self.claimBtn)
         self.btnRow.addWidget(self.closeBtn)
         self.btnRow.addStretch(1)
@@ -842,7 +855,26 @@ class _SecuritySub(_SubPage):
 
 
 class GovernancePage(QWidget):
-    """治理中心：待审批/待认领交接/隔离区/整合提案/待验证决策/关注管理/技能统计/安全与闸门 八段。"""
+    """治理中心：待审批/待认领交接/隔离区/整合提案/待验证决策/关注管理/技能统计/安全与闸门 八段。
+
+    R240：八段**只刷当前可见的那一段**，切段时再补。定罪来自
+    `output/_r240_subcost.py`（真实库 best-of-2）：整页 `reload()` 464ms，其中
+    security 336ms + consolidate 119ms 占 98%，而默认段 approvals 只要 2ms、其余
+    五段各 1–5ms；一次页面级刷新还要付掉 `brain.journal_verify` 6 次、
+    `ops.run_check` 12 次（守卫测试把这组次数钉成了断言）。
+
+    代价必须一起写：看不见的段不再被刷新。因此任何一段被**写过库**之后单独刷新（治理
+    动作路径是子页自己 `self.reload()`），其余段一律回到「待重读」名单，切过去必然重读
+    ——宁可多读一次，也不给看旧数据。
+
+    但「标脏」的触发条件只认**写**，不认**读**（R241 修 R240 自己埋的坑）：切段补读、
+    筛选开关这些不改数据的刷新若也标脏兄弟段，来回切段就每次全重读，懒加载退化成
+    「只缓存当前那一段」——security 段 336ms 会被反复付。撞出这条的是守卫用例
+    `test_reveal_all_segments_actually_lands_every_segment`：兑现八段后待读名单仍剩 7 段。
+    """
+
+    _KEYS = ("approvals", "handoffs", "quarantine", "consolidate",
+             "decision", "view", "skill", "security")
 
     def __init__(self, win, parent=None):
         super().__init__(parent)
@@ -858,18 +890,69 @@ class GovernancePage(QWidget):
         self.subs = (_ApprovalsSub(win), _HandoffsSub(win), _QuarantineSub(win),
                      _ConsolidateSub(win), _DecisionSub(win), _ViewSub(win),
                      _SkillStatsSub(win), _SecuritySub(win))
-        for key, sub in zip(("approvals", "handoffs", "quarantine", "consolidate",
-                             "decision", "view", "skill", "security"), self.subs):
+        # 键↔段只用这一张表映射（R167：`currentItem()` 是控件不是路由键，别比字符串）
+        self._idx = {key: i for i, key in enumerate(self._KEYS)}
+        self._pending = set(self._KEYS)  # 建好即全段待读：首屏只兑现可见段
+        for sub in self.subs:
+            sub.page = self
+        self.seg.currentItemChanged.connect(self._on_seg_changed)
+        for key, sub in zip(self._KEYS, self.subs):
             self.seg.addItem(key, sub.TITLE)
             self.stack.addWidget(sub)
-        self.seg.currentItemChanged.connect(
-            lambda key: self.stack.setCurrentIndex(
-                {"approvals": 0, "handoffs": 1, "quarantine": 2, "consolidate": 3,
-                 "decision": 4, "view": 5, "skill": 6, "security": 7}.get(key, 0)))
         lay.addWidget(self.seg)
         lay.addWidget(self.stack, 1)
         self.seg.setCurrentItem("approvals")
 
+    def _on_seg_changed(self, key):
+        self.stack.setCurrentIndex(self._idx.get(key, 0))
+        self._load_current()
+
+    def _current_key(self) -> str:
+        i = self.stack.currentIndex()
+        return self._KEYS[i] if 0 <= i < len(self._KEYS) else self._KEYS[0]
+
+    def _load_current(self):
+        key = self._current_key()
+        if key not in self._pending:
+            return
+        self._pending.discard(key)
+        # 补读是**读**：不写库，也就没资格把兄弟段标脏（R241）。
+        self.subs[self._idx[key]].reload(dirty_siblings=False)
+
+    def note_sub_reload(self, sub):
+        """某段自己刷过了：这次动作可能改到别的段可见的数据，其余段全部标回待重读。
+
+        标完立刻兑现**当前可见段**——`seg.setCurrentItem()` 切到已经显示的段不会发信号，
+        只标脏会让屏幕上那一段停在旧数据上（守卫用例
+        `test_write_then_other_segment_reload_then_switch_shows_new_state` 钉的就是这条）。
+        不变量：屏幕上那一段永远不旧于最近一次治理写入；只有**看不见**的段才等切过去再读。
+        """
+        for key, s in zip(self._KEYS, self.subs):
+            if s is not sub:
+                self._pending.add(key)
+        self._load_current()
+
+    def pending_keys(self):
+        """还没补读的段（切过去时会重读）——给测试与巡检看，别拿它当缓存判据。"""
+        return tuple(key for key in self._KEYS if key in self._pending)
+
+    def reveal_all_segments(self):
+        """诊断/守卫专用：按正常切段路径把八段各走一遍，让内容全部落地，最后回到原段。
+
+        懒加载把看不见的段推迟到「切过去才读」，而结构基线（`tools/gui_snapshot.py`）
+        和区块图标守卫（`tests/gui/test_spacing_guard.py`）要钉的是**每一段的文案与区块
+        在产品里真存在**。不让它们先兑现，基线就会退化成「只守首屏」——等于把八分之七
+        的文案守卫静默放开（R240 门禁实测两条红正是这么来的）。
+
+        只走 `setCurrentItem` → `_load_current` 这条用户路径，不绕过 `_pending`，
+        所以它兑现的就是用户真点过去会看到的东西。
+        """
+        origin = self._current_key()
+        for key in self._KEYS:
+            self.seg.setCurrentItem(key)
+        self.seg.setCurrentItem(origin)
+
     def reload(self):
-        for sub in self.subs:
-            sub.reload()
+        """页面级刷新（窗口 apply / 切页兑现）：全段作废，但只兑现可见的那一段。"""
+        self._pending = set(self._KEYS)
+        self._load_current()

@@ -101,9 +101,13 @@ class HelpPage(QWidget):
     <li><b>两个 agent 撞车怎么办？</b>agent 开工调 hub_heartbeat，同项目有别人活跃时会收到预警；总览页也能看到谁在干活。</li>
     </ul>
     <h2>命令行速查（CLI）</h2>
-    <p>维护者用：不开界面也能自检、看队列、部署——在 AgentHub 项目目录执行：</p>
+    <p>日常用界面就够：<b>设置 → 系统自检 → 运行自检</b>（一整套检查，失败项带可执行修复口径，可一键复制报告）。
+    下面这些是维护者用的——不开界面也能自检、看队列、部署，在 AgentHub 项目目录执行：</p>
     <ul>
-    <li><code>python cli.py doctor [--full]</code>：一键自检；默认精简输出，<code>--full</code> 展开完整修复口径</li>
+    <li><code>python cli.py init --root 目录</code>：把已有空目录建成大脑（目录结构+库，幂等不覆盖）</li>
+    <li><code>python cli.py doctor [--full]</code>：一键自检（与设置页那颗按钮同一套检查）；默认精简输出，<code>--full</code> 展开完整修复口径</li>
+    <li><code>python cli.py doctor --json</code> / <code>--only a,b</code> / <code>--skip a</code> / <code>--no-machine</code> / <code>--slow 8</code>：单行 JSON 给脚本读、只跑白名单项、跳过某项、摘掉与根目录无关的机器级项、强制列出耗时榜</li>
+    <li><code>python cli.py check --list</code> / <code>python cli.py check deploy_diff --target 目录</code>：自检清单之外的单项检查（回归、部署一致性等）从这里进；需要 target 的项不会给你默认值，填错目录直接是用法错误退出码，不会被当成「检查发现问题」</li>
     <li><code>python cli.py next --agent 名字</code>：按优先级看待认领 / 进行中 / 等待依赖</li>
     <li><code>python cli.py deploy</code> / <code>python cli.py release</code>：部署 MCP server / 发布一致性检查</li>
     <li><code>python tools/real_walkthrough.py 根目录 dark --size 920x600 --pages stats_page</code>：

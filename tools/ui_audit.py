@@ -5,6 +5,7 @@
 按运维手册 §13 手动跑。用法：python tools/ui_audit.py
 退出码：0=全过；1=有 FAIL。
 """
+import os
 import re
 import subprocess
 import sys
@@ -16,15 +17,39 @@ ROOT = Path(__file__).resolve().parent.parent
 results = []
 
 
+def _decode(raw: bytes) -> str:
+    """先按 UTF-8 解，解不开再按本机 locale（GBK）解。
+
+    被探测工具在 `import _console` 之前就崩时（语法错/导入错），traceback 走的是
+    locale 编码；只按 UTF-8 解会把 R220 刚加的「失败证据」变成一串 �。
+    """
+    if not raw:
+        return ""
+    for enc in ("utf-8", sys.getfilesystemencoding()):
+        try:
+            return raw.decode(enc)
+        except (UnicodeDecodeError, LookupError):
+            continue
+    return raw.decode("utf-8", "replace")
+
+
 def run(name, cmd, parse=None):
     t0 = time.perf_counter()
-    r = subprocess.run(cmd, capture_output=True, text=True,
-                       encoding="utf-8", errors="replace", cwd=ROOT,
-                       timeout=600)
-    out = (r.stdout or "") + (r.stderr or "")
+    # 子进程统一 UTF-8 输出：不然管道下默认 locale 编码，与本进程解析口径不一致
+    env = dict(os.environ, PYTHONIOENCODING="utf-8")
+    try:
+        r = subprocess.run(cmd, capture_output=True, cwd=ROOT, env=env, timeout=600)
+    except subprocess.TimeoutExpired:
+        results.append((name, False, f"{time.perf_counter() - t0:.0f}s",
+                        "超时 600s", ["子进程未退出；单独重跑该命令看卡在哪一页/哪一步"]))
+        return
+    out = _decode(r.stdout) + _decode(r.stderr)
     ok = r.returncode == 0
-    detail = parse(out) if parse and ok else ("FAIL" if not ok else "")
-    results.append((name, ok, f"{time.perf_counter() - t0:.0f}s", detail))
+    detail = parse(out) if parse else ""
+    # R220：失败时原实现只回一个「FAIL」——真正的断言/差异被丢掉，等于把排查
+    # 推回给人重跑一遍（还要再等几分钟）。失败时保留输出尾部作为证据。
+    evidence = [] if ok else [ln for ln in out.strip().splitlines() if ln.strip()][-8:]
+    results.append((name, ok, f"{time.perf_counter() - t0:.0f}s", detail, evidence))
 
 
 def parse_snapshot(out):
@@ -52,10 +77,12 @@ def main():
 
     print("=== UI 体检摘要 ===")
     bad = 0
-    for name, ok, cost, detail in results:
+    for name, ok, cost, detail, evidence in results:
         print(f"{'✓' if ok else '✗'} {name}（{cost}）{('：' + detail) if detail else ''}")
+        for ln in evidence:
+            print(f"    {ln}")
         bad += 0 if ok else 1
-    print(f"结论：{'全过' if bad == 0 else f'{bad} 项 FAIL'}")
+    print(f"结论：{'全过' if bad == 0 else f'{bad} 项 FAIL（证据见上）'}")
     sys.exit(1 if bad else 0)
 
 

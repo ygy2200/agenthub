@@ -26,12 +26,19 @@ ROOT = Path(__file__).resolve().parents[2]
 sys.path.insert(0, str(ROOT))
 
 
+def test_snapshot_tool_importable_as_package():
+    """守卫必须能被 pytest 真导入：曾因 `_console` 不在 sys.path 整用例 skip，
+    快照早已漂移全量测试却一直“通过”（R217：守卫静默失效比误报危险）。"""
+    import tools.gui_snapshot as g
+    assert g.SNAP.exists(), "结构基线缺失：跑 python tools/gui_snapshot.py --update"
+
+
 def test_gui_structural_snapshot_matches_baseline():
     import pytest
-    try:
-        import tools.gui_snapshot as g
-    except ImportError as e:
-        pytest.skip(f"GUI 快照工具不可用（{e}）——GUI 侧检查，可跳过")
+    pytest.importorskip("PySide6")
+    # 只 skip「环境没装 GUI 框架」；其它 ImportError 一律红——不能再把守卫
+    # 的依赖问题变成静默 skip（R217 教训）。
+    import tools.gui_snapshot as g
 
     if not g.SNAP.exists():
         pytest.skip("尚无 GUI 结构基线——先跑一次 "
@@ -46,11 +53,19 @@ def test_gui_structural_snapshot_matches_baseline():
     # 全局状态（core.get_root / 主题 / 已实例化窗口）污染。
     import os
     import subprocess
+    import core
+    # R232：采集**不得改写用户真实配置**。gui_snapshot 曾漏设 _skip_close_hooks，
+    # w.close() 把快照窗口的 1283×823 几何与导航态写进 ~/.agenthub/config.json；
+    # 这条断言是那道副作用的回归闸门（内容比对，忽略 mtime 噪音）。
+    cfg_before = core.CONFIG_FILE.read_bytes() if core.CONFIG_FILE.exists() else b""
     env = {**os.environ, "QT_QPA_PLATFORM": "offscreen", "PYTHONIOENCODING": "utf-8"}
     proc = subprocess.run(
         [sys.executable, str(ROOT / "tools" / "gui_snapshot.py"), "--json"],
         cwd=ROOT, env=env, capture_output=True, text=True,
         encoding="utf-8", errors="replace", timeout=300)
+    cfg_after = core.CONFIG_FILE.read_bytes() if core.CONFIG_FILE.exists() else b""
+    assert cfg_after == cfg_before, (
+        "快照采集改写了用户真实配置（~/.agenthub/config.json）——诊断工具必须与用户状态隔离")
     detail = (proc.stdout or "") + (proc.stderr or "")
     assert proc.returncode == 0, (
         "GUI 结构回归（如为有意改动，跑 python tools/gui_snapshot.py --update 重建基线）：\n"
@@ -60,10 +75,8 @@ def test_gui_structural_snapshot_matches_baseline():
 def test_snapshot_diff_catches_regressions():
     """反向验证：守卫必须真能抓到回归，且完全一致时不误报。"""
     import pytest
-    try:
-        import tools.gui_snapshot as g
-    except ImportError as e:
-        pytest.skip(f"GUI 快照工具不可用（{e}）")
+    pytest.importorskip("PySide6")
+    import tools.gui_snapshot as g
     if not g.SNAP.exists():
         pytest.skip("无基线，diff 反向验证一并跳过")
 

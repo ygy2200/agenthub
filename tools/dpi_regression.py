@@ -18,6 +18,8 @@ PassThrough 策略 + PreferVerticalHinting 修复）。字号阶梯改过之后�
 """
 from __future__ import annotations
 
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import os
 import re
 import subprocess

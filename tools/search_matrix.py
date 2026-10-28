@@ -4,6 +4,8 @@
 一次性诊断脚本（2026-10-17 R4）。用法：python search_matrix.py
 判定：命中数 + 首条相关性 + 时延。零命中且相关词存在 = 真盲区。
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import sys
 import time
 from pathlib import Path

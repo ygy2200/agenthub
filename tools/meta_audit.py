@@ -4,6 +4,8 @@
 一次性诊断脚本（2026-10-17 R6）。口径与 brain.metacognition 的 meta_ratio 一致：
 内容含 AgentHub / hub_ / 大脑 的记忆计为 meta（大脑关于自己的记忆）。
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import sys
 from pathlib import Path
 

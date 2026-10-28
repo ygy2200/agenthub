@@ -16,6 +16,12 @@ config.agents.json 假适配器全部导进 tmp（设计好的扩展点，零改
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tools"))
+import _console  # noqa: F401,E402  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import io
 import json
 import os
@@ -27,7 +33,7 @@ import tempfile
 import time
 import urllib.error
 import urllib.request
-from contextlib import redirect_stdout
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import cli
@@ -220,6 +226,26 @@ def t_task_cli(tmp):
     # argparse 子命令接线（含 --root）
     rc, out = _capture(cli.main, ["--root", root, "tasks", "--project", "CLI"])
     assert rc == 0 and "任务" in out and f"#{a}" in out, (rc, out)
+    # R226：--root 位置无关——写在子命令后面也要生效（R225 实跑 doctor 撞到过
+    # 「unrecognized arguments: --root」，全局选项只在子命令前有效）
+    rc, out = _capture(cli.main, ["tasks", "--project", "CLI", "--root", root])
+    assert rc == 0 and f"#{a}" in out, (rc, out)
+
+    # R227：init 在已有空目录建出可用大脑（目录结构+建库），幂等不覆盖、不替用户造目录
+    init_root = Path(tmp) / "hub_cli_init"
+    init_root.mkdir()
+    rc, out = _capture(cli.main, ["init", "--root", str(init_root)])
+    assert rc == 0 and "已初始化" in out, (rc, out)
+    assert (init_root / "_hub" / "brain.db").is_file()
+    rules_before = (init_root / "_hub" / "rules.md").read_text(encoding="utf-8")
+    rc, out = _capture(cli.main, ["init", "--root", str(init_root)])
+    assert rc == 0 and "校验完成" in out and "既有数据未动" in out, (rc, out)
+    assert (init_root / "_hub" / "rules.md").read_text(encoding="utf-8") == rules_before
+    rc, out = _capture(cli.cmd_tasks, str(init_root))
+    assert rc == 0 and "暂无任务" in out, (rc, out)
+    missing_root = Path(tmp) / "hub_cli_init_missing"
+    rc, out = _capture(cli.main, ["init", "--root", str(missing_root)])
+    assert rc == 2 and "目录不存在" in out and not missing_root.exists(), (rc, out)
     rc, out = _capture(cli.main, ["--root", root, "checkpoint", str(b), "CLI 主入口写入",
                                   "--agent", "cliagent"])
     assert rc == 0 and "检查点已写入" in out, (rc, out)
@@ -902,6 +928,87 @@ def t_governance_cli(tmp):
     assert rc == 0 and "安全拦截" in out and "2 次" in out, (rc, out)
 
 
+def t_doctor_entry_r237(tmp):
+    """R237 自检入口的真跑面：单测里 run_patrol 是假报告，这里全部走**真库真巡检**。
+
+    真跑才能钉住的三件事：① 真 `run_patrol` 返回值必须**真的可 json.dumps**（datetime /
+    Path 之类的对象一旦混进去，假字典测不出来）；② `--only` 的注册表顺序、`--no-machine`
+    的摘除集合，都要对着运行时注册表核对，不是对着我抄的清单；③ 用法错误（拼错项名、
+    缺 target、target 不是目录）必须是退出码 2 且 stdout 全空——巡检一旦跑起来，
+    「你没敲对」和「大脑有问题」就分不清了。
+    """
+    import ops
+    root = Path(tmp) / "hub_r237"
+    root.mkdir(parents=True, exist_ok=True)
+    import brain
+    brain.ensure_schema(str(root))
+
+    def _cap2(argv):
+        """doctor/check 会把用法错误写到 stderr，所以要同时截两条流。"""
+        out, err = io.StringIO(), io.StringIO()
+        with redirect_stdout(out), redirect_stderr(err):
+            rc = cli.main(argv)
+        return rc, out.getvalue(), err.getvalue()
+
+    # ① 真巡检的 JSON：单行、可解析、结构与假报告同构
+    rc, out, err = _cap2(["--root", str(root), "doctor", "--json"])
+    assert rc in (0, 1), (rc, err[:200])
+    line = out.strip("\r\n")
+    assert "\n" not in line, "doctor --json 必须是单行（多行就没法 jq 一行一条读）"
+    data = json.loads(line)
+    for k in ("schema", "root", "asked", "filters", "slowest", "report"):
+        assert k in data, f"缺键 {k}：{sorted(data)}"
+    assert data["asked"] == list(ops.PATROL_CHECKS), "--json 默认范围应等于巡检清单"
+    rep = data["report"]
+    assert rep["total"] == len(data["asked"])
+    assert sum(t["ms"] for t in rep.get("timings") or []) <= int(rep["elapsed_ms"]) + 50, rep
+    for row in data["slowest"]:
+        assert 0.0 <= row["share"] <= 1.0, row
+    assert sum(r["share"] for r in data["slowest"]) <= 1.001, data["slowest"]
+
+    # ② 范围裁剪对着运行时注册表核对
+    rc, out, err = _cap2(["--root", str(root), "doctor", "--json",
+                          "--only", "ghost_memory,env"])
+    data = json.loads(out.strip("\r\n"))
+    asked = data["asked"]
+    assert asked == ["env", "ghost_memory"], f"顺序须跟随注册表而非书写顺序：{asked}"
+    assert data["filters"]["only"] == ["ghost_memory", "env"], data["filters"]
+    rc, out, err = _cap2(["--root", str(root), "doctor", "--json", "--no-machine"])
+    data = json.loads(out.strip("\r\n"))
+    assert not (set(data["asked"]) & set(ops.MACHINE_CHECKS)), data["asked"]
+    assert len(data["asked"]) == len(ops.PATROL_CHECKS) - len(
+        set(ops.PATROL_CHECKS) & set(ops.MACHINE_CHECKS))
+    assert data["filters"]["no_machine"] is True and data["filters"]["only"] == []
+
+    # ③ 用法错误：不跑巡检、stdout 不留结论、stderr 点名
+    for argv, why in (
+        (["--root", str(root), "doctor", "--only", "stale_heath"], "拼错的巡检项名"),
+        (["--root", str(root), "doctor", "--only", "env", "--skip", "env"], "自相矛盾的过滤"),
+        (["--root", str(root), "doctor", "--only", "hygiene,env"], "注册表里有但不归 doctor 跑的项"),
+        (["--root", str(root), "check", "no_such_check"], "不存在的检查项"),
+        (["--root", str(root), "check", "deploy_diff"], "需要 target 却没给"),
+        (["--root", str(root), "check", "py_compile", "--target", str(root / "nope")],
+         "target 不是目录"),
+    ):
+        rc, out, err = _cap2(argv)
+        assert rc == 2, f"{why}应退 2：rc={rc} out={out[:120]!r}"
+        assert out.strip() == "", f"{why}不得伪装成检查结论：{out[:120]!r}"
+        assert err.strip(), f"{why}要在 stderr 说清缺什么"
+    rc, out, err = _cap2(["--root", str(root), "doctor", "--only", "stale_heath"])
+    assert "stale_heath" in err, err[:200]
+
+    # ④ --list 现读注册表；单检查项真跑只给结论不炸
+    rc, out, err = _cap2(["--root", str(root), "check", "--list"])
+    assert rc == 0 and all(name in out for name in ops.CHECKS), out[:200]
+    rc, out, err = _cap2(["--root", str(root), "check", "deploy_diff",
+                          "--target", str(tmp)])
+    assert rc == 1 and "deploy_diff" in out, (rc, out[:200])
+    rc, out, err = _cap2(["--root", str(root), "check", "env", "--json"])
+    data = json.loads(out.strip("\r\n"))
+    assert rc in (0, 1) and data["name"] == "env", (rc, out[:200])
+    assert data["result"]["summary"], data
+
+
 def main():
     tmp = tempfile.mkdtemp(prefix="agenthub_cli_")
     print(f"临时目录：{tmp}\n")
@@ -941,6 +1048,9 @@ def main():
          lambda: t_governance_cli(tmp))
     case("R100·CLI 审批退回（原因必填/自退拒/非审批拒/成功回执与状态/已批准不可退/argparse 接线）",
          lambda: t_reject_cli(tmp))
+    case("R237·CLI 自检入口真跑（doctor --json 可解析/--only 跟随注册表/--no-machine 摘机器级/"
+         "用法错误退 2 且 stdout 空/check --list 现读注册表）",
+         lambda: t_doctor_entry_r237(tmp))
     print()
     if FAILED:
         print(f"未通过 {len(FAILED)} 项：{'、'.join(FAILED)}")

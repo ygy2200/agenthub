@@ -10,10 +10,11 @@
 
 ## 快速开始
 
-1. **接入**：GUI「接入中心」一键写入，或 `python cli.py onboard <agent>`（先 `python cli.py discover` 看本机有哪些）。
-2. **开工**：让 agent 调 `hub_get_progress(limit=15)` 对齐进度；查背景用 `hub_memory_read(query="项目名 关键词")`。
-3. **收工**：`hub_log_work`（四段式）→ `hub_memory_write` 沉淀 → `hub_ops_run` 自检。
-4. **体检**：`python cli.py --root <根目录> doctor`；故障排查、备份恢复、发布流程见 **[docs/运维手册.md](docs/运维手册.md)**。
+1. **建脑**：挑一个**已有**目录当根（路径打错不会被凭空造出来），`python cli.py init --root <目录>` 建出 `00_Inbox` / `99_Archive` / `_hub` 与大脑库（幂等，已有数据不动）；GUI 等价入口是「设置 → 根目录 → 初始化目录结构」。
+2. **接入**：GUI「接入中心」一键写入，或 `python cli.py onboard <agent>`（先 `python cli.py discover` 看本机有哪些）。
+3. **开工**：让 agent 调 `hub_get_progress(limit=15)` 对齐进度；查背景用 `hub_memory_read(query="项目名 关键词")`。
+4. **收工**：`hub_log_work`（四段式）→ `hub_memory_write` 沉淀 → `hub_ops_run` 自检。
+5. **体检**：GUI「设置 → 系统自检」一键跑完巡检清单（失败项带修复口径、可复制报告），或 `python cli.py doctor --root <根目录>`（`--root` 写在子命令前后都行）。给脚本/agent 读就 `doctor --json`（单行），只想看某几项 `--only a,b`、想跳过机器级项 `--no-machine`；巡检清单之外的单项检查（如 `deploy_diff`、`regression`）用 `python cli.py check <项名> --target <目录>`，`check --list` 看全量。故障排查、备份恢复、发布流程见 **[docs/运维手册.md](docs/运维手册.md)**。
 
 场景化帮助直接问 agent：`hub_help(topic="start|search|backup|tasks|recover|release")`——不用翻文档也能拿到下一步命令。
 
@@ -61,7 +62,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 
 ## 版本演进
 
-当前版本 **v2.41.77**。完整版本历史（229 个版本，含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。
+当前版本 **v2.41.99**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
 
 ## 设计原则
 
@@ -82,7 +83,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 python main.py
 ```
 
-打包：`build.bat`。测试：`python tests/run_all.py`（unit / gui / e2e 三层门禁）；对抗性回归：`python adv_brain.py`、`python adv_mcp.py`、`python adv_concurrency.py` 等 12 套（清单见 `tools/` 与运维手册）。
+打包：`build.bat`。测试：`python tests/run_all.py`（unit / gui / e2e 三层门禁；单文件无 junit 的崩溃会空闲重跑一次并标注）；对抗性回归：`python adv_brain.py`、`python adv_mcp.py`、`python adv_concurrency.py` 等 12 套（清单见 `tools/` 与运维手册）。
 
 ## 技术栈
 
@@ -112,7 +113,7 @@ unified project records, input/output file management, a public memory, capabili
 
 Download the single-file `AgentHub.exe` from [Releases](https://github.com/ygy2200/agenthub/releases), pick your records folder, and connect your agents in the "Connect" page.
 
-Current version **v2.41.77** — full version history in [CHANGELOG.md](CHANGELOG.md).
+Current version **v2.41.99** — full version history in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

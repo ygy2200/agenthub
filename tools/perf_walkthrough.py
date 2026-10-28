@@ -55,7 +55,13 @@ def main() -> int:
 
     beat = Beat()
     beat.t.start()
-    # 先排空窗口初始 refresh，避免把它算进第一页
+    # 显式等窗口首个全局刷新（ScanWorker 后台扫描完成后才 apply，落在 1–3s 后）：
+    # 以前只静默 0.3s 就开测，启动刷新会随机落进「总览」的 800ms 窗口，
+    # 表现为间歇性 2.4s 假慢页（R217 根因之一）。
+    deadline = time.perf_counter() + 20
+    while time.perf_counter() < deadline and not getattr(w, "_apply_count", 0):
+        app.processEvents()
+        time.sleep(0.005)
     idle_end = time.perf_counter() + 0.3
     while time.perf_counter() < idle_end:
         app.processEvents()

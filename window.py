@@ -29,10 +29,45 @@ from pages.components_page import ComponentsPage  # noqa: F401
 from pages.settings_page import SettingsPage  # noqa: F401
 
 
+def _close_hooks_quiet(env, skip_flag) -> bool:
+    """这个窗口实例退出时是否**什么都不该写**（不备份大脑、不存配置、不排硬退定时器）。
+
+    判据是「它不是用户正在用的桌面会话」，不是「调用方记不记得打标记」：
+    R232 只挡了 pytest（`PYTEST_CURRENT_TEST`），不带 pytest 的离屏诊断脚本照样把
+    测试窗口几何写进用户真实配置（R240 实测：`output/_r240_subcost.py` 一次
+    `win.close()` 覆盖了 `win_geometry`，旧值无备份不可恢复）。离屏平台根本没有
+    真实桌面窗口，它的几何/导航态对用户配置就没有意义——从结构上杜绝，比要求
+    每个脚本自觉可靠。
+
+    只有 offscreen 这一档算非桌面会话：minimal/windows 等仍按生产走，否则用户
+    下次开应用窗口位置每次都回默认，是比上述事故更常被察觉的回归。
+    """
+    if skip_flag:
+        return True
+    if env.get("PYTEST_CURRENT_TEST"):
+        return True
+    return env.get("QT_QPA_PLATFORM") == "offscreen"
+
+
 # ---------------------------------------------------------------- 主窗口
 
 class AgentHubWindow(FluentWindow):
     """主窗口。边缘缩放：原生 hit-test（BORDER_WIDTH 加宽）+ Qt QSizeGrip 角落手柄双保险。"""
+
+    # R217：这些页的数据刷新在 apply() 里同步跑会卡住主线程（真实库实测：
+    # brain 659ms + governance 617ms + stats 536ms，合计 2.36s）。它们此刻并不可见，
+    # 改为「标脏 + 首次切到该页再加载」——启动只刷新当前可见页，点开某页时再付它的加载成本。
+    _DB_PAGES = ("timeline_page", "stats_page", "brain_page", "today_page",
+                 "signal_page", "governance_page", "playbook_page")
+
+    # R239：这些页把取数交给后台线程。判据是实测的取数/绘制比例（output/_r239_dupes.txt）：
+    # 统计页 383ms 墙钟里取数 345ms、画控件 38ms；大脑页 375/13；治理页 489/3。
+    # 也就是说 R217 的「点开这页时再付它的成本」加上 R238 的「付完再上屏」合起来
+    # = 切页硬冻 0.4s（期间不重绘、不响应点击）。既然成本几乎全在数据库而不在绘制，
+    # 就把取数挪出 UI 线程、上屏时先盖骨架屏，回到主线程只干那 3~38ms 的渲染。
+    # 前提：页面实现 fetch_db(root)（只读库）+ apply_db(bundle)（只碰控件）——
+    # timeline/search/report/settings/hub 早就按 FnWorker 这套惯例走，不是新发明。
+    _DB_ASYNC = ("stats_page",)
 
     def __init__(self):
         super().__init__()
@@ -41,6 +76,16 @@ class AgentHubWindow(FluentWindow):
         # 密实度（P4 设置页开关）：必须在建页面前生效——行高与间距在建布局时就读了
         tokens.set_density(tokens.load_density_choice())
         self._workers = []
+        self._apply_count = 0  # 首次全局刷新的完成次数（走查工具据此等启动完成）
+        # 懒刷新的脏名单**从构造起就得在**：原先只在 apply() 里创建，于是首轮扫描落地之前
+        # （真实库实测 887ms）切到数据页时 switchTo 走 hasattr 为假的分支——既不加脏也不
+        # 加载，页面空白且没人负责补（R238）。
+        self._db_dirty = set(self._DB_PAGES)
+        # 异步取数的在飞账本：_db_seq[attr]＝该页最后一次请求的序号，回调结果序号不符
+        # 就直接丢（刷新后到达的旧读取不许盖掉新数据）；_db_pending 防连点同一页叠线程。
+        self._db_seq = {}
+        self._db_pending = set()
+        self._db_req = 0
         if self.root and os.path.isdir(self.root):
             # 建表 + 历史 md/jsonl 增量迁移（幂等），后台跑防卡启动
             w = FnWorker(lambda: brain.init_db(self.root), self)
@@ -145,7 +190,7 @@ class AgentHubWindow(FluentWindow):
                 _sc = QShortcut(QKeySequence(f"Ctrl+{_ctrl}"), self)
                 _sc.activated.connect(lambda a=_attr: self.switchTo(getattr(self, a)))
         self._workers = getattr(self, "_workers", [])  # 迁移线程已在 __init__ 挂入
-        QTimer.singleShot(200, self.refresh)
+        defer(self, self.refresh, 200)   # R239：延后回调挂窗口寿命，拆窗后不再在死控件上刷新
         # 开机自检（大脑自己跑，agent 不参与）：启动 5 分钟后后台跑一次 env 环境预检落流水。
         # QTimer 挂 self 为 parent——窗口销毁时定时器随之销毁，不会在死对象上触发
         self._auto_env_timer = QTimer(self)
@@ -201,11 +246,23 @@ class AgentHubWindow(FluentWindow):
         编排中心 4 页没进名单 → 深色主题下这 4 页渲染成白底（像素采样近白 79–82%，
         正常页 3–7%），内容近乎不可见。现在首次上色在 `_add()`（唯一入口）完成，
         本方法改为遍历 `actions.PAGES` 重刷——**名单消失，新增页面自动覆盖**。
-        经 qconfig.themeChangedFinished 信号随任何主题变化自动更新。"""
+        经 qconfig.themeChangedFinished 信号随任何主题变化自动更新。
+
+        R224：只对**当前可见页**立刻重刷，其余只标脏（`invalidate_page_background`），
+        等 `switchTo` 显示前补齐。理由：给页面根 setStyleSheet 会触发整页 re-polish
+        （实测约 17ms/页 × 18 页 ≈ 290ms），而换肤那一刻 17/18 的页面并不可见——
+        这是"换肤 787ms"里最后一块可省的钱。标脏不清 QSS：未补刷的页面仍带上一版
+        不透明底色，不会退化成透明页（R194 白底不可见那类 P0 的防线不靠"立刻全刷"）。
+        """
+        cur = self.stackedWidget.currentWidget()
         for _attr, _title, _icon, _group, _kw, _ctrl in actions.PAGES:
             page = actions.page_of(self, _attr)
-            if page is not None:
+            if page is None:
+                continue
+            if page is cur:
                 apply_page_background(page)
+            else:
+                invalidate_page_background(page)
 
     def _narrow_nav(self):
         """导航栏按上次退出时的显示模式恢复（qfw 有 COMPACT/MENU/EXPAND 三态，
@@ -223,9 +280,9 @@ class AgentHubWindow(FluentWindow):
         if panel is None or not hasattr(panel, "collapse"):
             return
         if core.load_config().get("nav_collapsed", True):
-            QTimer.singleShot(0, panel.collapse)  # 窗口显示后执行，初始化前调用无效
+            defer(panel, panel.collapse)  # 窗口显示后执行，初始化前调用无效（定时器随面板销毁）
         else:
-            QTimer.singleShot(0, panel.expand)
+            defer(panel, panel.expand)
 
     def _nav_collapsed_now(self):
         """用户视角的收起状态：仅 COMPACT 算收起；MENU（悬浮展开）/EXPAND 都算展开。"""
@@ -237,29 +294,46 @@ class AgentHubWindow(FluentWindow):
         """退出前：断后台线程信号（防 wait 超时后回调触碰已关闭的 UI）、等线程结束，备份大脑，再记住状态。
         wait 2s 超时的线程：切断 Qt 父子链并由 _DETACHED_THREADS 持引用——窗口销毁不再删除
         运行中线程（destroyed-while-running abort 即"有时候退出会报错"的根因），进程随后
-        经 os._exit 硬杀，不触发析构。SQLite 写入中途被杀由 WAL/退出自动备份兜底。"""
+        经 os._exit 硬杀，不触发析构。SQLite 写入中途被杀由 WAL/退出自动备份兜底。
+
+        _skip_close_hooks=True 供测试收尾：断线程信号后直接返回，不备份、不存配置、不排
+        2s 硬退定时器——定时器一旦触发 os._exit(0) 会连同 pytest 整个进程一起杀掉，
+        表现为套件跑完一个用例后静默退出、无汇总。
+
+        R232：pytest 进程内默认静默——测试/诊断工具常忘了设 _skip_close_hooks
+        （gui_snapshot 就漏了），一次 w.close() 把 920×600 的测试窗口几何写进用户
+        真实配置，下次开应用窗口尺寸就被改掉。PYTEST_CURRENT_TEST 由 pytest 注入且
+        会被子进程继承，作为兜底闸门；生产运行不受影响。
+
+        R240：判据抽成 `_close_hooks_quiet`，并把**离屏平台**也算非桌面会话——
+        R232 那条只挡 pytest，本轮诊断脚本（不经 pytest 的 offscreen 探针）又写了
+        一次用户配置。见该函数 docstring。"""
+        quiet = _close_hooks_quiet(os.environ, getattr(self, "_skip_close_hooks", False))
         for lst in self._collect_worker_lists():
             for t in list(lst):
                 try:
                     t.blockSignals(True)  # 阻断 done/finished 全部信号：wait 超时后线程回调不再进已关闭的界面
-                    if not t.wait(2000):
+                    if not t.wait(250 if quiet else 2000):
                         t.setParent(None)
                         _DETACHED_THREADS.append(t)
                 except Exception:
                     pass
-        if self.root and os.path.isdir(self.root):
+        if not quiet:
+            if self.root and os.path.isdir(self.root):
+                try:
+                    brain.backup_brain(self.root)  # 退出自动备份大脑（轮转保留30份）
+                except Exception:
+                    pass
             try:
-                brain.backup_brain(self.root)  # 退出自动备份大脑（轮转保留30份）
+                cfg = core.load_config()
+                cfg["win_geometry"] = bytes(self.saveGeometry().toBase64()).decode()
+                cfg["nav_collapsed"] = self._nav_collapsed_now()
+                core.save_config(cfg)
             except Exception:
                 pass
-        try:
-            cfg = core.load_config()
-            cfg["win_geometry"] = bytes(self.saveGeometry().toBase64()).decode()
-            cfg["nav_collapsed"] = self._nav_collapsed_now()
-            core.save_config(cfg)
-        except Exception:
-            pass
         super().closeEvent(e)
+        if quiet:
+            return
         # 退出挂起兜底（qfw item view+QSS 偶发挂起，os._exit 兜底须 exec 返回才生效）：
         # 走到这里备份/保存已全部完成，若 2 秒后事件循环仍未退出就硬杀，不给用户留"关不掉"。
         # 旧写法 lambda 引用 self.isVisible()——2 秒后窗口 C++ 对象可能已删（销毁时序不定），
@@ -287,6 +361,106 @@ class AgentHubWindow(FluentWindow):
             InfoBar.error("大脑建库失败", err, duration=5000, parent=self)
         self.settings_page.reload()
         self.refresh()
+
+    def switchTo(self, page, *args, **kwargs):  # noqa: N802  qfluentwidgets 同名 API
+        """切页即兑现懒刷新：apply() 只把数据页标脏，真正加载发生在用户要看它时。
+
+        R224：页面底色同理——换肤只刷可见页，其余标脏；这里在 show **之前**补齐，
+        避免"先白闪一帧再变成目标主题色"。已是当前色时是空操作（不多付 re-polish）。
+
+        R238：数据也一并提到 show **之前**（底色与数据同一条口径），并且只有真填上
+        才消脏；填不上就保留标记。启动窗口里首轮扫描尚未落地时，脏名单从构造起就在，
+        切页因此不会"既不加载也不留标记"。
+
+        R239 修订：`_DB_ASYNC` 里的页做不到"上屏前填好"——那 345ms 取数压在 UI 线程
+        就是切页硬冻。改为上屏前盖**骨架屏**（真忙态），不变量从「上屏前填好数据」
+        收紧回「上屏时页面上必须有东西：数据或忙态，绝不是一屏 0/空白」，脏标记
+        仍只在数据真正落地后消。
+        """
+        apply_page_background(page)
+        if hasattr(self, "_db_dirty"):
+            attr = self._page_attr(page)
+            if attr in self._db_dirty:
+                # 先填数据**再**让页面上屏：super().switchTo 之后才加载的话，用户看到的
+                # 是一帧空白再蹦出内容（实测治理页 509ms、大脑页 402ms、统计页 354ms）。
+                # 也只有真填上才消脏——失败/没选目录时保留标记，下次切页或下次刷新再试，
+                # 消掉就等于让这页空白到下一次全局刷新。
+                if self._reload_db_page(attr):
+                    self._db_dirty.discard(attr)
+        super().switchTo(page, *args, **kwargs)
+
+    def _page_attr(self, page) -> str:
+        for attr, *_ in actions.PAGES:
+            if getattr(self, attr, None) is page:
+                return attr
+        return ""
+
+    def _reload_db_page(self, attr: str, force: bool = False) -> bool:
+        """按需加载一个数据页；返回是否真的填上了（False＝保持脏）。"""
+        if not self.root:
+            return False  # 还没选目录：读库只会得到"没有数据"的假状态，不如不填
+        if attr in self._DB_ASYNC:
+            page = getattr(self, attr, None)
+            if page is not None and hasattr(page, "fetch_db"):
+                return self._start_db_fetch(attr, page, force)
+            # 页面还没做取数/渲染分离：退回同步加载，语义与 R238 一致
+        try:
+            if attr == "timeline_page":
+                if brain.records_count(self.root) > VIRTUAL_THRESHOLD:
+                    self.timeline_page.set_virtual(self.root)
+                else:
+                    self.timeline_page.set_records(brain.list_records(self.root, limit=2000))
+            elif attr == "stats_page":
+                self.stats_page.set_db(brain.stats(self.root))
+            else:
+                getattr(self, attr).reload()
+        except Exception:  # noqa: BLE001 单页加载失败不该拦住切页
+            return False
+        return True
+
+    def _start_db_fetch(self, attr: str, page, force: bool) -> bool:
+        """取数交给 FnWorker（后台线程），回来只渲染；返回 False＝消脏责任在回调。"""
+        if attr in self._db_pending and not force:
+            return False  # 该页已有一次读取在飞：连点不该再叠一条线程
+        self._db_req += 1
+        seq = self._db_req
+        self._db_seq[attr] = seq
+        self._db_pending.add(attr)
+        root = self.root
+        try:
+            page.show_busy()
+        except Exception:  # noqa: BLE001 占位画不出来不影响取数
+            pass
+        w = FnWorker(lambda: page.fetch_db(root), self)
+        w.done.connect(lambda res, a=attr, s=seq: self._on_db_fetched(a, s, res))
+        w.finished.connect(lambda wk=w: self._workers.remove(wk) if wk in self._workers else None)
+        self._workers.append(w)
+        w.start()
+        return False
+
+    def _on_db_fetched(self, attr: str, seq: int, res) -> None:
+        """取数回来了（已在主线程）：过期结果直接丢，其余按成功/失败各自收口。"""
+        if self._db_seq.get(attr) != seq:
+            return  # 刷新/重新请求之后才到达的旧读取——渲染它就会用旧数据盖新数据
+        self._db_pending.discard(attr)
+        page = getattr(self, attr, None)
+        if page is None:
+            return
+        if isinstance(res, Exception):
+            try:
+                page.show_failure(res)
+            except Exception:  # noqa: BLE001 报错文案本身画不出来不该再炸一次
+                pass
+            return  # 失败保持标脏：下次切页/刷新还会重试，不静默留白
+        try:
+            page.apply_db(res)
+        except Exception as e:  # noqa: BLE001
+            try:
+                page.show_failure(e)
+            except Exception:
+                pass
+            return
+        self._db_dirty.discard(attr)
 
     def refresh(self):
         if not self.root:
@@ -320,20 +494,14 @@ class AgentHubWindow(FluentWindow):
         except Exception:
             pass
         self.project_page.set_snapshot(snap)
-        try:
-            # P2-3a：>阈值行进虚拟滚动（按页后台拉取），小库走旧全量路径
-            if brain.records_count(self.root) > VIRTUAL_THRESHOLD:
-                self.timeline_page.set_virtual(self.root)
-            else:
-                self.timeline_page.set_records(brain.list_records(self.root, limit=2000))
-            self.stats_page.set_db(brain.stats(self.root))
-            self.brain_page.reload()
-            self.today_page.reload()
-            self.signal_page.reload()
-            self.governance_page.reload()
-            self.playbook_page.reload()
-        except Exception:
-            pass
+        # R217：数据页改为按需刷新（见 _DB_PAGES）。刷新时用户正看着的那页立即兑现，
+        # 其余标脏等切页——否则每次 apply 都要把 2s+ 的重活压在不可见页上。
+        self._db_dirty = set(self._DB_PAGES)
+        _cur_attr = self._page_attr(self.stackedWidget.currentWidget())
+        # force=True：刷新意味着「刚才那次的库状态已经不作数了」，此时在飞的读取要作废，
+        # 由这次刷新重新发起——序号一变，旧回调自动被丢（见 _on_db_fetched）。
+        if _cur_attr in self._db_dirty and self._reload_db_page(_cur_attr, force=True):
+            self._db_dirty.discard(_cur_attr)
         self.audit_page.set_snapshot(snap)
         self.overview_page.set_snapshot(snap)
         try:
@@ -356,6 +524,7 @@ class AgentHubWindow(FluentWindow):
             # ——新增页面自动获得，不需要记得手工调 polish_*
             polish_lists(_pg)
             polish_cards(_pg)
+        self._apply_count += 1
 
 
 def _install_crash_hook():

@@ -82,7 +82,12 @@ class CommandPalette(QWidget):
         self.show()
         self.raise_()
         self.activateWindow()
-        QTimer.singleShot(30, self.search.setFocus)  # 延迟聚焦：等面板渲染完
+        # 延迟聚焦：等面板渲染完。定时器挂本面板——面板先销毁则这次延后自动作废，
+        # 不会在已删除的输入框上跑 setFocus（R239 同批清理的调用点）。
+        self._focusTimer = QTimer(self)
+        self._focusTimer.setSingleShot(True)
+        self._focusTimer.timeout.connect(self.search.setFocus)
+        self._focusTimer.start(30)
 
     def _collect(self):
         """每次 popup 重新收集（数据动态变化：项目列表/主题）。

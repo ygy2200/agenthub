@@ -3,6 +3,8 @@
 用 PrintWindow 抓真机渲染，验证主窗口 + Ctrl+K 命令面板。
 用法：python verify_exe_v225.py
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import ctypes
 import ctypes.wintypes as wt
 import os

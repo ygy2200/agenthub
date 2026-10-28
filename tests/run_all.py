@@ -20,12 +20,20 @@ GUI 层按文件拆到独立进程并设超时——状态不互相污染，卡�
 异常码（≥0xC0000000）→ 判测试通过并记「退出告警」（R10 实测 Qt 在 pytest 汇总
 完成后析构崩溃，结果本身有效）；junit 不完整或普通非零 rc → 硬失败。告警不会
 被吞掉：逐文件打印，层汇总计入条数，最终报告列为遗留。
+
+R231：**无 junit 的目标空闲重跑一次**。真实场景（2026-10-27 R230 首跑）：GUI 套件与
+12 套 adv_* 回归并行，`test_connect_page_summary.py` 在 `helpers.settle` 的
+processEvents 里段错，junit 缺失 → 整层假红；系统空闲后同一文件 3 passed。
+无 junit＝子进程没跑到 pytest 汇总（段错/被杀），这类崩溃对负载敏感、对代码不敏感；
+真实缺陷在重跑里会复现。所以只在「无 junit」且非超时时等 3 秒重跑一次，重跑通过
+标注「首次崩溃已重跑通过」并计入层汇总；超时不重跑（时间成本翻倍且超时通常是真卡死）。
 """
 import os
 import shutil
 import subprocess
 import sys
 import tempfile
+import time
 import xml.etree.ElementTree as ET
 from pathlib import Path
 
@@ -88,6 +96,24 @@ def _run_pytest(target: Path, xml_path: Path, timeout_s: int):
         return -1, True
 
 
+def _run_target(target: Path, xml_path: Path, timeout_s: int):
+    """跑一个目标；无 junit（子进程没跑到汇总）时等 RETRY_PAUSE_S 重跑一次。
+    返回 (rc, timed_out, counts, retried)。超时不重跑。"""
+    rc, timed_out = _run_pytest(target, xml_path, timeout_s)
+    if timed_out:
+        return rc, timed_out, None, False
+    counts = _junit_counts(xml_path)
+    if counts is not None:
+        return rc, timed_out, counts, False
+    time.sleep(RETRY_PAUSE_S)
+    rc, timed_out = _run_pytest(target, xml_path, timeout_s)
+    return rc, timed_out, (None if timed_out else _junit_counts(xml_path)), True
+
+
+# 重跑前的停顿：给系统一点时间回收上一次崩溃的进程/句柄，也避免瞬间同址复崩
+RETRY_PAUSE_S = 3.0
+
+
 def main() -> int:
     failed = []
     tmp = Path(tempfile.mkdtemp(prefix="agenthub_pytest_"))
@@ -99,18 +125,22 @@ def main() -> int:
             totals = [0, 0, 0, 0]
             problems = []
             warnings = []
+            retries = []
             for i, target in enumerate(targets, 1):
                 xml_path = tmp / f"{name}_{i}.xml"
-                rc, timed_out = _run_pytest(target, xml_path, timeout_s)
+                rc, timed_out, counts, retried = _run_target(target, xml_path, timeout_s)
                 label = target.name if per_file else path
+                if retried:
+                    retries.append(label)
                 if timed_out:
                     problems.append(f"{label} 超时(>{timeout_s}s)")
                     print(f"  [{i}/{len(targets)}] {label}: 超时", flush=True)
                     continue
-                counts = _junit_counts(xml_path)
                 if counts is None:
-                    problems.append(f"{label} 无 junit 结果(rc={rc})")
-                    print(f"  [{i}/{len(targets)}] {label}: 无 junit 结果", flush=True)
+                    problems.append(f"{label} 无 junit 结果(rc={rc}"
+                                    + ("，重跑后仍无" if retried else "") + ")")
+                    print(f"  [{i}/{len(targets)}] {label}: 无 junit 结果"
+                          + ("（重跑后仍无）" if retried else ""), flush=True)
                     continue
                 tests, failures, errors, skipped = counts
                 for j, v in enumerate(counts):
@@ -132,8 +162,11 @@ def main() -> int:
                           flush=True)
                 else:
                     note = ""
+                    if retried:
+                        note = "，首次崩溃已重跑通过"
+                        warnings.append(f"{label}: 首次无 junit，重跑通过")
                     if native_crash:
-                        note = f"，退出告警 rc=0x{rc:08X}（pytest 汇总后崩溃）"
+                        note += f"，退出告警 rc=0x{rc:08X}（pytest 汇总后崩溃）"
                         warnings.append(f"{label}: rc=0x{rc:08X}")
                     if per_file or note:
                         print(f"  [{i}/{len(targets)}] {label}: PASS"
@@ -148,6 +181,8 @@ def main() -> int:
                 detail += f", {skipped} skipped"
             if problems:
                 detail += f"；{len(problems)} 个目标异常"
+            if retries:
+                detail += f"；{len(retries)} 个崩溃重跑通过"
             if warnings:
                 detail += f"；{len(warnings)} 个退出告警"
             ok = not problems and tests > 0 and failures == 0 and errors == 0

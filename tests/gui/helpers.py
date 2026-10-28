@@ -41,9 +41,81 @@ def insert_records(root, n, projects=5):
 
 
 def boot_window(qapp, root):
-    """构造真实窗口（core.get_root 已由 hub_root fixture patch 指向临时库）。"""
+    """构造真实窗口（core.get_root 已由 hub_root fixture patch 指向临时库）。
+
+    测试窗口一律走无副作用关闭：closeEvent 正常路径会备份大脑、存配置并排一个
+    2s 硬退定时器（os._exit(0)）——同进程的 pytest 会被它整个杀掉。"""
     import ui
     w = ui.AgentHubWindow()
+    w._skip_close_hooks = True
     w.resize(1280, 820)
     w.show()
+    _WINDOWS.append(w)
     return w
+
+
+_WINDOWS = []
+
+
+def cleanup_windows(app=None):
+    """用例边界销毁窗口（R221）。
+
+    用例只在 finally 里 `w.hide()`，窗口本身活到进程结束——106 个用例在同一进程里
+    堆出上百个窗口和后台扫描线程（实测跑到 26% 已 2.9GB / 90 线程、CPU 打满），
+    事件循环越跑越慢，套件从秒级变成二十分钟级。关闭 + deleteLater + 冲刷
+    DeferredDelete，让每个用例从干净状态开始。
+
+    只在**全部后台线程已结束**时才删：QThread 带任务时被析构会让整个进程进入
+    半死状态（实测后续出现 `QFile.open → SystemError: bad argument to internal
+    function` 这类毫不相干的报错）。等不到就只隐藏并保留引用——内存仍比不删低
+    （不可见窗口不参与绘制），但绝不在线程在飞时销毁。
+    """
+    import gc
+    from PySide6.QtCore import QCoreApplication, QEvent
+    from PySide6.QtWidgets import QWidget
+    kept = []
+    for w in _WINDOWS:
+        try:
+            if not _workers_idle(w):
+                kept.append(w)
+                continue
+            _deregister_styles(w, QWidget)
+            w.close()
+            w.deleteLater()
+        except RuntimeError:  # 已被 Qt 销毁
+            pass
+    _WINDOWS[:] = kept
+    if app is not None:
+        QCoreApplication.sendPostedEvents(None, QEvent.Type.DeferredDelete)
+        app.processEvents()
+    gc.collect()
+
+
+def _workers_idle(w, budget_s=1.0):
+    """窗口及其各页的后台线程是否都已结束（未结束的只断信号，不销毁窗口）。"""
+    try:
+        lists = w._collect_worker_lists()
+    except Exception:  # noqa: BLE001
+        return True
+    idle = True
+    for lst in lists:
+        for t in list(lst):
+            try:
+                t.blockSignals(True)
+                if t.isRunning() and not t.wait(int(budget_s * 1000)):
+                    idle = False
+            except RuntimeError:
+                pass
+    return idle
+
+
+def _deregister_styles(w, QWidget):
+    try:
+        from qfluentwidgets.common.style_sheet import styleSheetManager
+    except Exception:  # noqa: BLE001 qfw 换版本时清理照常进行
+        return
+    for x in [w] + w.findChildren(QWidget):
+        try:
+            styleSheetManager.deregister(x)
+        except Exception:  # noqa: BLE001
+            pass

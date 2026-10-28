@@ -149,11 +149,25 @@ def test_section_icons_min(qapp, hub_root):
         w.switchTo(page)
         for _ in range(5):
             qapp.processEvents()
+        # R240：分段懒加载的页面只有可见段落了内容，图标（空态/区块头带的 IconWidget）
+        # 自然只剩一两个——先按用户切段路径兑现全部段，本守卫才还在守整页。
+        rev = getattr(page, "reveal_all_segments", None)
+        if callable(rev):
+            rev()
+        for _ in range(5):
+            qapp.processEvents()
         n = len([c for c in page.findChildren(QWidget) if type(c).__name__ == "IconWidget"])
         if n < 2:
             low.append(f"{title}={n}")
     assert not low, f"这些页的区块图标少于 2 个（请用 section_head(text, icon)）：{low}"
+
+
+def test_set_spacing_uses_tokens():
     """setSpacing 必须走 tokens.SPACE_*（或 0），不允许裸网格整数。
+
+    R241 修复结构：本函数的 `def` 行在 d5b36b3（第三轮视觉重塑）被一次 Edit 吞掉，
+    整段并进了上一个用例 `test_section_icons_min` 的体内——图标断言一红，这里连跑都
+    没跑（守卫自身失灵的第 N 次复发，`output/_r241_fused_defs.py` 全仓扫描仅此一处）。
 
     2026-10-15 第二轮扩面。上一轮只守"值在 4px 网格上"，于是 25 处 `setSpacing(8)`
     原样留着——**两套来源并存**：改 token 只改到一半，和第一轮"页头 28→24 只落地

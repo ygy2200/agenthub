@@ -7,6 +7,12 @@
 """
 from __future__ import annotations
 
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tools"))
+import _console  # noqa: F401,E402  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import datetime
 import json
 import os
@@ -730,7 +736,7 @@ def t_emb_local_first(tmp):
     跑的是默认环境（不设 HF_HUB_OFFLINE），测的正是生产路径。"""
     import os as _os
     import time as _t
-    if not brain._HAS_ST:
+    if brain._st_cls() is None:
         return  # 未装依赖：语义路本就降级，跳过
     cache = _os.path.join(_os.path.expanduser("~"), ".cache", "huggingface", "hub",
                           "models--BAAI--bge-small-zh-v1.5")
@@ -5120,6 +5126,8 @@ def main():
          lambda: t_tok_cache_bounded(tmp))
     case("R100 审批退回（原因必填/owner 不能自退/非审批与非在办拒/批准后拒/释放持有与租约/留痕累计/信号/journal）",
          lambda: t_task_reject(tmp))
+    case("R236 df 单次扫描条件聚合（跨过 64 分块逐键等值/语料总量/已取代行不再加分/闸门行为不变）",
+         lambda: t_token_df_bulk_equiv(tmp))
     shutil_rmtree(tmp)
     print()
     if FAILED:
@@ -6241,25 +6249,87 @@ def t_coverage_gate_reuses_df(tmp):
 
     3 万记录库实测：每个 token 两条全表 COUNT，重复一遍约占单次检索 15%。
     行为不变（乱码查询仍被闸掉），只断言扫描次数。
+    R236 换了接缝：df 与语料总量合并进 _token_stats（一次连接、每表一次扫描），所以
+    拦截点从 _token_df 移到 _token_stats——契约本身（一次闸门只扫一遍）不变，同时钉住
+    _token_df 仍等价委托，防止后人把「只扫一遍」在重构里悄悄丢掉。
     """
     root = str(Path(tmp) / "hub_gate_reuse")
     Path(root).mkdir(parents=True, exist_ok=True)
     brain.init_db(root)
     calls = {"n": 0}
-    orig = brain._token_df
+    orig = brain._token_stats
 
     def counting(r, tokens):
         calls["n"] += 1
         return orig(r, tokens)
 
-    brain._token_df = counting
+    brain._token_stats = counting
     try:
         rows = [{"id": 1, "title": "无关", "content": "内容", "project": "p"}]
         out = brain._coverage_gate(root, rows, "zzz qqq wwww", min_match=2)
     finally:
-        brain._token_df = orig
+        brain._token_stats = orig
     assert out == [], out                      # 乱码查询仍被闸掉（行为不变）
     assert calls["n"] == 1, f"df 被重复扫描 {calls['n']} 次"
+    # 委托关系单独验（不能塞进上面计数窗口，否则把「只扫一遍」的断言自己污染掉）
+    toks = ["zzz", "qqq", "wwww"]
+    assert brain._token_df(root, toks) == brain._token_stats(root, toks)[0]
+
+
+def t_token_df_bulk_equiv(tmp):
+    """R236：df 从「每 token 两条全表 COUNT」换成「每表一次 SUM(content LIKE) 条件聚合」。
+
+    对抗点不是快不快，是**分块边界与口径**：token 数跨过内部 64 的分块时必须逐块累加，
+    上百个 token（含重复、含库里没有的、含 % 与 _ 通配符）要与逐 token 参照实现逐键相等。
+    另外 docstring 承诺的「只算活跃行」这轮才真正落到 SQL——被 supersede 的行不再进 df。
+    """
+    root = str(Path(tmp) / "hub_df_equiv")
+    Path(root).mkdir(parents=True, exist_ok=True)
+    brain.init_db(root)
+    for i in range(40):
+        brain.add_memory(root, f"记忆样本{i} 存在 在的 供应商{i % 7} 报价 a_b c-d e.f",
+                         kind="fact", agent="qoder")
+    for i in range(60):
+        brain.add_record(root, f"项目{i % 3}", "qoder", "2026-10-20", f"标题{i}",
+                         f"内容{i} 存在 沙漠 爆显 100% ghost_memory_{i % 5}", source="hub")
+    solo = brain.add_memory(root, "专词唯一孤本 供应商旧版", kind="fact", agent="qoder")
+    keep = brain.add_memory(root, "现行版：供应商9 报价", kind="fact", agent="qoder")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE memories SET superseded_by=? WHERE id=?", (keep, solo))
+        conn.commit()
+
+    toks = [f"tok{n}" for n in range(80)] + ["供应", "应商", "存在", "在的", "沙漠", "爆显",
+                                             "ghost_memory_3", "a_b", "100%", "c-d", "e.f",
+                                             "供应", "存在", "根本不存在的串zzz", "专词"]
+    assert len(set(toks)) > 64, "样本必须跨过 64 的分块边界"
+
+    def ref(tokens):
+        df = {}
+        with brain.db_conn(root) as conn:
+            for t in tokens:
+                like = f"%{brain._like_escape(t)}%"
+                n = 0
+                for tbl, cond in (("records", brain._rec_live_sql()), ("memories", brain._live_sql())):
+                    n += conn.execute(f"SELECT COUNT(*) FROM {tbl} WHERE ({cond}) AND content LIKE ? ESCAPE '\\'",
+                                      (like,)).fetchone()[0]
+                df[t] = n
+        return df
+
+    got, total = brain._token_stats(root, toks)
+    assert got == ref(toks), "分块条件聚合与逐 token 参照不一致"
+    with brain.db_conn(root) as conn:
+        expect_total = (conn.execute("SELECT COUNT(*) FROM records WHERE " + brain._rec_live_sql()).fetchone()[0]
+                        + conn.execute("SELECT COUNT(*) FROM memories WHERE " + brain._live_sql()).fetchone()[0])
+        raw_solo = conn.execute("SELECT COUNT(*) FROM memories WHERE content LIKE '%专词%'").fetchone()[0]
+    assert total == expect_total, (total, expect_total)
+    assert got["ghost_memory_3"] > 0 and got["根本不存在的串zzz"] == 0
+    assert raw_solo == 1 and got["专词"] == 0, "已取代的行仍在给 df 加分"
+
+    # 闸门行为不变：乱码查询被闸成 0 命中、真查询照常返回
+    assert brain._coverage_gate(root, [{"id": 1, "title": "无关", "content": "内容", "project": "p"}],
+                                "zzz qqq www eee", min_match=2) == []
+    rows = [{"id": 2, "title": "沙漠爆显存", "content": "红色沙漠爆显存 崩溃", "project": "p"}]
+    assert [r["id"] for r in brain._coverage_gate(root, rows, "沙漠 爆显 存", min_match=2)] == [2]
 
 
 def t_tok_cache_bounded(tmp):

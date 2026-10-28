@@ -7,6 +7,10 @@
   python cli.py offboard <agent>   # 下线接入：移除引导块 + 摘掉 MCP 条目（默认预演，--apply 才写）
   python cli.py refresh            # 把所有 agent 的引导刷新到当前版本
   python cli.py discover           # 扫描常见位置，找「有配置但未登记」的 agent
+  python cli.py init --root <目录>  # 把已有空目录初始化成大脑（建目录结构+建库，幂等）
+  python cli.py doctor              # 一键自检（--json 机器读 / --only a,b / --skip a / --no-machine / --slow 5）
+  python cli.py check --list        # 跑单项检查：ops 注册表里挑一项（deploy_diff/regression/hygiene…）
+  python cli.py check deploy_diff --target <源码根>   # 需要目录的项必须显式给 --target
 
 根目录默认读 ~/.agenthub/config.json 的 root（与 MCP 一致），可用 --root 覆盖。
 """
@@ -207,30 +211,235 @@ def cmd_release(root: str) -> int:
     return 0 if r["ok"] else 1
 
 
-def cmd_doctor(root: str, full: bool = False) -> int:
+SLOW_ROWS_DEFAULT = 5
+
+
+def _checks_csv(value: str) -> list:
+    """`--only a,b` → ['a','b']（去空白、保序、去重）。"""
+    seen, out = set(), []
+    for part in (value or "").split(","):
+        n = part.strip()
+        if n and n not in seen:
+            seen.add(n)
+            out.append(n)
+    return out
+
+
+def _doctor_select(names, only=(), skip=(), no_machine=False, machine=()) -> list:
+    """体检子集选择（纯函数，R237）：白名单 → 摘机器级 → 黑名单。
+
+    顺序永远跟随 `names`（PATROL_CHECKS 是「先验库、再看环境」的排布，
+    按用户输入顺序跑会让 db_integrity 的短路保护失效）。
+    """
+    sel = [n for n in names if not only or n in set(only)]
+    if no_machine:
+        sel = [n for n in sel if n not in set(machine)]
+    if skip:
+        sel = [n for n in sel if n not in set(skip)]
+    return sel
+
+
+def _unknown_checks(wanted, registry) -> list:
+    """拼错的检查名必须点名。静默把没跑过的项当成「跑过且绿」是体检器最坏的错——
+    漏报比误报危险，所以这里选择退出码 2 而不是「忽略这个 token 继续跑」。"""
+    return [w for w in wanted if w not in registry]
+
+
+def _slow_rows(timings, n=SLOW_ROWS_DEFAULT) -> list:
+    """耗时账本 TopN：`share` 按**实际跑过的项**合计，不是墙钟——被 db_integrity
+    短路的项不在这笔账上，用墙钟当分母会把占比算小。"""
+    rows = sorted(timings or [], key=lambda x: -int(x.get("ms") or 0))
+    total = sum(int(t.get("ms") or 0) for t in rows) or 1
+    return [{"name": t.get("name", ""), "ms": int(t.get("ms") or 0),
+             "share": round(int(t.get("ms") or 0) / total, 3)}
+            for t in rows[:max(1, int(n or SLOW_ROWS_DEFAULT))]]
+
+
+def cmd_doctor(root: str, full: bool = False, as_json: bool = False, only: str = "",
+               skip: str = "", no_machine: bool = False, slow: int = 0) -> int:
     """R8 一键自检：巡检聚合，逐条给可执行修复建议（有问题时退出码 1，供脚本判断）。
-    R178：默认只给失败项相关的修复口径与 3 条明细，`--full` 才展开完整口径与全部明细。"""
+    R178：默认只给失败项相关的修复口径与 3 条明细，`--full` 才展开完整口径与全部明细。
+    R237：`--json` 机器可读（agent 不必 parse 中文文本）；`--only/--skip/--no-machine`
+    跑子集（改一行代码就只验那行，别等全量巡检）；`--slow N` 打耗时账本。
+    不带这些旗标时，输出与 R236 逐字相同（发布回归按此对账）。"""
     import ops  # noqa: PLC0415
-    rep = ops.run_patrol(root)
-    print(f"一键自检：{rep['checked']} 项，通过 {len(rep['passed'])}，"
-          f"问题 {len(rep['issues'])}，耗时 {rep['elapsed_ms']}ms")
-    for i in rep["issues"]:
-        print(f"✗ {i['name']}：{i['summary']}")
+    lst_only, lst_skip = _checks_csv(only), _checks_csv(skip)
+    unknown = _unknown_checks(lst_only + lst_skip, ops.CHECKS)
+    if unknown:
+        print(f"✗ 未注册的检查项：{'、'.join(unknown)}"
+              f"（可选项见 python cli.py check --list）", file=sys.stderr)
+        return 2
+    # 注册表里有、但巡检清单里没有的名字：留着会被 _doctor_select 悄悄丢掉，
+    # 于是「--only hygiene,env」实际只跑 env 却不吭声——同样是漏报。
+    not_patrol = _unknown_checks(lst_only, ops.PATROL_CHECKS)
+    if not_patrol:
+        print(f"✗ --only 里的 {'、'.join(not_patrol)} 不在 doctor 的巡检清单里"
+              f"（doctor 只跑 patrol 那批）。单项检查请用 "
+              f"python cli.py check {not_patrol[0]} [--target <目录>]",
+              file=sys.stderr)
+        return 2
+    names = _doctor_select(ops.PATROL_CHECKS, lst_only, lst_skip,
+                           no_machine, ops.MACHINE_CHECKS)
+    if not names:
+        print("✗ 过滤后没有任何检查项可跑：--only/--skip/--no-machine 把巡检筛空了。"
+              "--only 只认 doctor 巡检清单里的名字；单项检查请用 python cli.py check <name>",
+              file=sys.stderr)
+        return 2
+    rep = ops.run_patrol(root, checks=names)
+    if as_json:
+        print(json.dumps({"schema": 1, "root": root, "asked": names,
+                          "filters": {"only": lst_only, "skip": lst_skip,
+                                      "no_machine": no_machine, "full": bool(full)},
+                          "slowest": _slow_rows(rep.get("timings")),
+                          "report": rep}, ensure_ascii=False))
+        return 0 if rep["ok"] else 1
+    issues = rep["issues"]
+    n_decide = rep.get("decide_count", 0)
+    n_fix = len(issues) - n_decide
+    if n_decide and n_fix:
+        split = f"（可直接修复 {n_fix} · 需你拍板 {n_decide}）"
+    elif n_decide:
+        split = f"（均需你拍板 {n_decide}）"
+    else:
+        split = ""
+    same_cause = rep.get("same_cause_skipped", 0)
+    if same_cause:
+        head = (f"{rep['checked']}/{rep.get('total', rep['checked'])} 项"
+                f"（同因跳过 {same_cause}）")
+    else:
+        head = f"{rep['checked']} 项"
+    print(f"一键自检：{head}，通过 {len(rep['passed'])}，"
+          f"问题 {len(issues)}{split}，耗时 {rep['elapsed_ms']}ms")
+    n_slow = int(slow) if int(slow) > 0 else (3 if rep["elapsed_ms"] >= 3000 else 0)
+    if n_slow:
+        rows = _slow_rows(rep.get("timings"), n_slow)
+        print(f"耗时 Top{n_slow}：" + " · ".join(
+            f"{r['name']} {r['ms']}ms({r['share'] * 100:.0f}%)" for r in rows))
+    for i in issues:
+        tags = []
+        if i.get("scope") == "machine":
+            tags.append("机器级")
+        if i.get("kind") == "decide":
+            tags.append("要拍板")
+        tag = f"（{' · '.join(tags)}）" if tags else ""
+        print(f"✗ {i['name']}{tag}：{i['summary']}")
         brief = i.get("fix_brief") or i["fix"]
         print(f"  修复：{brief}")
         if full and brief != i["fix"]:
             print(f"  完整口径：{i['fix']}")
+        n_same = i.get("skipped_same_cause") or 0
+        if n_same:
+            print(f"  注：另有 {n_same} 项依赖大脑库的检查因同一原因跳过"
+                  f"（建库/指对根目录后自动恢复）")
         detail = i["detail"] if full else i["detail"][:3]
         for d in detail:
             print(f"    · {d}")
         rest = len(i["detail"]) - len(detail)
         if rest > 0:
             print(f"    · …另有 {rest} 条明细（加 --full 看全部）")
+    n_machine = sum(1 for i in issues if i.get("scope") == "machine")
+    if n_machine:
+        print(f"提示：其中 {n_machine} 项是机器级状态（运行进程 / 全局 agent 配置），"
+              f"与当前根目录无关——换 --root 也会照实报。")
+    if n_decide and n_fix:
+        print(f"提示：「要拍板」{n_decide} 项不是照着修就能消的——修复行里是选项（留用/下线、"
+              f"合并哪条、认领或关单），选定后命令照跑；其余 {n_fix} 项可直接执行。")
     if not rep["issues"]:
         print("全部通过。")
     if rep["skipped"]:
-        print("跳过：" + "、".join(f"{s['name']}({s['why']})" for s in rep["skipped"]))
+        print("跳过：" + "；".join(ops.format_skipped(rep["skipped"])))
     return 0 if rep["ok"] else 1
+
+
+def cmd_check(name: str = "", target: str = "", root: str = "",
+              as_json: bool = False, list_checks: bool = False) -> int:
+    """R237：命令行跑**单项**检查（ops 注册表里的项都能跑，doctor 巡检只含其中免 target 的那批）。
+
+    为什么要它：以前只有 MCP 侧 `hub_ops_run` 能跑单项，纯 CLI 的 agent 只能手搓
+    `python -c "import ops; ops.run_check(...)"`——本会话就因 `cli.py check` 不存在
+    吃到一次退出码 2。改一行代码只验那行，不该等全量巡检跑完。
+
+    需要 target 的项**必须显式给 --target，不给默认值**：cli.py 自己也部署在
+    `~/.agenthub/mcp_server/`，「默认取脚本所在目录」在那份副本上会变成「部署目录和自己比」，
+    deploy_diff 必然全绿——那是假阳性。`_deploy_diff` 的 ui.py 探针实测挡住了这条，
+    但把正确性寄托在别人的探针上不划算，所以入口层直接拒绝空 target。
+    """
+    import ops  # noqa: PLC0415
+    if list_checks:
+        for n in sorted(ops.CHECKS):
+            desc, needs = ops.CHECKS[n]
+            print(f"{n:16s} {'需要 --target' if needs else '免 target  '} {desc[:70]}")
+        return 0
+    if name not in ops.CHECKS:
+        print(f"✗ 未注册的检查项：{name or '(空)'}"
+              f"（python cli.py check --list 看全部 {len(ops.CHECKS)} 项）", file=sys.stderr)
+        return 2
+    needs_target = ops.CHECKS[name][1]
+    if needs_target and not target:
+        print(f"✗ {name} 需要 --target <目录>（刻意不设默认：在部署副本上跑会是自己比自己）",
+              file=sys.stderr)
+        return 2
+    if target and not Path(target).is_dir():
+        # 走 run_check 也能挡住，但那是「检查发现问题」（退出码 1）；路径打错是用法错误（2），
+        # 混在一起脚本就没法区分「代码没过」和「命令敲错了」。
+        print(f"✗ target 不是目录：{target}", file=sys.stderr)
+        return 2
+    r = ops.run_check(name, target, root)
+    if as_json:
+        print(json.dumps({"schema": 1, "name": name, "target": target, "root": root,
+                          "result": r}, ensure_ascii=False))
+        return 0 if r.get("ok") else 1
+    print(("✓ " if r.get("ok") else "✗ ") + f"{name}：{r.get('summary', '')}")
+    for line in r.get("detail") or []:
+        print("   · " + line)
+    return 0 if r.get("ok") else 1
+
+
+def _db_counts(db: Path) -> tuple:
+    """初始化后回读记录/记忆条数；库被别的进程占用时返回 (-1, -1) 而不是假报 0。"""
+    out = []
+    for table in ("records", "memories"):
+        try:
+            with sqlite3.connect(str(db)) as c:
+                out.append(c.execute(f"SELECT COUNT(*) FROM {table}").fetchone()[0])
+        except sqlite3.Error:
+            return (-1, -1)
+    return tuple(out)
+
+
+def cmd_init(root: str) -> int:
+    """R227 把已有目录初始化成大脑：建目录结构/规则模板 + 建库（幂等，不覆盖已有数据）。
+    不替用户创建目录——路径打错时宁可报错，也不要凭空造一棵树。"""
+    import brain  # noqa: PLC0415
+    if not root:
+        print("未取到根目录；用 --root 指定（如 python cli.py init --root D:/data/我的大脑）")
+        return 2
+    if not Path(root).is_dir():
+        print(f"目录不存在：{root}")
+        print('先手动建好目录再初始化（防止路径打错凭空造树），例如：mkdir "%s"' % root)
+        return 2
+    had_db = brain.db_path(root).exists()
+    err = core.init_hub(root)
+    if err:
+        print(f"初始化目录结构失败：{err}")
+        return 1
+    err = brain.init_db(root)
+    if err:
+        print(f"建库失败：{err}")
+        return 1
+    db = brain.db_path(root)
+    n_rec, n_mem = _db_counts(db)
+    print(("大脑校验完成（已存在，既有数据未动）：" if had_db else "大脑已初始化：") + str(root))
+    print(f"  目录：{core.DIR_INBOX}/ {core.DIR_ARCHIVE}/ {core.DIR_META}/（已有内容原样保留）")
+    print(f"  档案：{core.rules_file(root).name} / {core.memory_file(root).name}")
+    if n_rec < 0:
+        print(f"  数据库：{db}（有条目，但库正被其他进程占用，条数暂不可读）")
+    else:
+        print(f"  数据库：{db}（记录 {n_rec} 条 / 记忆 {n_mem} 条）")
+    print("下一步：")
+    print(f'  python cli.py doctor --root "{root}"        # 跑整套自检')
+    print(f'  python cli.py onboard <agent> --root "{root}"  # 把某个 agent 接进来')
+    return 0
 
 
 def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: int,
@@ -907,7 +1116,7 @@ def main(argv=None) -> int:
                 "  agenthub tasks --approvals       # 看待审批任务\n"
                 "  agenthub call hub_search keyword=关键词 limit=5\n"
                 "  agenthub serve --open            # 本机只读仪表盘\n"
-                "\n根目录：--root，或写入 ~/.agenthub/config.json 的 root"),
+                "\n根目录：--root（写在子命令前或后都行），或写入 ~/.agenthub/config.json 的 root"),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
     sub = ap.add_subparsers(dest="cmd", metavar="命令")
@@ -915,7 +1124,13 @@ def main(argv=None) -> int:
 
     def _cmd(name, help=""):
         """子命令用同一句话做列表 help 与 `命令 --help` 的 description。"""
-        return _add_cmd(name, help=help, description=help)
+        p = _add_cmd(name, help=help, description=help)
+        # R226：--root 要能写在子命令之后（`agenthub doctor --root D:\...`）。
+        # argparse 的全局选项只在前置位置生效；SUPPRESS 保证没写时不覆盖全局值，
+        # 也不必给 60+ 个子命令各写一份默认值（那样会互相盖掉）。
+        p.add_argument("--root", default=argparse.SUPPRESS,
+                       help="大脑根目录（同全局 --root；写在子命令前或后都行）")
+        return p
 
     p_status = _cmd("status", help="各 agent 接入状态")
     p_status.add_argument("agent", nargs="?", default="", help="只看某个 agent；留空看全部")
@@ -932,6 +1147,7 @@ def main(argv=None) -> int:
     p_off.add_argument("--keep-mcp", action="store_true", help="保留 MCP 条目，只摘引导")
     _cmd("refresh", help="刷新所有 agent 引导到当前版本")
     _cmd("discover", help="扫描常见位置，找未登记 agent")
+    _cmd("init", help="把已有目录初始化成大脑（建目录结构+建库，幂等不覆盖数据）")
     _cmd("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
     _cmd("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
     p_bp = _cmd("backup-prune", help="备份盘点与清理（默认预演，--apply 才删）")
@@ -940,6 +1156,22 @@ def main(argv=None) -> int:
     p_doc = _cmd("doctor", help="一键自检：巡检聚合 + 可执行修复建议")
     p_doc.add_argument("--full", action="store_true",
                        help="展开完整修复口径与全部明细（默认只列失败项相关口径与前 3 条）")
+    p_doc.add_argument("--json", action="store_true", dest="as_json",
+                       help="输出一份 JSON（含逐项耗时与 report 原文），给脚本/agent 解析用，退出码不变")
+    p_doc.add_argument("--only", default="",
+                       help="只跑这些巡检项（逗号分隔，如 stale_health,ghost_memory）")
+    p_doc.add_argument("--skip", default="", help="跳过这些巡检项（逗号分隔）")
+    p_doc.add_argument("--no-machine", action="store_true", dest="no_machine",
+                       help="跳过机器级检查（runtime_health/rules_health）：改数据时不必管别的 agent 的配置")
+    p_doc.add_argument("--slow", type=int, default=0, metavar="N",
+                       help="打印耗时 TopN（ms 与占实跑项的比例）")
+    p_chk = _cmd("check", help="跑单项 ops 检查（含需要 target 的回归/部署比对）；--list 看清单")
+    p_chk.add_argument("name", nargs="?", default="",
+                       help="检查项名（如 deploy_diff / regression / py_compile / hygiene）")
+    p_chk.add_argument("--target", default="",
+                       help="被检目录（需要 target 的项必填且不设默认，防止在部署副本上自己比自己）")
+    p_chk.add_argument("--json", action="store_true", dest="as_json", help="输出 JSON（name/target/root/result）")
+    p_chk.add_argument("--list", action="store_true", dest="list_checks", help="列出全部检查项与是否要 target")
     p_bp.add_argument("--keep-zip", type=int, default=3)
     p_bp.add_argument("--keep-snapshot", type=int, default=10)
     p_bp.add_argument("--keep-legacy", type=int, default=1)
@@ -1071,7 +1303,14 @@ def main(argv=None) -> int:
         if args.cmd == "backup-drill":
             return cmd_backup_drill(_root(args.root), args.path)
         if args.cmd == "doctor":
-            return cmd_doctor(_root(args.root), full=args.full)
+            return cmd_doctor(_root(args.root), full=args.full, as_json=args.as_json,
+                              only=args.only, skip=args.skip, no_machine=args.no_machine,
+                              slow=args.slow)
+        if args.cmd == "check":
+            return cmd_check(args.name, args.target, _root(args.root),
+                             as_json=args.as_json, list_checks=args.list_checks)
+        if args.cmd == "init":
+            return cmd_init(_root(args.root))
         root = _root(args.root)
         if not root or not Path(root).is_dir():
             print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")

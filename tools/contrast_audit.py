@@ -13,6 +13,8 @@
 """
 from __future__ import annotations
 
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
+
 import re
 import sys
 from pathlib import Path

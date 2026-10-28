@@ -45,7 +45,11 @@ def test_signal_tabs_keep_height_when_inbox_empty(qapp, hub_root):
         w.switchTo(w.signal_page)
         settle(qapp, max_s=2.0)
         p = w.signal_page
-        assert p.seg.height() == 26, f"空收件箱把 tab 栏撑到 {p.seg.height()}px"
+        assert p.seg.height() == p.seg.maximumHeight() < 40, (
+            f"空收件箱把 tab 栏撑到 {p.seg.height()}px（自身高 {p.seg.maximumHeight()}）")
+        # 不断言具体 26px：sizeHint 随进程内字体库变化（test_agent_cards_layout 会把
+        # 微软雅黑装进字体库，同一断言从 26 变 31）。真正的不变量是「构造时钉死高度、
+        # 空态不把富余高度摊给 tab 栏」。
         assert all(it.geometry().bottom() < p.seg.height()
                    for it in p.seg.items.values()), "tab 文字跑出 tab 栏"
         assert p._gap_added, "空态未挂弹簧，剩余高度会再次摊给 tab 栏"

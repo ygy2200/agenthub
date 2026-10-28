@@ -13,6 +13,8 @@
 
 用法：python tools/profile_eval.py [大脑根目录]
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import json
 import os
 import sqlite3

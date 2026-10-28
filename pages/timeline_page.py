@@ -330,7 +330,7 @@ class TimelinePage(QWidget):
         chunk, rest = pending[:RENDER_CHUNK], pending[RENDER_CHUNK:]
         self._append_rows(chunk)
         if rest:
-            QTimer.singleShot(0, lambda: self._drain_rows(rest, total_rows, st, epoch))
+            defer(self, lambda: self._drain_rows(rest, total_rows, st, epoch))
         else:
             st["offset"] += total_rows
             st["loading"] = False

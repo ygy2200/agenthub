@@ -4,6 +4,8 @@
 用法：python tools/bench_timeline.py [N]
 输出：注入耗时 / 首页就绪 / 逐页加载（含控件渲染）/ 滚动到底自动加载 / box 规模。
 """
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import os
 import sys
 import tempfile

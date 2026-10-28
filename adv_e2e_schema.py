@@ -2,6 +2,12 @@
 """端到端对照：缺 distill_seen 表的库，serve 启动是否自愈。
 部署版（补丁前 serve 不建表）应报错；源码版（ensure_schema）应自愈。
 运行：python adv_e2e_schema.py  （一次性验证脚本，不进回归）"""
+
+import os as _os
+import sys as _sys
+
+_sys.path.insert(0, _os.path.join(_os.path.dirname(_os.path.abspath(__file__)), "tools"))
+import _console  # noqa: F401,E402  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import json
 import shutil
 import subprocess

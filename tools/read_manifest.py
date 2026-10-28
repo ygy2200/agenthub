@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """安全读取 PE 内嵌 manifest（LOAD_LIBRARY_AS_DATAFILE，不执行代码）。
 用法：python read_manifest.py <exe路径>"""
+
+import _console  # noqa: F401  统一 UTF-8 控制台（R222）：GBK 管道下 print("✓") 会崩
 import ctypes
 import sys
 
