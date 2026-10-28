@@ -62,12 +62,13 @@ class AgentHubWindow(FluentWindow):
 
     # R239：这些页把取数交给后台线程。判据是实测的取数/绘制比例（output/_r239_dupes.txt）：
     # 统计页 383ms 墙钟里取数 345ms、画控件 38ms；大脑页 375/13；治理页 489/3。
+    # （R243 后大脑页取数只剩 ~40ms——只取屏幕上真会画的东西，见 output/_r243_brain_cost.txt。）
     # 也就是说 R217 的「点开这页时再付它的成本」加上 R238 的「付完再上屏」合起来
     # = 切页硬冻 0.4s（期间不重绘、不响应点击）。既然成本几乎全在数据库而不在绘制，
     # 就把取数挪出 UI 线程、上屏时先盖骨架屏，回到主线程只干那 3~38ms 的渲染。
     # 前提：页面实现 fetch_db(root)（只读库）+ apply_db(bundle)（只碰控件）——
     # timeline/search/report/settings/hub 早就按 FnWorker 这套惯例走，不是新发明。
-    _DB_ASYNC = ("stats_page",)
+    _DB_ASYNC = ("stats_page", "brain_page")
 
     def __init__(self):
         super().__init__()

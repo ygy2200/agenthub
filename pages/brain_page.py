@@ -101,21 +101,54 @@ class BrainPage(QWidget):
         self.scroll.enableTransparentBackground()  # 必须在 setWidget 后（qfw API 需 widget 已存在才命中 body；2026-10-10 深底错配根因）
         outer.addWidget(self.scroll, 1)
 
+    # ------------------------------------------------------------ 取数 / 渲染分离（R243）
+    # 定罪（真实库 best-of-3，output/_r243_brain_cost.txt）：一次同步刷新 173ms，其中
+    # health_report 167ms —— 而它的 75%（similar_memories 125ms）算的是本页从不渲染的
+    # 重复/矛盾对；「置顶记忆」为找 8 条付了 140ms（空查询也进融合检索、加载语义模型）。
+    # 「展开全部」只是多显示 5 行，旧实现走 reload(force=True) 整次重读 428ms。
+
+    def fetch_db(self, root: str) -> dict:
+        """读这一页要的全部数据——在 FnWorker 后台线程跑，禁止在这里碰任何控件。"""
+        try:
+            tasks = brain.task_annotate(root, brain.task_list(root, limit=12))
+        except Exception:  # noqa: BLE001 单段读不出来不拖垮整页
+            tasks = []
+        try:
+            leases = brain.file_lease_list(root, include_released=False, limit=200)
+        except Exception:  # noqa: BLE001
+            leases = []
+        try:
+            events = brain.event_list(root, limit=8)
+        except Exception:  # noqa: BLE001
+            events = []
+        try:
+            pins = brain.list_pinned_memories(root, limit=8)
+        except Exception:  # noqa: BLE001
+            pins = []
+        return {"health": brain.health_report(root, include_dups=False),
+                "tasks": tasks, "leases": leases, "events": events, "pins": pins}
+
     def reload(self, force: bool = False):
+        """同步刷新（勾销待办 / 走查工具 / 异步回退路径在用）。"""
         root = self.win.root
         if not root:
             return
         try:
-            h = brain.health_report(root)
+            bundle = self.fetch_db(root)
         except Exception as e:
             # R143：读失败时页头给错误而非静默空白（用户分不清「没数据」和「坏了」）
-            self.valMem.setText("—")
-            self.valCrys.setText("—")
-            self.valPush.setText("—")
-            self.valTodo.setText("—")
+            for v in (self.valMem, self.valCrys, self.valPush, self.valTodo):
+                v.setText("—")
+            self._hide_overlay()
             InfoBar.error("大脑体检读取失败", f"{type(e).__name__}: {str(e)[:80]}",
                          duration=6000, parent=self.win)
             return
+        self.apply_db(bundle, force=force)
+
+    def apply_db(self, bundle: dict, force: bool = False):
+        """只碰控件的渲染：拿已经取好的数据填页面，一次数据库都不读。"""
+        self._hide_overlay()
+        h = bundle.get("health") or {}
         # R162：数据指纹跳过——qfw 组件整页重建在长跑下原生内存线性涨（老化实测
         # 30 轮 +256MB、60 轮 +505MB 完美线性；对照纯 QLabel 仅 ~4.5KB/个 vs
         # qfw 组件 ~40KB/个——第三方库固有分配行为）。真实使用中 F5 连点/切页触发
@@ -127,8 +160,10 @@ class BrainPage(QWidget):
         except Exception:  # noqa: BLE001 有不可序列化字段就退回总是重建
             fp = ""
         if not force and fp and getattr(self, "_data_fp", None) == fp:
+            self._last = bundle
             return
         self._data_fp = fp
+        self._last = bundle
         # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
         self.scroll.verticalScrollBar().setValue(0)
         self.valMem.setText(str(h["memories"]))
@@ -136,37 +171,12 @@ class BrainPage(QWidget):
         self.valPush.setText(str(h.get("recall_push_total", 0)))
         self.valTodo.setText(str(h["todo_count"]))
 
-        def clear(box):
-            while box.count():
-                it = box.takeAt(0)
-                wid = it.widget()
-                if wid:  # 先摘出父级再排队销毁：立即从界面消失，不与新一轮内容重叠
-                    wid.setParent(None)
-                    wid.deleteLater()
-                sub = it.layout()
-                if sub:  # 行布局（徽章+进度条/文本+按钮）也是布局项，不递归拆净子控件会残留叠加
-                    clear(sub)
-                    # R161：布局对象自身也是 QObject——每轮 addLayout 的新行布局不销毁
-                    # 就线性累积（老化实测 30 轮 +256MB，锁定本页；widget 已拆但 layout
-                    # 壳与 spacer item 永生）
-                    sub.deleteLater()
-
         # 唤起排行（验收①：推送 top 应是工作知识而非元信息）
-        clear(self.topBox)
         tops = h.get("top_pushed", [])
-        shown = tops if self._top_expanded else tops[:5]
-        for m in shown:
-            self.topBox.addWidget(self._mem_row(f"#{m['id']} ×{m['use_count']}", m))
-        self.topToggle.setVisible(len(tops) > 5)
-        self.topToggle.setText(
-            "收起" if self._top_expanded else f"展开全部 {len(tops)} 条")
-        if not tops:
-            self.topBox.addWidget(empty_state(
-                "HISTORY", "还没有记忆被唤起",
-                "agent 每次开工报到时会自动推送相关记忆；这里累计被推送的次数"))
+        self._render_top(tops)
 
         # 使用分布（验收①：searches 有跨 agent 真实数据）
-        clear(self.useBox)
+        self._clear(self.useBox)
         merged: dict = {}
         for src in (h.get("search_by_agent", {}), h.get("push_by_agent", {})):
             for k, v in src.items():
@@ -191,17 +201,11 @@ class BrainPage(QWidget):
                 "agent 主动检索或接收开工推送后，这里按家分布累计"))
 
         # 任务看板（P3-2 状态机视图）：状态胶囊 + 认领人 + 阻塞信息
-        clear(self.taskBox)
-        try:
-            # R14 与 MCP/CLI 同口径：注解一次带出任务租约状态、截止紧迫度、文件锁计数；
-            # 此前 GUI 自己重算租约/逾期，文件锁则完全看不见（控制面在桌面断了一截）。
-            tasks = brain.task_annotate(root, brain.task_list(root, limit=12))
-        except Exception:
-            tasks = []
-        try:
-            leases = brain.file_lease_list(root, include_released=False, limit=200)
-        except Exception:
-            leases = []
+        self._clear(self.taskBox)
+        # R14 与 MCP/CLI 同口径：注解一次带出任务租约状态、截止紧迫度、文件锁计数；
+        # 此前 GUI 自己重算租约/逾期，文件锁则完全看不见（控制面在桌面断了一截）。
+        tasks = bundle.get("tasks") or []
+        leases = bundle.get("leases") or []
         chip_key = {"in_progress": "accent", "blocked": "warning", "done": "success",
                     "dead": "warning", "cancelled": "text_secondary"}
         lease_label = {"expired": "租约过期", "ownerless": "无主", "unleased": "缺租约"}
@@ -306,7 +310,7 @@ class BrainPage(QWidget):
                 "agent 建任务并认领后，这里显示持有者与阻塞状态"))
 
         # 待办看板（验收③：欠账可见 + 勾销闭环）
-        clear(self.todoBox)
+        self._clear(self.todoBox)
         for t in h["todos"][:8]:
             r = QHBoxLayout()
             r.addWidget(BodyLabel(f"[{t['project']}·{t['date'][5:]}·{t['agent']}] {t['todo'][:56]}"), 1)
@@ -320,11 +324,8 @@ class BrainPage(QWidget):
                 "从记录里自动提取「后续 / 待验证 / 下一步…」句式；在时间线勾销即闭环"))
 
         # 事件流（P3-2）：agent 协作通道的 GUI 可观测面（写进展 / 增量订阅）
-        clear(self.eventBox)
-        try:
-            events = brain.event_list(root, limit=8)
-        except Exception:
-            events = []
+        self._clear(self.eventBox)
+        events = bundle.get("events") or []
         for e in events:
             proj = f"·{e['project']}" if e["project"] else ""
             self.eventBox.addWidget(BodyLabel(
@@ -335,11 +336,8 @@ class BrainPage(QWidget):
                 "agent 写下进展后，其他 agent 可以按增量订阅这些事件"))
 
         # 置顶记忆（验收④：置顶位工作知识占比）
-        clear(self.pinBox)
-        try:
-            pins = [m for m in brain.search_memories(root, "", "", 100) if m["pinned"]][:8]
-        except Exception:
-            pins = []
+        self._clear(self.pinBox)
+        pins = bundle.get("pins") or []
         for m in pins:
             self.pinBox.addWidget(self._mem_row(f"★ #{m['id']}", m))
         if not pins:
@@ -363,9 +361,87 @@ class BrainPage(QWidget):
         y = head.mapTo(self._body, QPoint(0, 0)).y() - tokens.SPACE_M
         bar.setValue(max(bar.minimum(), min(bar.maximum(), y)))
 
+    def _render_top(self, tops: list):
+        """只重画「唤起排行」——展开/收起是纯视图动作，第二次不该再读库（旧实现 428ms）。"""
+        self._clear(self.topBox)
+        shown = tops if self._top_expanded else tops[:5]
+        for m in shown:
+            self.topBox.addWidget(self._mem_row(f"#{m['id']} ×{m['use_count']}", m))
+        self.topToggle.setVisible(len(tops) > 5)
+        self.topToggle.setText(
+            "收起" if self._top_expanded else f"展开全部 {len(tops)} 条")
+        if not tops:
+            self.topBox.addWidget(empty_state(
+                "HISTORY", "还没有记忆被唤起",
+                "agent 每次开工报到时会自动推送相关记忆；这里累计被推送的次数"))
+
+    @staticmethod
+    def _clear(box):
+        while box.count():
+            it = box.takeAt(0)
+            wid = it.widget()
+            if wid:  # 先摘出父级再排队销毁：立即从界面消失，不与新一轮内容重叠
+                wid.setParent(None)
+                wid.deleteLater()
+            sub = it.layout()
+            if sub:  # 行布局（徽章+进度条/文本+按钮）也是布局项，不递归拆净子控件会残留叠加
+                BrainPage._clear(sub)
+                # R161：布局对象自身也是 QObject——每轮 addLayout 的新行布局不销毁
+                # 就线性累积（老化实测 30 轮 +256MB，锁定本页；widget 已拆但 layout
+                # 壳与 spacer item 永生）
+                sub.deleteLater()
+
     def _toggle_top(self):
         self._top_expanded = not self._top_expanded
-        self.reload(force=True)
+        b = getattr(self, "_last", None)
+        if not b:
+            self.reload(force=True)
+            return
+        self._render_top((b.get("health") or {}).get("top_pushed", []))
+
+    # ---------------------------------------------------------------- 忙态 / 失败占位
+    # 与统计页同一套语义（R239）：切页时先给真忙态，绝不把 170ms 取数压给 UI 线程。
+
+    def show_busy(self):
+        self._overlay("busy")
+
+    def show_failure(self, err) -> None:
+        self._overlay("fail", str(err))
+
+    def _overlay(self, kind: str, text: str = "") -> None:
+        box = getattr(self, "_ov", None)
+        if box is None:
+            box = QWidget(self)
+            box.setAttribute(Qt.WA_StyledBackground, True)
+            box.setStyleSheet(f"background:{tokens.resolve('bg_page')};")
+            lay = QVBoxLayout(box)
+            lay.setContentsMargins(tokens.SPACE_XL, tokens.SPACE_XL, tokens.SPACE_XL, tokens.SPACE_XL)
+            lay.setSpacing(tokens.SPACE_M)
+            self._ov_sk = Skeleton(rows=4, parent=box)
+            lay.addWidget(self._ov_sk)
+            self._ov_tx = CaptionLabel("", box)
+            self._ov_tx.setWordWrap(True)
+            lay.addWidget(self._ov_tx)
+            lay.addStretch(1)
+            self._ov = box
+        box.setGeometry(0, 0, max(self.width(), 320), max(self.height(), 240))
+        self._ov_sk.setVisible(kind == "busy")
+        self._ov_tx.setText("正在读取大脑数据…" if kind == "busy"
+                            else f"大脑加载失败：{text[:120]}（下次切页或刷新会自动重试）")
+        self._ov_tx.setVisible(kind != "busy")
+        box.show()
+        box.raise_()
+
+    def _hide_overlay(self) -> None:
+        box = getattr(self, "_ov", None)
+        if box is not None:
+            box.hide()
+
+    def resizeEvent(self, e):  # noqa: N802  Qt 同名 API
+        super().resizeEvent(e)
+        box = getattr(self, "_ov", None)
+        if box is not None and box.isVisible():
+            box.setGeometry(0, 0, max(self.width(), 320), max(self.height(), 240))
 
     @staticmethod
     def _mem_row(head: str, m: dict) -> QWidget:

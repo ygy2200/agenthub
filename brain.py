@@ -6782,6 +6782,17 @@ def _memories_search_fused(root: str, query: str, words: list, kind: str, limit:
     return [t[2] for t in fused[:max(0, min(int(limit), 100))]]
 
 
+def list_pinned_memories(root: str, limit: int = 8) -> list:
+    """置顶记忆清单（新→旧）。GUI 大脑页专用取数：此前走 `search_memories("", "", 100)`
+    再筛 pinned——空查询也会进融合检索（加载语义模型），真实库 140ms 只为找 8 条置顶。
+    与旧路径的可见差异只有一个方向：旧路径先截断「最近 100 条记忆」再筛，比第 100 条
+    更旧的置顶会被漏掉；这里直接按 pinned 取，漏置顶不再是设计行为。"""
+    with db_conn(root) as conn:
+        return [dict(r) for r in conn.execute(
+            "SELECT id, kind, content, pinned, use_count FROM memories WHERE "
+            + _live_sql() + " AND pinned=1 ORDER BY id DESC LIMIT ?", (limit,))]
+
+
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
                     count_hits: bool = True, semantic: bool = True) -> list:
     """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
@@ -10625,11 +10636,16 @@ def restore_project(root: str, name: str, agent: str = "") -> str:
     return ""
 
 
-def health_report(root: str) -> dict:
-    """大脑体检：汇总各智能维度 + 数据规模，供 hub_health 工具与 GUI 体检摘要。"""
+def health_report(root: str, include_dups: bool = True) -> dict:
+    """大脑体检：汇总各智能维度 + 数据规模，供 hub_health 工具与 GUI 体检摘要。
+
+    include_dups=False：跳过重复/矛盾分析（`similar_memories`，真实库 125ms，
+    占本报告 75%）。桌面「大脑页」从不渲染这两块，不该为自己的看不见付费。
+    此时 dup_* / conflict_* 一律返回 None＝「没算过」——写成 0 组就是在撒谎，
+    调用方要么用默认值，要么显式处理 None（`pages/brain_page.py` 两种都不用）。"""
     s = stats(root)
     todos = extract_todos(root, limit=50)
-    sims = similar_memories(root, limit=20)
+    sims = similar_memories(root, limit=20) if include_dups else []
     with db_conn(root) as conn:
         bare_titles = conn.execute(
             "SELECT COUNT(*) FROM records WHERE status='active' "
@@ -10706,11 +10722,14 @@ def health_report(root: str) -> dict:
             "errors_open": s.get("errors_open", 0),
             "searches_today": s.get("searches_today", 0), "searches_total": s.get("searches_total", 0),
             "todos": todos, "todo_count": len(todos),
-            "dup_memories": sims, "dup_memory_count": len(sims),
+            "dup_memories": sims if include_dups else None,
+            "dup_memory_count": len(sims) if include_dups else None,
             # 疑似互斥对（2026-10-13）：一条像在修正另一条——比"疑似重复"更危险，
             # 重复只是浪费上下文，互斥会让 agent 拿矛盾的事实干活。只报数不仲裁。
-            "conflict_pairs": [x for x in sims if "矛盾" in (x.get("verdict") or "")],
-            "conflict_pair_count": sum(1 for x in sims if "矛盾" in (x.get("verdict") or "")),
+            "conflict_pairs": ([x for x in sims if "矛盾" in (x.get("verdict") or "")]
+                               if include_dups else None),
+            "conflict_pair_count": (sum(1 for x in sims if "矛盾" in (x.get("verdict") or ""))
+                                    if include_dups else None),
             "bare_titles": bare_titles,
             "recall_push_total": push_total, "push_by_agent": push_by_agent,
             "search_by_agent": search_by_agent, "tool_breakdown": tool_breakdown,
