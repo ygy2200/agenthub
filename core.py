@@ -1442,10 +1442,94 @@ def _prune_backups(p: Path, keep: int = BACKUP_KEEP) -> None:
     按文件名内时间戳字典序排新旧（同秒高频覆写时 mtime 精度不可靠）。"""
     try:
         baks = sorted(p.parent.glob(p.name + ".bak-agenthub-*"))
-        for old in baks[:-keep] if len(baks) > keep else []:
-            old.unlink()
+        if len(baks) > keep:
+            # keep<=0 时 baks[:-0] 会是 baks[:0]（空）——负零切片陷阱，单独分支
+            for old in (baks if keep <= 0 else baks[:-keep]):
+                old.unlink()
     except OSError:
         pass
+
+
+# 会被 agenthub 外科编辑的外部配置所在目录（单一事实源：ops 整洁体检与本文件的
+# prune_config_backups 共用，别再各写一份——两处口径漂移时「体检报的红」与「清理能清的」
+# 会指向不同集合，用户按提示清完还是红的）。
+CONFIG_BACKUP_DIRS = [
+    ("hermes-home", "D:/hermes/Hermes Agent CN Desktop/data/hermes-home"),
+    ("claude", "~/.claude"),
+    ("codex", "~/.codex"),
+    ("dsh", "~/.dsh"),
+    ("zcode-cli", "~/.zcode/cli"),
+    ("workbuddy-bin", "~/.workbuddy/bin"),
+    ("agenthub-hooks", "~/.agenthub/hooks"),
+]
+
+
+def config_backup_dirs(root: str = "") -> list:
+    """展开 CONFIG_BACKUP_DIRS 为 [(名字, Path)]；root 非空时追加大脑 _hub 目录。"""
+    out = [(name, Path(os.path.expandvars(os.path.expanduser(p))))
+           for name, p in CONFIG_BACKUP_DIRS]
+    if root:
+        out.append(("brain-_hub", Path(root) / "_hub"))
+    return out
+
+
+def prune_config_backups(root: str = "", keep: int | None = None,
+                         apply: bool = False, dirs: list | None = None) -> dict:
+    """按原文件保留策略清理 agenthub 自产的配置备份（**默认只预演**，apply=True 才删）。
+
+    R254：`_prune_backups` 只在「那个文件下次被编辑」时才触发，存量备份（本机实测 66 份
+    超出 keep）可能几个月不动——体检报出来却没有任何立刻能做的动作，等于把问题丢回给人。
+    本函数是那条缺失的动作：与体检同一套分组口径（按原文件分组、只认 `.bak-agenthub-*`），
+    人工命名备份（bak-20260810 / bak-token-*）与任何非备份文件**一律不碰**。
+    每份被删文件进 journal（可追溯），且删前按「文件名时间戳字典序」保留最新 keep 份。
+    """
+    keep = BACKUP_KEEP if keep is None else keep
+    pairs = dirs if dirs is not None else config_backup_dirs(root)
+    groups: dict = {}
+    scanned = 0
+    for name, d in pairs:
+        try:
+            baks = [b for b in d.glob("*.bak*") if ".bak-agenthub-" in b.name and b.is_file()]
+        except OSError:
+            continue
+        scanned += len(baks)
+        for b in baks:
+            groups.setdefault((name, b.name.split(".bak-agenthub-")[0]), []).append(b)
+
+    candidates = []
+    for (name, orig), items in groups.items():
+        items.sort(key=lambda p: p.name)          # 名字内定宽时间戳 → 字典序即时间序
+        # 注意 items[:-keep] 在 keep=0 时是 items[:0]=[]（Python 负零切片陷阱），单独分开写
+        doomed = items if keep <= 0 else (items[:-keep] if len(items) > keep else [])
+        for old in doomed:
+            try:
+                st = old.stat()
+            except OSError:
+                continue
+            candidates.append({"dir": name, "orig": orig, "path": str(old),
+                               "size": st.st_size, "family": "config_bak"})
+    candidates.sort(key=lambda c: (c["dir"], c["orig"], c["path"]))
+
+    deleted, errors = [], []
+    if apply:
+        for c in candidates:
+            try:
+                Path(c["path"]).unlink()
+                deleted.append(c)
+            except OSError as e:
+                errors.append(f"{c['path']}: {e}")
+        if deleted:
+            try:                                   # 留痕（失败不影响结论）
+                journal(root, "cli", "备份清理",
+                        f"配置备份 {len(deleted)} 份（保留每文件 {keep} 份）")
+            except Exception:  # noqa: BLE001
+                pass
+
+    return {"scanned": scanned, "keep": keep, "apply": apply,
+            "candidates": [] if apply else candidates, "deleted": deleted,
+            "candidate_count": len(candidates),
+            "candidate_bytes": sum(c["size"] for c in candidates),
+            "errors": errors}
 
 
 # MCP 布局 → (格式, 键路径)。layout 保留向后兼容名；adapter 也可直接给 mcp.format + mcp.keyPath。

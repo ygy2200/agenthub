@@ -442,6 +442,28 @@ def cmd_init(root: str) -> int:
     return 0
 
 
+def cmd_config_prune(root: str, keep: int, apply: bool) -> int:
+    """R254：清理 agenthub 自产的 agent 配置备份（`.bak-agenthub-*`）。
+    默认只预演；--apply 才删。人工命名备份与非备份文件不碰（与整洁体检同一套口径）。"""
+    r = core.prune_config_backups(root, keep=keep or None, apply=apply)
+    print(f"扫描 agenthub 自产备份 {r['scanned']} 份，策略每文件保留 {r['keep']} 份")
+    rows = r["deleted"] if apply else r["candidates"]
+    freed = sum(x["size"] for x in rows)
+    if rows:
+        print(f"{'已删除' if apply else '可清理'} {len(rows)} 份 / {freed / 1024:.0f}KB：")
+        for c in rows[:20]:
+            print(f"  [{c['dir']}] {c['orig']}  {Path(c['path']).name}")
+        if len(rows) > 20:
+            print(f"  ……另有 {len(rows) - 20} 份")
+    else:
+        print("没有超出保留份数的 agenthub 自产备份。")
+    for e in r["errors"]:
+        print(f"错误：{e}")
+    if not apply and rows:
+        print("以上仅为预演；确认后加 --apply 执行。人工命名的 bak-* 不在清理范围。")
+    return 1 if r["errors"] else 0
+
+
 def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: int,
                      keep_bak: int, min_age_days: int, apply: bool) -> int:
     """R7 备份盘点与清理：默认只预演；--apply 才按保留策略真删（写 journal）。"""
@@ -1151,6 +1173,11 @@ def main(argv=None) -> int:
     _cmd("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
     _cmd("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
     p_bp = _cmd("backup-prune", help="备份盘点与清理（默认预演，--apply 才删）")
+    p_cp = _cmd("config-prune",
+                help="清理 agenthub 自产的 agent 配置备份（每文件留 N 份，默认预演，--apply 才删）")
+    p_cp.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
+    p_cp.add_argument("--keep", type=int, default=0,
+                      help=f"每份原文件保留几个备份（默认 {core.BACKUP_KEEP}）")
     p_bd = _cmd("backup-drill", help="恢复演练（校验+试恢复，不写现场数据，仅审计流水留痕）")
     p_bd.add_argument("path", nargs="?", default="", help="备份文件路径，留空=最新整包")
     p_doc = _cmd("doctor", help="一键自检：巡检聚合 + 可执行修复建议")
@@ -1296,6 +1323,8 @@ def main(argv=None) -> int:
             return cmd_release(_root(args.root))
         if args.cmd == "build-manifest":
             return cmd_build_manifest(Path(__file__).resolve().parent, args.phase)
+        if args.cmd == "config-prune":
+            return cmd_config_prune(_root(args.root), args.keep, args.apply)
         if args.cmd == "backup-prune":
             return cmd_backup_prune(_root(args.root), args.keep_zip, args.keep_snapshot,
                                     args.keep_legacy, args.keep_bak, args.min_age_days,

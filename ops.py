@@ -2817,16 +2817,7 @@ def _hygiene(root: str, dirs: list | None = None) -> dict:
     `dirs` 可注入（None = 本机默认清单），否则这套判定没法用临时目录验证。
     """
     if dirs is None:
-        dirs = [
-            ("hermes-home", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home")),
-            ("claude", Path.home() / ".claude"),
-            ("codex", Path.home() / ".codex"),
-            ("dsh", Path.home() / ".dsh"),
-            ("zcode-cli", Path.home() / ".zcode" / "cli"),
-            ("workbuddy-bin", Path.home() / ".workbuddy" / "bin"),
-            ("brain-_hub", (Path(root) / "_hub") if root else None),
-            ("agenthub-hooks", Path.home() / ".agenthub" / "hooks"),
-        ]
+        dirs = core.config_backup_dirs(root or "")   # 单一事实源（config-prune 用同一份清单）
     keep = core.BACKUP_KEEP
     rows, over, manual_total, total = [], [], 0, 0
     now = time.time()
