@@ -420,9 +420,14 @@ def t_backup_inventory_prune(tmp):
     assert r["candidates"] and not r["deleted"] and not r["apply"]
     assert len(r["candidates"]) == 9, [c["path"] for c in r["candidates"]]
     assert all(Path(c["path"]).exists() for c in r["candidates"]), "预演不得删文件"
-    # 真删：只删候选；最新 2 份快照保留；主库与非备份文件不动
-    r2 = brain.backup_prune(root, keep_zip=0, keep_snapshot=2, keep_legacy=1,
+    # R258：真删前先验留下的还原点——这批是 b"x" 假备份，验不过必须整单拦下（err 为空但 blocked）
+    rb = brain.backup_prune(root, keep_zip=0, keep_snapshot=2, keep_legacy=1,
                             keep_bak=1, min_age_days=0, apply=True)
+    assert not rb["ok"] and "校验失败" in rb.get("blocked", ""), rb.get("blocked")
+    assert not rb["deleted"] and all(Path(c["path"]).exists() for c in rb["candidates"])
+    # 真删：只删候选；最新 2 份快照保留；主库与非备份文件不动（跳过校验=本用例只测清理边界）
+    r2 = brain.backup_prune(root, keep_zip=0, keep_snapshot=2, keep_legacy=1,
+                            keep_bak=1, min_age_days=0, apply=True, verify_first=False)
     assert r2["ok"] and len(r2["deleted"]) == 9, r2["errors"]
     assert r2["reclaimed_bytes"] > 0
     assert snaps[3].exists() and snaps[4].exists(), "最新 2 份快照被误删"
@@ -437,7 +442,7 @@ def t_backup_inventory_prune(tmp):
     # min_age：超保留份数但太新 → 不动
     fresh = mk(hub / brain.BACKUP_DIR / "brain-20261020-999999.db", 777, 0)
     r3 = brain.backup_prune(root, keep_snapshot=1, keep_zip=0, keep_legacy=0,
-                            keep_bak=0, min_age_days=7, apply=True)
+                            keep_bak=0, min_age_days=7, apply=True, verify_first=False)
     assert not any(c["path"] == str(fresh) for c in r3["deleted"]), "未满最小年龄被删"
     assert fresh.exists()
 

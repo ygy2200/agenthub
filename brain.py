@@ -8543,24 +8543,48 @@ def signal_inbox(root: str, agent: str, unread_only: bool = False,
     """收件箱：发给我的 + 广播（to 空），新的在前；每行附 _read（我是否已读）与
     _stale（是否超过 SIGNAL_STALE_DAYS 天未读）。unread_only=True 只要未读；
     exclude_stale=True 再滤掉陈旧未读（开工推送用，避免旧信号永远占着推送名额）。
-    自己发的广播也在（群里自己发的也显示）。"""
+    自己发的广播也在（群里自己发的也显示）。
+
+    R272：未读过滤下推到 SQL（NOT EXISTS）——先取 30 条再在 Python 里筛未读，
+    30 条全读过时会返回空，而未读的老信号明明还在（「未读列表是空的」比不完整更可怕）。"""
     who = _norm_agent(agent)
     if not who:
         return []
+    lim = max(1, min(int(limit or 30), 200))
     with db_conn(root) as conn:
-        rows = [dict(r) for r in conn.execute(
-            "SELECT * FROM signals WHERE to_agent=? OR to_agent='' "
-            "ORDER BY id DESC LIMIT ?", (who, max(1, min(int(limit or 30), 200))))]
+        if unread_only:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM signals WHERE (to_agent=? OR to_agent='') AND NOT EXISTS "
+                "(SELECT 1 FROM signal_reads rr WHERE rr.signal_id=signals.id AND rr.agent=?) "
+                "ORDER BY id DESC LIMIT ?", (who, who, lim))]
+        else:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT * FROM signals WHERE to_agent=? OR to_agent='' "
+                "ORDER BY id DESC LIMIT ?", (who, lim))]
         for r in rows:
             r["_read"] = bool(conn.execute(
                 "SELECT 1 FROM signal_reads WHERE signal_id=? AND agent=?",
                 (r["id"], who)).fetchone())
             r["_stale"] = (not r["_read"]) and _signal_age_days(r.get("ts")) > SIGNAL_STALE_DAYS
-        if unread_only:
-            rows = [r for r in rows if not r["_read"]]
         if exclude_stale:
             rows = [r for r in rows if not r.get("_stale")]
     return rows
+
+
+def signal_count(root: str, agent: str, unread_only: bool = False) -> int:
+    """收件箱总数（R272）：列表带 LIMIT，抬头写「信号 N 条」不能是取到的条数。
+    自己发的广播计入（与 signal_inbox 同口径），未读口径含陈旧（总账用）。"""
+    who = _norm_agent(agent)
+    if not who:
+        return 0
+    q = "SELECT COUNT(*) FROM signals WHERE (to_agent=? OR to_agent='')"
+    args = [who]
+    if unread_only:
+        q += (" AND NOT EXISTS (SELECT 1 FROM signal_reads rr "
+              "WHERE rr.signal_id=signals.id AND rr.agent=?)")
+        args.append(who)
+    with db_conn(root) as conn:
+        return int(conn.execute(q, args).fetchone()[0])
 
 
 def signal_mark_read(root: str, signal_id, agent: str) -> str:
