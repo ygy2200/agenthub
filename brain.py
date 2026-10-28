@@ -7411,18 +7411,28 @@ def list_projects(root: str, limit: int = 50) -> list:
             (max(1, min(limit, 200)),))]
 
 
-def get_project(root: str, name: str) -> dict | None:
+def get_project(root: str, name: str, limit: int = 5) -> dict | None:
+    """项目概况 + 最近 limit 条记录。
+
+    R260：加 `total`（活跃记录总数）与 `shown`（本次列了几条）。此前只回 5 条、
+    **不报总数**——真实项目有 359 条记录时，调用方看到 5 条会以为这就是全部，
+    也不会想到还有 354 条要另找入口。信息缺失比信息过载更难发现。
+    """
     with db_conn(root) as conn:
         proj = conn.execute("SELECT name, agent, created FROM projects WHERE name=?", (name,)).fetchone()
         if not proj:
             return None
         recs = [dict(r) for r in conn.execute(
             "SELECT date,agent,title,content FROM records WHERE project=? AND status='active' "
-            "ORDER BY date DESC, id DESC LIMIT 5", (name,))]
+            "ORDER BY date DESC, id DESC LIMIT ?", (name, max(1, min(limit, 100))))]
+        total = conn.execute(
+            "SELECT COUNT(*) AS n FROM records WHERE project=? AND status='active'",
+            (name,)).fetchone()["n"]
         return {"name": proj["name"], "agent": proj["agent"], "created": proj["created"],
                 "last_active": conn.execute(
                     "SELECT MAX(date) AS d FROM records WHERE project=? AND status='active'",
-                    (name,)).fetchone()["d"] or "", "records": recs}
+                    (name,)).fetchone()["d"] or "",
+                "records": recs, "total": total, "shown": len(recs)}
 
 
 def project_exists(root: str, name: str) -> bool:
@@ -7813,7 +7823,8 @@ def ask(root: str, question: str, project: str = "", agent: str = "") -> dict:
         if proj:
             gp = get_project(root, proj)
             if gp:
-                parts.append(f"项目「{proj}」最后活跃 {gp.get('last_active','?')}，最近记录：")
+                parts.append(f"项目「{proj}」最后活跃 {gp.get('last_active','?')}，"
+                             f"共 {gp.get('total', 0)} 条记录，最近：")
                 for r in gp.get("records", [])[:3]:
                     parts.append(f"· {r.get('date','')}「{(r.get('title') or '')[:40]}」")
                 cites.append({"type": "project", "id": 0, "date": gp.get("last_active", ""),
