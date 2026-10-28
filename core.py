@@ -1428,7 +1428,13 @@ def _backup(p: Path) -> str:
     return str(bak)
 
 
-BACKUP_KEEP = 30  # 每个文件的备份保留上限（只清 agenthub 自己生成的备份）
+BACKUP_KEEP = 8   # 每个文件的备份保留上限（只清 agenthub 自己生成的备份）
+# R253：30 → 8。旧值不是「上限」而是「保底堆积量」——保留 30 份意味着每个被编辑过的
+# 配置文件常年躺 30 个副本，本机四个 agent 的引导文件（claude/dsh/hermes SOUL）实测
+# 各 30 份、合计 92 份，hygiene 因此永久报红（告警疲劳比不报更糟）。回滚场景真正要用
+# 的是「最近几次改坏了能退回」，8 份覆盖同一文件连续 8 次改动，够用且清得动。
+# 只清 `<name>.bak-agenthub-*`（自己生成的）：人工命名的 bak-20260810 / bak-token-*
+# 一律不碰——那不是我们的文件，删它等于替用户做决定。
 
 
 def _prune_backups(p: Path, keep: int = BACKUP_KEEP) -> None:

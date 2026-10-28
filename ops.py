@@ -2801,20 +2801,34 @@ def _backup_health(root: str) -> dict:
     return {"ok": not issues, "summary": summary, "detail": (detail or ["（无备份）"])[:8]}
 
 
-def _hygiene(root: str) -> dict:
+def _hygiene(root: str, dirs: list | None = None) -> dict:
     """整洁体检（2026-10-12 新增）：备份文件堆积 + agents 零记录冗余行。**只报不动手**——
-    删哪个由人决定（对齐「删文件前先确认」）。"""
-    dirs = [
-        ("hermes-home", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home")),
-        ("claude", Path.home() / ".claude"),
-        ("codex", Path.home() / ".codex"),
-        ("dsh", Path.home() / ".dsh"),
-        ("zcode-cli", Path.home() / ".zcode" / "cli"),
-        ("workbuddy-bin", Path.home() / ".workbuddy" / "bin"),
-        ("brain-_hub", (Path(root) / "_hub") if root else None),
-        ("agenthub-hooks", Path.home() / ".agenthub" / "hooks"),
-    ]
-    rows, total = [], 0
+    删哪个由人决定（对齐「删文件前先确认」）。
+
+    R253：判定口径从「整目录 .bak 总数 ≥100 就红」改成**按原文件的保留策略**。旧口径在
+    完全合规的机器上也会红：`core._prune_backups` 每个文件保 BACKUP_KEEP 份，四个 agent 的
+    引导文件（CLAUDE.md / AGENTS.md / SOUL.md / config.yaml）各自躺满上限 → 实测 146 个
+    .bak 一次越过阈值，检查项从此**常年报红**；一个永远红的检查等于没有检查（告警疲劳）。
+    新口径分两类：
+      ① **agenthub 自产备份**（`*.bak-agenthub-*`）：按原文件分组，> BACKUP_KEEP 才越界——
+         越界说明是旧版本写的或被人拷过，这是真策略违背，该红；
+      ② **人工命名备份**（bak-20260810 / bak-token-* / bak-addmcp…）：不是我们生成的，
+         只统计不判红——删它得用户点头。
+    `dirs` 可注入（None = 本机默认清单），否则这套判定没法用临时目录验证。
+    """
+    if dirs is None:
+        dirs = [
+            ("hermes-home", Path("D:/hermes/Hermes Agent CN Desktop/data/hermes-home")),
+            ("claude", Path.home() / ".claude"),
+            ("codex", Path.home() / ".codex"),
+            ("dsh", Path.home() / ".dsh"),
+            ("zcode-cli", Path.home() / ".zcode" / "cli"),
+            ("workbuddy-bin", Path.home() / ".workbuddy" / "bin"),
+            ("brain-_hub", (Path(root) / "_hub") if root else None),
+            ("agenthub-hooks", Path.home() / ".agenthub" / "hooks"),
+        ]
+    keep = core.BACKUP_KEEP
+    rows, over, manual_total, total = [], [], 0, 0
     now = time.time()
     for name, d in dirs:
         if d is None:
@@ -2825,13 +2839,23 @@ def _hygiene(root: str) -> dict:
             baks = []
         if not baks:
             continue
+        mine = [b for b in baks if ".bak-agenthub-" in b.name]
+        manual = [b for b in baks if ".bak-agenthub-" not in b.name]
+        manual_total += len(manual)
         total += len(baks)
+        groups = {}
+        for b in mine:
+            groups.setdefault(b.name.split(".bak-agenthub-")[0], []).append(b)
+        for orig, items in groups.items():
+            if len(items) > keep:
+                over.append((len(items) - keep, f"{name}/{orig}", len(items)))
         try:
             age = int((now - min(b.stat().st_mtime for b in baks)) / 86400)
         except OSError:
             age = 0
-        rows.append((len(baks), name, age))
+        rows.append((len(baks), name, age, len(manual)))
     rows.sort(key=lambda r: -r[0])
+    over.sort(key=lambda r: -r[0])
 
     # agents 零记录冗余行（排除 mcp-server：它是大脑自身身份，有错误登记记录）
     zero = []
@@ -2843,17 +2867,30 @@ def _hygiene(root: str) -> dict:
     except Exception:  # noqa: BLE001
         pass
 
-    detail = [f"{n} 个 .bak（{name}，最老 {age} 天）" for n, name, age in rows[:5]]
+    detail = []
+    if over:
+        detail.append(f"超出保留上限（> {keep} 份）：" + "、".join(
+            f"{where} {n} 份（多 {extra}）" for extra, where, n in over[:4]))
+    detail += [f"{n} 个 .bak（{name}，最老 {age} 天，其中人工命名 {m}）"
+               for n, name, age, m in rows[:5]]
+    if manual_total:
+        detail.append(f"人工命名备份 {manual_total} 个（非 agenthub 生成，不动）")
     if zero:
         detail.append("agents 零记录冗余行：" + "、".join(zero) + "（可清）")
-    detail.append("策略建议：按目录保留最近 10 份；超 30 天只列清单、人工确认后再删（不自动删）")
-    if total >= 100:
-        summary = f"整洁体检：备份文件 {total} 个已明显堆积（建议清理）；零记录 agent 行 {len(zero)}"
+    detail.append(f"策略：agenthub 自产备份按原文件保留最近 {keep} 份——该文件下次被 "
+                  f"agenthub 编辑时自动剪到 {keep} 份；人工命名的只列清单、确认后再删")
+
+    over_n = sum(1 for _ in over)
+    if over_n:
+        summary = (f"整洁体检：{over_n} 个文件的备份超出保留上限 {keep} 份"
+                   f"（共 {total} 个 .bak，可清 {sum(r[0] for r in over)} 份）；"
+                   f"零记录 agent 行 {len(zero)}")
     elif total:
-        summary = f"整洁体检：备份文件 {total} 个（{rows[0][1]} 最多 {rows[0][0]} 个），零记录 agent 行 {len(zero)}"
+        summary = (f"整洁体检：{total} 个 .bak 全部在策略内（{rows[0][1]} 最多 "
+                   f"{rows[0][0]} 个），零记录 agent 行 {len(zero)}")
     else:
         summary = "整洁体检：无备份堆积、无零记录 agent 行"
-    return {"ok": total < 100 and not zero, "summary": summary, "detail": detail[:8]}
+    return {"ok": not over and not zero, "summary": summary, "detail": detail[:8]}
 
 
 def _inbox(root: str) -> dict:
