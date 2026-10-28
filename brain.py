@@ -6797,25 +6797,31 @@ def list_pinned_memories(root: str, limit: int = 8) -> list:
 
 
 def search_memories(root: str, query: str = "", kind: str = "", limit: int = 20,
-                    count_hits: bool = True, semantic: bool = True) -> list:
+                    count_hits: bool = True, semantic: bool = True,
+                    gate: bool = True) -> list:
     """检索记忆：多词评分（命中词数，与 records 检索一致）；无 query 时置顶优先按 id 倒序。
     0 命中且 query 含 ≥4 字连续中文串时按 2-gram 重试（与 search_records 同因）。
 
     count_hits：带 query 的实际检索命中才计唤起（use_count+1）——主动检索是最高价值的
     唤起信号，此前只统计被动推送，衰减/有用率的输入数据系统性失真（0.2 修复）。
     空 query 列清单不计；写入查重等内部调用须显式传 False。
-    semantic=False：跳过语义第三路（R230 体检探针专用，避免为抽查加载编码模型）。"""
+    semantic=False：跳过语义第三路（R230 体检探针专用，避免为抽查加载编码模型）。
+    gate=False：跳过覆盖度闸门（R245 体检泄漏探针专用）。闸门只把候选分强弱再**删**，
+    删得越多漏报越多；探针要的是「管线能不能吐出已取代行」的超集，跳过闸门只会更严。
+    结构性过滤（_live_sql）不归闸门管，gate=False 也不放行已取代行。默认 True 不动。"""
     words = [w for w in re.split(r"\s+", (query or "").strip()) if w][:8]
     if _RRF_ENABLED:
         rows = _memories_search_fused(root, query or "", words, kind, limit, semantic)
     else:
         rows = _memories_query(root, words, kind, limit)  # 回滚开关：走旧单路
-    rows = _coverage_gate(root, rows, query or "")
+    if gate:
+        rows = _coverage_gate(root, rows, query or "")
     if not rows and words:
         retry = _retry_bigrams(query)
         if retry:
             rows = _memories_query(root, retry, kind, limit)  # 放宽重试保持旧路径（融合外）
-            rows = _coverage_gate(root, rows, query or "")
+            if gate:
+                rows = _coverage_gate(root, rows, query or "")
             for r in rows:  # 同 search_records：放宽召回须可识别
                 r["_bigram"] = True
     if rows:

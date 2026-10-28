@@ -36,8 +36,8 @@ def test_probe_still_catches_pipeline_leak(hub_root, monkeypatch):
     old, _ = _brain_with_superseded(hub_root)
     real = brain.search_memories
 
-    def leaky(root, query="", kind="", limit=20, count_hits=True, semantic=True):
-        rows = real(root, query, kind, limit, count_hits, semantic)
+    def leaky(root, query="", kind="", limit=20, count_hits=True, semantic=True, gate=True):
+        rows = real(root, query, kind, limit, count_hits, semantic, gate)
         if not any(r["id"] == old for r in rows):
             rows = rows + [{"id": old, "content": "旧结论"}]
         return rows

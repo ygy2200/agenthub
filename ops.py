@@ -1438,6 +1438,8 @@ def _stale_health(root: str) -> dict:
     #    ——体检是低频只读动作，此前语义路要为一次抽查加载编码模型（真实库实测 stale_health
     #    9.1s / 全检 11.8s）。语义路的过滤覆盖改由同批的结构性计数守：任何一条带向量的
     #    已取代行只要被 live 谓词放行就报——比抽样查询更强，不靠相似度碰巧命中。
+    #    R245：探针再传 gate=False——覆盖度闸门只删不添（_token_stats 的 LIKE 全表扫占单次
+    #    检索 59%，5 次探针 = 整项 97%）；跳过闸门让探针看到候选超集，检测严格更强。
     try:
         with brain.db_conn(root) as conn:
             sup = [dict(r) for r in conn.execute(
@@ -1455,7 +1457,7 @@ def _stale_health(root: str) -> dict:
             if not kw:
                 continue
             ids = [r["id"] for r in brain.search_memories(root, kw, "", 5, count_hits=False,
-                                                          semantic=False)]
+                                                          semantic=False, gate=False)]
             if mcode["id"] in ids:
                 leaks.append(mcode["id"])
     except Exception as e:  # noqa: BLE001

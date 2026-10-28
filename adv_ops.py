@@ -1657,8 +1657,9 @@ def main():
           shr["ok"] and not sem_calls, str({"ok": shr["ok"], "sem_calls": len(sem_calls)}))
     real_search = brain.search_memories
 
-    def leaky_search(root, query="", kind="", limit=20, count_hits=True, semantic=True):
-        rows = real_search(root, query, kind, limit, count_hits, semantic)
+    def leaky_search(root, query="", kind="", limit=20, count_hits=True, semantic=True,
+                     gate=True):
+        rows = real_search(root, query, kind, limit, count_hits, semantic, gate)
         return rows if any(r["id"] == old_id for r in rows) else rows + [{"id": old_id}]
 
     brain.search_memories = leaky_search
