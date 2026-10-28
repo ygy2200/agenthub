@@ -215,7 +215,16 @@ def run_patrol(root: str, checks=None, progress=None) -> dict:
     「问题」（空目录实测 17 条问题里 14 条同因）。命中 cause=db_missing 后，后续
     DB_BACKED_CHECKS 直接跳过、结果里计 `same_cause_skipped`；同一 cause 的重复
     问题折叠进首个问题的 `also`。
+
+    R247：整批巡检是一个刷新域——批内 `audit_chain` 与 `security_health` 各自都要
+    验一次审计链，而同进程同一批只读检查之间唯一的写入就是巡检自己刚落的流水行，
+    所以批内只验一次（真实库省 ~70ms/次）。域外（单项 `run_check` / MCP）仍每次真验。
     """
+    with refresh_scope():
+        return _run_patrol(root, checks, progress)
+
+
+def _run_patrol(root: str, checks=None, progress=None) -> dict:
     names = tuple(checks or PATROL_CHECKS)
     issues, passed, skipped = [], [], []
     timings = []
@@ -867,8 +876,30 @@ def _looks_placeholder(tok: str) -> bool:
     return any(mark in low for mark in _PLACEHOLDER_MARKERS)
 
 
+# 任何模式命中都必需的字面量（R247）。只是必要条件：精确分支沿用模式自身的大小写
+# （sk- / ghp_… / AKIA / -----BEGIN），口令关键词那条是 (?i) 所以按小写比对。
+_SECRET_NEEDLES_CS = ("sk-", "ghp_", "gho_", "ghu_", "ghs_", "ghr_",
+                      "AKIA", "-----BEGIN")
+_SECRET_NEEDLES_CI = ("password", "passwd", "passphrase", "secret", "api", "access")
+
+
+def _may_contain_secret(text: str) -> bool:
+    """False ⇒ 下面 5 个模式都不可能命中，整条可以跳过。
+
+    真实库 2027 条实测过筛 13%、逐条判定零差异（`output/_r247_screen.txt`）；
+    正则占明文扫描的 118.6/136ms，跳过 87% 的条数才有这 64% 的节省。
+    """
+    for n in _SECRET_NEEDLES_CS:
+        if n in text:
+            return True
+    low = text.lower()
+    return any(n in low for n in _SECRET_NEEDLES_CI)
+
+
 def _secret_label(text: str) -> str:
     """返回命中的凭据类型（空=干净）。只判类型，不返回密钥内容。"""
+    if not text or not _may_contain_secret(text):
+        return ""
     for label, pat in _SECRET_PATTERNS:
         m = pat.search(text or "")
         if not m:
