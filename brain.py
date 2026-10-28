@@ -6783,7 +6783,10 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     仅 entity 在表中有向量时生效；否则空（fail-open）。语义独有的候选（词法未召回）也能进融合。
     准入门槛（2026-10-11 实测标定）：①查询含中文；②余弦 ≥ _SEM_MIN_SIM。见常量区注释。
     行形态与词法两路完全一致（SELECT * + 同一 live 过滤）：调用方（融合/唤起计数）按
-    普通记忆行读 use_count/last_hit；被取代/过期/软删的行一概不得借语义路复活。"""
+    普通记忆行读 use_count/last_hit；被取代/过期/软删的行一概不得借语义路复活。
+    R251：先窄取 `e.eid, e.vec` 算余弦，只对过阈值候选（真实库每次 7–11 条）回表取全列——
+    原实现把 1575 行带 content 的 `r.*` 与向量一起拉回、99% 过不了 0.58 又丢掉（实测 22.9→12.7ms，
+    另省 1575 行 dict 构建），余弦本身只要 0.15ms。回表仍带存活谓词，两查之间被取代的行只会消失。"""
     if not query or not _SEM_CJK_RE.search(query):
         return []
     try:
@@ -6799,11 +6802,12 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
         return []
     tbl = "records" if entity == "records" else "memories"
     live = _rec_live_sql("r.") if entity == "records" else _live_sql("r.")
+    live_plain = _rec_live_sql() if entity == "records" else _live_sql()
     try:
         import numpy as np
         with db_conn(root) as c:
             rows = c.execute(
-                f"SELECT e.eid, e.vec, r.* FROM embeddings e JOIN {tbl} r ON e.eid=r.id "
+                f"SELECT e.eid, e.vec FROM embeddings e JOIN {tbl} r ON e.eid=r.id "
                 f"WHERE e.entity=? AND {live}", (entity,)).fetchall()
         if not rows:
             return []
@@ -6816,23 +6820,28 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
             v = np.frombuffer(row["vec"], dtype="float32")
             if v.shape[0] != q.shape[0]:
                 continue
-            vecs.append(v); kept.append(row)
+            vecs.append(v); kept.append(row["eid"])
         if not vecs:
             return []
         M = np.stack(vecs)                                    # (N, D)
         norms = np.linalg.norm(M, axis=1) + 1e-9
         sims = (M @ q) / (qn * norms)                        # 向量化余弦，与逐行公式数学等价
-        scored = []
-        for row, sim in zip(kept, sims):
-            if sim < _SEM_MIN_SIM:   # 门槛：弱相关的语义候选不得进融合（噪声/误召回治理）
-                continue
-            r = dict(row)
-            r.pop("vec", None)   # 剥掉 BLOB，保持行形态与词法路一致（几百字节/条）
-            r.pop("eid", None)
-            scored.append((row["id"], float(sim), r))
+        scored = [(eid, float(sim)) for eid, sim in zip(kept, sims)
+                  if sim >= _SEM_MIN_SIM]                    # 门槛：弱相关不进融合（噪声治理）
         scored.sort(key=lambda t: -t[1])
+        top = scored[:limit]
+        if not top:
+            return []
+        ids = [eid for eid, _ in top]
+        with db_conn(root) as c:
+            full = {r["id"]: dict(r) for r in c.execute(
+                f"SELECT * FROM {tbl} WHERE " + live_plain
+                + " AND id IN (" + ",".join("?" * len(ids)) + ")", ids)}
         out = []
-        for rank, (eid, sim, r) in enumerate(scored[:limit]):
+        for rank, (eid, sim) in enumerate(top):
+            r = full.get(eid)
+            if r is None:   # 两查之间被取代/过期：只会消失，不会复活（同 R250 回表语义）
+                continue
             r["_semantic_sim"] = round(sim, 4)
             out.append((eid, 1.0 / (_RRF_K + rank + 1), r))
         return out
