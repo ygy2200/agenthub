@@ -2782,6 +2782,18 @@ def task_approvals(root: str, project: str = "", limit: int = 50) -> list:
         return [dict(r) for r in conn.execute(q, args)]
 
 
+def task_approval_count(root: str, project: str = "") -> int:
+    """待审批任务总数（R273）：队列有 LIMIT，抬头不能把取到的条数当总数。"""
+    q = ("SELECT COUNT(*) FROM tasks WHERE status='in_progress' AND approval_required=1 "
+         "AND COALESCE(approved_by,'')=''")
+    args: list = []
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    with db_conn(root) as conn:
+        return int(conn.execute(q, args).fetchone()[0])
+
+
 def task_get(root: str, tid) -> dict:
     """按 id 取任务行（不存在返回 {}）。R35：记录绑定/漂移核对共用的只读入口。"""
     try:
@@ -4587,6 +4599,29 @@ def file_lease_list(root: str, path: str = "", project: str = "", owner: str = "
     now = datetime.datetime.now()
     with db_conn(root) as conn:
         return [_file_lock_row(dict(r), now) for r in conn.execute(q, args)]
+
+
+def file_lease_count(root: str, path: str = "", project: str = "",
+                     owner: str = "", include_released: bool = False) -> int:
+    """租约总数（R273）：与 file_lease_list 同过滤口径，列表抬头用它报总数。"""
+    q = "SELECT COUNT(*) FROM file_leases WHERE 1=1"
+    args: list = []
+    if path:
+        err, key, _, _ = _file_lock_path(root, path)
+        if err:
+            return 0
+        q += " AND path=?"
+        args.append(key)
+    if project:
+        q += " AND project=?"
+        args.append(project)
+    if owner:
+        q += " AND owner=?"
+        args.append(_norm_agent(owner))
+    if not include_released:
+        q += " AND released_at=''"
+    with db_conn(root) as conn:
+        return int(conn.execute(q, args).fetchone()[0])
 
 
 def file_lease_check(root: str, path: str) -> dict:
@@ -8721,6 +8756,17 @@ def checkpoint_list(root: str, task_id, limit: int = 20) -> list:
             (tid, max(1, min(int(limit or 20), 100))))]
 
 
+def checkpoint_count(root: str, task_id) -> int:
+    """某任务检查点总数（R273）：时间线有 LIMIT，抬头不能把取到的条数当总数。"""
+    try:
+        tid = int(task_id)
+    except (TypeError, ValueError):
+        return 0
+    with db_conn(root) as conn:
+        return int(conn.execute(
+            "SELECT COUNT(*) FROM checkpoints WHERE task_id=?", (tid,)).fetchone()[0])
+
+
 def checkpoint_latest(root: str, task_id):
     """某任务的最新一条检查点（没有则 None）——心跳 doing 行附它做进展摘要。"""
     try:
@@ -8855,18 +8901,31 @@ def quarantine_list(root: str, limit: int = 50) -> list:
     同名键会被 dict 展开覆盖（2026-10-12 实测踩坑）。"""
     out: list = []
     with db_conn(root) as conn:
+        # R273：截断留省略号——半句话读起来像错字，且看不出是被截的
         for r in conn.execute(
-                "SELECT id, substr(title,1,60) AS title, substr(content,1,80) AS content, "
+                "SELECT id, CASE WHEN length(title)>60 THEN substr(title,1,60)||'…' "
+                "ELSE title END AS title, "
+                "CASE WHEN length(content)>80 THEN substr(content,1,80)||'…' "
+                "ELSE content END AS content, "
                 "project, agent, created FROM records WHERE status='quarantine' "
                 "ORDER BY id DESC LIMIT ?", (max(1, min(int(limit or 50), 200)),)):
             out.append({"src": "record", **dict(r)})
         for r in conn.execute(
-                "SELECT id, kind, substr(content,1,80) AS content, agent, created "
+                "SELECT id, kind, CASE WHEN length(content)>80 THEN substr(content,1,80)||'…' "
+                "ELSE content END AS content, agent, created "
                 "FROM memories WHERE status='quarantine' ORDER BY id DESC LIMIT ?",
                 (max(1, min(int(limit or 50), 200)),)):
             out.append({"src": "memory", **dict(r)})
     out.sort(key=lambda x: x["id"], reverse=True)
     return out[:max(1, min(int(limit or 50), 200))]
+
+
+def quarantine_count(root: str) -> int:
+    """隔离区总数（R273）：记录+记忆两张表合并计数，列表抬头用它报总数。"""
+    with db_conn(root) as conn:
+        return int(conn.execute(
+            "SELECT (SELECT COUNT(*) FROM records WHERE status='quarantine')"
+            " + (SELECT COUNT(*) FROM memories WHERE status='quarantine')").fetchone()[0])
 
 
 # ---------------------------------------------------------------- 决策回路（M11）
