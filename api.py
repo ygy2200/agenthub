@@ -57,24 +57,27 @@ def _tool_list_drift() -> list:
     return sorted(out)
 
 
-def _call_tool(root: str, name: str, args: dict) -> tuple[str, bool]:
-    """调一个 MCP 工具，返回 (文本结果, 是否业务失败)。异常转成 (错误文本, True)。
+def _call_tool(root: str, name: str, args: dict) -> tuple[str, bool, str]:
+    """调一个 MCP 工具，返回 (文本结果, 是否业务失败, error_kind)。异常转成 (错误文本, True, "")。
 
     业务失败指工具成功执行但语义失败（如「项目不存在」），由 handle_message 标记 isError=True。
     此前只返回纯文本、丢失 isError，外部 HTTP 调用方无法程序化区分成功/失败（只能 hack 文本前缀）。
     现在透传 is_error，让 /api/call 用 HTTP 状态码（200/422）表达（与 R1-R7 的 isError 正确性一致）。
+    R289：同时透传 error_kind（transient/permanent/ambiguous），放进 X-Error-Kind 响应头——
+    外部调用方能按类型决定退避重试还是改参数，不必解析中文。
     """
     rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": name, "arguments": args}}
     try:
         r = agenthub_mcp.handle_message(rpc, root)
     except Exception as e:  # noqa: BLE001
-        return f"调用异常：{e}", True
+        return f"调用异常：{e}", True, "ambiguous"
     res = r.get("result") or {}
     if "content" in res:
-        return res["content"][0]["text"], bool(res.get("isError"))
+        kind = str((res.get("structuredContent") or {}).get("error_kind") or "")
+        return res["content"][0]["text"], bool(res.get("isError")), kind
     err = r.get("error") or {}
-    return err.get("message") or str(r), True
+    return err.get("message") or str(r), True, ""
 
 
 def _coerce(v: str):
@@ -136,11 +139,14 @@ class _Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass  # 静默：别把访问日志刷到控制台
 
-    def _send(self, code: int, body: str, ctype: str = "text/plain; charset=utf-8"):
+    def _send(self, code: int, body: str, ctype: str = "text/plain; charset=utf-8",
+              headers: dict | None = None):
         data = body.encode("utf-8")
         self.send_response(code)
         self.send_header("Content-Type", ctype)
         self.send_header("Content-Length", str(len(data)))
+        for k, v in (headers or {}).items():
+            self.send_header(k, v)
         self.end_headers()
         try:
             self.wfile.write(data)
@@ -208,9 +214,11 @@ class _Handler(BaseHTTPRequestHandler):
             if name in agenthub_mcp.WRITE_TOOLS and not (
                     self.allow_write and q.pop("token", "") == self.token):
                 return self._send(403, "写工具默认关闭（启动加 --allow-write 并带 token）")
-            text, is_error = _call_tool(self.root, name, q)
+            text, is_error, kind = _call_tool(self.root, name, q)
             # 业务失败用 422（请求格式合法但语义失败），让调用方程序化识别，而非 200 伪装成功
-            return self._send(200 if not is_error else 422, text)
+            # R289：error_kind 走响应头（body 仍是纯文本，dashboard 等旧客户端不受影响）
+            return self._send(200 if not is_error else 422, text,
+                              headers={"X-Error-Kind": kind} if kind else None)
         return self._send(404, "未知路由：" + u.path)
 
 

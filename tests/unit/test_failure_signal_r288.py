@@ -54,7 +54,7 @@ def test_cli_exit_code_reflects_business_failure(hub_root):
 def test_rest_call_exposes_is_error(hub_root):
     import api
     brain.init_db(hub_root)
-    text, is_err = api._call_tool(hub_root, "hub_get_record", {"record_id": 999})
-    assert is_err is True and "未找到记录" in text, (is_err, text)
-    text2, is_err2 = api._call_tool(hub_root, "hub_health", {})
-    assert is_err2 is False and "体检" in text2, (is_err2, text2)
+    text, is_err, kind = api._call_tool(hub_root, "hub_get_record", {"record_id": 999})
+    assert is_err is True and kind == "permanent" and "未找到记录" in text, (is_err, kind, text)
+    text2, is_err2, kind2 = api._call_tool(hub_root, "hub_health", {})
+    assert is_err2 is False and kind2 == "" and "体检" in text2, (is_err2, kind2, text2)

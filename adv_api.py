@@ -60,6 +60,16 @@ class _Client:
         except Exception as e:  # noqa: BLE001
             return 0, str(e)
 
+    def get_full(self, path: str):
+        """(状态码, 文本, 响应头)——R289 起错误分类走 X-Error-Kind 头。"""
+        try:
+            with urllib.request.urlopen(self.base + path, timeout=10) as r:
+                return r.status, r.read().decode("utf-8"), dict(r.headers)
+        except urllib.error.HTTPError as e:
+            return e.code, e.read().decode("utf-8", "ignore"), dict(e.headers)
+        except Exception as e:  # noqa: BLE001
+            return 0, str(e), {}
+
 
 def t_api_readonly():
     """只读面：仪表盘 + 五个常用路由 + 任意只读工具 + 404。"""
@@ -178,6 +188,30 @@ def t_api_call_iserror():
         httpd.server_close()
 
 
+def t_api_error_kind_header():
+    """R289：REST 业务失败除 422 外，还要给机器可读分类（X-Error-Kind）。
+
+    MCP 侧有 structuredContent.error_kind，REST 侧此前只有中文 body——外部调用方
+    要决定「退避重试」还是「改参数」只能解析中文。响应头与 MCP 同源，成功响应不带。
+    """
+    from urllib.parse import quote  # noqa: PLC0415
+    root = _fresh_root()
+    httpd, port, _ = api.serve(root, port=0)
+    threading.Thread(target=httpd.serve_forever, daemon=True).start()
+    try:
+        time.sleep(0.3)
+        c = _Client(port)
+        code, body, headers = c.get_full("/api/call?name=hub_get_project&project=" + quote("不存在的"))
+        assert code == 422, (code, body[:120])
+        assert headers.get("X-Error-Kind") == "permanent", (code, headers, body[:120])
+        code, body, headers = c.get_full("/api/call?name=hub_status")
+        assert code == 200, (code, body[:80])
+        assert "X-Error-Kind" not in headers, headers
+    finally:
+        httpd.shutdown()
+        httpd.server_close()
+
+
 def t_rest_selfheal_fresh_root():
     """R2：REST 分发入口自愈——全新根目录（未 init_db）经 api._call_tool → handle_message
     必须自己 ensure_schema，首请求不能 no such table。
@@ -186,7 +220,7 @@ def t_rest_selfheal_fresh_root():
     root = str(Path(_tf.mkdtemp()) / "hub_fresh")
     Path(root).mkdir(parents=True, exist_ok=True)  # 目录在，但库/表尚未建
     # 直接走 REST 分发路径（不经过 init_db）
-    text, is_error = api._call_tool(root, "hub_health", {})
+    text, is_error, _kind = api._call_tool(root, "hub_health", {})
     assert not is_error, ("hub_health 应当自愈成功", text[:200])
     assert "no such" not in text, ("首请求不应缺表/缺列", text[:200])
 
@@ -197,6 +231,7 @@ def main() -> int:
     case("写守卫（默认403 / 开启后无token仍403 / 带token才通）", t_api_write_guard)
     case("工具清单一致性（名不重复 / WRITE_TOOLS ⊆ TOOLS）", t_tool_list_consistency)
     case("Round9·REST桥透传isError（业务失败422/成功200/纯文本兼容）", t_api_call_iserror)
+    case("R289·REST错误分类响应头（失败带X-Error-Kind/成功不带）", t_api_error_kind_header)
     case("R2·REST分发自愈（全新根首请求不no such table）", t_rest_selfheal_fresh_root)
     failed = globals().get("_FAILED", [])
     print()
