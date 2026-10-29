@@ -90,6 +90,44 @@ def _root_problem(root: str, need_db: bool = False) -> str:
     return ""
 
 
+def _welcome_text(root: str) -> str:
+    """R712：裸跑 `agenthub` 的第一屏——30 多个命令的 argparse 清单不是新用户要的东西。"""
+    from agenthub_mcp import SERVER_INFO  # noqa: PLC0415  只在交互首屏用，不影响其他命令启动
+
+    shown = root or "（未配置）"
+    return "\n".join([
+        f"AgentHub 命令行 · v{SERVER_INFO['version']}",
+        "",
+        "第一次用（三步）：",
+        '  1. 建脑        agenthub init --root "<已有目录>"',
+        "  2. 接入 agent  agenthub onboard <agent>      # 例：agenthub onboard zcode",
+        "  3. 验收        agenthub status               # 有缺口退 1，可配 --json",
+        "",
+        "日常最常用：",
+        "  agenthub next --agent zcode     看下一步该做什么",
+        "  agenthub tasks --approvals      看待审批任务",
+        "  agenthub digest                 今天大家干了什么",
+        "  agenthub call hub_search keyword=关键词 limit=5",
+        "",
+        f"当前根目录：{shown}    （切换：agenthub root --set \"<目录>\"）",
+        "全部命令：agenthub --help    单个命令：agenthub help <命令>",
+    ])
+
+
+def cmd_help(ap, topic: str) -> int:
+    """R713：`agenthub help <命令>`——比 `agenthub <命令> --help` 更符合直觉的写法。"""
+    if not topic:
+        ap.print_help()
+        return 0
+    for a in ap._actions:  # noqa: SLF001
+        if isinstance(a, argparse._SubParsersAction):  # noqa: SLF001
+            if topic in a.choices:
+                print(a.choices[topic].format_help())
+                return 0
+    print(_unknown_command_message(topic, _command_names(ap)))
+    return 2
+
+
 def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
     rows = core.agent_bootstrap_status(root)
     if agent:
@@ -147,6 +185,7 @@ def cmd_onboard(root: str, agent: str) -> int:
     server = str(core.MCP_SERVER_DIR / "agenthub_mcp.py")
     done = []
     failed = []
+    skipped = []
     spec = core._mcp_spec_of(a)
     if spec:
         st = core.deploy_status()
@@ -166,8 +205,13 @@ def cmd_onboard(root: str, agent: str) -> int:
                                      agent=a.get("agent", ""),
                                      profile=(a.get("mcp") or {}).get("profile", ""))
         if err:
-            print(f"  ✗ MCP 写入失败：{err}")
-            failed.append(f"MCP 配置（{path}）：{err}")
+            # R714：bundle 型 agent 的「不自动写」是设计内行为——不算失败，也不谎称成功。
+            if core.is_mcp_unsupported(err):
+                print(f"  · {err}")
+                skipped.append(f"MCP 配置（{path}）：bundle 提供，需手工启用")
+            else:
+                print(f"  ✗ MCP 写入失败：{err}")
+                failed.append(f"MCP 配置（{path}）：{err}")
         else:
             done.append(f"MCP 配置（{fmt}）-> {path}")
     else:
@@ -190,7 +234,12 @@ def cmd_onboard(root: str, agent: str) -> int:
         print("\n没有可写入的接入点：该 agent 既未登记 MCP 配置，也没有引导文件路径。")
         print("  在 config.agents.json 补齐 mcp/instr_path 后再试。")
         return 1
-    print(f"\n接入完成。重启 {a['agent']} 后首次心跳即证明生效；复核：python cli.py status")
+    if skipped:
+        print(f"\n接入完成（{len(skipped)} 处需手工）：")
+        for sk in skipped:
+            print(f"  · {sk}")
+    else:
+        print(f"\n接入完成。重启 {a['agent']} 后首次心跳即证明生效；复核：python cli.py status")
     return 0
 
 
@@ -691,7 +740,7 @@ def cmd_call(root: str, tool: str, kv: list) -> int:
     rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": tool, "arguments": args}}
     try:
-        r = agenthub_mcp.handle_message(rpc, root)
+        r = agenthub_mcp.handle_message(rpc, root, log_tool_errors=False)
     except sqlite3.DatabaseError as e:
         import brain  # noqa: PLC0415
         if brain.is_db_corruption(e):
@@ -1300,6 +1349,51 @@ def _hoist_root(argv: list) -> list:
     return roots + rest
 
 
+def _version_line() -> str:
+    """R708：`agenthub --version` 的输出——版本是排障第一问，不该让你去翻源码。"""
+    import platform
+
+    import agenthub_mcp  # noqa: PLC0415
+    return (f"AgentHub v{agenthub_mcp.SERVER_INFO['version']}"
+            f" · MCP 协议 {agenthub_mcp.PROTOCOL_VERSION}"
+            f" · Python {platform.python_version()}"
+            f" · {sys.platform}")
+
+
+def _command_names(ap) -> list:
+    """从 parser 里取全部子命令名（唯一真相来源，不另维护常量）。"""
+    for a in ap._actions:  # noqa: SLF001  argparse 没有公开入口
+        if isinstance(a, argparse._SubParsersAction):  # noqa: SLF001
+            return list(a.choices)
+    return []
+
+
+def _first_command(argv: list) -> str:
+    """argv 里第一个「看起来是命令」的 token（跳过 --root 及其值）。"""
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--root":
+            i += 2
+            continue
+        if a.startswith("-"):
+            i += 1
+            continue
+        return a
+    return ""
+
+
+def _unknown_command_message(cmd: str, names: list) -> str:
+    import difflib
+
+    near = difflib.get_close_matches(cmd, names, n=3, cutoff=0.6)
+    lines = [f"未知命令：{cmd}"]
+    if near:
+        lines.append(f"  你可能想用：{'、'.join(near)}")
+    lines.append("  全部命令：agenthub --help")
+    return "\n".join(lines)
+
+
 def main(argv=None) -> int:
     # Windows OEM codepage（cmd 默认 850/936）下把中文重定向到管道会抛
     # UnicodeEncodeError 直接崩掉——我们的工具返回全是中文，这条必须最先做。
@@ -1328,6 +1422,8 @@ def main(argv=None) -> int:
                 "\n根目录：--root（写在子命令前或后都行），或写入 ~/.agenthub/config.json 的 root"),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
+    # R708：-V/--version 在任何位置都认（真正生效靠 parse_args 之前的预扫，这里只为进 --help 清单）
+    ap.add_argument("-V", "--version", action="store_true", help="打印版本号后退出")
     sub = ap.add_subparsers(dest="cmd", metavar="命令")
     _add_cmd = sub.add_parser
 
@@ -1341,6 +1437,8 @@ def main(argv=None) -> int:
                        help="大脑根目录（同全局 --root；写在子命令前或后都行）")
         return p
 
+    p_help = _cmd("help", help="查看某个命令的详细用法（agenthub help <命令>）")
+    p_help.add_argument("topic", nargs="?", default="", help="命令名；留空等同 agenthub --help")
     p_status = _cmd("status", help="各 agent 接入状态（有缺失时退出码 1）")
     p_status.add_argument("agent", nargs="?", default="", help="只看某个 agent；留空看全部")
     p_status.add_argument("--json", action="store_true", help="输出单行 JSON（脚本/CI 用）")
@@ -1509,9 +1607,22 @@ def main(argv=None) -> int:
     p_unlock.add_argument("--path", default="")
     p_unlock.add_argument("--agent", required=True)
     p_unlock.add_argument("--reason", default="")
+    # R708/R709：版本与命令名预扫要在 parse_args 之前——argparse 对未知命令只会甩
+    # 一屏「invalid choice: 'statu' (choose from 34 个)」，对 --version 直接报用法错误。
+    _argv_eff = list(sys.argv[1:] if argv is None else argv)
+    if any(a in ("-V", "--version") for a in _argv_eff):
+        print(_version_line())
+        return 0
+    _names = _command_names(ap)
+    _first = _first_command(_argv_eff)
+    if _first and _first not in _names:
+        print(_unknown_command_message(_first, _names))
+        return 2
     args = ap.parse_args(argv)
 
     try:
+        if args.cmd == "help":
+            return cmd_help(ap, args.topic)
         if args.cmd == "release":
             return cmd_release(_root(args.root))
         if args.cmd == "build-manifest":
@@ -1542,7 +1653,13 @@ def main(argv=None) -> int:
         root = _root(args.root)
         problem = _root_problem(root, args.cmd in _NEED_DB)
         if problem:
-            print(problem)
+            # R711：--json 是机器契约——出错也必须吐 JSON，否则脚本拿到的是半截人话，
+            # 报错变成 json.decoder.JSONDecodeError，真正的原因（路径打错）被吃掉。
+            if getattr(args, "json", False) or getattr(args, "as_json", False):
+                print(json.dumps({"ok": False, "root": root, "error": problem},
+                                 ensure_ascii=False))
+            else:
+                print(problem)
             return 2
         if args.cmd == "status":
             return cmd_status(root, args.agent, args.json)
@@ -1600,7 +1717,7 @@ def main(argv=None) -> int:
                             args.reason, args.project)
         if args.cmd == "unlock":
             return cmd_unlock(root, args.lease_id, args.path, args.agent, args.reason)
-        ap.print_help()
+        print(_welcome_text(root))
         return 0
     except sqlite3.DatabaseError as e:
         # R59：库文件损坏时不再把 sqlite 堆栈抛给用户——给恢复路径并退 2。

@@ -1630,6 +1630,17 @@ def _backup_copy(p: Path) -> str:
     return str(bak)
 
 
+# R714：bundle 型 agent（DSH 的 cordis profile）本来就没有可写的配置文件，
+# 「不自动写」是设计内行为，不是写入失败——onboard 的失败计数必须把两者分开，
+# 否则一个设计内的拒绝会让 `agenthub onboard dsh` 永远退 1，装机脚本再也无法判断成败。
+MCP_BUNDLE_PREFIX = "该 agent 的 MCP 由 bundle 提供"
+
+
+def is_mcp_unsupported(err: str) -> bool:
+    """err 是否属于「设计内不支持自动写」（而非真的写失败）。"""
+    return bool(err) and err.startswith(MCP_BUNDLE_PREFIX)
+
+
 def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, root: str,
                       agent: str = "", profile: str = "") -> str:
     """把 agenthub server 写入 agent 的 MCP 配置（**外科式**，格式无关；先备份，失败还原）。
@@ -1640,7 +1651,7 @@ def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, r
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     fmt, key_path = _mcp_spec(layout, str(p))
     if fmt == "bundle":
-        return "该 agent 的 MCP 由 bundle 提供（非普通配置文件），暂不自动写——请在它的 patch 里启用 mcp-agenthub"
+        return MCP_BUNDLE_PREFIX + "（非普通配置文件），暂不自动写——请在它的 patch 里启用 mcp-agenthub"
     # 坏 JSON 拒写（保护用户文件）
     if p.is_file() and fmt == "json":
         try:
@@ -1668,7 +1679,7 @@ def remove_mcp_entry(path: str, layout: str) -> str:
     p = Path(os.path.expandvars(os.path.expanduser(path)))
     fmt, key_path = _mcp_spec(layout, str(p))
     if fmt == "bundle":
-        return "该 agent 的 MCP 由 bundle 提供（非普通配置文件），暂不自动改"
+        return MCP_BUNDLE_PREFIX + "（非普通配置文件），暂不自动改"
     if not p.is_file():
         return "配置文件不存在"
     fmt, key_path = _mcp_spec(layout, str(p))

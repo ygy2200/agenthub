@@ -17,7 +17,9 @@ def test_top_help_has_examples_and_no_internal_ids(capsys):
     out = _help(capsys, ["--help"])
     assert "常用示例" in out and "agenthub next --agent" in out
     assert "根目录：--root" in out
-    assert re.search(r"usage: agenthub \[-h\] \[--root ROOT\] 命令", out)
+    # R708 起多了 -V/--version（排障第一问的出口），usage 行随之带上 [-V]。
+    assert re.search(r"usage: agenthub \[-h\] \[--root ROOT\] \[-V\] 命令", out)
+    assert "--version" in out and "打印版本号" in out
     assert not re.search(r"\b[RX]\d+\b", out), "顶层帮助仍含内部编号"
 
 

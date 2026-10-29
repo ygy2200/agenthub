@@ -163,7 +163,9 @@ def t_cli_bad_args(tmp):
         raised, code = False, rc
     except SystemExit as e:
         raised, code = True, e.code
-    assert raised and code != 0, f"未知子命令应非零退出，实得 raised={raised} code={code}"
+    # R709 起 main() 对未知命令直接返回 2（不再让 argparse 抛 SystemExit 并甩 34 项清单），
+    # 两种形态都合法——这里守的是「非零」，不是「必须抛异常」。
+    assert code != 0, f"未知子命令应非零退出，实得 raised={raised} code={code}"
     rc, out = _capture(cli.cmd_call, root, "hub_no_such_tool", [])
     assert rc != 0 or "错误" in out or "未知" in out, (rc, out[:200])
 
@@ -491,7 +493,10 @@ def t_onboard_multi_layout(tmp):
     root_b = _fake_adapter_hub(tmp, name="hub_onb_bundle", layout="bundle_dsh", preexisting=None)
     rc, out = _capture(cli.cmd_onboard, str(root_b), "测试甲")
     assert rc == 0, out
-    assert "bundle" in out and "✗" in out, f"bundle 必须明确拒写：{out}"
+    assert "bundle" in out and ("·" in out or "✗" in out), f"bundle 必须明确拒写：{out}"
+    # R714：bundle 的「不自动写」是设计内行为，不再算写入失败（退 0），但必须仍然显式告知
+    # 「1 处需手工」——否则用户以为 MCP 已经接好了。
+    assert "需手工" in out, f"bundle 拒写必须给出人工出口：{out}"
     assert not (root_b / "mcp.json").exists(), "bundle 拒写时不该造出配置文件"
     assert "agenthub:begin" in (root_b / "instr.md").read_text(encoding="utf-8"), \
         "bundle agent 的引导仍要注入（MCP 不可自动写不影响引导）"
