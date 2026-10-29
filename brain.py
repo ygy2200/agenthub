@@ -693,8 +693,15 @@ def check_agent(agent: str, root: str = "") -> tuple[str, str]:
     if low in reg:  # agent_key可能把带空格名拆过头，这里兜一层原样小写
         return low, ""
     avail = "、".join(sorted(reg))
+    # R297：拒收必须给出登记出口——新脑上没有本机主力 agent（如 qoder）时，
+    # 只说「可用：…」会让人以为无法挽回；config.agents.json 是零改码登记入口。
+    reg_hint = ""
+    if root:
+        reg_hint = (f"；若是新 agent，把它加进 {Path(root) / core.AGENTS_CONFIG_NAME}"
+                    "（{\"agents\":[{\"agent\":\"名字\",\"instr_path\":…}]}，零改码，"
+                    "格式见运维手册「配置与数据位置」）")
     return "", (f"agent 名「{raw}」不在注册表内，已拒收（避免时间线归属/统计出错）。"
-                f"可用：{avail}；确实无法归属时传 unknown。")
+                f"可用：{avail}{reg_hint}；确实无法归属时传 unknown。")
 
 
 def _upsert_agent(conn, agent: str, project: str = "", beat: bool = False, record: bool = False) -> None:
