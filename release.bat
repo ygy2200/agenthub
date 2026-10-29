@@ -40,6 +40,7 @@ if errorlevel 1 (
 )
 
 echo [5/5] agents status  (informational - onboarding gaps do not fail release)
+rem nofail: status only reports onboarding gaps; it must not fail the release (R721)
 D:\python311\python.exe cli.py status
 
 echo.
