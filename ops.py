@@ -1105,23 +1105,34 @@ def _schema_drift() -> dict:
                                 if isinstance(ek, ast.Constant) and ek.value == "enum" and isinstance(ev, (ast.List, ast.Tuple)):
                                     declared[name] = [c.value for c in ev.elts
                                                       if isinstance(c, ast.Constant)]
-    # ② call_tool 里每个工具块实际处理的字符串（== 右侧 与 in 元组成员）
+    # ② 分发函数里每个工具块实际处理的字符串（== 右侧 与 in 元组成员）
+    # R290：R283 把薄壳 call_tool 与分发函数 _call_tool_impl 拆开后，按名字取
+    # call_tool 会拿到没有分发逻辑的壳——62 处「声明了没实现」全是假警报，检查项
+    # 静默变成永远红/永不可信。改为按「含 name == "hub_*" 比较最多」选函数，
+    # 名字只作候选过滤；一个分发块都找不到就明确报检查器失效（不再假装有漂移）。
     handled: dict = {}
-    fn = next((n for n in ast.walk(tree)
-               if isinstance(n, ast.FunctionDef) and n.name == "call_tool"), None)
-    if fn is None:
-        return {"ok": False, "summary": "找不到 call_tool 函数", "detail": []}
+
+    def _dispatch_marks(f):
+        return [node for node in f.body
+                if isinstance(node, ast.If) and isinstance(node.test, ast.Compare)
+                and isinstance(node.test.left, ast.Name) and node.test.left.id == "name"
+                and any(isinstance(o, ast.Eq) for o in node.test.ops)
+                and any(isinstance(c, ast.Constant) and str(c.value).startswith("hub_")
+                        for c in node.test.comparators)]
+
+    cands = [n for n in ast.walk(tree)
+             if isinstance(n, ast.FunctionDef) and n.name in ("call_tool", "_call_tool_impl")]
+    fn = max(cands, key=lambda n: len(_dispatch_marks(n)), default=None)
+    if fn is None or not _dispatch_marks(fn):
+        return {"ok": False,
+                "summary": "检查器失效：找不到按工具名分发的函数（call_tool/_call_tool_impl）",
+                "detail": []}
     # 按行切块：`if name == "hub_x":` 到下一个同类 if
     marks = []
-    for node in fn.body:
-        if isinstance(node, ast.If) and isinstance(node.test, ast.Compare):
-            t = node.test
-            if (isinstance(t.left, ast.Name) and t.left.id == "name"
-                    and any(isinstance(o, ast.Eq) for o in t.ops)
-                    and any(isinstance(c, ast.Constant) and str(c.value).startswith("hub_")
-                            for c in t.comparators)):
-                marks.append((node.lineno, node.end_lineno or node.lineno,
-                              next(c.value for c in t.comparators if isinstance(c, ast.Constant))))
+    for node in _dispatch_marks(fn):
+        t = node.test
+        marks.append((node.lineno, node.end_lineno or node.lineno,
+                      next(c.value for c in t.comparators if isinstance(c, ast.Constant))))
     marks.sort()
     for i, (s, _e, tool) in enumerate(marks):
         end = marks[i + 1][0] - 1 if i + 1 < len(marks) else (fn.end_lineno or s)
