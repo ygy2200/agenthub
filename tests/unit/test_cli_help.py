@@ -15,7 +15,9 @@ def _help(capsys, argv):
 
 def test_top_help_has_examples_and_no_internal_ids(capsys):
     out = _help(capsys, ["--help"])
-    assert "常用示例" in out and "agenthub next --agent" in out
+    # R731：用 CMD 单一真源断言，前缀再改一次也不会误红。
+    import cli
+    assert "常用示例" in out and f"{cli.CMD} next --agent" in out
     assert "根目录：--root" in out
     # R708 起多了 -V/--version（排障第一问的出口），usage 行随之带上 [-V]。
     assert re.search(r"usage: agenthub \[-h\] \[--root ROOT\] \[-V\] 命令", out)

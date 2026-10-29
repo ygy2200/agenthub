@@ -36,8 +36,8 @@ def test_human_mode_unchanged(capsys, tmp_path):
 def test_bare_invocation_shows_first_steps(capsys):
     assert cli.main([]) == 0
     out = capsys.readouterr().out
-    assert "第一次用" in out and "agenthub status" in out
-    assert "agenthub help <命令>" in out
+    assert "第一次用" in out and "python cli.py status" in out
+    assert "python cli.py help <命令>" in out
     assert "positional arguments" not in out  # 不是 argparse 原样清单
 
 

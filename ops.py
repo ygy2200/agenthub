@@ -2845,6 +2845,26 @@ def _runtime_health(root: str = "") -> dict:
     return {"ok": info["count"] == 0, "summary": summary, "detail": detail[:8]}
 
 
+def _brain_is_empty(root: str) -> bool:
+    """R733：刚 init 出来的库只有种子模板，没有任何用户内容。
+
+    判据取「记录/任务/项目都为 0 且记忆不超过 2 条种子」——只要有一项非空就说明
+    已经有东西会丢。读不到就返回 False（宁可多报一条，也不静音真缺陷）。
+    """
+    import sqlite3  # noqa: PLC0415
+
+    try:
+        uri = f"file:{Path(_db_file(root)).as_posix()}?mode=ro"
+        with sqlite3.connect(uri, uri=True) as c:
+            def _n(t: str) -> int:
+                return c.execute(f"SELECT COUNT(*) FROM {t}").fetchone()[0]
+
+            return (_n("records") == 0 and _n("tasks") == 0
+                    and _n("projects") == 0 and _n("memories") <= 2)
+    except Exception:  # noqa: BLE001  库打不开/不是库 → 交给后面的盘点与折叠逻辑
+        return False
+
+
 def _backup_health(root: str) -> dict:
     """R7 备份健康：盘点四类备份 + 清理预演。只报不动手——删除由 backup_prune --apply 执行。"""
     if err := _need_root(root):
@@ -2855,6 +2875,14 @@ def _backup_health(root: str) -> dict:
     # 与 db_integrity 归同一根因，交给巡检折叠。
     if not _db_file(root).is_file():
         return _db_missing()
+    # R733：库建好了但一条内容都没有，同样是必然——刚 `init` 完就跑 doctor 的人
+    # 会先看到「备份健康：无 zip 整包；没有任何备份」一条红，而此刻他没有任何东西可备。
+    # 一条永远在首跑就红的自检，只会教人学会忽略自检。
+    if _brain_is_empty(root):
+        return {"ok": True,
+                "summary": "备份健康：空库（0 条记录 / 0 个任务 / 0 个项目），还没有需要备份的内容",
+                "detail": ["有了第一条记录再备：hub_export action=backup"
+                           "（一致性库 + 文件树单一 zip）"]}
     inv = _brain.backup_inventory(root)
     preview = _brain.backup_prune(root)  # 纯预演：不传 apply
     fams = inv["families"]

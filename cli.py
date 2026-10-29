@@ -28,6 +28,12 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import core  # noqa: E402
 
+# R731：提示句里「给人照抄」的命令前缀只允许一种写法。
+# 本机并没有 `agenthub` 这个可执行文件（README 全篇写 `python cli.py`），
+# 但 --help 首屏教用户敲 `agenthub init`——照抄必然 command not found。
+# prog="agenthub" 保留：那只是 usage 行的语法说明，不是可粘贴命令。
+CMD = "python cli.py"
+
 
 def _root(arg: str = "") -> str:
     if arg:
@@ -99,18 +105,18 @@ def _welcome_text(root: str) -> str:
         f"AgentHub 命令行 · v{SERVER_INFO['version']}",
         "",
         "第一次用（三步）：",
-        '  1. 建脑        agenthub init --root "<已有目录>"',
-        "  2. 接入 agent  agenthub onboard <agent>      # 例：agenthub onboard zcode",
-        "  3. 验收        agenthub status               # 有缺口退 1，可配 --json",
+        f'  1. 建脑        {CMD} init --root "<已有目录>"',
+        f"  2. 接入 agent  {CMD} onboard <agent>      # 例：{CMD} onboard zcode",
+        f"  3. 验收        {CMD} status               # 有缺口退 1，可配 --json",
         "",
         "日常最常用：",
-        "  agenthub next --agent zcode     看下一步该做什么",
-        "  agenthub tasks --approvals      看待审批任务",
-        "  agenthub digest                 今天大家干了什么",
-        "  agenthub call hub_search keyword=关键词 limit=5",
+        f"  {CMD} next --agent zcode     看下一步该做什么",
+        f"  {CMD} tasks --approvals      看待审批任务",
+        f"  {CMD} digest                 今天大家干了什么",
+        f"  {CMD} call hub_search keyword=关键词 limit=5",
         "",
-        f"当前根目录：{shown}    （切换：agenthub root --set \"<目录>\"）",
-        "全部命令：agenthub --help    单个命令：agenthub help <命令>",
+        f"当前根目录：{shown}    （切换：{CMD} root --set \"<目录>\"）",
+        f"全部命令：{CMD} --help    单个命令：{CMD} help <命令>",
     ])
 
 
@@ -632,7 +638,7 @@ def cmd_root(root: str, set_to: str = "") -> int:
     """
     cur = core.get_root()
     if not set_to:
-        print(cur or "（尚未配置根目录：先 agenthub init --root <目录>，再 agenthub root --set <目录>）")
+        print(cur or f"（尚未配置根目录：先 {CMD} init --root <目录>，再 {CMD} root --set <目录>）")
         return 0 if cur else 1
     target = os.path.abspath(os.path.expandvars(os.path.expanduser(set_to)))
     if not Path(target).is_dir():
@@ -735,9 +741,9 @@ def cmd_build_manifest(src: Path, phase: str) -> int:
 
 def cmd_call(root: str, tool: str, kv: list) -> int:
     """X5 CLI 客户端：命令行直调任意 MCP 工具——
-    agenthub call hub_health
-    agenthub call hub_search keyword=SQLite 记忆 limit=5
-    agenthub call hub_signals agent=zcode unread_only=true
+    python cli.py call hub_health
+    python cli.py call hub_search keyword=SQLite 记忆 limit=5
+    python cli.py call hub_signals agent=zcode unread_only=true
     值自动转型：true/false→bool、整数→int、其余→str；写工具需显式传 confirm=true。
     选大脑用 `--root`，`root=` 会被当场拒绝（R728：它不是任何工具的参数，静默忽略
     等于把写操作落到配置里的默认根目录）。"""
@@ -809,6 +815,46 @@ def cmd_serve(root: str, port: int, allow_write: bool, open_browser: bool) -> in
     """X2：启动本地 REST 服务 + Web 只读仪表盘（Ctrl+C 停止）。"""
     import api  # noqa: PLC0415  延迟导入：发布路径不该拉起 http 模块
     return api.serve_forever(root, port, allow_write, open_browser)
+
+
+def _err_line(action: str, err: str) -> str:
+    """R734：任务流转失败的统一出口——去重前缀 + 给下一步。
+
+    brain 侧的 err 大多自带「认领失败：」这类前缀（因为它同时服务 MCP 面），
+    CLI 再拼一次就成了「认领失败：认领失败：任务 #1 已被 zcode 认领」——
+    实测第二个人来抢同一条任务时必然看到这句。
+    """
+    e = (err or "").strip() or "原因未知"
+    if e.startswith(f"{action}失败"):
+        line = e
+    else:
+        line = f"{action}失败：{e}"
+    return line + "\n  " + _err_next_step(e)
+
+
+def _err_next_step(err: str) -> str:
+    """按失败原因给一句能照抄的下一步（不给万能话术：对不上就退回 help）。"""
+    e = err or ""
+    if "不存在" in e:
+        return f"下一步：{CMD} tasks                       # 看现有任务与 id"
+    if "已被" in e and "认领" in e:
+        return (f"下一步：{CMD} next --agent <你的名字>     # 换一条；"
+                f"或 {CMD} tasks 看谁在办")
+    if "前置" in e or "阻塞" in e or "依赖" in e:
+        return f"下一步：{CMD} next --agent <你的名字>     # 看还差哪一条"
+    if "持有者" in e or "由" in e and "持有" in e:
+        return f"下一步：{CMD} tasks                       # 看持有者与租约"
+    if "技能" in e:
+        return (f'下一步：{CMD} call hub_agent agent=<你的名字> action=skills skills="<技能>"  '
+                f"# 补能力声明")
+    if "WIP" in e or "上限" in e:
+        return f"下一步：{CMD} tasks --owner <你的名字>       # 先把在办清掉"
+    if "冻结" in e:
+        return f"下一步：{CMD} freeze --off                # 解除全局写入冻结"
+    if "reason" in e:
+        return (f'下一步：补 --defer-reason "<为什么现在不做/什么时候再看>"'
+                f"（延后必须写原因，避免变成软删除）")
+    return f"下一步：{CMD} help tasks                  # 状态机与参数"
 
 
 def _task_line(t: dict) -> str:
@@ -929,7 +975,12 @@ def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
                          ensure_ascii=False))
         return 0
     if not rows:
-        print("暂无任务（hub_task_add 新建；状态 pending/in_progress/blocked/done/cancelled/dead）")
+        # R732：空态是「第一次看任务看板」的唯一一屏，原来只给 MCP 工具名
+        # hub_task_add——纯 CLI 用户照着敲是 command not found，等于死路。
+        print(f"暂无任务（状态：{'/'.join(brain.TASK_STATUSES)}）")
+        print(f'  新建：{CMD} call hub_task_add title="…" project="<对象-问题>" '
+              f'agent=<你的名字> priority=P2')
+        print(f"  字段与状态机：{CMD} help tasks")
         return 0
     brain.task_annotate(root, rows)
     print(f"任务 {len(rows)} 条（进行中→阻塞→待办→完成 排序）：")
@@ -1114,7 +1165,11 @@ def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5,
             for line in reasons:
                 print(line)
         else:
+            # R732：空队列不是错误，但得告诉人「怎么把活放进来」。
             print("前沿队列为空（没有待办/在办任务）。")
+            print(f'  放一条活进来：{CMD} call hub_task_add title="…" '
+                  f'project="<对象-问题>" agent={agent or "<你的名字>"}')
+            print(f"  看已有任务：{CMD} tasks")
         return 0
     print(f"下一步推荐（前沿队列）共 {c['ready']} 条：")
     for line in reasons:
@@ -1154,7 +1209,7 @@ def cmd_claim(root: str, task_id, agent: str) -> int:
     import brain  # noqa: PLC0415
     err, row = brain.task_claim(root, task_id, agent)
     if err:
-        print(f"认领失败：{err}")
+        print(_err_line("认领", err))
         return 1
     how = "续期" if row.get("_renewed") else (row.get("_takeover") or "认领")
     print(f"{how}成功：任务 #{row['id']} {row['title'][:50]} @{row['owner']}"
@@ -1176,7 +1231,7 @@ def cmd_update(root: str, task_id, status: str = "", agent: str = "",
         if defer_until == "-":
             err, row = brain.task_undefer(root, task_id, agent=agent)
             if err:
-                print(f"唤醒失败：{err}")
+                print(_err_line("唤醒", err))
                 return 1
             if not row.get("_was_deferred"):
                 print(f"任务 #{row['id']} 当前没有延后标记（无需恢复）")
@@ -1185,7 +1240,7 @@ def cmd_update(root: str, task_id, status: str = "", agent: str = "",
             return 0
         err, row = brain.task_defer(root, task_id, defer_until, reason=defer_reason, agent=agent)
         if err:
-            print(f"延后失败：{err}")
+            print(_err_line("延后", err))
             return 1
         print(f"任务 #{row['id']} 已延后至 {row['_defer_until']}"
               f"（约 {row['_defer_hours']:g} 小时）：{row['title'][:50]}")
@@ -1203,7 +1258,7 @@ def cmd_update(root: str, task_id, status: str = "", agent: str = "",
                                  cancel_reason=cancel_reason,
                                  approval_required=approval)
     if err:
-        print(f"更新失败：{err}")
+        print(_err_line("更新", err))
         return 1
     who = f" @{row['owner']}" if row.get("owner") else ""
     print(f"任务 #{row['id']} 已更新："
@@ -1219,7 +1274,7 @@ def cmd_retry(root: str, task_id, reason: str, agent: str = "",
     import brain  # noqa: PLC0415
     err, row = brain.task_retry(root, task_id, agent=agent, reason=reason, delay=delay)
     if err:
-        print(f"重试失败：{err}")
+        print(_err_line("重试", err))
         return 1
     if row.get("_dead"):
         print(f"任务 #{row['id']} 已进入死信（第 {row['_attempts']} 次失败）："
@@ -1242,7 +1297,7 @@ def cmd_approve(root: str, task_id, agent: str = "", note: str = "") -> int:
     import brain  # noqa: PLC0415
     err, row = brain.task_approve(root, task_id, agent=agent, note=note)
     if err:
-        print(f"审批失败：{err}")
+        print(_err_line("审批", err))
         return 1
     print(f"任务 #{row['id']} 已批准完成（复核人 {row['_approved_by']}）：{row['title'][:50]}")
     print("持有者现在可以 cli.py update %s --status done --agent ..." % row["id"])
@@ -1254,7 +1309,7 @@ def cmd_reject(root: str, task_id, reason: str, agent: str = "") -> int:
     import brain  # noqa: PLC0415
     err, row = brain.task_reject(root, task_id, agent=agent, reason=reason)
     if err:
-        print(f"退回失败：{err}")
+        print(_err_line("退回", err))
         return 1
     print(f"任务 #{row['id']} 已退回返工（退回人 {row['_rejected_by']}）：{row['title'][:50]}")
     print(f"原因：{row['_reject_note'][:120]}")
@@ -1539,8 +1594,11 @@ def _unknown_command_message(cmd: str, names: list) -> str:
     near = _suggest_commands(cmd, names)
     lines = [f"未知命令：{cmd}"]
     if near:
+        # R732：只说「你可能想用 tasks」还要人再猜一次怎么敲；直接给能粘的命令。
+        # 只给 help 形式：它一定跑得通（有些子命令缺参数会退 2，不能承诺「照抄即用」）。
         lines.append(f"  你可能想用：{'、'.join(near)}")
-    lines.append("  全部命令：agenthub --help")
+        lines.append(f"  用法与示例：{CMD} help {near[0]}")
+    lines.append(f"  全部命令：{CMD} --help")
     return "\n".join(lines)
 
 
@@ -1564,11 +1622,11 @@ def main(argv=None) -> int:
         prog="agenthub",
         description="AgentHub 命令行：接入自查、任务队列、日结审计（数据全部来自本地大脑）",
         epilog=("常用示例：\n"
-                "  agenthub status                  # 看每个 agent 是否接入\n"
-                "  agenthub next --agent zcode      # 看下一步该做什么\n"
-                "  agenthub tasks --approvals       # 看待审批任务\n"
-                "  agenthub call hub_search keyword=关键词 limit=5\n"
-                "  agenthub serve --open            # 本机只读仪表盘\n"
+                f"  {CMD} status                  # 看每个 agent 是否接入\n"
+                f"  {CMD} next --agent zcode      # 看下一步该做什么\n"
+                f"  {CMD} tasks --approvals       # 看待审批任务\n"
+                f"  {CMD} call hub_search keyword=关键词 limit=5\n"
+                f"  {CMD} serve --open            # 本机只读仪表盘\n"
                 "\n根目录：--root（写在子命令前或后都行），或写入 ~/.agenthub/config.json 的 root"),
         formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json 的 root")
@@ -1587,8 +1645,8 @@ def main(argv=None) -> int:
                        help="大脑根目录（同全局 --root；写在子命令前或后都行）")
         return p
 
-    p_help = _cmd("help", help="查看某个命令的详细用法（agenthub help <命令>）")
-    p_help.add_argument("topic", nargs="?", default="", help="命令名；留空等同 agenthub --help")
+    p_help = _cmd("help", help=f"查看某个命令的详细用法（{CMD} help <命令>）")
+    p_help.add_argument("topic", nargs="?", default="", help=f"命令名；留空等同 {CMD} --help")
     p_status = _cmd("status", help="各 agent 接入状态（有缺失时退出码 1）")
     p_status.add_argument("agent", nargs="?", default="", help="只看某个 agent；留空看全部")
     p_status.add_argument("--json", action="store_true", help="输出单行 JSON（脚本/CI 用）")

@@ -36,7 +36,9 @@ def test_unknown_command_suggests_nearest(capsys):
     assert "未知命令：statu" in out
     assert "你可能想用：status" in out
     assert "invalid choice" not in out
-    assert "agenthub --help" in out
+    # R731：提示里的前缀走 cli.CMD 单一真源，别再写死（写死就会跟首屏打架）。
+    assert f"{cli.CMD} --help" in out
+    assert f"{cli.CMD} help status" in out  # R732：建议后直接给能粘的用法命令
 
 
 def test_unknown_command_no_false_suggestion(capsys):
