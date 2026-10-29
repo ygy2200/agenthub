@@ -19,7 +19,7 @@ def test_deploy_runs_diff_and_passes(tmp_path, capsys, monkeypatch):
         return {"ok": True, "summary": "11/11 与部署一致（X）", "detail": []}
 
     monkeypatch.setattr(ops, "run_check", fake_check)
-    rc = cli.main(["deploy"])
+    rc = cli.main(["deploy", "--root", str(tmp_path)])
     out = capsys.readouterr().out
     assert rc == 0, out
     assert seen["args"][0] == "deploy_diff", seen
@@ -33,13 +33,13 @@ def test_deploy_fails_when_diff_detected(tmp_path, capsys, monkeypatch):
         "summary": "10/11 与部署一致（X）",
         "detail": ["ops.py: 不一致（源码与部署谁新？先确认再同步）"],
     })
-    rc = cli.main(["deploy"])
+    rc = cli.main(["deploy", "--root", str(tmp_path)])
     out = capsys.readouterr().out
     assert rc == 1, out
     assert "ops.py: 不一致" in out, out
 
 
-def test_deploy_failure_skips_verification(capsys, monkeypatch):
+def test_deploy_failure_skips_verification(tmp_path, capsys, monkeypatch):
     monkeypatch.setattr(core, "deploy_server", lambda: ("", ""))
     called = []
 
@@ -48,7 +48,7 @@ def test_deploy_failure_skips_verification(capsys, monkeypatch):
         return {"ok": True, "summary": "", "detail": []}
 
     monkeypatch.setattr(ops, "run_check", tripwire)
-    rc = cli.main(["deploy"])
+    rc = cli.main(["deploy", "--root", str(tmp_path)])
     out = capsys.readouterr().out
     assert rc == 1, out
     assert not called, "部署失败时不应再跑一致性校验"

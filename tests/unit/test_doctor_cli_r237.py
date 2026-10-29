@@ -230,13 +230,21 @@ def test_check_json_wraps_result_with_the_args_used(monkeypatch, capsys, tmp_pat
                    "root": "D:/hub", "result": {"ok": True, "summary": "s", "detail": []}}
 
 
-def test_deployed_copy_cannot_pass_as_source_root():
+def test_deployed_copy_cannot_pass_as_source_root(tmp_path, monkeypatch):
     """真跑：拿部署目录当 deploy_diff 的 target 必须判否（缺 ui.py 探针）。
 
     这条不是给新代码兜底，是把「入口层拒绝空 target」的理由钉住——探针一旦被人摘掉，
     本用例就红，提醒重新加回，否则 deploy_diff 会在部署副本上静默全绿。
+
+    部署目录用临时目录模拟（R300 后 CI 修复）：本机没有 ~/.agenthub/mcp_server 时
+    会先命中「目标不存在」分支，断言就验不到探针本身——把部署目录钉进 tmp_path，
+    让用例在任何机器上都走「目录存在但缺 ui.py」这条真正要守的路径。
     """
-    r = ops.run_check("deploy_diff", str(ops.DEPLOY_DIR), "")
+    deploy = tmp_path / "mcp_server"
+    deploy.mkdir()
+    (deploy / "agenthub_mcp.py").write_text("", encoding="utf-8")
+    monkeypatch.setattr(ops, "DEPLOY_DIR", deploy)
+    r = ops.run_check("deploy_diff", str(deploy), "")
     assert r["ok"] is False and "源码目录" in r["summary"]
 
 
