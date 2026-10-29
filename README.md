@@ -18,6 +18,8 @@
 
 场景化帮助直接问 agent：`hub_help(topic="start|search|backup|tasks|recover|release")`——不用翻文档也能拿到下一步命令。
 
+给脚本/agent 读的 headless 面：`tasks` / `next` / `handoffs` 与 `status`/`doctor`/`check` 一样认 `--json`，stdout 整体是一个 JSON 文档、参数错也吐 JSON 并退 2；`next --json` 用 `hidden` 说清「ready 为空是被你的管控状态/能力声明挡住了，不是没活」。选大脑只用 `--root`，`call` 里传 `root=` 会在执行前被拒绝（R728）。详见运维手册 §4.8。
+
 ## 功能
 
 - **总览**：今天谁在干活、待处理数量、agent 阵容，一眼全局
@@ -62,7 +64,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 
 ## 版本演进
 
-当前版本 **v2.41.156**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
+当前版本 **v2.41.157**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
 
 ## 设计原则
 
@@ -113,7 +115,7 @@ unified project records, input/output file management, a public memory, capabili
 
 Download the single-file `AgentHub.exe` from [Releases](https://github.com/ygy2200/agenthub/releases), pick your records folder, and connect your agents in the "Connect" page.
 
-Current version **v2.41.156** — full version history in [CHANGELOG.md](CHANGELOG.md).
+Current version **v2.41.157** — full version history in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

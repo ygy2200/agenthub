@@ -4001,7 +4001,9 @@ def task_graph_audit(root: str) -> dict:
 def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> dict:
     """M1 前沿队列（Frontier）：依赖已满足、可直接开工的待办推荐；附进行中/可接管/等待。
     R2：可接管段同时收「租约过期」「无主」「租约缺失」三类（附 _takeover 原因）。
-    排序：priority（0 急 → 3 低）→ id（先来先做）。纯只读。返回结构化 dict 供 MCP 层排版。"""
+    排序：priority（0 急 → 3 低）→ id（先来先做）。纯只读。返回结构化 dict 供 MCP 层排版。
+    R727：`hidden`（{"control": n, "skills": n}）记录被管控状态/能力声明挡掉的条数——
+    counts 在过滤之后才算，调用方需要它才能区分「前沿真的空」与「活有但接不住」。"""
     try:
         lim = max(1, min(int(limit or 5), 20))
     except (TypeError, ValueError):
@@ -4057,15 +4059,25 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
             else:
                 ready.append(r)
     ctrl = agent_control_get(root, me) if me else {"agent": "", "state": "active", "note": ""}
+    hidden = {"control": 0, "skills": 0, "skills_wanted": []}
     if me and ctrl["state"] in ("draining", "paused", "offline"):
         # 收尾/暂停的 agent 不再被推荐新活；在办与等待段仍可见，便于收口。
+        # R727：藏了几条要如实报出去——调用方分不清「库里没活」和「活被状态挡住」。
+        hidden["control"] = len(ready) + len(takeover)
         ready, takeover = [], []
     have_skills = agent_skills_get(root, me) if me else []
     if have_skills:
         # R37：声明了能力的 agent 只看得到自己接得住的任务；没声明则不筛（兼容存量）。
         have_s = ",".join(have_skills)
+        dropped = [t for t in ready + takeover
+                   if not _skill_match(t.get("skills") or "", have_s)]
         ready = [t for t in ready if _skill_match(t.get("skills") or "", have_s)]
         takeover = [t for t in takeover if _skill_match(t.get("skills") or "", have_s)]
+        hidden["skills"] = len(dropped)
+        # 被挡的活要什么技能一并给出：只说「筛掉了 3 条」等于让人再猜一轮
+        hidden["skills_wanted"] = sorted({s.strip() for t in dropped
+                                          for s in (t.get("skills") or "").split(",")
+                                          if s.strip()})
     ready.sort(key=lambda t: (t["_priority"], t["id"]))
     doing.sort(key=lambda t: (t["_priority"], t["id"]))
     waiting.sort(key=lambda t: (t["_priority"], t["id"]))
@@ -4074,6 +4086,7 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
     return {"ready": ready[:lim], "doing": doing[:lim], "takeover": takeover[:lim],
             "waiting": waiting[:lim], "backoff": backoff[:lim],
             "deferred": deferred[:lim], "control": ctrl,
+            "hidden": hidden, "skills": list(have_skills),
             "counts": {"ready": len(ready), "doing": len(doing),
                        "takeover": len(takeover), "waiting": len(waiting),
                        "backoff": len(backoff), "deferred": len(deferred)}}

@@ -455,14 +455,23 @@ def cmd_doctor(root: str, full: bool = False, as_json: bool = False, only: str =
                           "report": rep}, ensure_ascii=False))
         return 0 if rep["ok"] else 1
     issues = rep["issues"]
+    # R722：根目录问题与机器级问题分节——两类问题的「修法」完全不同（一个改库，一个改本机
+    # 进程/别的 agent 配置），此前共用 ✗ 前缀，只有行尾「（机器级）」区分，扫一眼会以为
+    # 有两处坏在同一个地方。
+    root_issues = [i for i in issues if i.get("scope") != "machine"]
+    machine_issues = [i for i in issues if i.get("scope") == "machine"]
     n_decide = rep.get("decide_count", 0)
     n_fix = len(issues) - n_decide
+    parts = []
+    if machine_issues and root_issues:
+        parts.append(f"根目录 {len(root_issues)} · 机器级 {len(machine_issues)}")
+    elif machine_issues:
+        parts.append(f"机器级 {len(machine_issues)}")
     if n_decide and n_fix:
-        split = f"（可直接修复 {n_fix} · 需你拍板 {n_decide}）"
+        parts.append(f"可直接修复 {n_fix} · 需你拍板 {n_decide}")
     elif n_decide:
-        split = f"（均需你拍板 {n_decide}）"
-    else:
-        split = ""
+        parts.append(f"均需你拍板 {n_decide}")
+    split = f"（{'；'.join(parts)}）" if parts else ""
     same_cause = rep.get("same_cause_skipped", 0)
     if same_cause:
         head = (f"{rep['checked']}/{rep.get('total', rep['checked'])} 项"
@@ -476,10 +485,10 @@ def cmd_doctor(root: str, full: bool = False, as_json: bool = False, only: str =
         rows = _slow_rows(rep.get("timings"), n_slow)
         print(f"耗时 Top{n_slow}：" + " · ".join(
             f"{r['name']} {r['ms']}ms({r['share'] * 100:.0f}%)" for r in rows))
-    for i in issues:
+    def emit(i, in_machine_section=False):
         tags = []
-        if i.get("scope") == "machine":
-            tags.append("机器级")
+        if i.get("scope") == "machine" and not in_machine_section:
+            tags.append("机器级")  # 分节标题已经说过一次，节内不再重复贴标
         if i.get("kind") == "decide":
             tags.append("要拍板")
         tag = f"（{' · '.join(tags)}）" if tags else ""
@@ -501,10 +510,15 @@ def cmd_doctor(root: str, full: bool = False, as_json: bool = False, only: str =
         rest = len(i["detail"]) - len(detail)
         if rest > 0:
             print(f"    · …另有 {rest} 条明细（加 --full 看全部）")
-    n_machine = sum(1 for i in issues if i.get("scope") == "machine")
-    if n_machine:
-        print(f"提示：其中 {n_machine} 项是机器级状态（运行进程 / 全局 agent 配置），"
-              f"与当前根目录无关——换 --root 也会照实报。")
+
+    for i in root_issues:
+        emit(i)
+    if machine_issues:
+        if root_issues:
+            print()
+        print("机器级问题（与本目录无关：运行进程 / 全局 agent 配置；换 --root 也一样报）：")
+        for i in machine_issues:
+            emit(i, in_machine_section=True)
     if n_decide and n_fix:
         print(f"提示：「要拍板」{n_decide} 项不是照着修就能消的——修复行里是选项（留用/下线、"
               f"合并哪条、认领或关单），选定后命令照跑；其余 {n_fix} 项可直接执行。")
@@ -724,14 +738,24 @@ def cmd_call(root: str, tool: str, kv: list) -> int:
     agenthub call hub_health
     agenthub call hub_search keyword=SQLite 记忆 limit=5
     agenthub call hub_signals agent=zcode unread_only=true
-    值自动转型：true/false→bool、整数→int、其余→str；写工具需显式传 confirm=true。"""
+    值自动转型：true/false→bool、整数→int、其余→str；写工具需显式传 confirm=true。
+    选大脑用 `--root`，`root=` 会被当场拒绝（R728：它不是任何工具的参数，静默忽略
+    等于把写操作落到配置里的默认根目录）。"""
     import agenthub_mcp  # noqa: PLC0415  延迟导入：CLI 发布路径不该被 MCP 模块拖慢
     args: dict = {}
+    reserved = []
     for item in kv or []:
         if "=" not in item:
             print(f"参数应为 key=value：{item}")
             return 2
         k, v = item.split("=", 1)
+        k = k.strip()
+        if k in ("root", "hub_root"):
+            # R728：79 个工具里没有一个接受 root——它唯一的含义是「指哪个大脑」，
+            # 当未知参数忽略掉等于把写操作落到配置里的默认根目录（实测踩过：临时目录
+            # 的演练改到了真实库）。所以在 dispatch 前硬拦，一行都不执行。
+            reserved.append((k, v.strip()))
+            continue
         v = v.strip()
         low = v.lower()
         if low in ("true", "false"):
@@ -740,6 +764,16 @@ def cmd_call(root: str, tool: str, kv: list) -> int:
             args[k] = int(v)
         else:
             args[k] = v
+    if reserved:
+        k, v = reserved[0]
+        rest = " ".join(f"{a}={b}" for a, b in
+                        (x.split("=", 1) for x in kv if "=" in x
+                         and x.split("=", 1)[0].strip() not in ("root", "hub_root")))
+        print(f"{k} 不是工具参数：选大脑请用 --root（写在 call 前后都行）。\n"
+              f"    这样跑：python cli.py --root {v or '<目录>'} call {tool}"
+              + (f" {rest}" if rest else "") + "\n"
+              f"    不拦的话这次会写到配置里的默认根目录：{root}")
+        return 2
     rpc = {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
            "params": {"name": tool, "arguments": args}}
     try:
@@ -804,11 +838,21 @@ def _age_span(hours) -> str:
 
 def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
               limit: int = 50, stats: bool = False, days: int = 7,
-              approvals: bool = False) -> int:
-    """任务看板（headless）：状态/负责人/截止/前置/租约/阻塞原因；--stats 看过程统计。"""
+              approvals: bool = False, as_json: bool = False) -> int:
+    """任务看板（headless）：状态/负责人/截止/前置/租约/阻塞原因；--stats 看过程统计。
+
+    R724：`--json` 给脚本读（看板/统计/待审批三条路径都覆盖）。此前只有中文行，
+    agent 要拿任务 id 只能正则切 `_task_line` 的成品字符串——行格式一改就静默解析错，
+    而 `status`/`doctor` 早有 `--json`，同一个 CLI 里两种口径最容易被当成 bug。
+    """
     import brain  # noqa: PLC0415
     if approvals:
         rows = brain.task_approvals(root, project=project, limit=limit)
+        if as_json:
+            brain.task_annotate(root, rows)
+            print(json.dumps({"ok": True, "count": len(rows), "approvals": rows},
+                             ensure_ascii=False))
+            return 0
         if not rows:
             print("待审批任务：无（审批队列为空）")
             return 0
@@ -825,9 +869,13 @@ def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
         return 0
     if stats:
         if not 1 <= int(days) <= 365:
-            print("days 范围 1..365")
+            print("days 范围 1..365" if not as_json else
+                  json.dumps({"ok": False, "error": "days 范围 1..365"}, ensure_ascii=False))
             return 2
         m = brain.task_metrics(root, days=int(days), project=project, agent=owner)
+        if as_json:
+            print(json.dumps({"ok": True, "stats": m}, ensure_ascii=False))
+            return 0
         f, w, r = m["flow"], m["wip"], m["retry"]
         dc = f["done_cycle_hours"]
 
@@ -867,9 +915,19 @@ def cmd_tasks(root: str, status: str = "", project: str = "", owner: str = "",
             print("  风险信号：无")
         return 0
     if status and status not in brain.TASK_STATUSES:
-        print(f"status 只能是 {'/'.join(brain.TASK_STATUSES)}（收到「{status}」）")
+        if as_json:
+            print(json.dumps({"ok": False,
+                              "error": f"status 只能是 {'/'.join(brain.TASK_STATUSES)}"
+                                       f"（收到「{status}」）"}, ensure_ascii=False))
+        else:
+            print(f"status 只能是 {'/'.join(brain.TASK_STATUSES)}（收到「{status}」）")
         return 2
     rows = brain.task_list(root, status=status, owner=owner, project=project, limit=limit)
+    if as_json:
+        brain.task_annotate(root, rows)
+        print(json.dumps({"ok": True, "count": len(rows), "tasks": rows},
+                         ensure_ascii=False))
+        return 0
     if not rows:
         print("暂无任务（hub_task_add 新建；状态 pending/in_progress/blocked/done/cancelled/dead）")
         return 0
@@ -932,14 +990,31 @@ def cmd_digest(root: str, days: int = 1) -> int:
 
 
 def cmd_handoffs(root: str, project: str = "", include_all: bool = False,
-                 close_id: int = 0, reason: str = "", agent: str = "") -> int:
-    """R92 交接清单/作废（headless）；--close 走 brain.close_handoff 同一状态机。"""
+                 close_id: int = 0, reason: str = "", agent: str = "",
+                 as_json: bool = False) -> int:
+    """R92 交接清单/作废（headless）；--close 走 brain.close_handoff 同一状态机。
+
+    R726：`--json`——列清单与作废都吐 JSON（含 `_age_h/_age_days/_stale` 标注原样透传，
+    不在 CLI 侧重算时间，避免与文本模式口径分叉）。
+    """
     import brain  # noqa: PLC0415
     if close_id:
         msg = brain.close_handoff(root, close_id, agent or "cli", reason)
-        print(msg)
-        return 0 if msg.startswith("已关闭") else 2
+        ok = msg.startswith("已关闭")
+        if as_json:
+            print(json.dumps({"ok": ok, "handoff_id": close_id, "message": msg},
+                             ensure_ascii=False))
+        else:
+            print(msg)
+        return 0 if ok else 2
     rows = brain.list_handoffs(root, project, include_claimed=include_all)
+    if as_json:
+        # brain.list_handoffs 已经把 _age_h/_age_days/_stale 算好了（handoff_annotate），
+        # 文本模式用的就是这份标注——JSON 直接透传，两边口径不会分叉
+        print(json.dumps({"ok": True, "count": len(rows),
+                          "include_all": bool(include_all), "handoffs": rows},
+                         ensure_ascii=False))
+        return 0
     if not rows:
         print("（无交接记录）" if include_all else "（无未认领交接）")
         return 0
@@ -989,17 +1064,61 @@ def cmd_security(root: str, days: int = 7) -> int:
     return 0
 
 
-def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5) -> int:
-    """前沿队列（headless）：可认领/进行中/可接管/等待依赖/退避/延后。"""
+def _next_hidden_reasons(agent: str, res: dict, brain) -> list:
+    """R727：把「ready=0」的原因说清楚。被管控状态挡着与被能力声明筛掉，出路完全不同：
+    前者改回 active 就有活，后者要么换人要么撤销声明。文案只在真藏了东西时出现。"""
+    h = res.get("hidden") or {}
+    out = []
+    st = (res.get("control") or {}).get("state") or "active"
+    if h.get("control") and st != "active":
+        who = f"@{agent}" if agent else "该 agent"
+        out.append(f"  ⚠ {who} 处于「{brain.AGENT_CONTROL_CN.get(st, st)}」（{st}）：{h['control']} 条"
+                   f"新活被挡住不推荐（在办/等待仍照常列出）——不是大脑里没活\n"
+                   f'    恢复接活：cli.py call hub_agent action=control agent={agent} '
+                   f'state="active" confirm=true')
+    if h.get("skills"):
+        mine = "、".join(res.get("skills") or []) or "-"
+        want = "、".join(h.get("skills_wanted") or []) or "别的技能"
+        out.append(f"  ⚠ 你的能力声明「{mine}」筛掉 {h['skills']} 条"
+                   f"（这些要的是「{want or '别的技能'}」）——不是没有活\n"
+                   f"    放开筛选：cli.py call hub_agent action=skills agent={agent} "
+                   f'skills="-" confirm=true')
+    return out
+
+
+def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5,
+             as_json: bool = False) -> int:
+    """前沿队列（headless）：可认领/进行中/可接管/等待依赖/退避/延后。
+
+    R725：`--json`——「下一步干什么」是 agent 开工的第一问，此前只有中文行；脚本要么
+    正则切 `_task_line`，要么绕道 `call hub_next`（参数名与 CLI 不一致，两边各记一套）。
+    """
     import brain  # noqa: PLC0415
     res = brain.task_next(root, project=project, owner=agent, limit=limit)
     brain.task_annotate(root, res["ready"] + res["doing"] + res["takeover"] + res["waiting"]
                         + res.get("backoff", []) + res.get("deferred", []))
     c = res["counts"]
+    if as_json:
+        keys = ("ready", "doing", "takeover", "waiting", "backoff", "deferred")
+        # limit/control/hidden 一起给：脚本要能看出「这组被 --limit 截了」「ready=0 是因为
+        # 这个 agent 处于 draining/paused」——否则只能靠猜，猜错就去找大脑的数。
+        print(json.dumps({"ok": True, "limit": limit, "control": res.get("control"),
+                          "hidden": res.get("hidden"), "skills": res.get("skills"),
+                          "counts": c, **{k: res.get(k, []) for k in keys}},
+                         ensure_ascii=False))
+        return 0
+    reasons = _next_hidden_reasons(agent, res, brain)
     if not any(c.values()):
-        print("前沿队列为空（没有待办/在办任务）。")
+        if reasons:
+            print("没有可推荐的下一步（不是没活，是被你自己的状态/能力挡住了）：")
+            for line in reasons:
+                print(line)
+        else:
+            print("前沿队列为空（没有待办/在办任务）。")
         return 0
     print(f"下一步推荐（前沿队列）共 {c['ready']} 条：")
+    for line in reasons:
+        print(line)
     for i, t in enumerate(res["ready"], 1):
         print(f"  {i}. {_task_line(t)}")
     for label, key in (("进行中", "doing"), ("可接管", "takeover"), ("等待中", "waiting")):
@@ -1386,10 +1505,38 @@ def _first_command(argv: list) -> str:
     return ""
 
 
-def _unknown_command_message(cmd: str, names: list) -> str:
+# 打错的命令与真命令之间，有时差的不是几个字母而是**词**：`todo-list` 与 `tasks`
+# 逐字比毫无相似度（difflib 给不出建议），但意图明确。这里收成一张对照表，只收录
+# 「用户或 agent 真实会脱口而出的叫法」，不当第二个命令系统用。
+_COMMAND_SYNONYMS = {
+    "todo": "tasks", "todos": "tasks", "todo-list": "tasks", "todolist": "tasks",
+    "kanban": "tasks", "board": "tasks", "backlog": "tasks",
+    "handover": "handoffs", "takeover": "handoffs",
+    "daily": "digest", "standup": "digest", "report": "digest", "summary": "digest",
+    "diagnose": "doctor", "selfcheck": "doctor", "health": "doctor",
+    "connect": "onboard", "install": "onboard", "inject": "onboard",
+    "disconnect": "offboard", "uninstall": "offboard",
+    "server": "serve", "dashboard": "serve",
+    "history": "audit-export",
+}
+
+
+def _suggest_commands(cmd: str, names: list) -> list:
+    """命令猜疑：同义词先给（意图对得上），再用 difflib 补字形相近的；去重、最多 3 条。"""
     import difflib
 
-    near = difflib.get_close_matches(cmd, names, n=3, cutoff=0.6)
+    out = []
+    syn = _COMMAND_SYNONYMS.get(cmd.strip().lower())
+    if syn and syn in names:
+        out.append(syn)
+    for n in difflib.get_close_matches(cmd, names, n=3, cutoff=0.6):
+        if n not in out:
+            out.append(n)
+    return out[:3]
+
+
+def _unknown_command_message(cmd: str, names: list) -> str:
+    near = _suggest_commands(cmd, names)
     lines = [f"未知命令：{cmd}"]
     if near:
         lines.append(f"  你可能想用：{'、'.join(near)}")
@@ -1520,6 +1667,8 @@ def main(argv=None) -> int:
     p_tasks.add_argument("--days", type=int, default=7, help="--stats 窗口天数，默认 7")
     p_tasks.add_argument("--approvals", action="store_true",
                          help="待审批队列（等最久的先看，含待批时长）")
+    p_tasks.add_argument("--json", action="store_true", dest="as_json",
+                         help="机器可读输出（看板/统计/待审批三条路径都认；出错也吐 JSON）")
     p_digest = _cmd("digest", help="团队日结（流动/风险/按 agent 记分卡）")
     p_digest.add_argument("--days", type=int, default=1, help="窗口天数 1..365，默认 1")
     p_handoffs = _cmd("handoffs", help="交接清单（默认看未认领；--all 含已认领/已作废）")
@@ -1530,12 +1679,16 @@ def main(argv=None) -> int:
                             help="作废交接 id（仅 open；需 --reason）")
     p_handoffs.add_argument("--reason", default="", help="作废原因（--close 必填）")
     p_handoffs.add_argument("--agent", default="", help="操作人（缺省 cli）")
+    p_handoffs.add_argument("--json", action="store_true", dest="as_json",
+                            help="机器可读输出（列清单与 --close 结果都认）")
     p_security = _cmd("security", help="越权拦截态势（默认近 7 天）")
     p_security.add_argument("--days", type=int, default=7, help="窗口天数 1..365，默认 7")
     p_next = _cmd("next", help="前沿队列（可认领/进行中/可接管/等待依赖/退避/延后）")
     p_next.add_argument("--project", default="", help="按项目过滤；留空看全部")
     p_next.add_argument("--agent", default="", help="该 agent 名下的在办任务归入「进行中」")
     p_next.add_argument("--limit", type=int, default=5, help="每组最多几条，默认 5")
+    p_next.add_argument("--json", action="store_true", dest="as_json",
+                        help="机器可读输出（counts + 六组任务原样字段）")
     p_claim = _cmd("claim", help="认领任务（原子；前置未完成会拒绝）")
     p_claim.add_argument("task_id", type=int)
     p_claim.add_argument("--agent", required=True)
@@ -1683,16 +1836,18 @@ def main(argv=None) -> int:
             return cmd_serve(root, args.port, args.allow_write, args.open)
         if args.cmd == "tasks":
             return cmd_tasks(root, args.status, args.project, args.owner, args.limit,
-                             stats=args.stats, days=args.days, approvals=args.approvals)
+                             stats=args.stats, days=args.days, approvals=args.approvals,
+                             as_json=args.as_json)
         if args.cmd == "handoffs":
             return cmd_handoffs(root, args.project, args.include_all, args.close_id,
-                                args.reason, args.agent)
+                                args.reason, args.agent, as_json=args.as_json)
         if args.cmd == "security":
             return cmd_security(root, args.days)
         if args.cmd == "digest":
             return cmd_digest(root, args.days)
         if args.cmd == "next":
-            return cmd_next(root, args.project, args.agent, args.limit)
+            return cmd_next(root, args.project, args.agent, args.limit,
+                            as_json=args.as_json)
         if args.cmd == "claim":
             return cmd_claim(root, args.task_id, args.agent)
         if args.cmd == "update":

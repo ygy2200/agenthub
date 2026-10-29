@@ -95,9 +95,13 @@ def test_doctor_marks_machine_scope(monkeypatch, capsys):
     monkeypatch.setattr(ops, "run_patrol", lambda root, checks=None: rep)
     assert cli.cmd_doctor("x") == 1
     out = capsys.readouterr().out
-    assert "✗ runtime_health（机器级）：" in out
-    assert "✗ rules_health（机器级 · 要拍板）：" in out
-    assert "2 项是机器级状态" in out and "与当前根目录无关" in out
+    # R722 改版式：机器级问题不再逐行贴「（机器级）」，而是单列一节并在计数里说清。
+    # 意图不变——「别让人以为新库坏了」由节标题承担，且比三个字后缀更醒目。
+    assert "问题 2（机器级 2；可直接修复 1 · 需你拍板 1）" in out
+    assert "机器级问题（与本目录无关" in out
+    assert "✗ runtime_health：" in out
+    assert "✗ rules_health（要拍板）：" in out
+    assert "（机器级）" not in out
 
 
 def test_doctor_shows_slowest_checks(monkeypatch, capsys):
