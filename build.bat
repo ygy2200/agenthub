@@ -14,7 +14,7 @@ echo [1/4] 构建清单 start（快照源码哈希）...
 D:\python311\python.exe cli.py build-manifest start
 if errorlevel 1 (
   echo 构建清单 start 失败
-  pause
+  if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
 D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx --name AgentHub ^
@@ -32,22 +32,27 @@ D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx 
   main.py
 if errorlevel 1 (
   echo 打包失败
-  pause
+  if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
 echo [2/4] 构建清单 finish（记录 exe sha256）...
 D:\python311\python.exe cli.py build-manifest finish
 if errorlevel 1 (
   echo 构建清单 finish 失败
-  pause
+  if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
 copy /y dist\AgentHub.exe "%USERPROFILE%\Desktop\AgentHub.exe"
+if errorlevel 1 (
+  echo [ABORT] copy to Desktop failed - close Desktop AgentHub.exe if locked or readonly, rerun
+  if not defined AGENTHUB_NOPAUSE pause
+  exit /b 1
+)
 echo [3/4] 发布一致性检查（清单/源码/桌面副本哈希）...
 D:\python311\python.exe cli.py release
 if errorlevel 1 (
   echo 发布检查未通过：exe 与源码或桌面副本不一致
-  pause
+  if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
 echo [4/4] 完成：桌面 AgentHub.exe
