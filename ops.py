@@ -1987,8 +1987,16 @@ def _disk_and_brain(root: str) -> list:
 
 
 def _need_root(root: str):
-    return None if (root and Path(root).is_dir()) else {
-        "ok": False, "summary": "需要有效的大脑根目录（MCP server 启动参数）", "detail": []}
+    """根目录不可用时的统一出口（R716）。
+
+    原先这里自成一套返回（只有 summary/detail，不带 cause），于是空目录巡检里
+    `backup_health`/`mcp_drift`/`inbox` 各报一条「需要有效的大脑根目录」，还各带一段
+    与病因无关的修复手册（备整包 / 改 agent 的 MCP args / 分拣 00_Inbox）——同一个根因摊成
+    四条，最该看的那条（db_integrity 的「建库或指对根目录」）被压在中间。
+    「目录不存在」与「库里没有 brain.db」对用户是同一件事（建库先得有目录），所以直接复用
+    `_db_missing()`：带 cause=db_missing 与可执行修复口径，由 run_patrol 折叠成一条。
+    """
+    return None if (root and Path(root).is_dir()) else _db_missing()
 
 
 def _import_brain():
@@ -2771,6 +2779,11 @@ def _backup_health(root: str) -> dict:
     if err := _need_root(root):
         return err
     _brain = _import_brain()
+    # R716：目录在、库还没有（新目录只建了壳）时，「没有备份」是必然而不是缺陷——
+    # 空目录实测会单列一条「备份健康：无 zip 整包；没有任何备份」，把人引去先备一份不存在的库。
+    # 与 db_integrity 归同一根因，交给巡检折叠。
+    if not (Path(root) / _brain.core.DIR_META / _brain.DB_NAME).is_file():
+        return _db_missing()
     inv = _brain.backup_inventory(root)
     preview = _brain.backup_prune(root)  # 纯预演：不传 apply
     fams = inv["families"]
@@ -3415,7 +3428,7 @@ def _recent_anomalies(root: str, days: int = 7) -> list:
 
 def _brain(root: str) -> dict:
     if not root or not Path(root).is_dir():
-        return {"ok": False, "summary": "需要有效的大脑根目录（MCP server 启动参数）", "detail": []}
+        return _db_missing()  # R716：与 db_integrity 同因，交给巡检折叠成一条
     try:
         h = _import_brain().health_report(root)
     except Exception as e:  # noqa: BLE001

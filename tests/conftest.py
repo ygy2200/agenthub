@@ -37,6 +37,20 @@ def hub_root(tmp_path, monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_host_credentials(monkeypatch):
+    """R717：测试进程不许读本机真实 GitHub 凭据。
+
+    `git credential fill` 会把 Windows 凭据管理器里的真 token 交出来：R715 里四条
+    「整条链都空」的用例因此由绿转红，而且断言失败时 pytest 会把真 token 原文打进日志。
+    这里把两个默认来源钉成「拿不到」；要验证某来源的用例自己注入 runner。
+    """
+    import release_token
+    monkeypatch.setattr(release_token, "_default_git_runner",
+                        lambda host, timeout: (1, ""))
+    monkeypatch.setattr(release_token, "_default_runner", lambda cmd, timeout: (1, ""))
+
+
+@pytest.fixture(autouse=True)
 def _flush_qt_deletes():
     """每个用例结束后强制冲刷 Qt 的 DeferredDelete 队列（R199）。
 

@@ -25,4 +25,4 @@ D:\python311\python.exe cli.py status
 
 echo.
 echo Done.
-pause
+if not defined AGENTHUB_NOPAUSE pause

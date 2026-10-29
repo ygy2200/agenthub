@@ -51,4 +51,4 @@ if errorlevel 1 (
   exit /b 1
 )
 echo [4/4] 完成：桌面 AgentHub.exe
-pause
+if not defined AGENTHUB_NOPAUSE pause

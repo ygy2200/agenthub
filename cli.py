@@ -488,6 +488,9 @@ def cmd_doctor(root: str, full: bool = False, as_json: bool = False, only: str =
         print(f"  修复：{brief}")
         if full and brief != i["fix"]:
             print(f"  完整口径：{i['fix']}")
+        also = i.get("also") or []
+        if also:
+            print(f"  同因：{'、'.join(also)} 也是这条原因（不单独计，根因修好一起恢复）")
         n_same = i.get("skipped_same_cause") or 0
         if n_same:
             print(f"  注：另有 {n_same} 项依赖大脑库的检查因同一原因跳过"
