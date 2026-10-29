@@ -2808,8 +2808,13 @@ def _runtime_health(root: str = "") -> dict:
     procs = info.get("procs") or []
     origin = "运行中 MCP 进程" if via_marker else "当前进程"
     if info["count"]:
-        top = info["stale"][0]
-        summary = (f"运行版本：落后 {info['count']} 个文件（{top['file']}）——需重启 MCP 进程"
+        top = info["stale"][0]  # stale 按 mtime 倒序，[0] 是最近改动的那个
+        # R738：原来写「落后 4 个文件（ops.py）」——括号里只点一个名字，读起来像「只落后 ops.py」，
+        # 而列表里其实还有 3 个；明细里能看到全部，但摘要是人最先看的一行。
+        # 单文件时直接点名（此时括号没有歧义），多文件时说明这是「最近改动」的那个。
+        named = (f"（{top['file']}）" if info["count"] == 1
+                 else f"（最近改动：{top['file']}，另 {info['count'] - 1} 个）")
+        summary = (f"运行版本：落后 {info['count']} 个文件{named}——需重启 MCP 进程"
                    f"（{origin}加载的是 {fmt(info['started'])} 启动时的代码）")
         detail = [f"{r['file']}  {fmt(r['mtime'])}（{reasons.get(r.get('reason'), '更新')}）"
                   for r in info["stale"][:5]]

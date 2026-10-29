@@ -528,11 +528,52 @@ def cmd_doctor(root: str, full: bool = False, as_json: bool = False, only: str =
     if n_decide and n_fix:
         print(f"提示：「要拍板」{n_decide} 项不是照着修就能消的——修复行里是选项（留用/下线、"
               f"合并哪条、认领或关单），选定后命令照跑；其余 {n_fix} 项可直接执行。")
+    # R739：修复行里的 `hub_export` / `hub_memory_supersede` 是 MCP 工具名（注册表同时供
+    # `hub_ops_run` 用），命令行照抄是 command not found。只在真的出现时补一行换算说明，
+    # 不改注册表文案——那是 MCP 面该看到的写法。有 CLI 原生命令的（claim/next/update…）
+    # 优先指原生命令，剩下的才教 `call`。
+    mcp_line = _mcp_tool_hint(rep["issues"])
+    if mcp_line:
+        print(mcp_line)
     if not rep["issues"]:
         print("全部通过。")
     if rep["skipped"]:
         print("跳过：" + "；".join(ops.format_skipped(rep["skipped"])))
     return 0 if rep["ok"] else 1
+
+
+def _mcp_tools_in_issues(issues: list) -> list:
+    """R739：修复行里出现过的 MCP 工具名（`hub_xxx`），按出现顺序去重。"""
+    import re  # noqa: PLC0415
+
+    out = []
+    for i in issues or []:
+        for tool in re.findall(r"\bhub_[a-z0-9_]+\b", str(i.get("fix") or "")):
+            if tool not in out:
+                out.append(tool)
+    return out
+
+
+def _mcp_tool_hint(issues: list) -> str:
+    """R739：把「修复行里的 MCP 工具名」翻译成命令行写法；没有就返回空串。
+
+    分两档：有 CLI 原生命令的直接指过去（`claim`/`next`/`update`…），
+    其余的教 `call`——不把 10 个名字堆一行（实测那行有 130 字，没人读）。
+    """
+    tools = _mcp_tools_in_issues(issues)
+    if not tools:
+        return ""
+    native = {k: v for k, v in _TOOL_CLI_FORM.items() if not v.startswith("call ")}
+    have = [t for t in tools if t in native][:3]
+    only = [t for t in tools if t not in native]
+    parts = []
+    if have:
+        pairs = " / ".join(f"{t}→{CMD} {native[t].split(' ')[0]}" for t in have)
+        parts.append(f"{pairs}")
+    if only:
+        shown = "、".join(only[:3]) + (f" 等 {len(only)} 个" if len(only) > 3 else "")
+        parts.append(f"{shown}只能用 {CMD} call <工具名> <同样的 key=value>")
+    return "提示：修复行里的 hub_xxx 是 MCP 工具名，命令行改用——" + "；".join(parts) + "。"
 
 
 def cmd_check(name: str = "", target: str = "", root: str = "",
@@ -613,7 +654,10 @@ def cmd_init(root: str) -> int:
         return 1
     db = brain.db_path(root)
     n_rec, n_mem = _db_counts(db)
-    print(("大脑校验完成（已存在，既有数据未动）：" if had_db else "大脑已初始化：") + str(root))
+    # R737：同一屏只允许一种路径分隔符。原来抬头是用户传进来的 `.../Temp/hubtest1`（正斜杠）、
+    # 下一行数据库却是 str(Path) 的反斜杠——看起来像两个人写的两段输出。
+    shown = os.path.normpath(str(root))
+    print(("大脑校验完成（已存在，既有数据未动）：" if had_db else "大脑已初始化：") + shown)
     print(f"  目录：{core.DIR_INBOX}/ {core.DIR_ARCHIVE}/ {core.DIR_META}/（已有内容原样保留）")
     print(f"  档案：{core.rules_file(root).name} / {core.memory_file(root).name}")
     if n_rec < 0:
@@ -621,12 +665,12 @@ def cmd_init(root: str) -> int:
     else:
         print(f"  数据库：{db}（记录 {n_rec} 条 / 记忆 {n_mem} 条）")
     print("下一步：")
-    print(f'  python cli.py doctor --root "{root}"        # 跑整套自检')
-    print(f'  python cli.py onboard <agent> --root "{root}"  # 把某个 agent 接进来')
+    print(f'  {CMD} doctor --root "{shown}"        # 跑整套自检')
+    print(f'  {CMD} onboard <agent> --root "{shown}"  # 把某个 agent 接进来')
     cfg_root = _root("")
     if not cfg_root or not _same_dir(cfg_root, root):
-        print(f'  python cli.py root --set "{root}"  # 让所有 agent 改用这个大脑'
-              f'（当前全局根目录：{cfg_root or "未配置"}）')
+        print(f'  {CMD} root --set "{shown}"  # 让所有 agent 改用这个大脑'
+              f'（当前全局根目录：{os.path.normpath(cfg_root) if cfg_root else "未配置"}）')
     return 0
 
 
@@ -776,7 +820,7 @@ def cmd_call(root: str, tool: str, kv: list) -> int:
                         (x.split("=", 1) for x in kv if "=" in x
                          and x.split("=", 1)[0].strip() not in ("root", "hub_root")))
         print(f"{k} 不是工具参数：选大脑请用 --root（写在 call 前后都行）。\n"
-              f"    这样跑：python cli.py --root {v or '<目录>'} call {tool}"
+              f"    这样跑：{CMD} --root {v or '<目录>'} call {tool}"
               + (f" {rest}" if rest else "") + "\n"
               f"    不拦的话这次会写到配置里的默认根目录：{root}")
         return 2
@@ -796,11 +840,41 @@ def cmd_call(root: str, tool: str, kv: list) -> int:
         return 1
     res = r.get("result") or {}
     if "content" in res:
-        print(res["content"][0]["text"])
+        text = res["content"][0]["text"]
+        print(text)
+        if not res.get("isError"):
+            extra = _cli_equivalent(text)
+            if extra:
+                print(f"  （CLI 写法：{extra}）")
         return 1 if res.get("isError") else 0
     err = r.get("error") or {}
     print(err.get("message") or str(r))
     return 1
+
+
+# R735：`call` 打印的是 MCP 面的正文，它给的后续指引是 MCP 工具名
+# （「认领：hub_claim；下一步推荐：hub_next；列表：hub_tasks」）——
+# 用 CLI 的人照抄是 command not found。正文本身不能改（MCP 面读它是对的），
+# 所以在 CLI 侧补一行等价写法；只列真的在正文里出现过的，不铺全表。
+_TOOL_CLI_FORM = {
+    "hub_task_add": "call hub_task_add title=… project=… agent=…",
+    "hub_claim": "claim <id> --agent <名字>",
+    "hub_next": "next --agent <名字>",
+    "hub_tasks": "tasks",
+    "hub_task_update": "update <id> --status <状态>",
+    "hub_handoff": "handoffs",
+    "hub_digest": "digest",
+    "hub_search": "call hub_search keyword=… limit=5",
+}
+
+
+def _cli_equivalent(text: str) -> str:
+    """正文里出现过的 MCP 工具 → 对应的 CLI 写法，用 · 连成一行；没命中返回空串。"""
+    seen = []
+    for tool, form in _TOOL_CLI_FORM.items():
+        if tool in (text or "") and form not in seen:
+            seen.append(form)
+    return " · ".join(seen)
 
 
 def cmd_list_tools(root: str) -> int:
@@ -1067,7 +1141,11 @@ def cmd_handoffs(root: str, project: str = "", include_all: bool = False,
                          ensure_ascii=False))
         return 0
     if not rows:
+        # R736：空态是「接手别人活」这件事唯一的入口，只报「无」等于把人挡在门外。
         print("（无交接记录）" if include_all else "（无未认领交接）")
+        print(f'  留一份交接：{CMD} call hub_handoff action=create project="<对象-问题>" '
+              f'agent=<你的名字> done="做完了什么" next_step="下一步做什么"')
+        print(f"  交接清单用法：{CMD} help handoffs")
         return 0
     print(f"交接 {len(rows)} 条（{'全部' if include_all else 'open'}，新在前）：")
     for r in rows:
@@ -1460,7 +1538,8 @@ def cmd_locks(root: str, project: str = "", owner: str = "", path: str = "",
     rows = brain.file_lease_list(root, project=project, owner=owner,
                                  include_released=include_released, limit=limit)
     if not rows:
-        print("暂无文件租约（hub_lock action=acquire 或 cli.py lock <path> --agent ...）")
+        print(f"暂无文件租约（{CMD} call hub_lock action=acquire path=<文件> "
+              f"agent=<你的名字>；或 {CMD} lock <path> --agent ...）")
         return 0
     active = sum(1 for r in rows if r.get("_active"))
     expired = sum(1 for r in rows if r.get("_expired"))
