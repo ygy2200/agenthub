@@ -59,15 +59,69 @@ def _same_dir(a: str, b: str) -> bool:
         return False
 
 
-def cmd_status(root: str, agent: str = "") -> int:
+# 需要读脑库的命令：目录没初始化时必须先拦下，否则 sqlite 只会抛英文 OperationalError。
+# R707：只收「对脑库动状态/取业务数据」的命令。诊断类（doctor/check/backup-*）刻意不收——
+# 它们的职责就是判断脑库坏在哪，闸门拦住等于把唯一的自救入口锁死（实测 doctor 对空目录
+# 能给出「未建库」并列出 13 项同因跳过，正是用户最需要看到的）。
+_NEED_DB = {
+    "role", "call", "serve", "tasks", "digest", "handoffs", "security", "next",
+    "claim", "update", "retry", "approve", "reject", "freeze", "audit-export",
+    "checkpoint", "locks", "lock", "unlock",
+}
+
+
+def _root_problem(root: str, need_db: bool = False) -> str:
+    """根目录不可用时的可行动说明；可用返回空串。"""
+    if not root:
+        return ("未找到大脑根目录。\n"
+                "  建脑：python cli.py init --root \"<已有目录>\"\n"
+                "  切到已有大脑：python cli.py root --set \"<目录>\"")
+    p = Path(root)
+    if not p.exists():
+        return (f"大脑根目录不存在：{root}\n"
+                "  路径打错？init 只接受已有目录（不会凭空创建）。\n"
+                f"  建脑：先创建该目录，再 python cli.py init --root \"{root}\"")
+    if not p.is_dir():
+        return f"大脑根目录不是文件夹：{root}\n  用 --root 指向目录，或 root --set 切换。"
+    if need_db and not (p / core.DIR_META).is_dir():
+        return (f"该目录还不是 AgentHub 大脑：{root}\n"
+                f"  初始化（保留原数据）：python cli.py init --root \"{root}\"\n"
+                "  只是查看接入状态/工具清单不需要初始化。")
+    return ""
+
+
+def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
     rows = core.agent_bootstrap_status(root)
     if agent:
         rows = [r for r in rows if agent.lower() in r["agent"].lower()]
+    cfg_root = _root("")
+    mismatch = bool(cfg_root and not _same_dir(cfg_root, root))
+    problems = []
+    for r in rows:
+        issues = []
+        if r["mcp"] is False:
+            issues.append("MCP 未接入")
+        if r.get("boot_stale"):
+            issues.append("引导过期")
+        if not r.get("boot") and r.get("instr_path"):
+            issues.append("引导未注入")
+        if issues:
+            problems.append({"agent": r["agent"], "issues": issues})
+    if as_json:
+        print(json.dumps({
+            "bootstrap_version": core.BOOTSTRAP_VERSION,
+            "root": root,
+            "config_root": cfg_root,
+            "root_mismatch": mismatch,
+            "healthy": not problems,
+            "problems": problems,
+            "agents": rows,
+        }, ensure_ascii=False))
+        return 1 if problems else 0
     print(f"AgentHub 接入状态（当前引导版本 v{core.BOOTSTRAP_VERSION}）")
     # R293：agent 的 MCP 进程跟随全局配置根目录，不是本命令的 --root。
     # 两者不同时必须明说——否则新初始化的空大脑会显示「全部 ✓」，造成已接入的假象。
-    cfg_root = _root("")
-    if cfg_root and not _same_dir(cfg_root, root):
+    if mismatch:
         print(f"⚠ 本次查看的是 {root}")
         print(f"  但全局配置根目录是 {cfg_root}——上面各 agent 实际写入的是后者。")
         print(f'  切换：python cli.py root --set "{root}"')
@@ -77,7 +131,9 @@ def cmd_status(root: str, agent: str = "") -> int:
         if mcp == "✓" and prof:  # P3-1：显示工具面切片（缺省 admin=全量不显示）
             mcp = f"✓({prof})"
         print(f"  {r['agent']:12} [{r['channel']:10}] 引导:{_boot_mark(r):9} MCP:{mcp}  {r['instr_path']}")
-    return 0
+    if problems:
+        print(f"\n{len(problems)} 个 agent 需要处理——修好后重跑：python cli.py onboard <agent>")
+    return 1 if problems else 0
 
 
 def cmd_onboard(root: str, agent: str) -> int:
@@ -90,14 +146,28 @@ def cmd_onboard(root: str, agent: str) -> int:
     py = core.find_python()
     server = str(core.MCP_SERVER_DIR / "agenthub_mcp.py")
     done = []
+    failed = []
     spec = core._mcp_spec_of(a)
     if spec:
+        st = core.deploy_status()
+        if st["state"] != "ready":
+            py, deployed = core.deploy_server()
+            if not deployed:
+                print("  ✗ MCP server 部署失败：~/.agenthub/mcp_server 未就绪")
+                print("    未部署时接入条目会指向不存在的文件。先跑 python cli.py deploy 看原因。")
+                print("\n接入未完成：1 处写入失败（配置未改动）。")
+                return 1
+            server = deployed
+            fix = "（修复落后副本）" if st["state"] == "stale" else ""
+            print(f"  ✓ MCP server 已部署{fix} -> {deployed}")
+            done.append(f"MCP server -> {deployed}")
         path, fmt, _kp = spec
         err = core.install_mcp_entry(path, (a.get("mcp") or {}).get("layout", ""), py, server, root,
                                      agent=a.get("agent", ""),
                                      profile=(a.get("mcp") or {}).get("profile", ""))
         if err:
             print(f"  ✗ MCP 写入失败：{err}")
+            failed.append(f"MCP 配置（{path}）：{err}")
         else:
             done.append(f"MCP 配置（{fmt}）-> {path}")
     else:
@@ -107,12 +177,20 @@ def cmd_onboard(root: str, agent: str) -> int:
         err = core.inject_bootstrap(bp, root, agent="user")
         if err:
             print(f"  ✗ 引导注入失败：{err}")
+            failed.append(f"引导规则（{bp}）：{err}")
         else:
             done.append(f"引导规则 -> {bp}")
     for d in done:
         print(f"  ✓ {d}")
-    if done:
-        print(f"\n接入完成。重启 {a['agent']} 后首次心跳即证明生效；复核：python cli.py status")
+    if failed:
+        print(f"\n接入未完成：{len(failed)} 处写入失败（已成功的部分保留）。")
+        print("  排查：python cli.py doctor；修复后重跑 onboard（幂等）。")
+        return 1
+    if not done:
+        print("\n没有可写入的接入点：该 agent 既未登记 MCP 配置，也没有引导文件路径。")
+        print("  在 config.agents.json 补齐 mcp/instr_path 后再试。")
+        return 1
+    print(f"\n接入完成。重启 {a['agent']} 后首次心跳即证明生效；复核：python cli.py status")
     return 0
 
 
@@ -165,19 +243,25 @@ def cmd_offboard(root: str, agent: str, apply: bool = False,
 
 
 def cmd_refresh(root: str) -> int:
-    n, fail = 0, 0
+    n, fail, same = 0, 0, 0
     for a in core.load_agent_adapters(root):
         path = _boot_of(a)
         if not path:
             continue
+        p = Path(os.path.expandvars(os.path.expanduser(path)))
+        before = core.read_text(p) if p.is_file() else ""
         err = core.inject_bootstrap(path, root, agent="user")
         if err:
             print(f"  ✗ {a['agent']}: {err}")
             fail += 1
+        elif p.is_file() and core.read_text(p) == before and before:
+            same += 1
+            print(f"  · {a['agent']} 已是最新")
         else:
             n += 1
             print(f"  ✓ {a['agent']} -> {path}")
-    print(f"刷新完成：{n} 个成功" + (f"，{fail} 个失败" if fail else ""))
+    tail = f"，{same} 个已是最新" if same else ""
+    print(f"刷新完成：{n} 个更新" + tail + (f"，{fail} 个失败" if fail else ""))
     return 0 if not fail else 1
 
 
@@ -1024,9 +1108,9 @@ def cmd_freeze(root: str, minutes=None, reason: str = "", off: bool = False,
         fr = brain.freeze_get(root)
         if not fr["active"]:
             print(f"写入未冻结{'（上次冻结已过期）' if fr['expired'] else ''}。"
-                  "冻结：cli.py freeze --minutes 30 --reason \"...\"（0=手动解冻）")
+                  "冻结：cli.py freeze --minutes 30 --reason \"...\"（0=持续冻结直到 --off）")
             return 0
-        until = fr["until"][:19].replace("T", " ") if fr["until"] else "手动解冻"
+        until = fr["until"][:19].replace("T", " ") if fr["until"] else "持续冻结（直到 --off）"
         rem = f"，约剩 {fr['remaining_min']:g} 分钟" if fr["until"] else ""
         print(f"⛔ 全局写入已冻结：{until}{rem}｜由 {fr['by'] or '-'} 开启")
         print(f"原因：{fr['reason'] or '-'}")
@@ -1036,7 +1120,7 @@ def cmd_freeze(root: str, minutes=None, reason: str = "", off: bool = False,
     if err:
         print(f"冻结失败：{err}")
         return 1
-    until = fr["until"][:19].replace("T", " ") if fr["until"] else "手动解冻"
+    until = fr["until"][:19].replace("T", " ") if fr["until"] else "持续冻结（直到 --off）"
     print(f"⛔ 全局写入已{'延长至' if fr.get('_was_active') else '冻结至'} {until}："
           f"{fr['reason'][:80]}")
     print("写工具全部拒收（读工具照常）；解除：cli.py freeze --off")
@@ -1257,8 +1341,9 @@ def main(argv=None) -> int:
                        help="大脑根目录（同全局 --root；写在子命令前或后都行）")
         return p
 
-    p_status = _cmd("status", help="各 agent 接入状态")
+    p_status = _cmd("status", help="各 agent 接入状态（有缺失时退出码 1）")
     p_status.add_argument("agent", nargs="?", default="", help="只看某个 agent；留空看全部")
+    p_status.add_argument("--json", action="store_true", help="输出单行 JSON（脚本/CI 用）")
     p_role = _cmd("role", help="查看或授予 agent 角色（worker/manager）")
     p_role.add_argument("agent", nargs="?", default="")
     p_role.add_argument("--set", dest="role", choices=["worker", "manager"], default="",
@@ -1387,7 +1472,7 @@ def main(argv=None) -> int:
     p_reject.add_argument("--agent", default="", help="复核人 agent 名（管理面可空）")
     p_freeze = _cmd("freeze", help="全局写入冻结（应急闸门；--off 解除）")
     p_freeze.add_argument("--minutes", type=int, default=None,
-                          help="冻结分钟数：0=手动解冻；缺省=只查看状态")
+                          help="冻结分钟数：0=持续冻结直到 --off 解除；缺省=只查看状态")
     p_freeze.add_argument("--reason", default="", help="冻结原因（冻结时必填）")
     p_freeze.add_argument("--off", action="store_true", help="解除冻结（幂等）")
     p_freeze.add_argument("--agent", default="", help="操作人（缺省 cli）")
@@ -1450,12 +1535,17 @@ def main(argv=None) -> int:
             return cmd_init(_root(args.root))
         if args.cmd == "root":
             return cmd_root(_root(args.root), args.root_set)
+        if args.cmd == "tools":
+            return cmd_list_tools(_root(args.root))
+        if args.cmd == "discover":
+            return cmd_discover(_root(args.root))
         root = _root(args.root)
-        if not root or not Path(root).is_dir():
-            print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")
+        problem = _root_problem(root, args.cmd in _NEED_DB)
+        if problem:
+            print(problem)
             return 2
         if args.cmd == "status":
-            return cmd_status(root, args.agent)
+            return cmd_status(root, args.agent, args.json)
         if args.cmd == "role":
             return cmd_role(root, args.agent, args.role)
         if args.cmd == "onboard":
@@ -1465,12 +1555,8 @@ def main(argv=None) -> int:
                                 keep_guide=args.keep_guide, keep_mcp=args.keep_mcp)
         if args.cmd == "refresh":
             return cmd_refresh(root)
-        if args.cmd == "discover":
-            return cmd_discover(root)
         if args.cmd == "deploy":
             return cmd_deploy(root)
-        if args.cmd == "tools":
-            return cmd_list_tools(root)
         if args.cmd == "call":
             return cmd_call(root, args.tool, args.kv)
         if args.cmd == "serve":

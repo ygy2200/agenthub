@@ -635,7 +635,7 @@ def t_freeze_cli(tmp):
     assert rc == 0 and "全局写入已冻结" in out and "迁移中" in out, (rc, out)
 
     rc, out = _capture(cli.cmd_freeze, root, 0, "改手动", False, "qoder")
-    assert rc == 0 and "已延长至" in out and "手动解冻" in out, (rc, out)
+    assert rc == 0 and "已延长至" in out and "持续冻结" in out, (rc, out)
     rc, out = _capture(cli.cmd_freeze, root, None, "", True, "qoder")
     assert rc == 0 and "已解除" in out, (rc, out)
     rc, out = _capture(cli.cmd_freeze, root, None, "", True, "qoder")

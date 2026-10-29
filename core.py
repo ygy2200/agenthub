@@ -1086,11 +1086,14 @@ def inject_bootstrap(path: str, root: str, agent: str = "user") -> str:
     try:
         p.parent.mkdir(parents=True, exist_ok=True)
         old = read_text(p) if p.is_file() else ""
+        old = old.replace("\r\n", "\n").replace("\r", "\n")
         body = _strip_bootstrap(old).rstrip("\n")
         text = (body + "\n\n" + bootstrap_text(root) + "\n") if body.strip() \
             else bootstrap_text(root) + "\n"
+        if p.is_file() and old == text:
+            return ""  # 内容一致就不重写：不产生备份、不动 mtime（refresh 可反复跑）
         bak = _backup(p) if p.is_file() else ""
-        p.write_text(text, encoding="utf-8")
+        p.write_text(text, encoding="utf-8", newline="\n")
     except OSError as e:
         if bak:
             try:

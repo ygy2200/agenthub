@@ -1090,7 +1090,7 @@ def _freeze_read(conn) -> dict:
                 "by": str(d.get("by") or ""), "at": str(d.get("at") or ""),
                 "minutes": minutes})
     if not until:
-        out["active"] = True  # 手动解冻型冻结
+        out["active"] = True  # 持续冻结型（直到手动解除）
         return out
     try:
         end = datetime.datetime.strptime(until, "%Y-%m-%dT%H:%M:%S")
@@ -1116,16 +1116,16 @@ def freeze_get(root: str) -> dict:
 
 
 def freeze_set(root: str, minutes: int = 0, reason: str = "", agent: str = "") -> tuple:
-    """冻结全局写入。minutes=0 手动解冻；1..1440 定时自动解冻。返回 (错误或 "", 状态)。"""
+    """冻结全局写入。minutes=0 持续冻结直到手动解除；1..1440 定时自动解冻。返回 (错误或 "", 状态)。"""
     reason = (reason or "").strip()
     if not reason:
         return "reason 必填（冻结是全库写闸门，必须写清为什么，解冻时按它对账）", {}
     try:
         minutes = int(minutes or 0)
     except (TypeError, ValueError):
-        return "minutes 必须是整数（0=手动解冻，1..1440=定时解冻）", {}
+        return "minutes 必须是整数（0=持续冻结直到手动解除，1..1440=定时解冻）", {}
     if minutes < 0 or minutes > FREEZE_MAX_MINUTES:
-        return f"minutes 只能是 0（手动解冻）或 1..{FREEZE_MAX_MINUTES}（收到 {minutes}）", {}
+        return f"minutes 只能是 0（持续冻结）或 1..{FREEZE_MAX_MINUTES}（收到 {minutes}）", {}
     now = datetime.datetime.now()
     until = "" if minutes == 0 else (
         now + datetime.timedelta(minutes=minutes)).strftime("%Y-%m-%dT%H:%M:%S")
@@ -1137,7 +1137,7 @@ def freeze_set(root: str, minutes: int = 0, reason: str = "", agent: str = "") -
         prev = _freeze_read(conn)
         conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)", (FREEZE_KEY, payload))
         _journal_row(conn, agent, "延长写入冻结" if prev["active"] else "写入冻结", "global",
-                     f"{reason[:80]}｜{'手动解冻' if not until else '至 ' + until}")
+                     f"{reason[:80]}｜{'持续冻结' if not until else '至 ' + until}")
     return "", freeze_get(root) | {"_was_active": prev["active"]}
 
 

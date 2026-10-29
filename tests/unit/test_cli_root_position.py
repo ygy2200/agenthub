@@ -8,6 +8,7 @@ R225 实跑 doctor 时撞到 `unrecognized arguments: --root`：argparse 的全�
 import pytest
 
 import cli
+import core
 
 
 def _spy_doctor(monkeypatch):
@@ -57,8 +58,13 @@ def test_unknown_option_still_errors(monkeypatch, tmp_path):
 
 
 def test_call_root_between_tool_and_kv(monkeypatch, tmp_path):
-    """R295：`call <tool> --root X key=value` 曾被 argparse 拒绝（nargs='*' 与穿插选项冲突）。"""
+    """R295：`call <tool> --root X key=value` 曾被 argparse 拒绝（nargs='*' 与穿插选项冲突）。
+
+    R707 起 `call` 属「需要脑库」的命令，未初始化目录会被根目录闸门拦在解析之后——
+    本例只验证 argv 位置，所以先造出最小脑库结构（_hub），别让闸门遮住 argparse 行为。
+    """
     seen = []
+    (tmp_path / core.DIR_META).mkdir()
 
     def fake_call(root, tool, kv):
         seen.append((root, tool, kv))
@@ -71,10 +77,20 @@ def test_call_root_between_tool_and_kv(monkeypatch, tmp_path):
 
 def test_call_root_equals_form_after_kv(monkeypatch, tmp_path):
     seen = []
+    (tmp_path / core.DIR_META).mkdir()
     monkeypatch.setattr(cli, "cmd_call",
                         lambda root, tool, kv: seen.append((root, tool, kv)) or 0)
     assert cli.main(["call", "hub_search", "keyword=x", f"--root={tmp_path}"]) == 0
     assert seen == [(str(tmp_path), "hub_search", ["keyword=x"])], seen
+
+
+def test_doctor_not_blocked_by_db_gate(tmp_path):
+    """R707：诊断命令不能被「该目录还不是大脑」的闸门锁死——它正是判断坏在哪的入口。"""
+    assert "doctor" not in cli._NEED_DB
+    assert "check" not in cli._NEED_DB
+    assert "backup-prune" not in cli._NEED_DB
+    # 闸门确实跳过 doctor：直接对空目录跑自检，返回码来自自检本身（有缺口=1），不是闸门的 2。
+    assert cli.main(["doctor", "--root", str(tmp_path)]) in (0, 1)
 
 
 def test_hoist_root_keeps_missing_value():

@@ -5485,8 +5485,8 @@ def t_freeze_surface(hub):
     assert "已撤销" in undo and "已全局冻结" not in undo, undo
 
     ext = m.call_tool("hub_freeze", {"action": "freeze", "minutes": 0,
-                                     "reason": "延长为手动解冻", "agent": "zcode"}, rs)
-    assert "已延长" in ext and "手动解冻" in ext and "已延长至" in ext, ext
+                                     "reason": "延长为持续冻结", "agent": "zcode"}, rs)
+    assert "已延长" in ext and "持续冻结" in ext and "已延长至" in ext, ext
 
     # 到期自动失效：改 until 到过去，状态报过期且写入恢复
     import json as _json
