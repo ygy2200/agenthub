@@ -18,7 +18,9 @@ jobs:
         with:
           python-version: "3.11"
       - name: 安装依赖
-        run: pip install PySide6 PySide6-Fluent-Widgets pytest
+        # numpy：语义检索测试（R251/R252/R257）在模块级 import，缺了会在收集期中断整个单元层；
+        # 产品打包 spec 把它当可选依赖排除，所以 CI 必须显式装
+        run: pip install PySide6 PySide6-Fluent-Widgets pytest numpy
       - name: 工具示例 × schema 漂移审计
         run: python tools/audit_tool_docs.py
       - name: 单元层
@@ -37,6 +39,6 @@ jobs:
         with:
           python-version: "3.11"
       - name: 安装依赖
-        run: pip install PySide6 PySide6-Fluent-Widgets pytest
+        run: pip install PySide6 PySide6-Fluent-Widgets pytest numpy
       - name: unit / gui / e2e
         run: python tests/run_all.py
