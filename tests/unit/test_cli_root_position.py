@@ -54,3 +54,31 @@ def test_unknown_option_still_errors(monkeypatch, tmp_path):
     with pytest.raises(SystemExit):
         cli.main(["doctor", "--bogus"])
     assert seen == []
+
+
+def test_call_root_between_tool_and_kv(monkeypatch, tmp_path):
+    """R295：`call <tool> --root X key=value` 曾被 argparse 拒绝（nargs='*' 与穿插选项冲突）。"""
+    seen = []
+
+    def fake_call(root, tool, kv):
+        seen.append((root, tool, kv))
+        return 0
+
+    monkeypatch.setattr(cli, "cmd_call", fake_call)
+    assert cli.main(["call", "hub_search", "--root", str(tmp_path), "keyword=x", "limit=5"]) == 0
+    assert seen == [(str(tmp_path), "hub_search", ["keyword=x", "limit=5"])], seen
+
+
+def test_call_root_equals_form_after_kv(monkeypatch, tmp_path):
+    seen = []
+    monkeypatch.setattr(cli, "cmd_call",
+                        lambda root, tool, kv: seen.append((root, tool, kv)) or 0)
+    assert cli.main(["call", "hub_search", "keyword=x", f"--root={tmp_path}"]) == 0
+    assert seen == [(str(tmp_path), "hub_search", ["keyword=x"])], seen
+
+
+def test_hoist_root_keeps_missing_value():
+    """`--root` 缺值时不吞别的参数，交给 argparse 报用法错误。"""
+    assert cli._hoist_root(["call", "hub_search", "--root"]) == ["call", "hub_search", "--root"]
+    assert cli._hoist_root(["doctor", "--root", "D:/x", "--full"]) == \
+        ["--root", "D:/x", "doctor", "--full"]

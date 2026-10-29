@@ -1191,6 +1191,31 @@ def cmd_unlock(root: str, lease_id=None, path: str = "", agent: str = "",
     return 0
 
 
+def _hoist_root(argv: list) -> list:
+    """把 `--root X` 一律提到最前（R295）。
+
+    argparse 的 nargs='*' 位置参数（`call <tool> key=value…`）不能与穿插在中间的
+    选项共存：`call hub_search --root X keyword=test` 会报 unrecognized arguments。
+    R226 承诺「--root 写在子命令前后都行」，这里统一搬到全局位置兑现。
+    只识别独立的 `--root`/`--root=`；缺值时原样保留，让 argparse 正常报用法错误。
+    """
+    roots, rest = [], []
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == "--root" and i + 1 < len(argv):
+            roots += ["--root", argv[i + 1]]
+            i += 2
+            continue
+        if a.startswith("--root="):
+            roots += ["--root", a.split("=", 1)[1]]
+            i += 1
+            continue
+        rest.append(a)
+        i += 1
+    return roots + rest
+
+
 def main(argv=None) -> int:
     # Windows OEM codepage（cmd 默认 850/936）下把中文重定向到管道会抛
     # UnicodeEncodeError 直接崩掉——我们的工具返回全是中文，这条必须最先做。
@@ -1203,6 +1228,10 @@ def main(argv=None) -> int:
     # 默认关掉（用户显式设了别的值则尊重）。
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
+    if argv is not None:
+        argv = _hoist_root(list(argv))
+    else:
+        sys.argv[1:] = _hoist_root(sys.argv[1:])
     ap = argparse.ArgumentParser(
         prog="agenthub",
         description="AgentHub 命令行：接入自查、任务队列、日结审计（数据全部来自本地大脑）",
