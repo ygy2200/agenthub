@@ -2329,6 +2329,12 @@ def audit_list(root: str, limit: int = 20) -> list:
             "SELECT * FROM op_audit ORDER BY id DESC LIMIT ?", (max(1, min(int(limit), 200)),))]
 
 
+def audit_count(root: str) -> int:
+    """写操作审计总数（R276）：audit_list 有 LIMIT，抬头不能把「取到的条数」当总数。"""
+    with db_conn(root) as conn:
+        return int(conn.execute("SELECT COUNT(*) FROM op_audit").fetchone()[0])
+
+
 def log_tool_call(root: str, tool: str, agent: str = "",
                   channel: str = "") -> None:
     """C3→D6/R6：工具调用留痕。**全部工具**都记（R6 扩面前只有 4 个能力型只读工具记，
@@ -5469,15 +5475,18 @@ def task_closure_quality_report(root: str, days: int = 7, project: str = "",
         limit = 20
     cutoff = (datetime.datetime.now() - datetime.timedelta(days=days)) \
         .isoformat(timespec="seconds")
-    q = "SELECT id FROM tasks WHERE status='done' AND done_at>=?"
+    where = "status='done' AND done_at>=?"
     args: list = [cutoff]
     if (project or "").strip():
-        q += " AND project=?"
+        where += " AND project=?"
         args.append(project.strip())
-    q += " ORDER BY done_at DESC LIMIT ?"
-    args.append(limit)
     with db_conn(root) as conn:
-        ids = [r[0] for r in conn.execute(q, args)]
+        # R276：LIMIT 前先数一遍候选——counts.total 是「体检了几单」，不是窗口内总数。
+        matched = int(conn.execute(
+            f"SELECT COUNT(*) FROM tasks WHERE {where}", args).fetchone()[0])
+        ids = [r[0] for r in conn.execute(
+            f"SELECT id FROM tasks WHERE {where} ORDER BY done_at DESC LIMIT ?",
+            args + [limit])]
     items = []
     for tid in ids:
         err, rep = task_closure_quality(root, tid)
@@ -5486,6 +5495,7 @@ def task_closure_quality_report(root: str, days: int = 7, project: str = "",
     items.sort(key=lambda x: (x["score"], -x["task"]))
     scores = [x["score"] for x in items]
     return {"window_days": days, "project": (project or "").strip(),
+            "matched": matched,
             "counts": {"total": len(items),
                        "ok": sum(1 for x in items if x["ok"]),
                        "warned": sum(1 for x in items if not x["ok"]),
@@ -12021,6 +12031,20 @@ def playbook_runs(root: str, playbook: str = "", limit: int = 10) -> list:
             return [dict(r) for r in conn.execute(sql, args).fetchall()]
     except sqlite3.Error:
         return []
+
+
+def playbook_run_count(root: str, playbook: str = "") -> int:
+    """执行历史总数（R276）：与 playbook_runs 同过滤口径，列表有 LIMIT。"""
+    sql = "SELECT COUNT(*) FROM playbook_runs"
+    args: list = []
+    if playbook:
+        sql += " WHERE playbook=?"
+        args.append(playbook)
+    try:
+        with db_conn(root) as conn:
+            return int(conn.execute(sql, args).fetchone()[0])
+    except sqlite3.Error:
+        return 0
 
 
 def playbook_run_steps(root: str, run_id) -> list:
