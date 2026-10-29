@@ -4087,7 +4087,7 @@ def t_task_identity_gate(hub):
             ("hub_task_update", {"task_id": 1, "status": "done"}),
             ("hub_task_update", {"task_id": 1, "handoff_to": "hermes"}),
             ("hub_task_retry", {"task_id": 1, "reason": "匿名"}),
-            ("hub_task_update", {"task_id": 1, "status": "deferred",
+            ("hub_task_update", {"task_id": 1, "status": "pending",
                                  "defer_until": "2030-01-01", "defer_reason": "匿名"}),
             ("hub_task_approve", {"task_id": 2}),
         ):

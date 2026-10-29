@@ -5519,7 +5519,7 @@ def event_add(root: str, content: str, kind: str = "progress", project: str = ""
 
 
 def event_list(root: str, since_id: int = 0, limit: int = 30, project: str = "",
-               agent: str = "") -> list:
+               agent: str = "", kind: str = "") -> list:
     """事件流（倒序）；增量订阅传 since_id=上次最大 id 只取新事件。"""
     q = "SELECT * FROM events WHERE id>?"
     args: list = [max(0, int(since_id or 0))]
@@ -5529,6 +5529,9 @@ def event_list(root: str, since_id: int = 0, limit: int = 30, project: str = "",
     if agent:
         q += " AND agent=?"
         args.append(_norm_agent(agent) or agent)
+    if kind:
+        q += " AND kind=?"
+        args.append(kind)
     q += " ORDER BY id DESC LIMIT ?"
     args.append(max(1, min(int(limit or 30), 200)))
     with db_conn(root) as conn:
@@ -7767,7 +7770,7 @@ def search_files(root: str, kw: str, limit: int = 20) -> list:
 # ---------------------------------------------------------------- 人的随记（08 计划方向 A）
 
 _NOTE_SOURCES = ("human", "agent", "web")
-_NOTE_MOODS = ("", "兴奋", "笃定", "疑问", "纠结", "灵感", "低落", "平静")
+NOTE_MOODS = ("", "兴奋", "笃定", "疑问", "纠结", "灵感", "低落", "平静")
 
 
 # ---------------------------------------------------------------- 问大脑（D2：Dialectic API 零 LLM 版）
@@ -7955,7 +7958,7 @@ def add_note(root: str, content: str, tags: str = "", link: str = "",
         raise ValueError("content 必填")
     if source not in _NOTE_SOURCES:
         source = "human"
-    mood = mood if mood in _NOTE_MOODS else ""
+    mood = mood if mood in NOTE_MOODS else ""
     with db_conn(root) as conn:
         cur = conn.execute(
             "INSERT INTO notes(ts,source,content,tags,link,mood,open_at,context) "

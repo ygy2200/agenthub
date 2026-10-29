@@ -1163,7 +1163,7 @@ class MoodPicker(QWidget):
         h.setContentsMargins(0, 0, 0, 0)
         h.setSpacing(tokens.SPACE_S)
         self._buttons = {}
-        for m in [x for x in brain._NOTE_MOODS if x]:
+        for m in [x for x in brain.NOTE_MOODS if x]:
             b = QPushButton(m)
             b.setCheckable(True)
             b.setCursor(Qt.PointingHandCursor)
