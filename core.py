@@ -1009,7 +1009,8 @@ def init_hub(root: str) -> str:
 BOOTSTRAP_BEGIN = "<!-- agenthub:begin -->"
 BOOTSTRAP_END = "<!-- agenthub:end -->"
 # 引导块格式版本：内容格式变更时 +1，让 bootstrap_version() 识别「注入了但过时」的块
-BOOTSTRAP_VERSION = "5"  # v5（2026-10-12）：把「干完活记大脑」升为醒目铁律（软治理 agent 唯一杠杆）
+BOOTSTRAP_VERSION = "6"  # v6（2026-10-29）：建项目示例改回真参数名 project=（v5 一直写 name=，
+# 而 hub_create_project 的必填参数是 project——照抄指引必然报「必填参数 project 缺失」）
 
 # 注：引导注入目标已统一到下方 AGENT_ADAPTERS（单一事实来源）。
 # 2026-10-09 清理死代码：此处原有一份 BOOTSTRAP_TARGETS，被文件末尾同名派生版本覆盖，
@@ -1033,7 +1034,7 @@ def bootstrap_text(root: str) -> str:
 - 检索带具体关键词：hub_memory_read/hub_search 的 query 写「项目名/组件名/错误类型」，
   不要空查或只查一个泛词——问得越准，大脑答得越准；
   重要决策依据的检索，自行精读 top5（hub_get_record）再下结论（宽容召回按相关度排序，弱相关自行取舍）
-- 新项目先 hub_create_project(name)，命名「对象-问题」结构；不确定项目名先 hub_list_projects
+- 新项目先 hub_create_project(project="对象-问题")，命名「对象-问题」结构；不确定项目名先 hub_list_projects
 - 团队规范：hub_get_rules
 - 若某个 hub_ 工具不在你的工具列表里（本接入可能按 profile 精简了工具面）：藏起≠禁用——
   hub_search_tools 搜全量工具、hub_call_tool 直接调用（写工具同样受 dry_run/confirm/审计约束）
