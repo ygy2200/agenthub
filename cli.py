@@ -8,6 +8,8 @@
   python cli.py refresh            # 把所有 agent 的引导刷新到当前版本
   python cli.py discover           # 扫描常见位置，找「有配置但未登记」的 agent
   python cli.py init --root <目录>  # 把已有空目录初始化成大脑（建目录结构+建库，幂等）
+  python cli.py root [--set 目录]   # 查看/切换全局根目录（agent 的 MCP 进程按它取数）
+  python cli.py deploy              # 部署 MCP server 并自校验一致性
   python cli.py doctor              # 一键自检（--json 机器读 / --only a,b / --skip a / --no-machine / --slow 5）
   python cli.py check --list        # 跑单项检查：ops 注册表里挑一项（deploy_diff/regression/hygiene…）
   python cli.py check deploy_diff --target <源码根>   # 需要目录的项必须显式给 --target
@@ -48,11 +50,27 @@ def _boot_mark(r: dict) -> str:
     return "✗"
 
 
+def _same_dir(a: str, b: str) -> bool:
+    """两个路径是否指向同一目录（大小写/分隔符不敏感）。"""
+    try:
+        return os.path.normcase(os.path.abspath(os.path.expanduser(a))) == \
+            os.path.normcase(os.path.abspath(os.path.expanduser(b)))
+    except Exception:  # noqa: BLE001
+        return False
+
+
 def cmd_status(root: str, agent: str = "") -> int:
     rows = core.agent_bootstrap_status(root)
     if agent:
         rows = [r for r in rows if agent.lower() in r["agent"].lower()]
     print(f"AgentHub 接入状态（当前引导版本 v{core.BOOTSTRAP_VERSION}）")
+    # R293：agent 的 MCP 进程跟随全局配置根目录，不是本命令的 --root。
+    # 两者不同时必须明说——否则新初始化的空大脑会显示「全部 ✓」，造成已接入的假象。
+    cfg_root = _root("")
+    if cfg_root and not _same_dir(cfg_root, root):
+        print(f"⚠ 本次查看的是 {root}")
+        print(f"  但全局配置根目录是 {cfg_root}——上面各 agent 实际写入的是后者。")
+        print(f'  切换：python cli.py root --set "{root}"')
     for r in rows:
         mcp = "—" if r["mcp"] is None else ("✓" if r["mcp"] else "✗")
         prof = r.get("profile", "")
@@ -449,6 +467,41 @@ def cmd_init(root: str) -> int:
     print("下一步：")
     print(f'  python cli.py doctor --root "{root}"        # 跑整套自检')
     print(f'  python cli.py onboard <agent> --root "{root}"  # 把某个 agent 接进来')
+    cfg_root = _root("")
+    if not cfg_root or not _same_dir(cfg_root, root):
+        print(f'  python cli.py root --set "{root}"  # 让所有 agent 改用这个大脑'
+              f'（当前全局根目录：{cfg_root or "未配置"}）')
+    return 0
+
+
+def cmd_root(root: str, set_to: str = "") -> int:
+    """R293：查看或切换全局根目录。
+
+    没有这个命令时，`init --root 新目录` 之后 agent 的 MCP 进程仍按全局配置写旧大脑，
+    而 CLI 无法改配置（过去只能开 GUI 设置页），用户看到 status 全绿却被误导。
+    """
+    cur = core.get_root()
+    if not set_to:
+        print(cur or "（尚未配置根目录：先 agenthub init --root <目录>，再 agenthub root --set <目录>）")
+        return 0 if cur else 1
+    target = os.path.abspath(os.path.expandvars(os.path.expanduser(set_to)))
+    if not Path(target).is_dir():
+        print(f"目录不存在：{target}")
+        return 2
+    if not Path(target, "_hub", "brain.db").is_file():
+        print(f"该目录还不是大脑（缺 _hub/brain.db）：{target}")
+        print(f'  先初始化：python cli.py init --root "{target}"')
+        return 2
+    if cur and _same_dir(cur, target):
+        print(f"全局根目录已经是它：{cur}")
+        return 0
+    try:
+        core.set_root(target)
+    except ValueError as e:
+        print(f"设置失败：{e}")
+        return 1
+    print(f"根目录已切换：{cur or '（未配置）'} -> {target}")
+    print("已在跑的 agent 进程下次调用即按新根目录取数；复核：python cli.py status")
     return 0
 
 
@@ -1191,6 +1244,9 @@ def main(argv=None) -> int:
     _cmd("refresh", help="刷新所有 agent 引导到当前版本")
     _cmd("discover", help="扫描常见位置，找未登记 agent")
     _cmd("init", help="把已有目录初始化成大脑（建目录结构+建库，幂等不覆盖数据）")
+    p_root = _cmd("root", help="查看或切换全局根目录（agent 的 MCP 进程按它取数）")
+    p_root.add_argument("--set", dest="root_set", default="", metavar="目录",
+                        help="把全局根目录切到该目录（需已 init）")
     _cmd("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
     _cmd("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
     p_bp = _cmd("backup-prune", help="备份盘点与清理（默认预演，--apply 才删）")
@@ -1363,6 +1419,8 @@ def main(argv=None) -> int:
                              as_json=args.as_json, list_checks=args.list_checks)
         if args.cmd == "init":
             return cmd_init(_root(args.root))
+        if args.cmd == "root":
+            return cmd_root(_root(args.root), args.root_set)
         root = _root(args.root)
         if not root or not Path(root).is_dir():
             print(f"未取到有效的大脑根目录（{root!r}）；用 --root 指定。")

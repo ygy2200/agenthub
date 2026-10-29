@@ -10,7 +10,7 @@
 
 ## 快速开始
 
-1. **建脑**：挑一个**已有**目录当根（路径打错不会被凭空造出来），`python cli.py init --root <目录>` 建出 `00_Inbox` / `99_Archive` / `_hub` 与大脑库（幂等，已有数据不动）；GUI 等价入口是「设置 → 根目录 → 初始化目录结构」。
+1. **建脑**：挑一个**已有**目录当根（路径打错不会被凭空造出来），`python cli.py init --root <目录>` 建出 `00_Inbox` / `99_Archive` / `_hub` 与大脑库（幂等，已有数据不动）；GUI 等价入口是「设置 → 根目录 → 初始化目录结构」。建完用 `python cli.py root --set <目录>` 把全局根目录切过来——agent 的 MCP 进程跟随它取数（只 init 不切换，agent 还写旧大脑；`status` 会在两者不一致时告警）。
 2. **接入**：GUI「接入中心」一键写入，或 `python cli.py onboard <agent>`（先 `python cli.py discover` 看本机有哪些）。
 3. **开工**：让 agent 调 `hub_get_progress(limit=15)` 对齐进度；查背景用 `hub_memory_read(query="项目名 关键词")`。
 4. **收工**：`hub_log_work`（四段式）→ `hub_memory_write` 沉淀 → `hub_ops_run` 自检。
@@ -62,7 +62,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 
 ## 版本演进
 
-当前版本 **v2.41.143**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
+当前版本 **v2.41.144**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
 
 ## 设计原则
 
@@ -113,7 +113,7 @@ unified project records, input/output file management, a public memory, capabili
 
 Download the single-file `AgentHub.exe` from [Releases](https://github.com/ygy2200/agenthub/releases), pick your records folder, and connect your agents in the "Connect" page.
 
-Current version **v2.41.143** — full version history in [CHANGELOG.md](CHANGELOG.md).
+Current version **v2.41.144** — full version history in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
