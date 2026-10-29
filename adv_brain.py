@@ -6468,6 +6468,12 @@ def t_conflict_current_hint(tmp):
                                 "打平旧", "同步间隔是每 5 分钟")
     flat_new = brain.add_record(root, "测试-项目", "zcode", "2026-10-25",
                                 "打平新", "同步间隔是每 5 分钟——不对，实际是每 30 分钟")
+    # 打平必须显式钉同一秒（R298）：原先靠两次插入恰好落在同一秒，跨秒边界时
+    # 系统会正确地判出新旧 → 这条断言偶发假红（本轮实测复现一次）。
+    t_flat = base.isoformat(timespec="seconds")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET created=? WHERE id IN (?,?)",
+                     (t_flat, flat_old, flat_new))
     res2 = brain.search_all(root, "同步间隔")
     by2 = {r["id"]: r for r in res2["records"]}
     assert flat_old in by2 and flat_new in by2, list(by2)

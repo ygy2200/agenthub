@@ -107,8 +107,6 @@ _SENTINEL_MAX = 8  # 句柄上限：临时库（测试）增多时淘汰最旧�
 def _keep_wal(root: str) -> None:
     """为已存在的 brain.db 维持一条常驻连接（幂等、失败静默、永不建库）。"""
     p = str(db_path(root))
-    if not os.path.exists(p):
-        return
     with _SENTINEL_LOCK:
         c = _SENTINELS.get(p)
         if c is not None:
@@ -117,6 +115,11 @@ def _keep_wal(root: str) -> None:
                 return
             except sqlite3.Error:
                 _SENTINELS.pop(p, None)
+        # R298：exists() 放在哨兵命中之后。原来每条短连接都要 stat 一次库文件
+        # （Windows 实测 1.4ms/次，一次 search_all 23 条连接 ≈ 32ms 全花在确认
+        # 「库还在」——而有常驻句柄时它必然还在）。哨兵缺席（首连/被淘汰）才值得 stat。
+        if not os.path.exists(p):
+            return
         if len(_SENTINELS) >= _SENTINEL_MAX:
             for k in list(_SENTINELS)[:max(1, _SENTINEL_MAX // 2)]:
                 try:
@@ -1870,6 +1873,24 @@ def _retry_bigrams(query: str) -> list:
 _CJK_ALL_RE = re.compile(r"[一-鿿]+")  # 任意长度中文段（_retry_bigrams 的 {4,} 是重试语义，这里要全量分词）
 _BM25_K1, _BM25_B = 1.5, 0.75  # BM25 经典参数，进常量便于评测集调参（07 计划 P4.2）
 
+_DF_MEMO = threading.local()   # R298：单次 search_all 内的 df 复用（见 _df_memo_scope）
+
+
+@contextmanager
+def _df_memo_scope():
+    """一次 search_all 内复用 _token_stats 结果（R298，线程本地、退出即弃）。
+
+    search_records 与 search_memories 各调一次 _coverage_gate，kw 相同 → 同一批 token
+    的 df 被整表扫两遍（真实库实测 33ms/次）。只做「同一次查询内」复用：df 是精度
+    启发式（fail-open），但不该跨查询缓存——别的进程随时在写，缓存会让 idf 悄悄过期。
+    """
+    prev = getattr(_DF_MEMO, "cache", None)
+    _DF_MEMO.cache = {}
+    try:
+        yield
+    finally:
+        _DF_MEMO.cache = prev
+
 
 def _token_stats(root: str, tokens: list) -> tuple:
     """一次连接内算完 (每个 token 的活跃行文档频率, 活跃语料行数)。
@@ -1886,6 +1907,11 @@ def _token_stats(root: str, tokens: list) -> tuple:
     df: dict = {t: 0 for t in tokens}
     if not tokens:
         return df, 0
+    memo = getattr(_DF_MEMO, "cache", None)
+    key = (str(root), tuple(tokens)) if memo is not None else None
+    if key is not None and key in memo:
+        c_df, c_n = memo[key]
+        return dict(c_df), c_n
     try:
         with db_conn(root) as conn:
             for tbl, live in (("records", _rec_live_sql()), ("memories", _live_sql())):
@@ -1900,6 +1926,8 @@ def _token_stats(root: str, tokens: list) -> tuple:
                        + conn.execute("SELECT COUNT(*) FROM memories WHERE " + _live_sql()).fetchone()[0])
     except Exception:  # noqa: BLE001 闸门是精度优化，读不了库就不加权
         return {}, 0
+    if key is not None:
+        memo[key] = (dict(df), n_total)
     return df, n_total
 
 
@@ -6506,11 +6534,17 @@ def _cross_enrich(root: str, r: dict, limit: int = 30) -> None:
         if not seeds:
             seeds = [x["id"] for x in rows]
         seeds = seeds[:_GRAPH_SEED_N]
-        for eid, _sc in _graph_expand_cross(root, src, dst, seeds, limit=8):
-            dst_rows = r["memories"] if dst == "memory" else r["records"]
-            if any(x["id"] == eid for x in dst_rows):
-                continue
-            row = _rows_by_ids(root, dst, [eid]).get(eid)
+        dst_rows = r["memories"] if dst == "memory" else r["records"]
+        have = {x["id"] for x in dst_rows}
+        pending = [eid for eid, _sc in _graph_expand_cross(root, src, dst, seeds, limit=8)
+                   if eid not in have]
+        if not pending:
+            continue
+        # 一次 IN 查询取齐（R298）：原实现每个候选单开连接，实测一次 search_all 里有
+        # 16/37 个连接耗在这——批量后每方向 1 个，结果与顺序不变。
+        fetched = _rows_by_ids(root, dst, pending)
+        for eid in pending:
+            row = fetched.get(eid)
             if not row:
                 continue
             row["_cross"] = f"来自{src}"
@@ -7590,13 +7624,14 @@ def search_all(root: str, kw: str, limit: int = 30) -> dict:
     返回 {"records": [...], "memories": [...], "notes": [...], "tasks": [...], "errors": [...], "files": [...]}"""
     if not kw.strip():
         return {"records": [], "memories": [], "notes": [], "tasks": [], "errors": [], "files": []}
-    out = {"records": search_records(root, kw, limit=limit),
-           "memories": search_memories(root, kw, limit=limit),  # 必须关键字：search_memories 第三参是 kind，
-           "notes": search_notes(root, kw, limit),             # 位置传 limit 会把 limit 塞进 kind（2026-10-13 实测）
-           "tasks": search_tasks(root, kw, limit),
-           "errors": search_errors(root, kw, limit),
-           "files": search_files(root, kw, limit)}
-    _cross_enrich(root, out, limit)   # 跨类型图增强：从一类条目沿图把另一类带回来
+    with _df_memo_scope():
+        out = {"records": search_records(root, kw, limit=limit),
+               "memories": search_memories(root, kw, limit=limit),  # 必须关键字：search_memories 第三参是 kind，
+               "notes": search_notes(root, kw, limit),             # 位置传 limit 会把 limit 塞进 kind（2026-10-13 实测）
+               "tasks": search_tasks(root, kw, limit),
+               "errors": search_errors(root, kw, limit),
+               "files": search_files(root, kw, limit)}
+        _cross_enrich(root, out, limit)   # 跨类型图增强：从一类条目沿图把另一类带回来
     return out
 
 
