@@ -40,6 +40,8 @@ BUILD_MANIFEST = "AgentHub.build.json"
 RELEASE_SKIP_PREFIXES = ("adv_", "fix_", "test_")
 RELEASE_SKIP_FILES = {"diag_launch.py", "drag_probe.py", "layout_stress.py",
                       "smoke_ui.py", "ui_audit.py", "make_icon.py", "publish.py"}
+# R729：溯源门拒绝发布时列出的未提交路径条数上限（只用于说清「脏在哪」，不做判定）
+DIRTY_PATHS_MAX = 8
 
 # name -> (一句话说明, 是否需要 target 目录)
 CHECKS = {
@@ -675,7 +677,7 @@ def _db_integrity(root: str) -> dict:
     「检查失败」；完整性检查要给出的是「哪条恢复路径」，并让巡检短路后续项。
     """
     import brain  # noqa: PLC0415
-    p = Path(root) / brain.core.DIR_META / brain.DB_NAME if root else None
+    p = _db_file(root)
     if not root or p is None or not p.is_file():
         return _db_missing()
     try:
@@ -712,7 +714,7 @@ def _db_health(root: str) -> dict:
       - -wal/-shm 残留本身不算错（常驻连接下正常），只在体积异常时才报
     """
     import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
-    p = Path(root) / brain.core.DIR_META / brain.DB_NAME if root else None
+    p = _db_file(root)
     if not root or p is None or not p.is_file():
         return _db_missing()
     lines: list = []
@@ -838,7 +840,7 @@ def _audit_chain(root: str) -> dict:
         return err
     try:
         brain = _import_brain()
-        if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
+        if not _db_file(root).is_file():
             return _db_missing()
         v = verify_cached(root, brain)
     except Exception as e:  # noqa: BLE001
@@ -962,7 +964,7 @@ def _security_health(root: str) -> dict:
         return err
     try:
         brain = _import_brain()
-        if not (Path(root) / brain.core.DIR_META / brain.DB_NAME).is_file():
+        if not _db_file(root).is_file():
             return _db_missing()
         v = verify_cached(root, brain)
         fr = brain.freeze_get(root)
@@ -1740,6 +1742,40 @@ def _app_version(root: Path) -> str:
     return m.group(1) if m else ""
 
 
+def _git_dirty_paths(root: str | Path, limit: int = DIRTY_PATHS_MAX) -> list[str]:
+    """工作树上的未提交路径样本（保序、去重、截断）；git 不可用返回 []。
+
+    R729：拒绝发布时要把「脏的是什么」说出口。之前只报「dirty=true —— 提交后重建」，
+    操作者得自己再跑一次 git status 才知道脏在哪；实测踩过：并行 agent 在本仓库里的私有
+    目录（未跟踪、不是源码）就能把溯源门顶死，而提示语完全没指向它。
+    """
+    try:
+        st = subprocess.run(["git", "status", "--porcelain"], cwd=root,
+                            capture_output=True, text=True, timeout=30)
+        if st.returncode != 0:
+            return []
+        return _parse_porcelain(st.stdout, limit)
+    except (OSError, subprocess.SubprocessError):
+        return []
+
+
+def _parse_porcelain(out: str, limit: int = DIRTY_PATHS_MAX) -> list[str]:
+    """`git status --porcelain` → 路径列表。每行是 `XY<空格>路径`；重命名行是 `R  旧 -> 新`
+    取新路径；带引号的路径还原回原样。"""
+    paths: list[str] = []
+    for line in out.splitlines():
+        if len(line) < 4:
+            continue
+        p = line[3:].strip()
+        if " -> " in p:
+            p = p.split(" -> ", 1)[1]
+        if len(p) >= 2 and p[0] == '"' and p[-1] == '"':
+            p = p[1:-1]
+        if p and p not in paths:
+            paths.append(p)
+    return paths[:limit]
+
+
 def _git_state(root: str | Path) -> tuple[str, bool | None]:
     """(HEAD 短 sha, 构建/检查时工作树是否脏)。git 不可用或不在仓库里返回 ("", None)。
 
@@ -1761,6 +1797,18 @@ def _git_state(root: str | Path) -> tuple[str, bool | None]:
         return "", None
 
 
+def _dirty_hint(paths: list[str]) -> str:
+    """脏路径 → 「，未提交：a.py、b.py」；没有样本时返回空串，让原文案照旧。
+
+    用逗号接在既有括号里，而不是再套一层括号——「（清单 dirty=true（未提交：x））」读起来像乱码。
+    """
+    if not paths:
+        return ""
+    return f"，未提交：{'、'.join(paths[:5])}"
+
+
+
+
 def build_manifest(root: str | Path, phase: str = "start") -> dict:
     """构建清单两阶段。start 必须在 PyInstaller 之前跑（快照输入哈希），
     finish 在打包后跑（记录产物 sha256）。build.bat 自动调用，也可手工补跑。"""
@@ -1780,6 +1828,8 @@ def build_manifest(root: str | Path, phase: str = "start") -> dict:
             "exe": None,
             "git_head": head,
             "dirty": dirty,
+            # 只有真脏时才多问一次 git：干净构建是常态，不值得为它多跑一条命令
+            "dirty_paths": _git_dirty_paths(root) if dirty else [],
         }
         path.write_text(json.dumps(data, ensure_ascii=False, indent=2), encoding="utf-8")
         return {"ok": True, "manifest": str(path),
@@ -1850,14 +1900,18 @@ def _release(target: Path, home: Path | None = None) -> dict:
         head_now, _ = _git_state(target)
         prov = str(manifest.get("git_head") or "")
         dirty = manifest.get("dirty")
-        state = {True: "工作树脏", False: "工作树干净", None: "构建时状态未记录（旧清单）"}[dirty]
+        # 优先用打包那一刻落进清单的样本——「污染这次构建的」与「现在工作树上的」不是同一批文件
+        dp = (manifest.get("dirty_paths") or _git_dirty_paths(target)) if dirty is True else []
+        hint = _dirty_hint(dp)
+        state = {True: f"工作树脏{hint}", False: "工作树干净",
+                 None: "构建时状态未记录（旧清单）"}[dirty]
         line = f"构建溯源  {prov or '未记录'}（{state}）"
         if head_now and prov and head_now != prov:
             line += f"，HEAD 现为 {head_now}"
         detail.append(line)
         if dirty is True:
             return {"ok": False,
-                    "summary": "exe 由未提交的工作树构建（清单 dirty=true）—— 提交后重建再发布",
+                    "summary": f"exe 由未提交的工作树构建（清单 dirty=true{hint}）—— 提交后重建再发布",
                     "detail": detail}
         if not desktop.is_file():
             detail.append("桌面副本  不存在")
@@ -1917,8 +1971,11 @@ def publish_provenance(target: str | Path, version: str, exe: str | Path | None 
         if mv != version:
             problems.append(f"清单版本 v{mv or '?'} ≠ 要发布的 v{version} —— 用当前源码重建（build.bat）")
         dirty = manifest.get("dirty")
+        dp = (manifest.get("dirty_paths") or _git_dirty_paths(target)) if dirty is True else []
+        hint = _dirty_hint(dp)
         if dirty is True:
-            problems.append("构建时工作树是脏的（清单 dirty=true）—— 提交源码后重建")
+            problems.append(f"构建时工作树是脏的（清单 dirty=true{hint}）—— 提交源码后重建"
+                            + ("；确认不是源码就把它加进 .gitignore" if dp else ""))
         elif dirty is None:
             problems.append("清单没记构建时是否脏（旧版清单）—— 用新版 build.bat 重建一次")
         gh = str(manifest.get("git_head") or "")
@@ -2009,6 +2066,20 @@ def _import_core():
     sys.path.insert(0, str(Path(__file__).resolve().parent))
     import core  # noqa: PLC0415
     return core
+
+
+def _db_file(root: str) -> Path | None:
+    """大脑库文件路径——「库在不在」的唯一种法（R730）。
+
+    原来同一行 `Path(root) / brain.core.DIR_META / brain.DB_NAME` 在 5 个检查里各写一遍，
+    其中 `brain.core` 还是「brain 恰好 import 了 core」的传递依赖（ops 本来就自己 import core）。
+    真正的代价在对应用例上炸出来：`backup_health` 走 `_import_brain()` 拿到的对象拼路径，
+    对抗套件把它桩成只带 inventory/prune 的替身时直接 AttributeError，adv_ops 从那一行往后
+    整段没跑过。路径算法收在一处，替身只需要供一个 DB_NAME。
+    """
+    if not root:
+        return None
+    return Path(root) / core.DIR_META / _import_brain().DB_NAME
 
 
 def _agents(root: str) -> dict:
@@ -2782,7 +2853,7 @@ def _backup_health(root: str) -> dict:
     # R716：目录在、库还没有（新目录只建了壳）时，「没有备份」是必然而不是缺陷——
     # 空目录实测会单列一条「备份健康：无 zip 整包；没有任何备份」，把人引去先备一份不存在的库。
     # 与 db_integrity 归同一根因，交给巡检折叠。
-    if not (Path(root) / _brain.core.DIR_META / _brain.DB_NAME).is_file():
+    if not _db_file(root).is_file():
         return _db_missing()
     inv = _brain.backup_inventory(root)
     preview = _brain.backup_prune(root)  # 纯预演：不传 apply

@@ -13,3 +13,6 @@ drag_probe.py
 *.bak-*
 output/
 ..output*
+# 并行 agent 在本仓库里的私有记忆/自动化目录：不是 AgentHub 源码，
+# 但 `git status --porcelain` 会把它算成脏，直接顶掉构建溯源门（dirty=true 拒绝发布）。
+.workbuddy/

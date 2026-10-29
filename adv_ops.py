@@ -1297,6 +1297,11 @@ def main():
     # ---- R18 备份健康口径：单份整包大于旧 1GB 线属正常（必要还原点），
     #      缺失/陈旧/可清理积压/总量达整包 4 倍才判失败。用假盘点避免造 GB 级文件。
     class _FakeBackupBrain:
+        # R730：ops._db_file 只向 brain 要 DB_NAME（不再穿透 brain.core），替身供这一个属性就够。
+        # 之前替身没有 .core，_backup_health 的「库在不在」判断当场 AttributeError，
+        # 而这 5 条断言全在 try 里——adv_ops 从这一行往后整段从来没跑过。
+        DB_NAME = _b.DB_NAME
+
         def __init__(self, inv, prev):
             self.inv, self.prev = inv, prev
 
@@ -1305,6 +1310,12 @@ def main():
 
         def backup_prune(self, _root):
             return self.prev
+
+    # 独立的根：_backup_health 会 stat <root>/_hub/brain.db 判断「库在不在」，
+    # 但不能在 tmp 里落一个空 brain.db（坏字节会毒化后面复用 tmp 的真库用例）。
+    bk_root = tmp / "hub_backup"
+    build_fake_hub(bk_root)
+    (bk_root / "_hub" / _b.DB_NAME).write_bytes(b"")  # 只占位存在性，本检查不开库
 
     def _inv(total_mb, zip_mb, zip_count=1, age=1):
         return {"families": {
@@ -1320,27 +1331,27 @@ def main():
     _none = {"candidates": [], "candidate_bytes": 0}
     try:
         ops._import_brain = lambda: _FakeBackupBrain(_inv(1300, 1260), _none)
-        r = ops.run_check("backup_health", root=str(tmp))
+        r = ops.run_check("backup_health", root=str(bk_root))
         check("backup_health 单份整包超 1GB 不误报（总量绝对值只作信息）",
               r["ok"] and "整包" in r["summary"], str(r["summary"]))
         check("backup_health detail 解释总量口径",
               any("不按总量绝对值" in d for d in r["detail"]), str(r["detail"]))
         ops._import_brain = lambda: _FakeBackupBrain(_inv(5750, 1150, zip_count=5), _none)
-        r = ops.run_check("backup_health", root=str(tmp))
+        r = ops.run_check("backup_health", root=str(bk_root))
         check("backup_health 总量达整包 4 倍即判堆积",
               (not r["ok"]) and "堆积" in r["summary"], str(r["summary"]))
         ops._import_brain = lambda: _FakeBackupBrain(_inv(1300, 1260, age=9), _none)
-        r = ops.run_check("backup_health", root=str(tmp))
+        r = ops.run_check("backup_health", root=str(bk_root))
         check("backup_health 最新备份超 7 天点名",
               (not r["ok"]) and "最新备份已" in r["summary"], str(r["summary"]))
         ops._import_brain = lambda: _FakeBackupBrain(_inv(1300, 1260, zip_count=0), _none)
-        r = ops.run_check("backup_health", root=str(tmp))
+        r = ops.run_check("backup_health", root=str(bk_root))
         check("backup_health 无整包点名",
               (not r["ok"]) and "无 zip 整包" in r["summary"], str(r["summary"]))
         ops._import_brain = lambda: _FakeBackupBrain(
             _inv(1300, 1260), {"candidates": [{"path": "x"}] * 3,
                                "candidate_bytes": 600 * 1048576})
-        r = ops.run_check("backup_health", root=str(tmp))
+        r = ops.run_check("backup_health", root=str(bk_root))
         check("backup_health 可清理积压超 512MB 点名",
               (not r["ok"]) and "可清理" in r["summary"], str(r["summary"]))
     finally:
