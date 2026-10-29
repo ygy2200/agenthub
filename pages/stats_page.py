@@ -110,8 +110,9 @@ class StatsPage(QWidget):
             dc = bundle.get("distill") or 0
             if dc:
                 tip.append(f"蒸馏候选 {dc} 条")
+            crys = ("—" if h["crystallization"] is None else f"{h['crystallization']}%")
             self.healthLine.setText(
-                f"结晶率 {h['crystallization']}%（记忆/记录）· 检索 今日 {h['searches_today']} / 累计 {h['searches_total']} 次"
+                f"结晶率 {crys}（记忆/记录）· 检索 今日 {h['searches_today']} / 累计 {h['searches_total']} 次"
                 + (" · " + " · ".join(tip) if tip else " · 各项整洁")
                 + "（agent 可调 hub_health / hub_distill 看完整报告）")
         m = bundle.get("tasks")

@@ -11322,7 +11322,8 @@ def health_report(root: str, include_dups: bool = True) -> dict:
                          f"读写比分母口径：{era_note}"),
             },
             "mem_governance": memory_governance_stats(root),
-            "crystallization": round(s["memories"] * 100 / max(1, s["records"]), 1)}
+            # 0 条记录时记忆/记录无意义（max(1,0) 会报 200%）；返回 None 表示「样本不足」
+            "crystallization": round(s["memories"] * 100 / s["records"], 1) if s["records"] else None}
 
 
 # ---------------------------------------------------------------- 环境档案（本机设置的结构化登记）

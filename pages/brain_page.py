@@ -167,7 +167,8 @@ class BrainPage(QWidget):
         # 滚动区内容尺寸可能随数据变化，刷新后回到顶部避免停在旧位置
         self.scroll.verticalScrollBar().setValue(0)
         self.valMem.setText(str(h["memories"]))
-        self.valCrys.setText(f"{h['crystallization']}%")
+        crys = h["crystallization"]
+        self.valCrys.setText("—" if crys is None else f"{crys}%")
         self.valPush.setText(str(h.get("recall_push_total", 0)))
         self.valTodo.setText(str(h["todo_count"]))
 

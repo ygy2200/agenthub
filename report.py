@@ -145,10 +145,11 @@ def _sec_wins(d) -> str:
         for m in top) or "<li>（还没有被唤起过的记忆——先用心跳与检索养起来）</li>"
     closed = d["done_todos"]
     honest = h.get("honest", {})
+    crys = "—" if h["crystallization"] is None else f"{h['crystallization']}%"
     return (f"<h3>被唤起最多的记忆（真实帮到工作的知识）</h3><ul>{lis}</ul>"
             f"<p><b>已闭环的待办 {closed} 条</b>（承诺过的事被勾销）· "
             f"记忆有用率 <b>{honest.get('memory_use_rate', 0)}%</b> · "
-            f"结晶率 <b>{h['crystallization']}%</b></p>")
+            f"结晶率 <b>{crys}</b></p>")
 
 
 def _frictions(d) -> list:

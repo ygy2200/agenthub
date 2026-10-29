@@ -3420,8 +3420,9 @@ def _brain(root: str) -> dict:
         h = _import_brain().health_report(root)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"体检失败：{type(e).__name__}: {str(e)[:100]}", "detail": []}
+    crys = "—" if h["crystallization"] is None else f"{h['crystallization']}%"
     return {"ok": True,
-            "summary": f"记录{h['records']} 记忆{h['memories']} 结晶率{h['crystallization']}% "
+            "summary": f"记录{h['records']} 记忆{h['memories']} 结晶率{crys} "
                        f"待办{h['todo_count']} 检索累计{h['searches_total']} 停滞项目{h['projects_stalled']}",
             "detail": _recent_anomalies(root)[:8]}
 
