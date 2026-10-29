@@ -8,7 +8,9 @@ dist_*/
 *.exe
 _adv_tmp/
 _pytest_tmp/
-publish.py
+# publish.py 必须入库：tests/unit 有两个模块级 import 它，CI 检出后缺它就在收集期
+# ModuleNotFoundError，整个单元层直接红（R749 的实测就是 2026-10-29 起每次 CI 全红）。
+# 它不含任何凭据——token 由 release_token.py 的查找链在运行时取。
 drag_probe.py
 *.bak-*
 output/

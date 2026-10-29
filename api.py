@@ -236,6 +236,23 @@ def serve(root: str, port: int = 8787, allow_write: bool = False,
     return httpd, httpd.server_address[1], token
 
 
+def _port_error_text(e: OSError, port: int) -> str:
+    """R743：端口起不来时别把 OS 原文甩给用户。
+
+    实测 `cli.py serve --port 8774`（端口被占）只会输出：
+        启动失败：[WinError 10013] 以一种访问权限不允许的方式做了一个访问套接字的尝试。
+    ——既没说清是「被占用」，也没给换端口的下一步；用户能做的只有去搜这个错误码。
+    """
+    code = getattr(e, "winerror", None) or getattr(e, "errno", None)
+    occupied = {10013, 10048, 98, 48, 13}  # WinError 10013/10048 / EADDRINUSE(98/48) / EACCES(13)
+    lines = [f"启动失败：本地端口 {port} 起不来（{type(e).__name__}: {e}）"]
+    if code in occupied or not code:
+        lines.append("  最常见原因：这个端口已被别的程序占着，或被防火墙/安全软件拦下了。")
+    lines.append(f"  换一个端口重试：python cli.py serve --port {port + 1}")
+    lines.append(f"  看是谁占着：netstat -ano | findstr :{port}（拿到 PID 后 tasklist /fi \"PID eq <pid>\"）")
+    return "\n".join(lines)
+
+
 def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
                   open_browser: bool = False) -> int:
     """CLI 入口：阻塞运行（Ctrl+C / Ctrl+Break 停止）。返回退出码。"""
@@ -262,7 +279,7 @@ def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
     try:
         httpd, real_port, token = serve(root, port, allow_write, open_browser)
     except OSError as e:
-        print(f"启动失败：{e}")
+        print(_port_error_text(e, port))
         return 1
     print(f"AgentHub REST 服务已启动：http://127.0.0.1:{real_port}/")
     print("只读为主；写工具" + (f"已开启（token={token}）" if allow_write else "已关闭"))

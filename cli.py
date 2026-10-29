@@ -276,8 +276,14 @@ def cmd_offboard(root: str, agent: str, apply: bool = False,
     if not apply:
         print(f"下线预演（未写入；加 --apply 执行）：{a['agent']}")
         for kind, where in todo:
-            print(f"  · 移除{kind} -> {where}")
-        print(f"  两处都会先备份，失败自动还原。执行：python cli.py offboard {agent} --apply")
+            print(f"  · 移除 {kind} -> {where}")   # R744：原来拼成「移除MCP 条目」，缺个分隔
+        # R744：预演存在的意义是「让人判断该不该按」。原来只有「会备份 / 失败还原」一句承诺，
+        # 既没说下线后这个 agent 会失去什么，也没说改主意怎么回来。
+        print("  影响：该 agent 之后不再收到引导（读不到规则），MCP 调用也会失败；"
+              "它已经写进大脑的记录不受影响，别的 agent 也不受影响。")
+        print(f"  回滚：改主意就重跑 python cli.py onboard {agent}"
+              f"（引导与 MCP 条目都会重建）；两处改动前都留了 .bak-agenthub-<时间戳> 备份，可直接拷回。")
+        print(f"  执行：python cli.py offboard {agent} --apply")
         return 0
 
     fail = 0
@@ -554,26 +560,41 @@ def _mcp_tools_in_issues(issues: list) -> list:
     return out
 
 
-def _mcp_tool_hint(issues: list) -> str:
-    """R739：把「修复行里的 MCP 工具名」翻译成命令行写法；没有就返回空串。
+def _mcp_tools_in_texts(texts) -> list:
+    """R745：任意文本里出现过的 MCP 工具名（digest 的建议来自 brain，同一族问题）。"""
+    import re  # noqa: PLC0415
 
-    分两档：有 CLI 原生命令的直接指过去（`claim`/`next`/`update`…），
-    其余的教 `call`——不把 10 个名字堆一行（实测那行有 130 字，没人读）。
+    out = []
+    for t in texts or []:
+        for tool in re.findall(r"(?<![a-z0-9_])hub_[a-z0-9_]+(?![a-z0-9_])", str(t)):
+            if tool not in out:
+                out.append(tool)
+    return out
+
+def _mcp_tool_hint(issues: list) -> str:
+    """R739：把「修复行里的 MCP 工具名」翻译成命令行写法；没有就返回空串。"""
+    return _tool_hint_line(_mcp_tools_in_issues(issues), where="修复行")
+
+
+def _tool_hint_line(tools: list, where: str = "提示行") -> str:
+    """R739/R745/R746：把 MCP 工具名翻译成命令行写法；没有就返回空串。
+
+    R746：映射表里的值就是「可照抄的骨架」（含必填占位符）。R739 曾为压行长
+    只取第一个词，把 `<id> --agent <名字>` 砍成裸 `claim`——照抄就是
+    「the following arguments are required」。行长不是砍参数的理由。
+    没进映射表的工具仍给通用 call 写法，不把 10 个名字堆一行。
     """
-    tools = _mcp_tools_in_issues(issues)
     if not tools:
         return ""
-    native = {k: v for k, v in _TOOL_CLI_FORM.items() if not v.startswith("call ")}
-    have = [t for t in tools if t in native][:3]
-    only = [t for t in tools if t not in native]
+    known = [t for t in tools if t in _TOOL_CLI_FORM][:3]
+    rest = [t for t in tools if t not in _TOOL_CLI_FORM]
     parts = []
-    if have:
-        pairs = " / ".join(f"{t}→{CMD} {native[t].split(' ')[0]}" for t in have)
-        parts.append(f"{pairs}")
-    if only:
-        shown = "、".join(only[:3]) + (f" 等 {len(only)} 个" if len(only) > 3 else "")
+    if known:
+        parts.append(" / ".join(f"{t}→{CMD} {_TOOL_CLI_FORM[t]}" for t in known))
+    if rest:
+        shown = "、".join(rest[:3]) + (f" 等 {len(rest)} 个" if len(rest) > 3 else "")
         parts.append(f"{shown}只能用 {CMD} call <工具名> <同样的 key=value>")
-    return "提示：修复行里的 hub_xxx 是 MCP 工具名，命令行改用——" + "；".join(parts) + "。"
+    return f"提示：{where}里的 hub_xxx 是 MCP 工具名，命令行改用——" + "；".join(parts) + "。"
 
 
 def cmd_check(name: str = "", target: str = "", root: str = "",
@@ -862,7 +883,7 @@ _TOOL_CLI_FORM = {
     "hub_next": "next --agent <名字>",
     "hub_tasks": "tasks",
     "hub_task_update": "update <id> --status <状态>",
-    "hub_handoff": "handoffs",
+    "hub_handoff": "call hub_handoff action=create project=… agent=… done=…",
     "hub_digest": "digest",
     "hub_search": "call hub_search keyword=… limit=5",
 }
@@ -1103,6 +1124,11 @@ def cmd_digest(root: str, days: int = 1) -> int:
     print("  建议：")
     for s in d["suggestions"]:
         print(f"    - {s}")
+    # R745：digest 的建议来自 brain（MCP 面同一份文案）——「hub_claim 认领」在命令行是
+    # command not found。与 R739 同一处置：文案不改，CLI 侧补一行换算。
+    hint = _tool_hint_line(_mcp_tools_in_texts(d["suggestions"]), where="建议行")
+    if hint:
+        print(hint)
     if d["agents"]:
         print("  按 agent：")
         for a in d["agents"][:8]:
@@ -1412,13 +1438,13 @@ def cmd_freeze(root: str, minutes=None, reason: str = "", off: bool = False,
         fr = brain.freeze_get(root)
         if not fr["active"]:
             print(f"写入未冻结{'（上次冻结已过期）' if fr['expired'] else ''}。"
-                  "冻结：cli.py freeze --minutes 30 --reason \"...\"（0=持续冻结直到 --off）")
+                  f"冻结：{CMD} freeze --minutes 30 --reason \"...\"（0=持续冻结直到 --off）")
             return 0
         until = fr["until"][:19].replace("T", " ") if fr["until"] else "持续冻结（直到 --off）"
         rem = f"，约剩 {fr['remaining_min']:g} 分钟" if fr["until"] else ""
         print(f"⛔ 全局写入已冻结：{until}{rem}｜由 {fr['by'] or '-'} 开启")
         print(f"原因：{fr['reason'] or '-'}")
-        print("写工具全部拒收（hub_freeze/hub_undo 例外）；解除：cli.py freeze --off")
+        print(f"写工具全部拒收（hub_freeze/hub_undo 例外）；解除：{CMD} freeze --off")
         return 0
     err, fr = brain.freeze_set(root, minutes, reason, agent or "cli")
     if err:
