@@ -192,13 +192,23 @@ def cmd_discover(root: str) -> int:
 
 
 def cmd_deploy(root: str) -> int:
-    """把 MCP server 部署到稳定路径 ~/.agenthub/mcp_server/。"""
+    """把 MCP server 部署到稳定路径 ~/.agenthub/mcp_server/，并立即自校验。
+
+    R292：只报「已部署」不算完——部署副本可能因清单漂移/中断落后于源码，
+    而连上来的其他 agent 会一直跑旧代码（R291 实测落后 22 个版本）。
+    部署后立刻对源码做 deploy_diff，不一致就以非零退出码暴露。
+    """
     py, server = core.deploy_server()
     if not server:
         print("部署失败（找不到可用 python 或写入失败）")
         return 1
     print(f"已部署 MCP server -> {server}")
-    return 0
+    import ops  # 同目录
+    r = ops.run_check("deploy_diff", str(Path(__file__).resolve().parent), "")
+    print(f"  {r['summary']}")
+    for line in r["detail"]:
+        print("  ", line)
+    return 0 if r["ok"] else 1
 
 
 def cmd_release(root: str) -> int:
