@@ -354,9 +354,17 @@ class AgentHubWindow(FluentWindow):
         self.search_page.edit.setFocus()
 
     def set_root(self, d):
+        # R296：先写配置再改内存——core.set_root 会因 Temp 路径/权限抛错，
+        # 之前先赋 self.root，异常后界面指向新目录、配置却还是旧的。
+        try:
+            core.set_root(d)
+        except (ValueError, OSError) as e:
+            InfoBar.error("根目录设置失败", str(e), duration=6000, parent=self)
+            return
         self.root = d
-        core.set_root(d)
-        core.init_hub(d)
+        err = core.init_hub(d)
+        if err:
+            InfoBar.error("目录结构初始化失败", err, duration=6000, parent=self)
         err = brain.init_db(d)
         if err:
             InfoBar.error("大脑建库失败", err, duration=5000, parent=self)
