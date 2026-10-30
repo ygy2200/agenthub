@@ -78,6 +78,21 @@ class FakeOpener:
         raise AssertionError(f"unexpected {method} {url}")
 
 
+class _RecordingOpener:
+    """把「建 Release / 传附件」的时机记进共享 order 列表（R759 顺序断言用）。"""
+
+    def __init__(self, order, inner):
+        self.order = order
+        self.inner = inner
+
+    def open(self, req, timeout=None):
+        url = req.full_url
+        method = req.get_method().upper()
+        if method == "POST" and url.endswith("/releases"):
+            self.order.append("release")
+        return self.inner.open(req, timeout=timeout)
+
+
 @pytest.fixture
 def exe(tmp_path, monkeypatch):
     f = tmp_path / "AgentHub.exe"
@@ -170,25 +185,33 @@ def _published(monkeypatch, fake, exe, extra=()):
 
 
 def test_push_returns_git_rc(exe, monkeypatch, capsys):
-    """push 失败必须变成 publish 的非零，不能被包成成功。"""
+    """push 失败必须变成 publish 的非零，且停在「什么都没发」的状态（R759 收紧）。"""
     calls = []
     monkeypatch.setattr(publish, "_git_push", lambda: (calls.append(1), 1)[1])
-    assert _published(monkeypatch, FakeOpener(), exe, ("--push",)) == 1
+    fake = FakeOpener()
+    assert _published(monkeypatch, fake, exe, ("--push",)) == 1
     assert calls == [1]
+    assert not [1 for m, u, _ in fake.calls if m in ("POST", "PATCH")], \
+        "推失败不许在 GitHub 上留下任何写入"
 
 
-def test_push_runs_after_successful_publish(exe, monkeypatch, capsys):
-    calls = []
-    monkeypatch.setattr(publish, "_git_push", lambda: (calls.append(1), 0)[1])
-    assert _published(monkeypatch, FakeOpener(), exe, ("--push",)) == 0
-    assert calls == [1], "发布成功后才 push"
+def test_push_runs_before_release_is_created(exe, monkeypatch, capsys):
+    """R759：tag 会被钉在「建 Release 那一刻的 main」上，所以必须先 push。"""
+    order = []
+    monkeypatch.setattr(publish, "_git_push", lambda: (order.append("push"), 0)[1])
+    monkeypatch.setattr(publish, "_opener",
+                        lambda token: _RecordingOpener(order, FakeOpener()))
+    assert publish.main(["--yes", "--repo", "o/r", "--exe", str(exe), "--push"]) == 0
+    assert order[0] == "push" and "release" in order
+    assert order.index("push") < order.index("release")
 
 
-def test_failed_upload_never_pushes(exe, monkeypatch, capsys):
+def test_failed_upload_still_rc1_after_push(exe, monkeypatch, capsys):
+    """推送已经成功时上传失败：仍要非零（日志与 RC 是最后一道防线）。"""
     calls = []
     monkeypatch.setattr(publish, "_git_push", lambda: (calls.append(1), 0)[1])
     assert _published(monkeypatch, FakeOpener(upload_ok=False), exe, ("--push",)) == 1
-    assert calls == [], "附件都没传上，绝不能再报「已推送」混淆事实"
+    assert calls == [1]
 
 
 # ---------- _git_push 本身 ----------

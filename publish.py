@@ -371,6 +371,16 @@ def _run(args) -> int:
         sys.exit("预检未通过，拒绝发布（还没有在 GitHub 上留下任何东西）")
     print(f"预检：身份 {pf['login']}，scope {pf['scopes']}")
 
+    # R759：先推代码再建 Release。GitHub 在 tag 不存在时会把 tag 钉在**当时的 main**
+    # 上；「publish 完再 push」让 tag 永远落后一个提交（实测 v2.41.159 指向 R740、
+    # v2.41.160 指向 R740 的 bump 提交，而同一个 exe 来自 R741/R742）。
+    # 推失败就停：此刻 GitHub 上什么都还没写，不会留下半成品。
+    if args.push:
+        rc = _git_push()
+        if rc != 0:
+            print("代码没推上去，Release 不再创建（GitHub 上没有任何改动）。")
+            return rc
+
     base = f"https://api.github.com/repos/{args.repo}"
     status, rel, _ = _call(opener, f"{base}/releases/tags/{tag}")
     if status == 200:
@@ -439,8 +449,6 @@ def _run(args) -> int:
                   "恢复：重跑 python publish.py --upload-only --yes")
             return 1
         print(f"Release 已公开：{pub.get('html_url') or tag}")
-    if args.push:
-        return _git_push()
     return 0
 
 
