@@ -25,6 +25,10 @@ jobs:
         run: python tools/audit_tool_docs.py
       - name: 单元层
         run: python -m pytest tests/unit -q
+      - name: 空 HOME 冒烟（防依赖开发机配置，B018）
+        # R764：HOME/USERPROFILE 指到临时目录并预埋毒配置——读了本机用户配置的用例
+        # 会拿到毒值当场红（R754 同族回归）。本地同一命令即可复现。
+        run: python tools/empty_home_smoke.py
 
   full:
     name: 三层门禁（手动触发）
