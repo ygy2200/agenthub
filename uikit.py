@@ -489,7 +489,15 @@ class ScanWorker(QThread):
         self.root = root
 
     def run(self):
-        self.done.emit(core.scan(self.root))
+        try:
+            snap = core.scan(self.root)
+        except Exception as e:  # noqa: BLE001
+            # R766：扫描线程不许静默死掉。以前异常只会被 Qt 打到 stderr，done 不发射，
+            # window.apply 永远不跑——用户按 F5 看到的就是「什么都没发生」。这里把异常
+            # 变成带 error 的空快照，交给 apply 统一弹「扫描失败」。
+            snap = core.Snapshot(root=self.root or "")
+            snap.error = f"扫描失败：{e}"
+        self.done.emit(snap)
 
 
 class SearchWorker(QThread):

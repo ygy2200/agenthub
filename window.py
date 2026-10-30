@@ -501,6 +501,11 @@ class AgentHubWindow(FluentWindow):
     def apply(self, snap):
         if snap.error and not snap.projects:
             InfoBar.error("扫描失败", snap.error, duration=4000, parent=self)
+            # R766：同一根目录下刷新失败，保留上一份内容。异常/暂时读不了 ≠ 库空了，
+            # 把整屏刷成 0 会让人以为数据丢了。换根目录时 root 不同，照常应用空态。
+            prev = getattr(self, "_last_snap", None)
+            if prev is not None and prev.root == snap.root:
+                return
         if self.root and not (Path(self.root) / core.DIR_META).is_dir() \
                 and not getattr(self, "_hub_warned", False):
             self._hub_warned = True
@@ -552,6 +557,7 @@ class AgentHubWindow(FluentWindow):
             polish_lists(_pg)
             polish_cards(_pg)
         self._apply_count += 1
+        self._last_snap = snap
 
 
 def _install_crash_hook():
