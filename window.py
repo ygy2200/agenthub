@@ -360,11 +360,16 @@ class AgentHubWindow(FluentWindow):
         self.search_page.edit.setFocus()
 
     def _warn_dead_root(self):
-        """R772：持久横幅（duration<0 不自动淡出），关掉后靠 F5 仍能复现失败提示。"""
+        """R772：持久横幅（duration<0 不自动淡出），关掉后靠 F5 仍能复现失败提示。
+
+        R775：补一句「插回后按 F5 重试」——扫描成功会撤掉这条横幅（见 apply），
+        不必非要重新选一遍目录。
+        """
         try:
             self._root_bar = InfoBar.error(
                 "根目录不存在",
-                f"{self.root} —— 可能盘符变了或移动硬盘未连接；到「设置」页重新选择根目录",
+                f"{self.root} —— 可能盘符变了或移动硬盘未连接；插回后按 F5 重试，"
+                "或到「设置」页重新选择根目录",
                 duration=-1, parent=self)
         except Exception:  # noqa: BLE001  UI 提示失败不许影响启动
             self._root_bar = None
@@ -522,6 +527,18 @@ class AgentHubWindow(FluentWindow):
         w.start()
 
     def apply(self, snap):
+        # R775：盘/网络盘回来了、扫描落地之后，R772 的「根目录不存在」横幅要撤——
+        # 错误提示不许比故障活得久。此前只有换根目录（set_root）才清它；插回盘按 F5
+        # 的用户会看到一条已经不成立的报错。设置页状态行同理（用户就在那页按 F5）。
+        # 放在错误分支之前：目录已可读但扫描因别的原因失败时，这条横幅同样不成立。
+        if getattr(self, "_root_bar", None) is not None and self.root \
+                and os.path.isdir(self.root):
+            try:
+                self._root_bar.close()
+            except RuntimeError:
+                pass
+            self._root_bar = None
+        self.settings_page.reload_root_state()
         if snap.error and not snap.projects:
             InfoBar.error("扫描失败", snap.error, duration=4000, parent=self)
             # R766：同一根目录下刷新失败，保留上一份内容。异常/暂时读不了 ≠ 库空了，

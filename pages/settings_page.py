@@ -252,6 +252,17 @@ class SettingsPage(QWidget):
 
     def reload(self):
         root = self.win.root or ""
+        self.reload_root_state()
+        if root:
+            self.rulesEdit.setPlainText(core.load_rules(root))
+
+    def reload_root_state(self):
+        """只重算根目录状态行（含路径标签）——规则编辑区不动。
+
+        R775：F5 刷新成功后 window.apply 会调它，让用户不必切页就能看到
+        「目录不可用 → 目录可用」。不直接调 reload() 是为了不覆盖正在编辑的规则文本。
+        """
+        root = self.win.root or ""
         self.rootLabel.setText(root or "未设置")
         if not root:
             self._root_tone = "neutral"
@@ -270,8 +281,6 @@ class SettingsPage(QWidget):
                 if os.path.isdir(os.path.join(root, core.DIR_META))
                 else "● 目录可用 · 大脑尚未初始化——点「初始化目录结构」启用共享记忆与流水")
         self._paint_root_state()
-        if root:
-            self.rulesEdit.setPlainText(core.load_rules(root))
 
     def _paint_root_state(self):
         """状态行随主题换色；bind_style 已登记，换肤时自动重算（R223 同族）。"""
