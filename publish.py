@@ -100,6 +100,22 @@ def _call(opener, url, method=None, data=None, timeout=120):
         raise NetworkError(str(getattr(e, "reason", e) or e)) from e
 
 
+# R752：本机实测 api.github.com 会偶发 SSL EOF / 连接超时。网络层失败是可重试的，
+# HTTP 4xx/5xx 不是——把两者混在一起，一次网络抖动就会被读成「token 坏了」。
+NET_RETRIES = 3
+NET_BACKOFF = 0.5
+
+
+def _call_retry(opener, url, method=None, data=None, timeout=120):
+    for attempt in range(NET_RETRIES):
+        try:
+            return _call(opener, url, method=method, data=data, timeout=timeout)
+        except NetworkError:
+            if attempt == NET_RETRIES - 1:
+                raise
+        time.sleep(NET_BACKOFF * (attempt + 1))
+
+
 def preflight(opener, repo: str) -> dict:
     """发布前预检：token 认不认、能不能写这个仓库。
 
@@ -108,7 +124,7 @@ def preflight(opener, repo: str) -> dict:
     """
     out = {"ok": False, "login": "", "scopes": "", "problems": []}
     try:
-        status, body, headers = _call(opener, "https://api.github.com/user")
+        status, body, headers = _call_retry(opener, "https://api.github.com/user")
         if status == 200:
             out["login"] = body.get("login", "")
             out["scopes"] = headers.get("X-OAuth-Scopes", "") or "（细粒度 token 不返回）"
@@ -119,7 +135,7 @@ def preflight(opener, repo: str) -> dict:
                 "让凭据管理器换掉旧值")
         else:
             out["problems"].append(f"查询 token 身份失败：HTTP {status}")
-        status, body, _ = _call(opener, f"https://api.github.com/repos/{repo}")
+        status, body, _ = _call_retry(opener, f"https://api.github.com/repos/{repo}")
         if status == 404:
             out["problems"].append(
                 f"仓库 {repo} 访问不到（404）：名字写错，或该 token 没有这个仓库的权限")
@@ -134,6 +150,25 @@ def preflight(opener, repo: str) -> dict:
             f"PUT /proxies/<分组>）")
     out["ok"] = not out["problems"]
     return out
+
+
+def _empty_release_audit(opener, repo: str) -> dict:
+    """R751：--check 顺带查「公开页上有没有空附件版本」。
+
+    R747 清理的两个（v2.41.159 / v2.41.77）是靠人手翻 Releases 页发现的——发布工具
+    自己能看见的东西，不该指望人去翻。草稿不算问题（访客看不见）。
+    本机实测 api.github.com 会偶发 SSL EOF / 连接超时：网络层失败重试，HTTP 错误不重试。
+    """
+    url = f"https://api.github.com/repos/{repo}/releases?per_page=30"
+    try:
+        status, rel, _ = _call_retry(opener, url, timeout=30)
+    except NetworkError as e:
+        return {"ok": False, "error": str(e), "tags": []}
+    if status != 200 or not isinstance(rel, list):
+        return {"ok": False, "error": f"HTTP {status}", "tags": []}
+    tags = [r.get("tag_name", "") for r in rel
+            if not r.get("draft") and not r.get("assets")]
+    return {"ok": True, "error": "", "tags": tags}
 
 
 class _UploadProgress:
@@ -230,11 +265,21 @@ def main(argv=None) -> int:
         if not token:
             print("\ntoken：不可用，预检无法进行（--yes 同样会被拒绝）")
             return 1
-        pf = preflight(_opener(token), args.repo)
+        opener = _opener(token)
+        pf = preflight(opener, args.repo)
         print(f"\n预检：身份 {pf['login'] or '未知'}，scope {pf['scopes']}")
         for p in pf["problems"]:
             print("  - " + p)
         print("预检  通过" if pf["ok"] else "预检  未通过")
+        audit = _empty_release_audit(opener, args.repo)
+        if not audit["ok"]:
+            print(f"Release 体检  查不了空附件版本：{audit['error']}")
+        elif not audit["tags"]:
+            print("Release 体检  空附件版本：0 个")
+        else:
+            print(f"Release 体检  空附件版本 {len(audit['tags'])} 个："
+                  f"{'、'.join(audit['tags'])}（公开页看着像「发版没带 exe」）")
+            print("       清理：GitHub → Releases → 该版本 → Delete（tag 保留）")
         return 0 if pf["ok"] else 1
 
     if not args.yes:

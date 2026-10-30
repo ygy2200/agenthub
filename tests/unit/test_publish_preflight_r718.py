@@ -6,7 +6,8 @@
 半有效（能读不能写）时，会留下一个**没有 exe 的 Release**，只能手工去网页删。
 预检把「我是谁」「这个仓库推得动吗」「网络通不通」三类失败分开报，且一次写请求都不发。
 
-注：`publish.py` 是本地发布脚本（.gitignore），CI 上不存在 → 本文件自动跳过。
+注：`publish.py` 自 R749 起已入库（曾因 .gitignore 导致 CI 收集期 ModuleNotFoundError），
+本文件在 CI 里会真跑；`importorskip` 保留给「有人在无该脚本的分支上跑」的场景。
 """
 import sys
 from pathlib import Path
@@ -65,8 +66,12 @@ def test_missing_repo_is_reported_as_scope_or_name(monkeypatch):
 
 
 def test_network_failure_hints_proxy(monkeypatch):
-    """直连 api.github.com 在本机会 SSL 断——提示必须给出实测可用的代理写法。"""
-    _seq(monkeypatch, [pub.NetworkError("SSL: UNEXPECTED_EOF_WHILE_READING")])
+    """直连 api.github.com 在本机会 SSL 断——提示必须给出实测可用的代理写法。
+
+    R752：网络层失败会重试 NET_RETRIES 次，所以这里按次数喂同样的异常。
+    """
+    monkeypatch.setattr(pub, "NET_BACKOFF", 0)
+    _seq(monkeypatch, [pub.NetworkError("SSL: UNEXPECTED_EOF_WHILE_READING")] * pub.NET_RETRIES)
     pf = pub.preflight(None, "ygy2200/agenthub")
     assert not pf["ok"]
     assert any("7890" in p for p in pf["problems"])

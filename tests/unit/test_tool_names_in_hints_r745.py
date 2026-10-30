@@ -1,6 +1,8 @@
 # -*- coding: utf-8 -*-
 """R745：digest 的「建议」和 freeze 的「怎么冻结」也在给 MCP 工具名 / 裸 cli.py。
 
+R754：三个用例都加 `hub_root`——此前靠本机 ~/.agenthub/config.json 才活着，CI 上退 2。
+
 真机（真实库 `cli.py digest`）：
       建议：
         - hub_claim 认领；长期无人做就 hub_task_update 关单      ← 命令行照抄 not found
@@ -19,6 +21,13 @@ sys.path.insert(0, str(ROOT))
 
 import brain  # noqa: E402
 import cli  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _brain(hub_root):
+    """R754：digest/freeze 走 _NEED_DB，临时根必须真初始化成大脑，否则根目录闸门退 2。"""
+    brain.init_db(hub_root)
+    return hub_root
 
 
 def test_extract_tools_with_word_boundaries():
@@ -45,7 +54,7 @@ def _digest(suggestions):
     }
 
 
-def test_digest_adds_cli_hint(monkeypatch, capsys):
+def test_digest_adds_cli_hint(monkeypatch, capsys, hub_root):
     monkeypatch.setattr(brain, "team_digest",
                         lambda root, days=1: _digest(["hub_claim 认领；hub_task_update 关单"]))
     assert cli.main(["digest"]) == 0
@@ -54,14 +63,14 @@ def test_digest_adds_cli_hint(monkeypatch, capsys):
     assert f"{cli.CMD} claim" in out and f"{cli.CMD} update" in out
 
 
-def test_digest_quiet_without_tools(monkeypatch, capsys):
+def test_digest_quiet_without_tools(monkeypatch, capsys, hub_root):
     monkeypatch.setattr(brain, "team_digest",
                         lambda root, days=1: _digest(["换关键词/补记录"]))
     assert cli.main(["digest"]) == 0
     assert "MCP 工具名" not in capsys.readouterr().out
 
 
-def test_freeze_hint_uses_full_prefix(monkeypatch, capsys):
+def test_freeze_hint_uses_full_prefix(monkeypatch, capsys, hub_root):
     monkeypatch.setattr(brain, "freeze_get", lambda root: {"active": False, "expired": False})
     assert cli.main(["freeze"]) == 0
     out = capsys.readouterr().out

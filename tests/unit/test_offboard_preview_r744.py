@@ -23,8 +23,12 @@ import core  # noqa: E402
 
 
 @pytest.fixture
-def wired(monkeypatch):
-    """把「某 agent 两处都接好了」这件事桩出来——断言不能跟着本机接入状态漂（R719）。"""
+def wired(monkeypatch, hub_root):
+    """把「某 agent 两处都接好了」这件事桩出来——断言不能跟着本机接入状态漂（R719）。
+
+    R754：`hub_root` 同时钉住 core.load_config——没有它，`cli.main(["offboard", …])`
+    会去读本机 ~/.agenthub/config.json，CI（无配置）直接退 2，本机却全绿。
+    """
     monkeypatch.setattr(core, "find_adapter",
                         lambda root, name: {"agent": "ZCode", "instr_path": "~/AGENTS.md"})
     monkeypatch.setattr(cli, "_boot_of", lambda a: "~/AGENTS.md")

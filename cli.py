@@ -1969,6 +1969,12 @@ def main(argv=None) -> int:
             return cmd_list_tools(_root(args.root))
         if args.cmd == "discover":
             return cmd_discover(_root(args.root))
+        if args.cmd is None:
+            # R753：裸跑是「问怎么用」，不是「执行命令」。放在根目录闸门之前，否则
+            # 没有大脑的新用户第一眼看到的是「未找到大脑根目录」+ 退 2，R712 的第一屏
+            # 对他们永远不可达。真执行命令时闸门照旧。
+            print(_welcome_text(_root(args.root)))
+            return 0
         root = _root(args.root)
         problem = _root_problem(root, args.cmd in _NEED_DB)
         if problem:
