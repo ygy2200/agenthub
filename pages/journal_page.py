@@ -73,6 +73,7 @@ class JournalPage(QWidget):
 
         # 列表区不包卡：ListWidget 自带边界，卡套列表=框中框
         g1 = QVBoxLayout()
+        self._g1 = g1
         g1.setSpacing(tokens.SPACE_S)
         g1.addWidget(section_head("错误登记（未关闭=待处理 · 已修复=已处理）", "FLAG"))
         errTop = QHBoxLayout()
@@ -103,6 +104,7 @@ class JournalPage(QWidget):
         lay.addLayout(g1, 2)
 
         g2 = QVBoxLayout()
+        self._g2 = g2          # R756：空态引导要挂在这两个布局里（列表为空时插到列表下方）
         g2.setSpacing(tokens.SPACE_S)
         g2.addWidget(section_head("操作流水（最新在上，最近 200 条）", "HISTORY"))
         self.jList = ListWidget()
@@ -138,8 +140,12 @@ class JournalPage(QWidget):
                 f"#{e['id']} [{st}] {_fmt_ts(e['ts'])}  {e['agent']}"
                 f" · {e['project'] or '无项目'}：{e['title']}{rep_tag}"
                 + (f"  ｜回滚：{e['undo'][:60]}" if e["undo"] else ""))
-        if not self.errors:
-            self.errList.addItem("（无错误登记）")
+        # R756：占位行换成标准空态（占位行只能说明「空」，说不出「这是什么/接下来做什么」，
+        # 且会被后续「列表是否为空」的检查当成真内容）。文案随场景切换由 list_empty_guard 同步。
+        self._empty_area(self.errList, self._g1, "还没有错误登记",
+                         "agent 执行出错会自动上报，也可用 cli.py report-error 手动登记；"
+                         "选中一条能看回滚方式并标记已修。")
+        self.errPreview.setVisible(bool(self.errors))
         self.errCount.setText(f"当前 {len(self.errors)} 条 · 未关闭 "
                               f"{sum(1 for e in self.errors if e['status'] == 'open')}")
         self.journal = brain.journal_list(self.win.root, 200)
@@ -150,14 +156,31 @@ class JournalPage(QWidget):
             tgt = Path(tgt).name if "/" in tgt or "\\" in tgt else tgt
             self.jList.addItem(f"{_fmt_ts(e['ts'])}  [{agent_disp(e['agent'])}]  {act}  {tgt}"
                                + (f"  {str(e['note'])[:70]}" if e["note"] else ""))
-        if not self.journal:
-            self.jList.addItem("（暂无操作流水——agent 接入引导后，它们的记录动作会出现在这里）")
+        self._empty_area(self.jList, self._g2, "还没有操作流水",
+                         "agent 接入引导后，写工作记录 / 建项目 / 改配置都会在这里留痕；"
+                         "记录类可撤销（原文会先自动备份）。")
         tight_rows(self.errList)
         tight_rows(self.jList)
         if self.errors:
             self.errList.setCurrentRow(self._row_of_err(self._sel_err_id))
         else:
             self._on_err_selected(-1)
+
+    def _empty_area(self, listw, layout, title, desc):
+        """列表为空时把列表收起来，让空态接管这块空间（R756）。
+
+        直接用 list_empty_guard 时空态被插在列表**下方**，而列表带着 stretch=1
+        （errList 还有 130px 最小高）——920×600 实测：上半屏一片灰，空态被挤到
+        视口下缘只露出半行。收起列表 + 把 stretch 交给空态，语义才是「这块区域
+        现在没有内容，告诉你怎么产生内容」。
+        """
+        hint = list_empty_guard(listw, layout, title, desc)
+        empty = listw.count() == 0
+        listw.setVisible(not empty)
+        idx = layout.indexOf(hint)
+        if idx >= 0:
+            layout.setStretch(idx, 1 if empty else 0)
+        return hint
 
     def _selected_error(self):
         row = self.errList.currentRow()
