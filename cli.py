@@ -595,7 +595,8 @@ def _tool_hint_line(tools: list, where: str = "提示行") -> str:
     """
     if not tools:
         return ""
-    known = [t for t in tools if t in _TOOL_CLI_FORM][:3]
+    known_all = [t for t in tools if t in _TOOL_CLI_FORM]
+    known = known_all[:3]
     rest = [t for t in tools if t not in _TOOL_CLI_FORM]
     parts = []
     if known:
@@ -603,6 +604,10 @@ def _tool_hint_line(tools: list, where: str = "提示行") -> str:
     if rest:
         shown = "、".join(rest[:3]) + (f" 等 {len(rest)} 个" if len(rest) > 3 else "")
         parts.append(f"{shown}只能用 {CMD} call <工具名> <同样的 key=value>")
+    # R758：两处折叠（未知工具 >3、已知工具 >3 被 [:3] 截断）都必须带出口，
+    # 否则用户拿着半截名字无从下手——`tools` 是现成命令，不额外造概念。
+    if len(known_all) > 3 or len(rest) > 3:
+        parts.append(f"全部 {len(tools)} 个见 {CMD} tools")
     return f"提示：{where}里的 hub_xxx 是 MCP 工具名，命令行改用——" + "；".join(parts) + "。"
 
 
