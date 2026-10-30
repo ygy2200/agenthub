@@ -128,6 +128,16 @@ class _SubPage(QWidget):
 
     def _finish(self):
         hint = list_empty_guard(self.listw, self.layout(), self.EMPTY_TITLE, self.EMPTY_DESC)
+        # R762：读失败时列表必然为空，若照常走「空态 + 收起摘要行」，刚写进 sumLabel 的
+        # 「读取失败：…」会被一起藏掉，用户只看到「暂无待批任务」——把故障说成没数据。
+        # 这条要先于空态分支判断。
+        if self.sumLabel.text().startswith("读取失败"):
+            if "重试" not in self.sumLabel.text() and "刷新" not in self.sumLabel.text():
+                self.sumLabel.setText(self.sumLabel.text() + "（下次切页或按 F5 重试）")
+            hint.setVisible(False)
+            self.sumLabel.setVisible(True)
+            self.listw.setVisible(False)
+            return
         empty = self.listw.count() == 0
         if empty:
             # 空列表仍占着 stretch，会把引导挤到页面底部；空态自己撑满并垂直居中。

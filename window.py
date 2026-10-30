@@ -423,9 +423,27 @@ class AgentHubWindow(FluentWindow):
                 self.stats_page.set_db(brain.stats(self.root))
             else:
                 getattr(self, attr).reload()
-        except Exception:  # noqa: BLE001 单页加载失败不该拦住切页
+        except Exception as e:  # noqa: BLE001 单页加载失败不该拦住切页
+            # R762：失败必须让用户看见。原来只在 except 里 return False，页面继续显示
+            # 上一次的内容——用户以为看到的是新数据。异步页有自己的失败占位（R239），
+            # 同步页统一走窗口级提示，并去重（同一页连续失败不刷屏）。
+            self._warn_db_failure(attr, e)
             return False
+        if hasattr(self, "_db_failed"):
+            self._db_failed.discard(attr)
         return True
+
+    def _warn_db_failure(self, attr: str, err: Exception) -> None:
+        """数据页读失败的一次性提示（成功重读后自动解除去重）。"""
+        if not hasattr(self, "_db_failed"):
+            self._db_failed = set()
+        if attr in self._db_failed:
+            return
+        self._db_failed.add(attr)
+        title = next((t for a, t, *_ in actions.PAGES if a == attr), attr)
+        InfoBar.error("数据加载失败",
+                      f"「{title}」读取失败：{err}（下次切页或按 F5 重试；其余页面不受影响）",
+                      duration=6000, parent=self)
 
     def _start_db_fetch(self, attr: str, page, force: bool) -> bool:
         """取数交给 FnWorker（后台线程），回来只渲染；返回 False＝消脏责任在回调。"""
