@@ -3648,7 +3648,8 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
     提示、不影响状态流转，结果附在返回行的 crystal 键）；done 后不可再改。
     R41 →cancelled：终态，必须写 cancel_reason；释放文件租约、退出所有队列与 WIP，
     保留 owner 供追溯（cancelled_by 记操作者）。
-    M1 新字段：priority(0~3) / deps(前置 id，传 "-" 清除) / due(截止日，传 "-" 清除)。
+    M1 新字段：priority(0~3) / deps(前置 id，传 "-" 清除) / due(截止日，传 "-" 清除)；
+    detail 同样可传 "-" 清除。
     R3：deps 拒绝自依赖与环（前向引用允许，成环拒绝），非法 id 串直接报错不静默清空。
     返回 (错误或 "", 行 dict)。"""
     who = _norm_agent(agent) or ""
@@ -3771,9 +3772,14 @@ def task_update(root: str, tid, status: str = "", agent: str = "",
             else:
                 sets.append("blocked_by=?")
                 args.append(blocked_raw[:200])
-        if (detail or "").strip():
-            sets.append("detail=?")
-            args.append(detail.strip()[:2000])
+        dt = (detail or "").strip()
+        if dt:
+            # 传 "-" 清除：与 deps/due/skills 同一约定，避免旧说明改不掉。
+            if dt == "-":
+                sets.append("detail=''")
+            else:
+                sets.append("detail=?")
+                args.append(dt[:2000])
         if priority is not None and str(priority).strip() != "":
             try:
                 sets.append("priority=?")

@@ -3,8 +3,8 @@
 
 hub_next 前沿队列的 GUI 呈现（同源 brain.task_next）：
   可认领（依赖已满足，按优先级 0急→3低 排序）/ 进行中 / 可接管（超 TTL 没人动）/ 等待依赖 四段。
-只读看板 + 管理面操作（标记完成/取消/重试/调优先级都走 task_update 管理通道，
-done 触发 M2 自动结晶）。认领/改依赖走 MCP（hub_claim）——桌面端不代理 agent 身份。
+只读看板 + 管理面操作（标记完成/取消/重试/调优先级/补详情与截止日都走 task_update
+管理通道，done 触发 M2 自动结晶）。认领/改依赖走 MCP（hub_claim）——桌面端不代理 agent 身份。
 """
 from __future__ import annotations
 
@@ -105,15 +105,22 @@ class TodayPage(QWidget):
         self.prioBtn = PushButton("优先级")
         self.prioBtn.setToolTip("调整选中任务的优先级（P0 紧急 → P3 低），越急越先进入可认领队列")
         self.prioBtn.clicked.connect(self._show_priority_menu)
+        # R799：交接时最先被问的两项——「这单要什么」和「什么时候要」——桌面原来改不了。
+        self.detailBtn = PushButton("详情")
+        self.detailBtn.setToolTip("查看并补充任务说明、调整截止日（状态与负责人仍由 agent 流转）")
+        self.detailBtn.clicked.connect(self.edit_details)
         self.listw.currentItemChanged.connect(lambda *_: self._sync_actions())
+        self.listw.itemDoubleClicked.connect(lambda *_: self.edit_details())
         row.addWidget(self.doneBtn)
         row.addWidget(self.retryBtn)
         row.addWidget(self.cancelBtn)
         row.addWidget(self.prioBtn)
-        # R197：界面上只留人话，精确工具名进 tooltip（R171 同款口径）——「hub_next ·
-        # hub_claim · hub_task_add」对用户是天书，对 agent 才是命令。
-        cap = CaptionLabel("认领请让 agent 做（桌面端不代理 agent 身份）")
-        cap.setToolTip("对应工具：hub_next（看下一步）· hub_claim（认领）· hub_task_add（新建）")
+        row.addWidget(self.detailBtn)
+        # R799：加「详情」后行变宽；920 窗下内容区只有 749px，说明收短到能完整显示，
+        # 边界解释挪进 tooltip（实测原句会被裁掉尾巴）。
+        cap = CaptionLabel("认领由 agent 做")
+        cap.setToolTip("桌面端不代理 agent 身份；对应工具：hub_next（看下一步）· "
+                       "hub_claim（认领）· hub_task_add（新建）")
         row.addWidget(cap)
         row.addStretch(1)
         lay.addLayout(row)
@@ -171,6 +178,8 @@ class TodayPage(QWidget):
                          or t.get("status") in ("in_progress", "blocked")))
         # R794：终态任务的优先级不再影响队列，别让按钮亮着骗人。
         self.prioBtn.setEnabled(bool(t) and t.get("status") not in brain.TASK_TERMINAL)
+        # R799：详情/截止日同理——列表只收非终态，但选中态可能滞后于刷新。
+        self.detailBtn.setEnabled(bool(t) and t.get("status") not in brain.TASK_TERMINAL)
 
     def _fill(self):
         self.listw.clear()
@@ -269,6 +278,8 @@ class TodayPage(QWidget):
             lines.append(f"延后到：{t['defer_until']}")
         if t.get("last_error"):
             lines.append(f"上次失败：{t['last_error']}")
+        if (t.get("detail") or "").strip():
+            lines.append(f"详情：{t['detail'].strip()[:200]}")
         return "\n".join(lines)
 
     def _selected_task(self):
@@ -315,6 +326,60 @@ class TodayPage(QWidget):
             return
         label = dict(NewTaskDialog.PRIORITIES).get(val, "")
         InfoBar.success("优先级已更新", f"#{t['id']} → P{val} {label}",
+                        duration=2500, parent=self)
+        self.reload()
+
+    def edit_details(self):
+        """打开详情对话框（R799）：选中任务的说明与截止日可改，其余只读。"""
+        t = self._selected_task()
+        if not t:
+            InfoBar.warning("先选中一个任务", "选中清单里的任务，再打开详情", parent=self)
+            return
+        if t.get("status") in brain.TASK_TERMINAL:
+            InfoBar.warning("状态不符", f"#{t['id']} 已是终态，详情不再修改", parent=self)
+            return
+        dlg = TaskDetailDialog(self.win, t)
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        self.save_details(v["detail"], v["due"])
+
+    def save_details(self, detail, due):
+        """保存详情/截止日（R799）：只写变化的字段，清空落库成空（brain 认 "-"）。
+
+        对话框与用例共用同一入口；空 agent＝管理面，别人持有的任务也能补说明。
+        """
+        t = self._selected_task()
+        if not t:
+            InfoBar.warning("先选中一个任务", "选中清单里的任务，再补详情或截止日", parent=self)
+            return
+        if t.get("status") in brain.TASK_TERMINAL:
+            InfoBar.warning("状态不符", f"#{t['id']} 已是终态，详情不再修改", parent=self)
+            return
+        detail = (detail or "").strip()
+        due = (due or "").strip()
+        changed = {}
+        if detail != (t.get("detail") or "").strip():
+            changed["detail"] = detail or "-"
+        if due != (t.get("due") or "").strip():
+            changed["due"] = due or "-"
+        if not changed:
+            InfoBar.info("没有改动", f"#{t['id']} 的详情与截止日都没变", duration=2000, parent=self)
+            return
+        try:
+            err, _row = brain.task_update(self.win.root, t["id"], agent="", **changed)
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("保存失败", str(e), parent=self)
+            return
+        if err:
+            InfoBar.error("保存失败", err, parent=self)
+            return
+        bits = []
+        if "detail" in changed:
+            bits.append("详情已更新" if detail else "详情已清空")
+        if "due" in changed:
+            bits.append(f"截止 {due}" if due else "截止日已清空")
+        InfoBar.success("任务已更新", f"#{t['id']} " + "，".join(bits),
                         duration=2500, parent=self)
         self.reload()
 

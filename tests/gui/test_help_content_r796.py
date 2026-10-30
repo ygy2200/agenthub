@@ -11,6 +11,7 @@ from pages.help_page import HelpPage
 def test_workbench_help_matches_desktop_actions(qapp):
     content = HelpPage.CONTENT
     assert "可直接认领" not in content
-    for action in ("新建任务", "标记完成", "记录失败重试", "取消", "调优先级"):
+    for action in ("新建任务", "标记完成", "记录失败重试", "取消", "调优先级",
+                   "补详情与截止日"):
         assert action in content, f"帮助页漏了桌面动作：{action}"
     assert "认领仍由 agent 做" in content

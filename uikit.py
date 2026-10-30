@@ -1486,6 +1486,68 @@ class NewTaskDialog(MessageBoxBase):
         }
 
 
+class TaskDetailDialog(MessageBoxBase):
+    """任务详情（R799）：补说明与截止日；状态/负责人只读，仍由 agent 流转。
+
+    桌面端此前能建任务、改优先级，却改不了「这单到底要什么」和「什么时候要」——
+    这两项恰恰是交接时最先被问的。保存走管理通道（空 agent），别人持有的任务也能补。
+    """
+
+    def __init__(self, parent, task):
+        super().__init__(parent)
+        self.task = dict(task or {})
+        status = self.task.get("status", "")
+        self.titleLabel = SubtitleLabel(f"任务详情 #{self.task.get('id', '')}")
+        self.titleView = StrongBodyLabel((self.task.get("title") or "(无标题)").strip())
+        self.titleView.setWordWrap(True)
+        meta = [f"状态：{brain.TASK_CN.get(status, status)}"]
+        if self.task.get("project"):
+            meta.append(f"项目：{self.task['project']}")
+        meta.append("负责人：" + (self.task.get("owner") or "未认领"))
+        meta.append(f"优先级：P{self.task.get('priority', 2)}")
+        if self.task.get("deps"):
+            meta.append(f"前置：{self.task['deps']}")
+        self.metaLabel = CaptionLabel(" · ".join(meta))
+        self.metaLabel.setWordWrap(True)
+        self.detailEdit = TextEdit()
+        self.detailEdit.setPlaceholderText("这单要做什么、验收标准、卡在哪——接手的人先看这里")
+        self.detailEdit.setPlainText((self.task.get("detail") or "").strip())
+        self.detailEdit.setFixedHeight(120)
+        self.dueEdit = LineEdit()
+        self.dueEdit.setText((self.task.get("due") or "").strip())
+        self.dueEdit.setPlaceholderText("截止日 YYYY-MM-DD（清空即取消截止）")
+        self.hint = CaptionLabel("改完点保存；状态、负责人仍由 agent 流转")
+        self.hint.setWordWrap(True)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.titleView)
+        self.viewLayout.addWidget(self.metaLabel)
+        self.viewLayout.addWidget(self.detailEdit)
+        self.viewLayout.addWidget(self.dueEdit)
+        self.viewLayout.addWidget(self.hint)
+        self.yesButton.setText("保存")
+        self.cancelButton.setText("取消")
+        self.dueEdit.textChanged.connect(self._check)
+        self._check()
+
+    def _check(self):
+        due = self.dueEdit.text().strip()
+        err = ""
+        if due:
+            try:
+                datetime.strptime(due, "%Y-%m-%d")
+            except ValueError:
+                err = "截止日要写成 YYYY-MM-DD，或清空"
+        self.hint.setText(err or "改完点保存；状态、负责人仍由 agent 流转")
+        self.hint.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};" if err else "")
+        self.yesButton.setEnabled(not err)
+
+    def values(self) -> dict:
+        return {
+            "detail": self.detailEdit.toPlainText().strip(),
+            "due": self.dueEdit.text().strip(),
+        }
+
+
 class ReasonDialog(MessageBoxBase):
     """必填理由（R792）：取消/重试都要留下为什么，否则复盘时任务凭空消失。"""
 

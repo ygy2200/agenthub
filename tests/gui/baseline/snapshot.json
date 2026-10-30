@@ -121,12 +121,12 @@
     },
     "today_page": {
       "title": "工作台",
-      "widget_count": 36,
+      "widget_count": 37,
       "class_count": {
         "QWidget": 6,
         "PageTitleLabel": 1,
         "CaptionLabel": 5,
-        "PushButton": 6,
+        "PushButton": 7,
         "IconWidget": 2,
         "StrongBodyLabel": 2,
         "ListWidget": 1,
@@ -148,7 +148,8 @@
         "待办清单",
         "新建任务…",
         "标记完成",
-        "认领请让 agent 做（桌面端不代理 agent 身份）",
+        "认领由 agent 做",
+        "详情",
         "近 24h：记录 0 · 任务完成 0 · 在办 0（租约逾期 0 / 等审批 0） · 风险 0 类",
         "还没有任务——点「新建任务…」建一条，或让 agent 说一句「新建任务 …」；它也会从工作记录的「待办」句子里自动提取",
         "重试…"
