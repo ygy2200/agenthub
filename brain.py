@@ -259,6 +259,11 @@ CREATE TABLE IF NOT EXISTS records (
 );
 CREATE INDEX IF NOT EXISTS idx_records_proj ON records(project);
 CREATE INDEX IF NOT EXISTS idx_records_date ON records(date);
+-- R769：时间线页切页时同步填过滤器下拉，6 万记录库实测 list_projects 111.5ms
+-- （逐项目 MAX(date)/COUNT(*) 相关子查询回表扫全部记录）→ 覆盖索引后 1.7ms；
+-- records_agents 的 DISTINCT lower(agent) 28.4ms → 13.9ms。查询语句不改。
+CREATE INDEX IF NOT EXISTS idx_records_proj_status_date ON records(project, status, date);
+CREATE INDEX IF NOT EXISTS idx_records_status_agent ON records(status, agent);
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT DEFAULT "note",
