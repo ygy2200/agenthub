@@ -120,7 +120,8 @@ class TodayPage(QWidget):
         self.prioBtn.clicked.connect(self._show_priority_menu)
         # R799：交接时最先被问的两项——「这单要什么」和「什么时候要」——桌面原来改不了。
         self.detailBtn = PushButton("详情")
-        self.detailBtn.setToolTip("查看并补充任务说明、调整截止日（状态与负责人仍由 agent 流转）")
+        self.detailBtn.setToolTip("查看并补充任务说明、调整截止日与前置依赖"
+                                  "（状态与负责人仍由 agent 流转）")
         self.detailBtn.clicked.connect(self.edit_details)
         self.listw.currentItemChanged.connect(lambda *_: self._sync_actions())
         self.listw.itemDoubleClicked.connect(lambda *_: self.edit_details())
@@ -338,6 +339,9 @@ class TodayPage(QWidget):
             lines.append("改期：选中任务 → 详情")
         if key == "waiting" and t.get("_wait"):
             lines.append("等待依赖：" + "、".join(f"#{w}" for w in TodayPage._wait_ids(t["_wait"])))
+        elif t.get("deps"):
+            lines.append("前置任务：" + "、".join(
+                f"#{d.lstrip('#')}" for d in re.split(r"[,\s，、;；]+", t["deps"]) if d.strip()))
         if key == "takeover" and t.get("_takeover"):
             lines.append(f"可接管原因：{t['_takeover']}")
         if key == "backoff":
@@ -411,12 +415,13 @@ class TodayPage(QWidget):
         if not dlg.exec():
             return
         v = dlg.values()
-        self.save_details(v["detail"], v["due"])
+        self.save_details(v["detail"], v["due"], v.get("deps"))
 
-    def save_details(self, detail, due):
-        """保存详情/截止日（R799）：只写变化的字段，清空落库成空（brain 认 "-"）。
+    def save_details(self, detail, due, deps=None):
+        """保存详情/截止日/依赖（R799/R805）：只写变化的字段，清空落库成空（brain 认 "-"）。
 
         对话框与用例共用同一入口；空 agent＝管理面，别人持有的任务也能补说明。
+        deps 传 None 表示不动依赖（兼容只改说明/截止日的调用）。
         """
         t = self._selected_task()
         if not t:
@@ -427,13 +432,17 @@ class TodayPage(QWidget):
             return
         detail = (detail or "").strip()
         due = (due or "").strip()
+        deps = None if deps is None else (deps or "").strip()
         changed = {}
         if detail != (t.get("detail") or "").strip():
             changed["detail"] = detail or "-"
         if due != (t.get("due") or "").strip():
             changed["due"] = due or "-"
+        if deps is not None and deps != (t.get("deps") or "").strip():
+            changed["deps"] = deps or "-"
         if not changed:
-            InfoBar.info("没有改动", f"#{t['id']} 的详情与截止日都没变", duration=2000, parent=self)
+            InfoBar.info("没有改动", f"#{t['id']} 的详情、截止日与依赖都没变",
+                         duration=2000, parent=self)
             return
         try:
             err, _row = brain.task_update(self.win.root, t["id"], agent="", **changed)
@@ -448,6 +457,8 @@ class TodayPage(QWidget):
             bits.append("详情已更新" if detail else "详情已清空")
         if "due" in changed:
             bits.append(f"截止 {due}" if due else "截止日已清空")
+        if "deps" in changed:
+            bits.append(f"前置 {deps}" if deps else "前置依赖已清空")
         InfoBar.success("任务已更新", f"#{t['id']} " + "，".join(bits),
                         duration=2500, parent=self)
         self.reload()

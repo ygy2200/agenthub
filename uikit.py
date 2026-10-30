@@ -1516,6 +1516,11 @@ class TaskDetailDialog(MessageBoxBase):
         self.dueEdit = LineEdit()
         self.dueEdit.setText((self.task.get("due") or "").strip())
         self.dueEdit.setPlaceholderText("截止日 YYYY-MM-DD（清空即取消截止）")
+        # R805：依赖原先只在只读 meta 里露个串，改一条依赖仍得开 agent；
+        # 语法与自依赖在对话框拦，成环由 brain 复核（它会给出完整环路径）。
+        self.depsEdit = LineEdit()
+        self.depsEdit.setText((self.task.get("deps") or "").strip())
+        self.depsEdit.setPlaceholderText("前置任务号，逗号分隔（例如 12,15；清空即取消依赖）")
         self.hint = CaptionLabel("改完点保存；状态、负责人仍由 agent 流转")
         self.hint.setWordWrap(True)
         self.viewLayout.addWidget(self.titleLabel)
@@ -1523,11 +1528,28 @@ class TaskDetailDialog(MessageBoxBase):
         self.viewLayout.addWidget(self.metaLabel)
         self.viewLayout.addWidget(self.detailEdit)
         self.viewLayout.addWidget(self.dueEdit)
+        self.viewLayout.addWidget(self.depsEdit)
         self.viewLayout.addWidget(self.hint)
         self.yesButton.setText("保存")
         self.cancelButton.setText("取消")
         self.dueEdit.textChanged.connect(self._check)
+        self.depsEdit.textChanged.connect(self._check)
         self._check()
+
+    @staticmethod
+    def parse_deps(text: str) -> list:
+        """把「12,15 / #12 #15」解析成有序去重的任务号；非法项保留原文交给校验报错。"""
+        out = []
+        for part in re.split(r"[,\s，、;；]+", (text or "").strip()):
+            part = part.lstrip("#")
+            if not part:
+                continue
+            if part.isdigit() and int(part) > 0:
+                if int(part) not in out:  # 重复项静默去重，不算非法输入
+                    out.append(int(part))
+            else:
+                return None
+        return out
 
     def _check(self):
         due = self.dueEdit.text().strip()
@@ -1537,14 +1559,23 @@ class TaskDetailDialog(MessageBoxBase):
                 datetime.strptime(due, "%Y-%m-%d")
             except ValueError:
                 err = "截止日要写成 YYYY-MM-DD，或清空"
+        deps_txt = self.depsEdit.text().strip()
+        if deps_txt and not err:
+            ids = self.parse_deps(deps_txt)
+            if ids is None:
+                err = "前置任务号要写成正整数，用逗号分隔（例如 12,15）"
+            elif int(self.task.get("id") or 0) in ids:
+                err = "不能依赖自己"
         self.hint.setText(err or "改完点保存；状态、负责人仍由 agent 流转")
         self.hint.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};" if err else "")
         self.yesButton.setEnabled(not err)
 
     def values(self) -> dict:
+        ids = self.parse_deps(self.depsEdit.text())
         return {
             "detail": self.detailEdit.toPlainText().strip(),
             "due": self.dueEdit.text().strip(),
+            "deps": ",".join(str(i) for i in ids) if ids is not None else self.depsEdit.text().strip(),
         }
 
 

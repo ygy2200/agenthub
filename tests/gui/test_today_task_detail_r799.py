@@ -121,7 +121,7 @@ def test_detail_dialog_prefills_and_validates_due(qapp):
         dlg.dueEdit.setText("")
         assert dlg.yesButton.isEnabled(), "清空截止日应允许保存"
         dlg.detailEdit.setPlainText("改过的说明")
-        assert dlg.values() == {"detail": "改过的说明", "due": ""}
+        assert dlg.values() == {"detail": "改过的说明", "due": "", "deps": "3,4"}
     finally:
         dlg.close()
         host.close()
