@@ -3,10 +3,12 @@
 
 hub_next 前沿队列的 GUI 呈现（同源 brain.task_next）：
   可认领（依赖已满足，按优先级 0急→3低 排序）/ 进行中 / 可接管（超 TTL 没人动）/ 等待依赖 四段。
-只读看板 + 管理面操作（标记完成=空 agent 走 task_update 管理通道，done 触发 M2 自动结晶）。
-认领/新建/改依赖走 MCP（hub_claim / hub_task_add）——桌面端不代理 agent 身份。
+只读看板 + 管理面操作（标记完成/取消/重试/调优先级都走 task_update 管理通道，
+done 触发 M2 自动结晶）。认领/改依赖走 MCP（hub_claim）——桌面端不代理 agent 身份。
 """
 from __future__ import annotations
+
+import re
 
 from PySide6.QtWidgets import QListWidgetItem  # noqa: F401  （uikit 的 * 不含它，显式带）
 
@@ -18,6 +20,33 @@ import brain
 # 段序；中文名用 brain.TASK_GROUP_CN（同源）。
 # R176：原只渲染前四段，退避/延后中的任务在 GUI 里凭空消失；六段都要可见。
 _GROUP_ORDER = ("ready", "doing", "takeover", "waiting", "backoff", "deferred")
+
+# R793：brain.team_digest 的 suggestions 是写给 agent 的（带工具名），工作台直接展示
+# 会漏出 hub_claim 这类天书。只在**展示层**换成人话，源数据保持 agent 可直接执行。
+_TOOL_HUMAN = (
+    (r"\s*\bhub_claim\b\s*认领", "认领"),
+    (r"\s*\bhub_task_update\b\s*关单", "更新任务关单"),
+    (r"\s*\bhub_task_add\b\s*新建任务", "新建任务"),
+    (r"\bhub_task_retry\b", "重试任务"),
+    (r"\bhub_heartbeat\b", "开工报到"),
+    (r"\bhub_log_work\b", "记录工作"),
+    (r"\bhub_memory_read\b", "查记忆"),
+    (r"\bhub_memory_write\b", "写记忆"),
+    (r"\bhub_report_error\b", "登记错误"),
+    (r"\bhub_list_errors\b", "查看错误"),
+    (r"\bhub_archive_project\b", "归档项目"),
+    (r"\bhub_ops_run\b", "运行检查"),
+    (r"\bhub_health\b", "体检"),
+    (r"\bhub_distill\b", "蒸馏"),
+    (r"\bhub_claim\b", "认领"),
+    (r"\bhub_[a-z_]+\b", "对应操作"),
+)
+
+
+def _human_hint(text: str) -> str:
+    for pattern, human in _TOOL_HUMAN:
+        text = re.sub(pattern, human, text)
+    return text
 
 
 class TodayPage(QWidget):
@@ -64,11 +93,26 @@ class TodayPage(QWidget):
         self.doneBtn = PushButton("标记完成")
         self.doneBtn.setToolTip("把选中的「进行中」任务标记完成（管理通道，空 agent）——完成自动结晶")
         self.doneBtn.clicked.connect(self.mark_done)
+        self.retryBtn = PushButton("重试…")
+        self.retryBtn.setToolTip("记录失败原因并放回队列（按失败次数指数退避）；"
+                                 "进行中 / 阻塞 / 已退避的任务可用")
+        self.retryBtn.clicked.connect(self.retry_task)
+        self.cancelBtn = PushButton("取消任务…")
+        self.cancelBtn.setToolTip("取消是终态，必须写明原因；保留任务供追溯，需要重做请新建")
+        self.cancelBtn.clicked.connect(self.cancel_task)
+        # R794：优先级原先只能让 agent 改，选中任务后桌面上却无从下手；
+        # 这是一次纯管理面字段更新，不需要代理 agent 身份。
+        self.prioBtn = PushButton("优先级")
+        self.prioBtn.setToolTip("调整选中任务的优先级（P0 紧急 → P3 低），越急越先进入可认领队列")
+        self.prioBtn.clicked.connect(self._show_priority_menu)
         self.listw.currentItemChanged.connect(lambda *_: self._sync_actions())
         row.addWidget(self.doneBtn)
+        row.addWidget(self.retryBtn)
+        row.addWidget(self.cancelBtn)
+        row.addWidget(self.prioBtn)
         # R197：界面上只留人话，精确工具名进 tooltip（R171 同款口径）——「hub_next ·
         # hub_claim · hub_task_add」对用户是天书，对 agent 才是命令。
-        cap = CaptionLabel("认领、新建、改优先级请让 agent 做（桌面端不代理 agent 身份）")
+        cap = CaptionLabel("认领请让 agent 做（桌面端不代理 agent 身份）")
         cap.setToolTip("对应工具：hub_next（看下一步）· hub_claim（认领）· hub_task_add（新建）")
         row.addWidget(cap)
         row.addStretch(1)
@@ -118,6 +162,15 @@ class TodayPage(QWidget):
         """
         t = self._selected_task()
         self.doneBtn.setEnabled(bool(t) and t.get("status") == "in_progress")
+        # 取消：任何非终态都可（列表本来就只收非终态）。
+        self.cancelBtn.setEnabled(bool(t) and t.get("status") not in brain.TASK_TERMINAL)
+        # 重试：只有失败过（attempts>0）或正卡在进行中/阻塞才有意义；
+        # 刚建出来的待办点「重试」只会凭空记一次失败。
+        self.retryBtn.setEnabled(
+            bool(t) and (int(t.get("attempts") or 0) > 0
+                         or t.get("status") in ("in_progress", "blocked")))
+        # R794：终态任务的优先级不再影响队列，别让按钮亮着骗人。
+        self.prioBtn.setEnabled(bool(t) and t.get("status") not in brain.TASK_TERMINAL)
 
     def _fill(self):
         self.listw.clear()
@@ -135,13 +188,15 @@ class TodayPage(QWidget):
             dg = brain.team_digest(self.win.root, days=1)
             f, cur = dg["flow"], dg["current"]
             w = cur["wip"]
-            tip = dg["suggestions"][0] if dg["risks"] and dg["suggestions"] else ""
+            tip = _human_hint(dg["suggestions"][0]) \
+                if dg["risks"] and dg["suggestions"] else ""
             self.digestLine.setText(
                 f"近 24h：记录 {f['records']} · 任务完成 {f['tasks_done']}"
                 f" · 在办 {cur['open_total']}"
                 f"（租约逾期 {w['stale_leases']} / 等审批 {w['approval_waiting']}）"
                 f" · 风险 {len(dg['risks'])} 类" + (f"；{tip}" if tip else ""))
-            self.digestLine.setToolTip("\n".join(f"- {s}" for s in dg["suggestions"]))
+            self.digestLine.setToolTip(
+                "\n".join(f"- {_human_hint(s)}" for s in dg["suggestions"]))
         except Exception as e:  # noqa: BLE001  日结失败不该拖垮工作台
             self.digestLine.setText(f"近 24h 日结读取失败：{e}")
         c = nxt["counts"]
@@ -220,6 +275,49 @@ class TodayPage(QWidget):
         it = self.listw.currentItem()
         return self._item2task.get(id(it)) if it else None
 
+    def _show_priority_menu(self):
+        t = self._selected_task()
+        if not t:
+            return
+        cur = int(t.get("_priority", 2))
+        menu = QMenu(self)
+        chosen = None
+        for val, label in NewTaskDialog.PRIORITIES:
+            act = menu.addAction(("✓ " if val == cur else "   ") + f"P{val} {label}")
+            act.setData(val)
+            if val == cur:
+                act.setEnabled(False)  # 当前档位不给点，避免「改了但没变」的假反馈
+        chosen = menu.exec(self.prioBtn.mapToGlobal(self.prioBtn.rect().bottomLeft()))
+        if chosen is not None:
+            self.set_priority(chosen.data())
+
+    def set_priority(self, priority: int):
+        """改选中任务优先级（R794）：列表按 P0→P3 排队，改完立刻重排。"""
+        t = self._selected_task()
+        if not t:
+            InfoBar.warning("先选中一个任务", "选中清单里的任务，再调整优先级", parent=self)
+            return
+        if t.get("status") in brain.TASK_TERMINAL:
+            InfoBar.warning("状态不符", f"#{t['id']} 已是终态，优先级不再影响队列", parent=self)
+            return
+        val = max(0, min(int(priority), 3))
+        if int(t.get("_priority", 2)) == val:
+            return
+        try:
+            # agent 空传＝管理面：进行中任务可能由别的 agent 持有，带 "gui" 会被
+            # 持有者校验挡掉（R794 实测），而桌面改优先级不该要求先接管任务。
+            err, _row = brain.task_update(self.win.root, t["id"], priority=val, agent="")
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("优先级更新失败", str(e), parent=self)
+            return
+        if err:
+            InfoBar.error("优先级更新失败", err, parent=self)
+            return
+        label = dict(NewTaskDialog.PRIORITIES).get(val, "")
+        InfoBar.success("优先级已更新", f"#{t['id']} → P{val} {label}",
+                        duration=2500, parent=self)
+        self.reload()
+
     # ---------- 操作 ----------
     def mark_done(self):
         t = self._selected_task()
@@ -240,4 +338,69 @@ class TodayPage(QWidget):
             return
         tip = "已标记完成" + ("（已自动结晶）" if row.get("crystal") else "")
         InfoBar.success("任务完成", f"#{t['id']} {tip}", parent=self)
+        self.reload()
+
+    def _require_reason(self, title, hint, placeholder, confirm_text) -> str:
+        dlg = ReasonDialog(self.win, title, hint, placeholder, confirm_text)
+        if not dlg.exec():
+            return ""
+        return dlg.reason()
+
+    def cancel_task(self, reason: str = ""):
+        """取消选中任务（R792）：终态必须写原因；reason 为空走对话框。"""
+        t = self._selected_task()
+        if not t:
+            InfoBar.warning("先选中一个任务", "选中清单里的任务，再取消", parent=self)
+            return
+        if t.get("status") in brain.TASK_TERMINAL:
+            InfoBar.warning("状态不符", f"#{t['id']} 已是终态，不能取消", parent=self)
+            return
+        reason = reason or self._require_reason(
+            f"取消任务 #{t['id']}",
+            "取消是终态，必须写清原因或替代方案（复盘时能查到）",
+            "例如：需求已撤，改由后续任务替代", "取消任务")
+        if not reason:
+            return
+        try:
+            err, _row = brain.task_update(self.win.root, t["id"], status="cancelled",
+                                          agent="", cancel_reason=reason)
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("取消失败", str(e), parent=self)
+            return
+        if err:
+            InfoBar.error("取消失败", err, parent=self)
+            return
+        InfoBar.success("任务已取消", f"#{t['id']} 已归档（保留记录，可追溯）",
+                        duration=3000, parent=self)
+        self.reload()
+
+    def retry_task(self, reason: str = ""):
+        """记录失败并退避（R792）：首次失败退避几分钟，次数耗尽自动进死信。"""
+        t = self._selected_task()
+        if not t:
+            InfoBar.warning("先选中一个任务", "选中清单里的任务，再重试", parent=self)
+            return
+        reason = reason or self._require_reason(
+            f"重试任务 #{t['id']}",
+            "写清上次失败原因 / 这次怎么改，没依据的退避只会变成无限重试",
+            "例如：网络超时，已确认代理后重试", "记录并重试")
+        if not reason:
+            return
+        try:
+            err, row = brain.task_retry(self.win.root, t["id"], agent="", reason=reason)
+        except Exception as e:  # noqa: BLE001
+            InfoBar.error("重试失败", str(e), parent=self)
+            return
+        if err:
+            InfoBar.error("重试失败", err, parent=self)
+            return
+        if row.get("_dead"):
+            InfoBar.warning("已进入死信",
+                            f"#{t['id']} 连续失败 {row.get('_attempts')} 次，"
+                            "已退出队列；需要再试请从这里复活", duration=4000, parent=self)
+        else:
+            mins = max(0, int(row.get("_backoff_seconds") or 0) // 60)
+            wait = f"{mins} 分钟后可再认领" if mins else "已立即可再认领"
+            InfoBar.success("已记录失败并退避", f"#{t['id']} {wait}",
+                            duration=3000, parent=self)
         self.reload()

@@ -1486,6 +1486,34 @@ class NewTaskDialog(MessageBoxBase):
         }
 
 
+class ReasonDialog(MessageBoxBase):
+    """必填理由（R792）：取消/重试都要留下为什么，否则复盘时任务凭空消失。"""
+
+    def __init__(self, parent, title, hint, placeholder, confirm_text="确定"):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel(title)
+        self.hint = CaptionLabel(hint)
+        self.reasonEdit = TextEdit()
+        self.reasonEdit.setPlaceholderText(placeholder)
+        self.reasonEdit.setFixedHeight(88)
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.hint)
+        self.viewLayout.addWidget(self.reasonEdit)
+        self.yesButton.setText(confirm_text)
+        self.cancelButton.setText("取消")
+        self.reasonEdit.textChanged.connect(self._check)
+        self._check()
+
+    def _check(self):
+        ok = bool(self.reasonEdit.toPlainText().strip())
+        self.yesButton.setEnabled(ok)
+        self.hint.setStyleSheet(
+            "" if ok else f"color:{tokens.C(tokens.DANGER)};")
+
+    def reason(self) -> str:
+        return self.reasonEdit.toPlainText().strip()
+
+
 class InboxPickDialog(MessageBoxBase):
     def __init__(self, parent, files):
         super().__init__(parent)

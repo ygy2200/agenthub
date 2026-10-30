@@ -158,7 +158,8 @@ def _frictions(d) -> list:
     if h["errors_open"]:
         out.append({"title": f"{h['errors_open']} 条错误登记未处置",
                     "evidence": "open 状态的错误登记挂在账上，下次踩坑时拦截提醒会反复弹它们",
-                    "fix": 'hub_list_errors 逐条看：已修复的 hub_report_error 无需重复，确认处置后走错误状态流转'})
+                    "fix": "让 agent 逐条查看错误清单：已修复的无需重复登记，确认处置后走错误状态流转"
+                           "（工具：hub_list_errors / hub_report_error）"})
     if h["dup_memory_count"]:
         out.append({"title": f"{h['dup_memory_count']} 组疑似重复记忆",
                     "evidence": "Jaccard 相似度检出，重复记忆让检索结果互相稀释",
@@ -190,11 +191,13 @@ def _frictions(d) -> list:
     if h["memories"] and zero * 2 >= h["memories"]:
         out.append({"title": f"{zero}/{h['memories']} 条记忆从未被唤起",
                     "evidence": "零唤起记忆在推送排序里已优先轮换曝光（v2.8.4），但仍大面积沉默说明内容本身低价值",
-                    "fix": "hub_health 看保鲜清单：环境已漂移的更新，无效的归档——用进废退"})
+                    "fix": "让 agent 跑一次体检看保鲜清单：环境已漂移的更新，无效的归档——用进废退"
+                           "（工具：hub_health）"})
     if h["projects_stalled"]:
         out.append({"title": f"{h['projects_stalled']} 个项目显式标记停滞（待归档决策）",
                     "evidence": "停滞项目挤占列表与注意力；显式标记是决策队列，不等于 90 天无活动（真实闲置天数用 hub_ops_run stalled 看）",
-                    "fix": "hub_archive_project 归档（需拍板，可逆：restore=true 一步恢复）；继续推进用 hub_task_add 写下下一步（任务写入自动恢复 active）"})
+                    "fix": "让 agent 归档已收口的项目（可逆）；继续推进就写下下一步"
+                           "（工具：hub_archive_project / hub_task_add）"})
     return out
 
 
@@ -233,7 +236,9 @@ def _sec_try(d) -> str:
               if t not in used and t != "hub_report"]
     if not unused:
         return "<p>工具箱里的能力都用起来了，没有闲置。</p>"
-    lis = "".join(f"<li><code>{_esc(t)}</code>：{_esc(desc)}</li>" for t, desc in unused[:MAX_LIST])
+    # R795：报告是给人看的，工具名放括号里——先读懂能做什么，再决定要不要转给 agent。
+    lis = "".join(f"<li>{_esc(desc)}（<code>{_esc(t)}</code>）</li>"
+                  for t, desc in unused[:MAX_LIST])
     return (f"<p>以下能力已内置但从未使用（检索日志与操作审计均零记录）：</p><ul>{lis}</ul>")
 
 
@@ -257,11 +262,12 @@ def _sec_rules(d) -> str:
 def _sec_better(d) -> str:
     tips = []
     if d["h"]["searches_total"] < 50:
-        tips.append("检索量偏低：开工时 hub_memory_read 带 query 查相关记忆、收工前把新知识沉淀，"
-                    "读写的飞轮转起来大脑才有用")
+        tips.append("检索量偏低：开工时让 agent 带着关键词查相关记忆（hub_memory_read）、"
+                    "收工前把新知识沉淀，读写的飞轮转起来大脑才有用")
     if not d["h"].get("search_by_agent"):
         tips.append("还没有 agent 主动检索过记忆——让常用 agent 的引导块里加一句「开工先 hub_memory_read 查本项目踩坑」")
-    tips.append("长任务开工先 hub_heartbeat（撞车预警+项目记忆自动推送），收工 hub_log_work（含收尾建议）")
+    tips.append("长任务开工先报到（hub_heartbeat：撞车预警+项目记忆自动推送），"
+                "收工记录工作（hub_log_work，含收尾建议）")
     lis = "".join(f"<li>{_esc(t)}</li>" for t in tips[:5])
     return f"<ul>{lis}</ul>"
 
@@ -354,9 +360,12 @@ def _html_doc(d: dict, secs: list) -> str:
             f"检索累计 {h['searches_total']} · 记忆有用率 {honest.get('memory_use_rate', 0)}% · "
             f"元信息占比 {honest.get('meta_ratio', 0)}%</p>"
             f"<p class='meta'>口径：{_esc(honest.get('note', ''))}</p>"
+            f"<p class='meta'>读法：文中 <code>hub_xxx</code> 是 agent 可直接执行的工具名；"
+            f"「修复」行的命令可原样转给 agent 执行。</p>"
             f"<nav>{nav}</nav>{body}"
             f"<p class='muted'>本报告由规则拼装（零 LLM），摩擦与建议均为提案——采纳由人拍板。"
-            f"重新生成：hub_report。</p></body></html>")
+            f"重新生成：在 AgentHub「运营报告」页点「生成并打开」，或让 agent 调 hub_report。</p>"
+            f"</body></html>")
 
 
 def generate_report(root: str, out: str = "") -> str:

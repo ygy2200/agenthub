@@ -63,7 +63,7 @@ class HelpPage(QWidget):
     <h2>各页面怎么用</h2>
     <ul>
     <li><b>总览</b>：今天谁在干活、待处理数量、agent 阵容与当前活跃会话，一眼全局。</li>
-    <li><b>工作台</b>：任务前沿（可认领/进行中/阻塞/等待）与近 24h 团队日结（风险与首要建议），可直接认领、标记完成。</li>
+    <li><b>工作台</b>：任务前沿（可认领/进行中/阻塞/等待）与近 24h 团队日结（风险与首要建议），可在桌面新建任务、标记完成、记录失败重试、取消、调优先级（认领仍由 agent 做，桌面端不代理 agent 身份）。</li>
     <li><b>信号中心</b>：agent 之间的广播与提醒（开工/撞车/交接），未读集中处理，可回复或标记已读。</li>
     <li><b>编排中心</b>：把多步工作编排成流程（触发器 / 图谱 / 跑一次 / 断点续跑），适合重复性交付。</li>
     <li><b>随记</b>：主人第一人称的想法/顿悟（Ctrl+Alt+N 随时记），与工作记忆分层但检索互通。</li>
@@ -211,17 +211,15 @@ class HelpPage(QWidget):
         rv.addLayout(head)
 
         self.browser = TextBrowser()
-        self.browser.setHtml(self.HTML)
         self.browser.setOpenExternalLinks(False)
         self.browser.verticalScrollBar().valueChanged.connect(self._sync_toc)
-        # 正文也走令牌：标题用主色、层级间距统一（此前是 qfw 默认样式，与页面脱节）
+        # 正文样式必须走文档默认样式表：widget QSS 的 h2/p 选择器只作用于控件本身，
+        # 不进入 QTextDocument（R791 实测换肤后正文仍停在上一主题色）。
+        self._render_doc()
         self.browser.setStyleSheet(
             f"TextBrowser{{background:{tokens.C('bg_surface')};"
             f"border:1px solid {tokens.C('stroke_medium')};"
-            f"border-radius:{tokens.RADIUS_CARD}px;padding:{tokens.PAD_CARD_WIDE}px;}}"
-            f"h2{{color:{tokens.C('accent')};margin:{tokens.SPACE_L}px 0 {tokens.SPACE_S}px 0;}}"
-            f"p,li{{color:{tokens.C('text_primary')};line-height:1.7;}}"
-            f"b{{color:{tokens.C('text_primary')};}}")
+            f"border-radius:{tokens.RADIUS_CARD}px;padding:{tokens.PAD_CARD_WIDE}px;}}")
         rv.addWidget(self.browser, 1)
 
         split = QSplitter(Qt.Horizontal)
@@ -233,15 +231,16 @@ class HelpPage(QWidget):
         split.setSizes([230, 760])
         lay.addWidget(split, 1)
 
-        # 高亮色来自 token，换肤后要重算；用弱引用回调，避免页面被样式注册表钉住。
+        # 正文字色/标题色与高亮都来自 token，换肤后要重算；用弱引用回调，
+        # 避免页面被样式注册表钉住。
         page_ref = weakref.ref(self)
 
-        def _refresh_highlight(_w=None):
+        def _refresh_doc(_w=None):
             page = page_ref()
             if page is not None:
-                page._apply_highlight()
+                page._restyle_doc()
 
-        bind_style(self.browser, _refresh_highlight)
+        bind_style(self.browser, _refresh_doc)
         self._rebuild_toc()
 
     # ---- 目录 / 检索
@@ -370,6 +369,31 @@ class HelpPage(QWidget):
         sec = self.SECTIONS[idx]
         self.browser.scrollToAnchor(sec["anchor"])
         self.atLabel.setText(f"正在看：{sec['title']}")
+
+    def _doc_stylesheet(self) -> str:
+        """QTextDocument 默认样式表（正文级的唯一着色入口）。"""
+        return (
+            f"h2{{color:{tokens.C('accent')};"
+            f"margin-top:{tokens.SPACE_L}px;margin-bottom:{tokens.SPACE_S}px;}}"
+            f"p,li{{color:{tokens.C('text_primary')};line-height:170%;}}"
+            f"b{{color:{tokens.C('text_primary')};}}"
+            f"a{{color:{tokens.C('accent')};}}"
+            f"code{{color:{tokens.C('text_primary')};"
+            f"background-color:{tokens.C('bg_inset')};"
+            f"font-family:'Cascadia Mono','Consolas',monospace;}}")
+
+    def _render_doc(self):
+        """按当前 token 重渲染正文；保留滚动位置（换肤不该把人弹回顶部）。"""
+        pos = self.browser.verticalScrollBar().value()
+        self.browser.document().setDefaultStyleSheet(self._doc_stylesheet())
+        self.browser.setHtml(self.HTML)
+        self.browser.verticalScrollBar().setValue(
+            min(pos, self.browser.verticalScrollBar().maximum()))
+
+    def _restyle_doc(self):
+        self._render_doc()
+        self._apply_highlight()
+        self._sync_toc()
 
     def _apply_highlight(self):
         selections = []

@@ -77,6 +77,9 @@ def main():
             if page is None:
                 continue
             w.switchTo(page)
+            # 统计/大脑页是异步取数：不等它落地就截图，拿到的是一屏骨架，
+            # 走查会误判「页面空白」。切换时同步发起请求，这里只等回调。
+            pump(app, lambda: not w._db_pending, 15)
             settle(app, max_s=3.0)
             pm = page.grab()
             if not pm.isNull():
