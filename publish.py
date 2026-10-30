@@ -16,6 +16,9 @@
     而不是先建出一个没有 exe 的空 Release（事后还得手工删）。--check 可单独只跑预检。
   · 断点重传（R717）：exe 上传失败时退出码非零并给出 `--upload-only` 的恢复命令；
     同名附件先删再传，避免「Release 有了但附件还是旧的」。
+  · 上传重试与对账（R765）：中断后最多 AGENTHUB_UPLOAD_RETRIES（默认 2）次，每次从 0 重传；
+    重传前先查远端附件表——同名且 size 一致说明响应丢了、附件其实已传好，按成功处理；
+    同名 size 不符（旧的/半截的）才删掉再传。慢代理（HTTPS_PROXY=…:7890）下不必人工盯。
 
 用法：
   python publish.py                     # 预演：看版本/tag/附件/说明来源
@@ -286,6 +289,75 @@ class _UploadProgress:
         return time.time() - self._t0
 
 
+def _upload_retries() -> int:
+    """R765：上传中断的总尝试次数。96MB 一次半小时，默认只多试一次。"""
+    try:
+        v = int(os.environ.get("AGENTHUB_UPLOAD_RETRIES", "2"))
+    except ValueError:
+        return 2
+    return min(max(v, 1), 5)
+
+
+def _find_asset(opener, base: str, rel_id, name: str):
+    """远端附件表里的同名附件；查不到或网络不通都返回 None。"""
+    try:
+        status, assets, _ = _call_retry(opener, f"{base}/releases/{rel_id}/assets")
+    except NetworkError:
+        return None
+    if status != 200:
+        return None
+    for a in assets or []:
+        if a.get("name") == name:
+            return a
+    return None
+
+
+def _upload_asset(opener, upload_url: str, base: str, rel_id, asset_name: str,
+                  exe: Path, timeout: float):
+    """POST exe；中断后有限重试，先按远端附件表对账再决定要不要重传（R765）。
+
+    对账解决的是「请求发出去了、附件其实建好了，只是响应丢了」：这时重传只会撞
+    422 already_exists，或先删掉刚传好的文件再白传一遍。同名但大小不符的附件是
+    旧的/半截的，删掉再传。返回 (asset, progress)；`_attempts`/`_elapsed` 仅供文案。
+    """
+    total = exe.stat().st_size
+    attempts = _upload_retries()
+    t0 = time.time()
+    last = ""
+    progress = None
+    for attempt in range(1, attempts + 1):
+        progress = _UploadProgress(exe, total)
+        try:
+            req = urllib.request.Request(upload_url, data=progress, method="POST")
+            req.add_header("Content-Type", "application/octet-stream")
+            req.add_header("Content-Length", str(total))
+            with opener.open(req, timeout=timeout) as r:
+                asset = json.loads(r.read())
+            asset["_attempts"] = attempt
+            asset["_elapsed"] = time.time() - t0
+            return asset, progress
+        except urllib.error.HTTPError as e:
+            last = f"HTTP {e.code} {e.reason}"
+        except (urllib.error.URLError, TimeoutError, OSError, NetworkError) as e:
+            last = str(getattr(e, "reason", e) or e)
+        found = _find_asset(opener, base, rel_id, asset_name)
+        if found and int(found.get("size") or 0) == total:
+            return ({"state": found.get("state", "uploaded"),
+                     "browser_download_url": found.get("browser_download_url", ""),
+                     "_reconciled": True, "_attempts": attempt,
+                     "_elapsed": time.time() - t0}, progress)
+        if found and found.get("id"):
+            _call(opener, f"{base}/releases/assets/{found['id']}", method="DELETE")
+            print(f"  同名附件大小 {found.get('size')} ≠ {total}，已删除后重传：{asset_name}")
+        if attempt < attempts:
+            wait = NET_BACKOFF * attempt
+            print(f"  上传中断（第 {attempt}/{attempts} 次）：{last}；"
+                  f"{wait:.1f}s 后从 0 重传", flush=True)
+            time.sleep(wait)
+    return ({"error": last, "_attempts": attempts,
+             "_elapsed": time.time() - t0}, progress)
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="创建 GitHub Release 并上传 exe（默认预演）")
     ap.add_argument("--yes", action="store_true", help="真的调用 GitHub API（默认只打印计划）")
@@ -482,24 +554,19 @@ def _run_inner(args) -> int:
     #   ③失败信息里带上「传了多少 / 花了多久」，能区分「网络慢」和「被拒」。
     timeout = _upload_timeout()
     total = args.exe.stat().st_size
-    progress = _UploadProgress(args.exe, total)
-    try:
-        req = urllib.request.Request(url, data=progress, method="POST")
-        req.add_header("Content-Type", "application/octet-stream")
-        req.add_header("Content-Length", str(total))
-        with opener.open(req, timeout=timeout) as r:
-            asset = json.loads(r.read())
-    except urllib.error.HTTPError as e:
-        asset = {"error": f"HTTP {e.code} {e.reason}"}
-    except (urllib.error.URLError, TimeoutError, OSError) as e:
-        asset = {"error": str(getattr(e, "reason", e) or e)}
+    asset, progress = _upload_asset(opener, url, base, rel["id"], asset_name,
+                                    args.exe, timeout)
     if asset.get("error") or not asset.get("browser_download_url"):
         print(f"exe 上传失败：{asset.get('error', '响应里没有下载地址')}"
-              f"（已传 {progress.sent / 1048576:.1f}/{total / 1048576:.0f}MB，"
-              f"{progress.seconds():.0f}s，超时上限 {timeout:.0f}s）")
+              f"（最后一次已传 {progress.sent / 1048576:.1f}/{total / 1048576:.0f}MB，"
+              f"共 {asset.get('_attempts', 1)} 次尝试，累计 "
+              f"{asset.get('_elapsed', progress.seconds()):.0f}s，"
+              f"单次超时上限 {timeout:.0f}s）")
         print("附件没传上：Release 仍是草稿，公开页看不到（不会留下空附件版本）。")
         print(f"恢复命令：python publish.py --upload-only --yes --exe {args.exe}")
         return 1
+    if asset.get("_reconciled"):
+        print(f"  附件已存在且大小一致（{total} 字节）：响应丢了，按附件表对账视为上传成功")
     print(f"exe 上传：{asset.get('state')}  {asset.get('browser_download_url', '')}")
     if rel.get("draft"):
         st, pub, _ = _call_retry(opener, f"{base}/releases/{rel['id']}", method="PATCH",
