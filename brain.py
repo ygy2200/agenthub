@@ -264,6 +264,14 @@ CREATE INDEX IF NOT EXISTS idx_records_date ON records(date);
 -- records_agents 的 DISTINCT lower(agent) 28.4ms → 13.9ms。查询语句不改。
 CREATE INDEX IF NOT EXISTS idx_records_proj_status_date ON records(project, status, date);
 CREATE INDEX IF NOT EXISTS idx_records_status_agent ON records(status, agent);
+-- R778：20 万记录库 today/timeline 同步切页 127/146ms（6 万时 60/75ms）。team_digest 的
+-- 「近 N 天」窗口把 date 包进 COALESCE(NULLIF(date,''),substr(created,1,10))，普通 date
+-- 索引用不上，实际扫全部 active 行（两条合计 91ms）；表达式索引后同一查询 0ms。
+-- records_page 首页 ORDER BY date DESC, id DESC 原来靠临时排序 20 万行（64–80ms），
+-- (status,date) 让 SQLite 反向扫索引直接取前 50 条（0.2ms）。
+CREATE INDEX IF NOT EXISTS idx_records_status_day
+    ON records(status, COALESCE(NULLIF(date,''), substr(created,1,10)));
+CREATE INDEX IF NOT EXISTS idx_records_status_date ON records(status, date);
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT DEFAULT "note",
@@ -1849,11 +1857,16 @@ def recent_diverse(root: str, limit: int = 8, pool: int = 200) -> list:
 
 
 def records_agents(root: str) -> list:
-    """records 出现过的 agent（小写去重；虚拟滚动模式填过滤器下拉用）。"""
+    """records 出现过的 agent（小写去重；虚拟滚动模式填过滤器下拉用）。
+
+    R778：`SELECT DISTINCT lower(agent)` 让 SQLite 建临时 B 树做 DISTINCT，20 万记录库
+    实测 87ms（覆盖索引能供 status 条件，但表达式结果不在索引里）；改取原始值在 Python
+    去重小写后 15.2ms。返回语义不变：小写、排序、空排除。"""
     with db_conn(root) as conn:
-        return [r[0] for r in conn.execute(
-            "SELECT DISTINCT lower(agent) FROM records "
-            "WHERE status='active' AND agent<>'' ORDER BY 1")]
+        rows = conn.execute(
+            "SELECT DISTINCT agent FROM records "
+            "WHERE status='active' AND agent<>''").fetchall()
+    return sorted({r[0].lower() for r in rows})
 
 
 def _like_escape(w: str) -> str:
