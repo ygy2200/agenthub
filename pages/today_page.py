@@ -9,6 +9,7 @@ hub_next 前沿队列的 GUI 呈现（同源 brain.task_next）：
 from __future__ import annotations
 
 import re
+from datetime import date
 
 from PySide6.QtWidgets import QListWidgetItem  # noqa: F401  （uikit 的 * 不含它，显式带）
 
@@ -230,8 +231,9 @@ class TodayPage(QWidget):
                 meta = []
                 if t.get("owner"):
                     meta.append(f"@{t['owner']}")
-                if t.get("due"):
-                    meta.append(f"截止:{t['due']}")
+                due_label = self._due_label(t)
+                if due_label:
+                    meta.append(due_label)
                 if key == "waiting" and t.get("_wait"):
                     meta.append("等待:" + ",".join(f"#{w}" for w in self._wait_ids(t["_wait"])))
                 if key == "takeover" and t.get("_takeover"):
@@ -251,6 +253,32 @@ class TodayPage(QWidget):
                 self.listw.addItem(it)
 
     @staticmethod
+    def _due_days(t: dict):
+        """距截止还有几天（负数=已逾期）；空/坏日期返回 None，界面退回原样显示。"""
+        due = (t.get("due") or "").strip()
+        if not due:
+            return None
+        try:
+            return (date.fromisoformat(due[:10]) - date.today()).days
+        except ValueError:
+            return None
+
+    @classmethod
+    def _due_label(cls, t: dict) -> str:
+        """截止日的人话摘要（R800）：逾期/今天到期要一眼看见，未来日期保持原样。"""
+        due = (t.get("due") or "").strip()
+        if not due:
+            return ""
+        days = cls._due_days(t)
+        if days is None:
+            return f"截止:{due}"
+        if days < 0:
+            return f"逾期 {-days} 天（{due[:10]}）"
+        if days == 0:
+            return "今天到期"
+        return f"截止:{due}"
+
+    @staticmethod
     def _wait_ids(wait) -> list:
         """依赖等待可能是 id 列表，也可能是任务行 dict 列表（brain 两种历史形态）。"""
         return [str(w.get("id") if isinstance(w, dict) else w) for w in (wait or [])]
@@ -266,7 +294,14 @@ class TodayPage(QWidget):
         if t.get("owner"):
             lines.append(f"负责人：{t['owner']}")
         if t.get("due"):
-            lines.append(f"截止：{t['due']}")
+            due = (t.get("due") or "").strip()
+            lines.append(f"截止：{due}")
+            days = TodayPage._due_days(t)
+            if days is not None and days < 0:
+                lines.append(f"已逾期 {-days} 天")
+            elif days == 0:
+                lines.append("今天到期")
+            lines.append("改期：选中任务 → 详情")
         if key == "waiting" and t.get("_wait"):
             lines.append("等待依赖：" + "、".join(f"#{w}" for w in TodayPage._wait_ids(t["_wait"])))
         if key == "takeover" and t.get("_takeover"):

@@ -231,7 +231,8 @@ class BrainPage(QWidget):
                 days = t.get("_due_days")
                 chip = status_chip(f"逾期 {due[5:10]}", "warning")
                 chip.setToolTip(f"截止 {due} 已过 {abs(days) if days is not None else '?'} 天；"
-                                "改期用 hub_task_update(due=...)")
+                                "改期：工作台选中任务 → 详情（也可让 agent 调 "
+                                "hub_task_update(due=...)）")
                 r.addWidget(chip)
             # R26 进展停滞：心跳在线不等于任务在走——只看租约的桌面会漏掉「人在、活停」
             if t.get("_progress_stall"):
