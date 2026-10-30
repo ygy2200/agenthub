@@ -163,12 +163,19 @@ def test_page_open_does_not_pay_the_security_segment_reads(qapp, hub_root):
     calls = {"verify": 0, "check": 0}
     v_orig, c_orig = brain.journal_verify, ops.run_check
 
+    # R776：前面用例的窗口可能仍活着（cleanup_windows 只删线程已空的窗口），它们的
+    # 5 分钟自动环境预检（window._auto_env_check → run_check("env", root=别的根)）会在
+    # 本用例执行期间到期——全模块 spy 会把它算成「打开治理页付了安全段的钱」。
+    # 全量实测正是这个签名：run_check 1 次 / journal_verify 0 次；只统计本用例根目录。
     def v(*a, **k):
-        calls["verify"] += 1
+        if (a[0] if a else k.get("root")) == hub_root:
+            calls["verify"] += 1
         return v_orig(*a, **k)
 
     def c(*a, **k):
-        calls["check"] += 1
+        _root = a[2] if len(a) > 2 else k.get("root", "")
+        if _root == hub_root:
+            calls["check"] += 1
         return c_orig(*a, **k)
 
     brain.journal_verify = v

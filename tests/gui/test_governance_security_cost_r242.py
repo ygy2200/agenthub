@@ -53,7 +53,9 @@ def test_one_visible_refresh_verifies_the_chain_once(qapp, hub_root):
         real = brain.journal_verify
 
         def spy(root):
-            calls.append(root)
+            # R776：只管本用例的根——残留窗口的自动预检/延迟加载也可能撞上全模块 spy
+            if root == hub_root:
+                calls.append(root)
             return real(root)
 
         brain.journal_verify = spy
