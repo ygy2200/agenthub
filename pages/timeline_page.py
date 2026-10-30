@@ -364,7 +364,7 @@ class TimelinePage(QWidget):
             more.clicked.connect(self._vfetch)
             self._add_content(more, Qt.AlignHCenter)
             self._tail.append(more)
-            cap = CaptionLabel(f"共 {st['total']} 条 · 虚拟滚动模式（滚动到底自动加载）")
+            cap = CaptionLabel(f"共 {st['total']} 条 · 滚动到底自动加载更多")
             self._add_content(cap, Qt.AlignHCenter)
             self._tail.append(cap)
         else:

@@ -52,6 +52,7 @@ TERMS = [
     (re.compile(r"\bjsonl\b"), "文件格式名（应说「导出文件」）", ()),
     (re.compile(r"\bP90\b"), "统计分位缩写（应说「慢 10% 耗时」并进 tooltip）", ()),
     (re.compile(r"\bWCAG\b"), "无障碍标准编号（应说「对比度验算」）", ()),
+    (re.compile(r"虚拟滚动|FnWorker|QThread"), "实现术语（应说用户能感知的行为）", ()),
     (re.compile(r"\btoken\b", re.I), "技术词 token（应说「凭据」）", ()),
     (re.compile(r"\bMCP\b"), "协议缩写——只有接入/帮助/资产页需要原词",
      ("connect_page.py", "help_page.py", "hub_page.py")),

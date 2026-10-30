@@ -18,6 +18,10 @@ def test_timeline_virtual_mode_and_paging(qapp, hub_root):
         f"虚拟模式首屏未就绪：virtual={tl._virtual} state={tl._vstate}"
     assert tl._vstate["total"] == 260
     assert not tl.all_entries, "虚拟模式不应把全量载入内存"
+    # R798：页脚只说用户能感知的行为（滚到底会继续加载），不暴露「虚拟滚动」实现词。
+    texts = [tw.text() for tw in getattr(tl, "_tail", []) if hasattr(tw, "text")]
+    assert any("滚动到底自动加载" in t for t in texts), texts
+    assert not any("虚拟滚动" in t for t in texts), texts
 
     # 分页到底（按钮路径）
     guard = 0

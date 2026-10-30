@@ -24,6 +24,6 @@ def test_jargon_terms_can_bite():
     import jargon_audit
 
     bad = ["最近会话（hub_heartbeat 上报）", "CLI：tasks --stats", "写进 journal 表",
-           "SQL 索引", "P90 4h", "WCAG 验算", "token 过期", "MCP 工具"]
+           "SQL 索引", "P90 4h", "WCAG 验算", "token 过期", "MCP 工具", "虚拟滚动模式"]
     hits = [t for t in bad if any(rx.search(t) for rx, _why, _allow in jargon_audit.TERMS)]
     assert len(hits) == len(bad), f"术语表失去咬合力：{set(bad) - set(hits)}"
