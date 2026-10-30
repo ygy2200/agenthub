@@ -4,6 +4,7 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+import os
 import ops
 import brain
 
@@ -106,6 +107,13 @@ class SettingsPage(QWidget):
         row.addWidget(pickBtn)
         row.addWidget(self.initBtn)
         g1.addLayout(row)
+        # R774：路径不可用/未初始化此前只在窗口横幅里说（R772），可设置页才是动手修的地方——
+        # 横幅关掉后这一页仍只显示路径本身，看不出「这目录现在是坏的」。
+        self._root_tone = "neutral"
+        self.rootState = CaptionLabel("")
+        self.rootState.setWordWrap(True)
+        bind_style(self.rootState, self._paint_root_state)
+        g1.addWidget(self.rootState)
         g1.addWidget(CaptionLabel("可以直接选现有目录（如桌面 zcode项目记录）立即可视化历史；"
                                  "也可以选新目录（推荐 D:\\AgentHub）后初始化全新结构。软件纯本地扫描，不改任何 agent。"))
         lay.addWidget(c1)
@@ -243,9 +251,33 @@ class SettingsPage(QWidget):
         super().showEvent(e)
 
     def reload(self):
-        self.rootLabel.setText(self.win.root or "未设置")
-        if self.win.root:
-            self.rulesEdit.setPlainText(core.load_rules(self.win.root))
+        root = self.win.root or ""
+        self.rootLabel.setText(root or "未设置")
+        if not root:
+            self._root_tone = "neutral"
+            self.rootState.setText(
+                "还没有选择根目录——点「选择…」选一个目录；新目录可再点「初始化目录结构」")
+        elif not os.path.isdir(root):
+            self._root_tone = "warning"
+            # R165：qfw 的 CaptionLabel 用 Segoe UI，✓/⚠ 会渲染成方框（字形门禁盯着），
+            # 状态语义一律用「！」/「●」这类有字形的符号表达。
+            self.rootState.setText(
+                "！目录不可用：可能盘符变了或移动硬盘未连接——点「选择…」重新指到可用目录")
+        else:
+            self._root_tone = "success"
+            self.rootState.setText(
+                "● 目录可用 · 大脑已初始化"
+                if os.path.isdir(os.path.join(root, core.DIR_META))
+                else "● 目录可用 · 大脑尚未初始化——点「初始化目录结构」启用共享记忆与流水")
+        self._paint_root_state()
+        if root:
+            self.rulesEdit.setPlainText(core.load_rules(root))
+
+    def _paint_root_state(self):
+        """状态行随主题换色；bind_style 已登记，换肤时自动重算（R223 同族）。"""
+        spec = {"warning": tokens.WARNING,
+                "success": tokens.SUCCESS}.get(getattr(self, "_root_tone", "neutral"))
+        self.rootState.setStyleSheet(f"color:{tokens.C(spec)};" if spec else "")
 
     def pick_root(self):
         from PySide6.QtWidgets import QFileDialog

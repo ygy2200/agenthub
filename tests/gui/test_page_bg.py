@@ -100,9 +100,15 @@ def test_theme_change_restyles_only_visible_page(qapp, hub_root, monkeypatch):
 
     calls = []
     real = window_mod.apply_page_background
+    # R773：前面用例的窗口可能因为后台线程未退而**仍活着**（helpers.cleanup_windows
+    # 只删线程已空的窗口），它们同样连着 themeChangedFinished——换肤时各自的可见页也会
+    # 调这个模块级函数。计数只算本窗口（产品同一时刻只有一个窗口，跨窗口调用是无害噪声）。
+    # 复现：_pytest_tmp/repro_two_windows_r773.py 两个存活窗口 → 一次换肤 2 次调用。
+    own = {p for _t, p in _pages(w)}
 
     def _spy(p):
-        calls.append(p)
+        if p in own:
+            calls.append(p)
         return real(p)
 
     monkeypatch.setattr(window_mod, "apply_page_background", _spy)

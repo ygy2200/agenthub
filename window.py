@@ -200,6 +200,12 @@ class AgentHubWindow(FluentWindow):
         self._auto_env_timer.start(5 * 60 * 1000)
         if not self.root:
             self.switchTo(self.settings_page)
+        elif not os.path.isdir(self.root):
+            # R772：盘符变了/移动硬盘没插时，此前既不建库也不扫描——总览页显示「项目总数 0」，
+            # 看起来就是一个空库（同 R762「读失败被当成空库」）。给一条持久的病因+下一步，
+            # 用户关掉横幅后仍可按 F5 重试（R766 的扫描失败提示走的是那条路）。
+            # defer 而非 QTimer.singleShot：延后回调必须挂窗口寿命（R239 门禁）。
+            defer(self, self._warn_dead_root)
 
     def _collect_worker_lists(self):
         """汇总窗口 + 各页面在飞的后台线程列表（退出前统一等待；页面自持 _workers）。"""
@@ -353,6 +359,16 @@ class AgentHubWindow(FluentWindow):
         self.switchTo(self.search_page)
         self.search_page.edit.setFocus()
 
+    def _warn_dead_root(self):
+        """R772：持久横幅（duration<0 不自动淡出），关掉后靠 F5 仍能复现失败提示。"""
+        try:
+            self._root_bar = InfoBar.error(
+                "根目录不存在",
+                f"{self.root} —— 可能盘符变了或移动硬盘未连接；到「设置」页重新选择根目录",
+                duration=-1, parent=self)
+        except Exception:  # noqa: BLE001  UI 提示失败不许影响启动
+            self._root_bar = None
+
     def set_root(self, d):
         # R296：先写配置再改内存——core.set_root 会因 Temp 路径/权限抛错，
         # 之前先赋 self.root，异常后界面指向新目录、配置却还是旧的。
@@ -362,6 +378,13 @@ class AgentHubWindow(FluentWindow):
             InfoBar.error("根目录设置失败", str(e), duration=6000, parent=self)
             return
         self.root = d
+        bar = getattr(self, "_root_bar", None)
+        if bar is not None:
+            try:
+                bar.close()   # R772：换到可用根目录后，别再挂着「根目录不存在」
+            except RuntimeError:
+                pass
+            self._root_bar = None
         err = core.init_hub(d)
         if err:
             InfoBar.error("目录结构初始化失败", err, duration=6000, parent=self)
@@ -542,8 +565,19 @@ class AgentHubWindow(FluentWindow):
             self.overview_page.set_sessions(brain.active_sessions(self.root, ttl=24 * 3600))
         except Exception:
             self.overview_page.set_sessions([])
-        self.journal_page.reload()
-        self.report_page.reload_reports()  # agent 侧 hub_report 可能生成了新报告，F5 后列表跟上
+        # R772：以上两页直接读库，根目录失效时抛 sqlite 错误会从 Qt 槽里冒出来、
+        # 把整次 apply 掐断在中间（后面的页全不更新、_apply_count 也不涨）。
+        # 失败要可见但不能让一次刷新半途死掉；成功一次后自动解除只提示一次的限制。
+        try:
+            self.journal_page.reload()
+            self.report_page.reload_reports()  # agent 侧 hub_report 可能生成了新报告，F5 后列表跟上
+        except Exception as e:  # noqa: BLE001
+            if not getattr(self, "_secondary_fail_warned", False):
+                self._secondary_fail_warned = True
+                InfoBar.warning("部分页面未能刷新", f"流水/报告读取失败：{e}",
+                                duration=6000, parent=self)
+        else:
+            self._secondary_fail_warned = False
         # 防横向溢出守卫（批次 3 修复）：刷新后对全页统一巡检（幂等、无视觉副作用）
         for _pg in (self.overview_page, self.today_page, self.signal_page,
                     self.governance_page, self.playbook_page, self.project_page, self.timeline_page,

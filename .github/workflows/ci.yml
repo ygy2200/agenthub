@@ -29,6 +29,11 @@ jobs:
         # R764：HOME/USERPROFILE 指到临时目录并预埋毒配置——读了本机用户配置的用例
         # 会拿到毒值当场红（R754 同族回归）。本地同一命令即可复现。
         run: python tools/empty_home_smoke.py
+      - name: 首启/根目录失效探针（R771，R773 进门禁）
+        # 三种真实开机态各起一次真窗口：无配置要落在设置页；配置的盘不在必须报
+        # 「根目录不存在」且设置页显示「目录不可用」；空目录必须跑完一次扫描。
+        # 探针自带临时 HOME 与 offscreen，约 20s，不依赖开发机状态。
+        run: python tools/root_boot_probe.py --out root-boot-ci
 
   full:
     name: 三层门禁（手动触发）

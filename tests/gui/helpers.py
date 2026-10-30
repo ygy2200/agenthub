@@ -40,6 +40,23 @@ def insert_records(root, n, projects=5):
                          (f"P{k}", "2026-10-11"))
 
 
+def dead_path(tag="dead"):
+    """返回一个确定不存在的路径。
+
+    优先落在**不存在的盘符**上（真实「移动硬盘拔了/盘符变了」场景）；CI 或本机恰好
+    所有候选盘都存在时，退回临时目录下不存在的子目录——两者走的是同一判定分支
+    （`os.path.isdir(root)` 为假），不会因为机器盘符不同而让用例失去意义。
+    """
+    import os
+    import tempfile
+    import uuid
+    suffix = f"__agenthub_{tag}_{uuid.uuid4().hex[:6]}"
+    for letter in "ZYXQRT":
+        if not os.path.exists(f"{letter}:/"):
+            return f"{letter}:/{suffix}"
+    return os.path.join(tempfile.gettempdir(), suffix)
+
+
 def boot_window(qapp, root):
     """构造真实窗口（core.get_root 已由 hub_root fixture patch 指向临时库）。
 
