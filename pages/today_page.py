@@ -22,6 +22,12 @@ import brain
 # R176：原只渲染前四段，退避/延后中的任务在 GUI 里凭空消失；六段都要可见。
 _GROUP_ORDER = ("ready", "doing", "takeover", "waiting", "backoff", "deferred")
 
+# R803：每组默认显示 20 条；超出时组头写「共 N，显示前 M」并给「显示更多」，
+# 免得摘要里的总数与列表长度对不上、用户以为任务丢了。
+_PAGE_DEFAULT = 20
+_PAGE_STEP = 30
+_PAGE_MAX = 200
+
 # R793：brain.team_digest 的 suggestions 是写给 agent 的（带工具名），工作台直接展示
 # 会漏出 hub_claim 这类天书。只在**展示层**换成人话，源数据保持 agent 可直接执行。
 _TOOL_HUMAN = (
@@ -69,6 +75,12 @@ class TodayPage(QWidget):
         # 占满整行：空标签构造时的 sizeHint 很小，若只按 Preferred 加进 HBox，
         # 六段摘要会被截成前两段（R176 真实窗口实测）。
         top.addWidget(self.sumLabel, 1)
+        # R803：截断时把「还有多少」摆到台面上；没有截断时按钮直接隐藏，空态不添噪音。
+        self._page_limit = _PAGE_DEFAULT
+        self.moreBtn = PushButton("显示更多")
+        self.moreBtn.clicked.connect(self.load_more)
+        self.moreBtn.hide()
+        top.addWidget(self.moreBtn)
         refreshBtn = PushButton(ic("SYNC", "INFO"), "刷新")
         refreshBtn.clicked.connect(self.reload)
         top.addWidget(refreshBtn)
@@ -185,12 +197,13 @@ class TodayPage(QWidget):
     def _fill(self):
         self.listw.clear()
         self._item2task.clear()
+        self.moreBtn.hide()
         if not self.win.root:
             self.sumLabel.setText("未配置数据根目录")
             self.digestLine.setText("")
             return
         try:
-            nxt = brain.task_next(self.win.root, limit=20)
+            nxt = brain.task_next(self.win.root, limit=self._page_limit)
         except Exception as e:  # noqa: BLE001  看板读失败不该拖垮窗口刷新
             self.sumLabel.setText(f"读取失败：{e}")
             return
@@ -215,11 +228,17 @@ class TodayPage(QWidget):
         parts = [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[:4]]
         parts += [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[4:] if c.get(k)]
         self.sumLabel.setText(" · ".join(parts))
+        hidden_n = 0
         for key in _GROUP_ORDER:
             items = nxt.get(key) or []
             if not items:
                 continue
-            head = QListWidgetItem(f"── {brain.TASK_GROUP_CN[key]}（{len(items)}）")
+            total = int(c.get(key) or 0)
+            shown = len(items)
+            if total > shown:
+                hidden_n += total - shown
+            label = f"{total}，显示前 {shown}" if total > shown else str(total)
+            head = QListWidgetItem(f"── {brain.TASK_GROUP_CN[key]}（{label}）")
             head.setFlags(Qt.ItemFlag.NoItemFlags)  # 分组标题不可选
             f = head.font()
             f.setBold(True)
@@ -251,6 +270,21 @@ class TodayPage(QWidget):
                 it.setToolTip(self._task_tip(t, key, title))
                 self._item2task[id(it)] = t
                 self.listw.addItem(it)
+        if hidden_n:
+            capped = self._page_limit >= _PAGE_MAX
+            self.moreBtn.setVisible(True)
+            self.moreBtn.setEnabled(not capped)
+            self.moreBtn.setToolTip(
+                f"还有 {hidden_n} 条未显示；点此每组再加载 {_PAGE_STEP} 条"
+                if not capped else
+                f"还有 {hidden_n} 条未显示，已达单组 {_PAGE_MAX} 条上限")
+
+    def load_more(self):
+        """展开列表（R803）：每次每组多取 30 条，直到 200 条上限。"""
+        if self._page_limit >= _PAGE_MAX:
+            return
+        self._page_limit = min(self._page_limit + _PAGE_STEP, _PAGE_MAX)
+        self.reload()
 
     @staticmethod
     def _due_days(t: dict):

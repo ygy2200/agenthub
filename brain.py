@@ -4034,9 +4034,10 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
     R2：可接管段同时收「租约过期」「无主」「租约缺失」三类（附 _takeover 原因）。
     排序：priority（0 急 → 3 低）→ id（先来先做）。纯只读。返回结构化 dict 供 MCP 层排版。
     R727：`hidden`（{"control": n, "skills": n}）记录被管控状态/能力声明挡掉的条数——
-    counts 在过滤之后才算，调用方需要它才能区分「前沿真的空」与「活有但接不住」。"""
+    counts 在过滤之后才算，调用方需要它才能区分「前沿真的空」与「活有但接不住」。
+    R803：limit 上限放宽到 200——GUI 需要「显示更多」逐段展开；MCP 默认仍是 5。"""
     try:
-        lim = max(1, min(int(limit or 5), 20))
+        lim = max(1, min(int(limit or 5), 200))
     except (TypeError, ValueError):
         lim = 5
     q = "SELECT * FROM tasks WHERE status IN ('pending','in_progress','blocked')"
