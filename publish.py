@@ -24,11 +24,16 @@
   python publish.py --yes --token-file ~/gh_token.txt   # 显式指定 token 文件
   python publish.py --upload-only --yes # 已建过 Release、只补传/换掉 exe
   python publish.py --yes --notes-file notes.md --exe dist/AgentHub.exe
+
+  # R755：一条命令发完并推送，输出同时落盘——不要再用 `python publish.py | tail && git push`，
+  # 管道会把退出码换成 tail 的 0，失败被静默吞掉（2026-10-29/30 各踩一次）。
+  python publish.py --yes --push --log-file publish.log
 """
 import argparse
 import json
 import os
 import re
+import subprocess
 import sys
 import time
 import urllib.error
@@ -171,6 +176,47 @@ def _empty_release_audit(opener, repo: str) -> dict:
     return {"ok": True, "error": "", "tags": tags}
 
 
+class _Tee:
+    """R755：同一份输出既给屏幕也给日志文件。管道会吃掉退出码与正文，日志文件不会。"""
+
+    def __init__(self, *streams):
+        self.streams = streams
+
+    @property
+    def encoding(self):
+        # StringIO 这类流 encoding 是 None，不能原样透出（调用方当成「有编码」会崩）
+        return getattr(self.streams[0], "encoding", None) or "utf-8"
+
+    def write(self, text):
+        for st in self.streams:
+            try:
+                st.write(text)
+            except Exception:  # noqa: BLE001 某个流坏了不该让整个发布中断
+                pass
+        return len(text)
+
+    def flush(self):
+        for st in self.streams:
+            try:
+                st.flush()
+            except Exception:  # noqa: BLE001
+                pass
+
+
+def _git_push() -> int:
+    """R755：发布成功后顺手 push。失败必须原样传回非零，不能被外层 `&&` 串丢。"""
+    print("git push origin HEAD …", flush=True)
+    p = subprocess.run(["git", "-C", str(ROOT), "push", "origin", "HEAD"],
+                       capture_output=True, text=True, encoding="utf-8", errors="replace")
+    out = ((p.stdout or "") + (p.stderr or "")).strip()
+    print(out or "（git 无输出）")
+    if p.returncode != 0:
+        print(f"推送失败（RC={p.returncode}）：Release 已建好，但代码没推上去；重跑 git push 即可。")
+        return 1
+    print("已推送。")
+    return 0
+
+
 class _UploadProgress:
     """R742：POST 大文件时顺手报进度。
 
@@ -221,8 +267,27 @@ def main(argv=None) -> int:
     ap.add_argument("--target", default="main", help="target_commitish，默认 main")
     ap.add_argument("--token-file", type=Path,
                     help="token 文件（一行，可带 BOM/换行）；给了就只认它，读不到直接报错")
+    ap.add_argument("--push", action="store_true",
+                    help="发布成功后顺手 git push（省掉 `… && git push` 的串命令）")
+    ap.add_argument("--log-file", type=Path,
+                    help="全部输出同时写进该文件（管道吃退出码时靠它留证据）")
     args = ap.parse_args(argv)
+    if not args.log_file:
+        return _run(args)
+    # 日志模式只包一层：_run 里任何分支 return/抛异常都必须把 sys.stdout 换回来，
+    # 否则同进程内再调用（pytest 直接 import 调 main）会一直往已关闭的文件里写。
+    _log = open(args.log_file, "w", encoding="utf-8", errors="replace")
+    old_out, old_err = sys.stdout, sys.stderr
+    sys.stdout, sys.stderr = _Tee(old_out, _log), _Tee(old_err, _log)
+    try:
+        print(f"日志：{args.log_file}（本行起全部输出同时落盘）")
+        return _run(args)
+    finally:
+        sys.stdout, sys.stderr = old_out, old_err
+        _log.close()
 
+
+def _run(args) -> int:
     version = current_version()
     tag = f"v{version}"
     if args.notes_file:
@@ -374,6 +439,8 @@ def main(argv=None) -> int:
                   "恢复：重跑 python publish.py --upload-only --yes")
             return 1
         print(f"Release 已公开：{pub.get('html_url') or tag}")
+    if args.push:
+        return _git_push()
     return 0
 
 
