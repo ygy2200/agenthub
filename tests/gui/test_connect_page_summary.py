@@ -9,7 +9,7 @@
 """
 from PySide6.QtWidgets import QWidget
 
-from helpers import settle
+from helpers import settle, track_window
 
 
 def _adapter(name, mcp=True, boot=True):
@@ -35,7 +35,8 @@ def _page(qapp, hub_root, monkeypatch, adapters, st, connected=(), booted=()):
 
     win = QWidget()
     win.root = str(hub_root)
-    page = ConnectPage(win)
+    track_window(win)          # B019：不登记的裸窗口不销毁，qfw 注册表会把整页留住
+    page = ConnectPage(win, win)
     settle(qapp, max_s=0.6)   # 等过 singleShot(400, refresh_status)
     page.refresh_status()
     return win, page

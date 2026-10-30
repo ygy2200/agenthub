@@ -74,6 +74,17 @@ def boot_window(qapp, root):
 _WINDOWS = []
 
 
+def track_window(win):
+    """登记用例自建的裸窗口，交给 `_flush_qt_deletes` 在用例边界确定销毁。
+
+    qfw 的 styleSheetManager 对每个注册控件持**强引用**，`close()` 只隐藏不销毁：
+    页面若没挂父窗口（`Page(win)` 的 parent 默认 None），它整个活到进程结束。
+    单文件连开多个窗口实测累到 ~100 个注册控件时，事件分发随机 access violation
+    （B019）。登记后 cleanup_windows 会 deregister + close + deleteLater + 冲刷。
+    """
+    _WINDOWS.append(win)
+
+
 def cleanup_windows(app=None):
     """用例边界销毁窗口（R221）。
 

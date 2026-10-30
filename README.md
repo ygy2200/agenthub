@@ -64,7 +64,7 @@ agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 age
 
 ## 版本演进
 
-当前版本 **v2.41.166**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
+当前版本 **v2.41.167**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
 
 ## 设计原则
 
@@ -115,7 +115,7 @@ unified project records, input/output file management, a public memory, capabili
 
 Download the single-file `AgentHub.exe` from [Releases](https://github.com/ygy2200/agenthub/releases), pick your records folder, and connect your agents in the "Connect" page.
 
-Current version **v2.41.166** — full version history in [CHANGELOG.md](CHANGELOG.md).
+Current version **v2.41.167** — full version history in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

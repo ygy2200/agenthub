@@ -7,6 +7,8 @@
 """
 from PySide6.QtWidgets import QWidget
 
+from helpers import track_window
+
 
 def _task(i, group, title="任务"):
     t = {"id": i, "project": "演示项目", "title": title, "owner": "",
@@ -47,7 +49,8 @@ def _page(qapp, hub_root, monkeypatch):
 
     win = QWidget()
     win.root = str(hub_root)
-    page = TodayPage(win)
+    track_window(win)          # B019：不登记的裸窗口不销毁，qfw 注册表会把整页留住
+    page = TodayPage(win, win)
     page.reload()
     return win, page, long_title
 
