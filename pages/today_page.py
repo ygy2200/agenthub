@@ -56,6 +56,11 @@ class TodayPage(QWidget):
         lay.addWidget(self.listw, 1)
 
         row = QHBoxLayout()
+        # R785：桌面端也能建任务——空态原来只教「让 agent 说一句」，没开 agent 时这一页无路可走。
+        self.newBtn = PrimaryPushButton(ic("ADD", "INFO"), "新建任务…")
+        self.newBtn.setToolTip("以桌面管理面（gui）署名建任务：创建后进「可认领」，agent 下次开工报到可见")
+        self.newBtn.clicked.connect(self.new_task)
+        row.addWidget(self.newBtn)
         self.doneBtn = PushButton("标记完成")
         self.doneBtn.setToolTip("把选中的「进行中」任务标记完成（管理通道，空 agent）——完成自动结晶")
         self.doneBtn.clicked.connect(self.mark_done)
@@ -75,9 +80,35 @@ class TodayPage(QWidget):
         self._fill()
         list_empty_guard(self.listw, self.layout(),
                          "前沿队列为空",
-                         "还没有任务——让 agent 说一句「新建任务 …」即可建；"
-                         "它也会从工作记录的「待办」句子里自动提取")
+                         "还没有任务——点「新建任务…」建一条，或让 agent 说一句「新建任务 …」；"
+                         "它也会从工作记录的「待办」句子里自动提取",
+                         action_text="新建任务…", action=self.new_task)
         self._sync_actions()
+
+    def new_task(self):
+        if not self.win.root:
+            InfoBar.warning("未设置根目录", "请先到设置页选择", duration=2500, parent=self.win)
+            return
+        try:
+            projects = [p["name"] for p in brain.list_projects(self.win.root, 200)]
+        except Exception:  # noqa: BLE001 项目下拉拿不到不该挡住建任务
+            projects = []
+        dlg = NewTaskDialog(self.win, projects)
+        if not dlg.exec():
+            return
+        v = dlg.values()
+        err, tid = self.create_task(v["title"], v["project"], v["priority"], v["due"])
+        if err:
+            InfoBar.error("创建失败", err, duration=4000, parent=self.win)
+            return
+        InfoBar.success("已创建任务", f"#{tid} {v['title']}（可认领）", duration=2500,
+                        parent=self.win)
+        self.reload()
+
+    def create_task(self, title, project="", priority=2, due=""):
+        """建任务（对话框与用例共用）：署名 gui 走管理通道，返回 (错误, id)。"""
+        return brain.task_add(self.win.root, title=title, project=project,
+                              priority=priority, due=due, agent="gui")
 
     def _sync_actions(self):
         """R198：只有选中「进行中」的任务才让「标记完成」可点。

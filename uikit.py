@@ -25,7 +25,7 @@ from PySide6.QtWidgets import (QApplication, QHBoxLayout, QLabel, QLineEdit, QMe
                                QStackedWidget, QSizeGrip, QSplitter, QTextEdit, QPushButton,
                                QDialog, QCheckBox, QCompleter, QLayout, QSizePolicy)
 from qfluentwidgets import (BodyLabel, CaptionLabel, CardWidget, CheckBox, ComboBox,
-                            FluentIcon as FIF,
+                            EditableComboBox, FluentIcon as FIF,
                             FluentWindow, IconWidget, InfoBar, LineEdit, ListWidget, MessageBox,
                             MessageBoxBase,
                             NavigationItemPosition, PrimaryPushButton, ProgressBar, PushButton,
@@ -1396,6 +1396,94 @@ class NewProjectDialog(MessageBoxBase):
 
     def name(self):
         return self.edit.text().strip()
+
+
+class MetricChip(QWidget):
+    """小指标块（R786）：标签在上、数值在下，用于把一整段「甲 X · 乙 Y」长句拆成可扫读的格子。
+
+    tone 走语义色（tokens.WARNING / DANGER），只给真需要警觉的格子用——
+    全彩等于没重点。数值可原地更新（set_value），不重建控件。
+    """
+
+    def __init__(self, label: str, value: str = "—", tone: str = "", parent=None):
+        super().__init__(parent)
+        self.setProperty("metricLabel", label)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, tokens.SPACE_L, 0)
+        lay.setSpacing(tokens.SPACE_XS)
+        self.valueLabel = StrongBodyLabel(str(value), self)
+        tokens.typeset(self.valueLabel, "body_strong")
+        self.label = CaptionLabel(label, self)
+        lay.addWidget(self.valueLabel)
+        lay.addWidget(self.label)
+        if tone:
+            self.valueLabel.setStyleSheet(f"color:{tokens.C(tone)};")
+
+    def set_value(self, value: str, tone: str = "") -> None:
+        self.valueLabel.setText(str(value))
+        self.valueLabel.setStyleSheet(f"color:{tokens.C(tone)};" if tone else "")
+
+
+class NewTaskDialog(MessageBoxBase):
+    """新建任务（R785）：工作台空态原先只写「让 agent 说一句『新建任务 …』」——
+    没开 agent 的用户在这一页无路可走。桌面端以管理面署名（gui）建任务，
+    创建后进「可认领」，agent 下次开工报到即可看到。"""
+
+    PRIORITIES = ((0, "紧急"), (1, "高"), (2, "中"), (3, "低"))
+
+    def __init__(self, parent, projects=None):
+        super().__init__(parent)
+        self.titleLabel = SubtitleLabel("新建任务")
+        self.hint = CaptionLabel("标题必填；创建后进入「可认领」，agent 下次开工报到就能看到")
+        self.titleEdit = LineEdit()
+        self.titleEdit.setPlaceholderText("要做的事，一句话说清")
+        self.projectCombo = EditableComboBox()
+        self.projectCombo.setPlaceholderText("项目（可空）")
+        for p in (projects or [])[:200]:
+            self.projectCombo.addItem(p)
+        self.prioCombo = ComboBox()
+        for val, label in self.PRIORITIES:
+            self.prioCombo.addItem(f"P{val} {label}", userData=val)
+        self.prioCombo.setCurrentIndex(2)
+        self.dueEdit = LineEdit()
+        self.dueEdit.setPlaceholderText("截止日 YYYY-MM-DD（可空）")
+        self.viewLayout.addWidget(self.titleLabel)
+        self.viewLayout.addWidget(self.hint)
+        self.viewLayout.addWidget(self.titleEdit)
+        self.viewLayout.addWidget(self.projectCombo)
+        self.viewLayout.addWidget(self.prioCombo)
+        self.viewLayout.addWidget(self.dueEdit)
+        self.yesButton.setText("创建")
+        self.cancelButton.setText("取消")
+        self.titleEdit.textChanged.connect(self._check)
+        self.dueEdit.textChanged.connect(self._check)
+        self._check()
+
+    def _due_error(self) -> str:
+        due = self.dueEdit.text().strip()
+        if not due:
+            return ""
+        try:
+            datetime.strptime(due, "%Y-%m-%d")
+        except ValueError:
+            return "截止日要写成 YYYY-MM-DD"
+        return ""
+
+    def _check(self):
+        err = "" if self.titleEdit.text().strip() else "标题必填"
+        err = err or self._due_error()
+        self.hint.setText(err or "标题合法，可以创建")
+        self.hint.setStyleSheet(
+            f"color:{tokens.C(tokens.DANGER)};" if err else f"color:{tokens.C(tokens.SUCCESS)};")
+        self.yesButton.setEnabled(not err)
+
+    def values(self) -> dict:
+        return {
+            "title": self.titleEdit.text().strip(),
+            "project": (self.projectCombo.currentText() or "").strip(),
+            "priority": self.prioCombo.currentData(),
+            "due": self.dueEdit.text().strip(),
+        }
 
 
 class InboxPickDialog(MessageBoxBase):

@@ -169,7 +169,7 @@ class OverviewPage(QWidget):
         self.agentBox.setSpacing(tokens.SPACE_XS)
         rightCol.addLayout(self.agentBox)
         rightCol.addSpacing(16)
-        rightCol.addWidget(section_head("最近会话（hub_heartbeat 上报 · 近 24 小时）", "PEOPLE"))
+        rightCol.addWidget(section_head("最近会话（agent 开工报到 · 近 24 小时）", "PEOPLE"))
         self.sessionBox = QVBoxLayout()
         self.sessionBox.setSpacing(tokens.SPACE_XS)
         rightCol.addLayout(self.sessionBox)

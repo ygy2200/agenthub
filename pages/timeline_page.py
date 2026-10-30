@@ -35,7 +35,10 @@ class TimelinePage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay, bottom=0)
         lay.addWidget(_page_head("时间线", "谁在什么时候干了什么——所有 agent 的最近动态"))
+        # R789：原先「筛选」标题独占一行、控件在下一行被推到最右，两者既不对齐
+        # 又白吃一行高度。标题与过滤控件合成一行：左侧标题、右侧控件。
         top = QHBoxLayout()
+        top.addWidget(section_head("筛选", "MENU"))
         top.addStretch(1)
         top.addWidget(CaptionLabel("agent"))
         self.agentFilter = ComboBox()
@@ -45,8 +48,8 @@ class TimelinePage(QWidget):
         self.projFilter = ComboBox()
         self.projFilter.setFixedWidth(220)
         top.addWidget(self.projFilter)
-        lay.addWidget(section_head("筛选", "MENU"))
         lay.addLayout(top)
+        lay.addSpacing(tokens.SPACE_M)   # 筛选行与动态列表是两个分区，留一档呼吸
         tip = CaptionLabel("按时间倒序 · 点击条目查看完整操作步骤 · 点击项目名跳转")
         lay.addWidget(section_head("全部动态", "HISTORY"))
         lay.addWidget(tip)
@@ -160,6 +163,15 @@ class TimelinePage(QWidget):
                 self._clear_layout(item.layout())
                 item.layout().deleteLater()
 
+    def _add_content(self, w, align=None):
+        """内容插在末尾吸收项之前（R789）：记录不足一屏时，富余高度留在列表底部，
+        不再被 QVBoxLayout 摊成分组之间上百像素的空白。"""
+        idx = max(0, self.box.count() - 1)
+        if align is None:
+            self.box.insertWidget(idx, w)
+        else:
+            self.box.insertWidget(idx, w, 0, align)
+
     def _clear_tail(self):
         for tw in getattr(self, "_tail", []):
             tw.setParent(None)
@@ -198,13 +210,17 @@ class TimelinePage(QWidget):
                     self._last_date = d
                     # 日期组不包卡：无框容器，分组靠日期标题+组间距（Linear：行是线不是卡）
                     group = QWidget()
+                    # R789：记录不足一屏时，QVBoxLayout 把富余高度平摊给每个组，
+                    # 日期标题与首行被拉开 70~100px（截图像素级实测）。组按内容高度
+                    # 收紧，富余空间留在列表底部，不再拆散「日期 → 记录」的视觉配对。
+                    group.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Maximum)
                     self._cur_card_lay = QVBoxLayout(group)
                     self._cur_card_lay.setContentsMargins(0, 0, 0, 0)
                     self._cur_card_lay.setSpacing(tokens.SPACE_S)
                     # 日期组标题走 section_head（2026-10-15 第二轮）：时间线页此前
                     # 整页零图标，纯 16px 灰字标题在长列表里没有视觉着陆点
                     self._cur_card_lay.addWidget(section_head(d, "CALENDAR"))
-                    self.box.addWidget(group)
+                    self._add_content(group)
                 self._add_row(r)
         finally:
             self.container.setUpdatesEnabled(True)
@@ -228,6 +244,7 @@ class TimelinePage(QWidget):
 
     def rebuild(self):
         self._clear_box()
+        self.box.addStretch(1)   # 末尾吸收项：内容不足一屏时富余高度留在底部
         self._clear_tail()
         self.rendered = 0
         self._last_date = None
@@ -248,17 +265,17 @@ class TimelinePage(QWidget):
         self._append_rows(batch)
         self.rendered += len(batch)
         if not entries:
-            self.box.addWidget(self._empty_hint())
+            self._add_content(self._empty_hint())
             return
         # 尾部：加载更多按钮 + 统计说明（直接放 box，居中对齐，增量时先移除旧尾部）
         self._clear_tail()
         if self.rendered < len(entries):
             more = PushButton(f"加载更多（还有 {len(entries) - self.rendered} 条）")
             more.clicked.connect(self.load_more)
-            self.box.addWidget(more, 0, Qt.AlignHCenter)
+            self._add_content(more, Qt.AlignHCenter)
             self._tail.append(more)
             cap = CaptionLabel(f"共 {len(entries)} 条，已显示 {self.rendered} 条；用上方过滤器可缩小范围")
-            self.box.addWidget(cap, 0, Qt.AlignHCenter)
+            self._add_content(cap, Qt.AlignHCenter)
             self._tail.append(cap)
 
     def load_more(self):
@@ -306,7 +323,7 @@ class TimelinePage(QWidget):
             return
         if isinstance(res, Exception):
             st["loading"] = False
-            self.box.addWidget(empty_state("INFO", "加载失败", str(res)[:120]))
+            self._add_content(empty_state("INFO", "加载失败", str(res)[:120]))
             return
         rows, total = res
         st["total"] = total
@@ -315,7 +332,7 @@ class TimelinePage(QWidget):
             if st["offset"] > 0:
                 st["offset"] = st["total"]  # 防御：翻到空页直接视为到底，防自动加载死循环
             else:
-                self.box.addWidget(self._empty_hint())
+                self._add_content(self._empty_hint())
             self._vtail()
             return
         # 分片装入：loading 保持 True 直到装完（期间不触发下一页拉取，防级联）
@@ -345,14 +362,14 @@ class TimelinePage(QWidget):
         if st["offset"] < st["total"]:
             more = PushButton(f"继续加载（已显示 {st['offset']} / {st['total']} 条）")
             more.clicked.connect(self._vfetch)
-            self.box.addWidget(more, 0, Qt.AlignHCenter)
+            self._add_content(more, Qt.AlignHCenter)
             self._tail.append(more)
             cap = CaptionLabel(f"共 {st['total']} 条 · 虚拟滚动模式（滚动到底自动加载）")
-            self.box.addWidget(cap, 0, Qt.AlignHCenter)
+            self._add_content(cap, Qt.AlignHCenter)
             self._tail.append(cap)
         else:
             cap = CaptionLabel(f"共 {st['offset']} 条，已全部加载")
-            self.box.addWidget(cap, 0, Qt.AlignHCenter)
+            self._add_content(cap, Qt.AlignHCenter)
             self._tail.append(cap)
 
     def _maybe_autoload(self, _value=None):

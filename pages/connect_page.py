@@ -30,13 +30,24 @@ class ConnectPage(QWidget):
         except Exception:  # noqa: BLE001 导入失败回退不带数字的措辞
             n_tools = 0
         n_seg = f"{n_tools} 个工具" if n_tools else "全套工具"
+        # R788：原先一段 150+ 字的协议/能力/操作混合说明，首屏读不出「先做什么」。
+        # 改为一句话目的 + 三步顺序；能力清单收进可展开的细节，需要时再看。
         self.introLabel = CaptionLabel(
-            f"AgentHub 通过标准 MCP 协议向所有 agent 提供 {n_seg}：项目登记/新建、工作记录（可撤销）、"
-            "全文搜索、团队规范、公用记忆读写、会话心跳防撞车、错误登记与查询、撤销、踩坑拦截、归档、技能/MCP 清单、进度对齐。"
-            "「一键接入」写入 MCP 配置，「注入引导」把开工规则写进 agent 的全局指令文件——"
-            "两步都做，agent 才会在每次会话自然使用公用大脑，无需口头提醒。")
+            "一句话：让所有 agent 共用同一个大脑——同一份项目进度、记忆与团队规范，"
+            f"每次开工自动对齐。按 ① 接入 → ② 引导 → ③ 开工自动报到 三步做（本页提供 {n_seg}）。")
         self.introLabel.setWordWrap(True)
         lay.addWidget(self.introLabel)
+        self.moreBtn = PushButton("能力清单")
+        self.moreBtn.setCheckable(True)
+        self.moreBtn.setToolTip("展开查看接入后 agent 能直接使用的全部能力")
+        self.introDetail = CaptionLabel(
+            "能力清单：项目登记与新建、工作记录（可撤销）、全文搜索、团队规范、公用记忆读写、"
+            "会话心跳防撞车、错误登记与查询、撤销、踩坑拦截、归档、技能与工具清单、进度对齐。")
+        self.introDetail.setWordWrap(True)
+        self.introDetail.setVisible(False)
+        self.moreBtn.toggled.connect(self.introDetail.setVisible)
+        lay.addWidget(self.moreBtn, 0, Qt.AlignLeft)
+        lay.addWidget(self.introDetail)
 
         # 卡片列表装滚动容器（2026-10-09 修：原先直接挂页面布局，窗口一缩小卡片被压扁、
         # 三行文字被裁掉看不见——用户报「拉大才完整、缩小就缺字」的真凶）。

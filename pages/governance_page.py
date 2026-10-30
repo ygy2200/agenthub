@@ -54,9 +54,22 @@ class _SubPage(QWidget):
         self.btnRow = QHBoxLayout()
         lay.addLayout(self.btnRow)
         self._build_buttons()
+        # R783：动作按钮跟随选中态。R198 只修了工作台/编排中心；治理中心各段空队列时
+        # 「批准完成/退回返工/认领交接/解除隔离/执行整合/对错部分对/取消关注」仍是亮的，
+        # 点下去只弹「先选中一条」——亮着却不能用，比灰着更费解。
+        self.listw.itemSelectionChanged.connect(self._sync_selection_widgets)
 
     def _build_buttons(self):
         pass
+
+    def _selection_widgets(self):
+        """必须有选中项才有意义的动作控件（R783）；其余动作走 `_action_widgets`。"""
+        return []
+
+    def _sync_selection_widgets(self):
+        ok = bool(self.win.root) and self.listw.currentItem() is not None
+        for w in self._selection_widgets():
+            w.setEnabled(ok)
 
     def _action_widgets(self):
         """无根目录时需要禁用的操作控件（空态 CTA 不在此列）。"""
@@ -125,6 +138,7 @@ class _SubPage(QWidget):
         for w in self._action_widgets():
             w.setEnabled(True)
         self.listw.setVisible(True)
+        self._sync_selection_widgets()
 
     def _finish(self):
         hint = list_empty_guard(self.listw, self.layout(), self.EMPTY_TITLE, self.EMPTY_DESC)
@@ -137,6 +151,7 @@ class _SubPage(QWidget):
             hint.setVisible(False)
             self.sumLabel.setVisible(True)
             self.listw.setVisible(False)
+            self._sync_selection_widgets()
             return
         empty = self.listw.count() == 0
         if empty:
@@ -154,6 +169,7 @@ class _SubPage(QWidget):
         else:
             self.sumLabel.setVisible(True)
         self.listw.setVisible(not empty)
+        self._sync_selection_widgets()
 
     def _fill(self):
         self.listw.clear()
@@ -188,6 +204,9 @@ class _ApprovalsSub(_SubPage):
         self.btnRow.addStretch(1)
 
     def _action_widgets(self):
+        return [self.approveBtn, self.rejectBtn]
+
+    def _selection_widgets(self):
         return [self.approveBtn, self.rejectBtn]
 
     def _fill(self):
@@ -319,6 +338,9 @@ class _HandoffsSub(_SubPage):
     def _action_widgets(self):
         return [self.claimBtn, self.closeBtn, self.allChk]
 
+    def _selection_widgets(self):
+        return [self.claimBtn, self.closeBtn]
+
     def _fill(self):
         super()._fill()
         if not self.win.root:
@@ -441,6 +463,9 @@ class _QuarantineSub(_SubPage):
     def _action_widgets(self):
         return [self.relBtn]
 
+    def _selection_widgets(self):
+        return [self.relBtn]
+
     def _fill(self):
         super()._fill()
         if not self.win.root:
@@ -490,6 +515,9 @@ class _ConsolidateSub(_SubPage):
         self.btnRow.addStretch(1)
 
     def _action_widgets(self):
+        return [self.applyBtn]
+
+    def _selection_widgets(self):
         return [self.applyBtn]
 
     def _fill(self):
@@ -556,6 +584,9 @@ class _DecisionSub(_SubPage):
     def _action_widgets(self):
         return self.verdictBtns
 
+    def _selection_widgets(self):
+        return self.verdictBtns
+
     def _fill(self):
         super()._fill()
         if not self.win.root:
@@ -614,6 +645,9 @@ class _ViewSub(_SubPage):
 
     def _action_widgets(self):
         return [self.followEdit, self.followBtn, self.unBtn]
+
+    def _selection_widgets(self):
+        return [self.unBtn]
 
     def _fill(self):
         super()._fill()

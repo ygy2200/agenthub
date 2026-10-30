@@ -63,7 +63,7 @@ class SettingsPage(QWidget):
         self.motionBox.stateChanged.connect(self._on_motion_toggle)
         g0.addWidget(self.motionBox)
 
-        themeNote = CaptionLabel("深色为默认（色值经 WCAG 对比度验算，全部达标）；"
+        themeNote = CaptionLabel("深色为默认（色值已做对比度验算，文字都达可读标准）；"
                                  "「跟随系统」会随 Windows 深浅色切换自动响应。密实度控制列表行高"
                                  "与间距缩放，切换后立即重排。")
         themeNote.setWordWrap(True)  # 920 窗宽下约 860px，不换行会被卡片右缘硬切（R189）
@@ -131,7 +131,7 @@ class SettingsPage(QWidget):
         dbRow.addWidget(self.dbLabel, 1)
         g1b.addLayout(dbRow)
         g1b.addWidget(CaptionLabel("每次退出软件自动备份（保留 30 份，在 _hub\\brain-backups\\）；"
-                                   "历史 md/jsonl 已增量迁移入库并保留为只读存档。"))
+                                   "历史记录文件已增量迁移入库，并保留为只读存档。"))
         lay.addWidget(c1b)
 
         # 系统自检（R225）：把只存在于命令行的 `cli.py doctor` 搬进界面。

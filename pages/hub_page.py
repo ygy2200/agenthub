@@ -116,7 +116,12 @@ class HubPage(QWidget):
         self.envList = ListWidget()
         for w in (self.skillList, self.mcpList, self.memList, self.cfgList, self.envList):
             self.stack.addWidget(w)
-            w.itemClicked.connect(self.on_preview)
+            # R784：选中态只认 currentItem——点选与键盘上下键走同一条路；列表清空/重填时
+            # Qt 会把当前项置空，动作按钮随之收回（原先只挂 itemClicked，清空后 cur_path
+            # 还停在上一视图的资产上，编辑/删除会打到错的对象）。
+            w.currentItemChanged.connect(
+                lambda cur, _prev, _w=w: self.on_preview(cur) if cur is not None
+                else self._reset_preview())
             w.itemDoubleClicked.connect(self.on_open)
             w.setContextMenuPolicy(Qt.CustomContextMenu)
             w.customContextMenuRequested.connect(self._ctx_menu)
@@ -147,9 +152,10 @@ class HubPage(QWidget):
         newMemBtn = PushButton(ic("ADD", "INFO"), "新建记忆")
         newMemBtn.clicked.connect(self.new_memory)
         editRow.addWidget(newMemBtn)
-        delMemBtn = PushButton(ic("DELETE", "INFO"), "删除选中记忆")
-        delMemBtn.clicked.connect(self.delete_memory)
-        editRow.addWidget(delMemBtn)
+        self.delMemBtn = PushButton(ic("DELETE", "INFO"), "删除选中记忆")
+        self.delMemBtn.setEnabled(False)
+        self.delMemBtn.clicked.connect(self.delete_memory)
+        editRow.addWidget(self.delMemBtn)
         lay.addLayout(editRow)
 
         self.preview = TextBrowser()
@@ -163,6 +169,7 @@ class HubPage(QWidget):
     # ---- 数据
     def _on_view_changed(self, idx):
         """视图切换：stack 翻页 + 过滤框按视图显隐（技能/记忆/环境档案各有过滤框）。"""
+        self._reset_preview()   # R784：跨视图不许留上一次的选中
         self.stack.setCurrentIndex(idx)
         self.skillFilter.setVisible(idx == 0)
         self.memFilter.setVisible(idx == 2)
@@ -450,11 +457,24 @@ class HubPage(QWidget):
             listw.addItem("（无）")
 
     # ---- 交互
+    def _reset_preview(self, msg="点击左侧列表项预览"):
+        """清掉选中派生态：cur_path 与四个动作按钮（R784 的唯一入口）。"""
+        self.cur_path = None
+        self.cur_editable = False
+        self.editBtn.setEnabled(False)
+        self.histBtn.setEnabled(False)
+        self.confirmBtn.setEnabled(False)
+        self.delMemBtn.setEnabled(False)
+        self.editBtn.setText("编辑并保存（自动备份）")
+        self.editBtn.setToolTip("")
+        self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>{msg}</p>")
+
     def on_preview(self, item):
         path = item.data(Qt.UserRole)
         self.cur_path = path
         self.cur_editable = False
         self.confirmBtn.setEnabled(False)
+        self.delMemBtn.setEnabled(False)
         if not path:
             self.preview.setHtml(f"<p style='color:{tokens.C(tokens.TEXT_3)}'>无内容</p>")
             return
@@ -477,6 +497,7 @@ class HubPage(QWidget):
             self.editBtn.setText("编辑这条记忆")
             self.histBtn.setEnabled(True)
             self.confirmBtn.setEnabled(True)
+            self.delMemBtn.setEnabled(True)
             m = next((x for x in self._mem_rows if x["id"] == int(path[4:])), None)
             if m:
                 fr = getattr(self, "_mem_fresh", {}).get(m["id"]) or brain.memory_freshness(m)

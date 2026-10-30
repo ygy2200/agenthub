@@ -46,6 +46,14 @@ class StatsPage(QWidget):
         self.healthLine.setWordWrap(True)
         self.taskLine = CaptionLabel("")
         self.taskLine.setWordWrap(True)
+        # R786：任务过程原是一整段「新建 X · 完成 Y（中位/P90）；在办 Z：租约超时/无主/等审批/逾期；
+        # 重试存量…；风险…（CLI：tasks --stats）」——六个维度挤在一行里，扫读成本高。
+        # 拆成指标格子：一句人话摘要 + 可扫读的方格，命令行口径收进 tooltip。
+        self.taskMetrics = QWidget()
+        self._taskFlow = FlowLayout(self.taskMetrics)
+        self._taskFlow.setContentsMargins(0, 0, 0, 0)
+        self._taskFlow.setSpacing(tokens.SPACE_M)
+        self._task_chips = {}
         # 可行动摘要前置：920×600 最小窗下，先看到「哪里不对/任务是否在走」，
         # 再看 agent/月度分布这类回溯性细节（分布区仍完整保留在下方滚动区）。
         lay.addSpacing(16)
@@ -54,6 +62,7 @@ class StatsPage(QWidget):
         lay.addSpacing(16)
         lay.addWidget(section_head("任务过程（近 7 天）", "HISTORY"))
         lay.addWidget(self.taskLine)
+        lay.addWidget(self.taskMetrics)
         # 内容组不包卡：间距+小标题分组
         for box, t, icn in ((self.agentBox, "各 agent 记录分布", "PEOPLE"),
                             (self.monthBox, "近 6 个月活跃", "CALENDAR")):
@@ -119,27 +128,18 @@ class StatsPage(QWidget):
         m = bundle.get("tasks")
         if m is None:
             self.taskLine.setText("任务统计暂不可用")
+            self._fill_task_metrics(None)
         else:
             f, w, r = m["flow"], m["wip"], m["retry"]
-            dc = f["done_cycle_hours"]
+            risks = m.get("risks") or []
+            self.taskLine.setText(
+                f"近 7 天新建 {f['created']} 条、完成 {f['done']} 条；"
+                f"当前在办 {w['in_progress']} 条，风险 {len(risks) or '无'} 项")
+            self.taskLine.setToolTip(
+                "命令行同口径：python cli.py tasks --stats"
+                "（近 7 天新建/完成/取消、完成周期中位与 P90、在办构成、重试存量、风险信号）")
+            self._fill_task_metrics(m)
 
-            def hh(x):
-                return "—" if x is None else f"{x:g}h"
-
-            tip = [f"近 7 天：新建 {f['created']} · 完成 {f['done']}"
-                   f" · 取消/死信 {f['cancelled_or_dead']}"
-                   f"（完成周期中位 {hh(dc['p50'])} / P90 {hh(dc['p90'])}）",
-                   f"在办 {w['in_progress']}：租约超时 {w['stale_leases']} · 无主 {w['unowned']}"
-                   f" · 等审批 {w['approval_waiting']} · 逾期 {w['overdue']}",
-                   f"重试存量 {r['tasks_with_attempts']} 单 / 累计 {r['attempts_total']} 次"]
-            if m.get("risks"):
-                labels = {"lease_stale": "租约超时", "unowned": "无主", "approval_waiting": "等审批",
-                          "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2"}
-                tip.append("风险：" + "、".join(
-                    f"{labels.get(x['kind'], x['kind'])} {x['count']}" for x in m["risks"]))
-            else:
-                tip.append("风险信号：无")
-            self.taskLine.setText("；".join(tip) + "（CLI：tasks --stats）")
 
         def clear(box):
             while box.count():
@@ -180,6 +180,53 @@ class StatsPage(QWidget):
         if not months:
             self.monthBox.addWidget(empty_state(
                 "CALENDAR", "暂无数据", "记录产生后，这里显示近 6 个月活跃度"))
+
+    def _fill_task_metrics(self, m):
+        """任务过程指标格（R786）：先清后填；tone 只给需要警觉的格子。
+
+        m=None（统计不可用）时留一行「—」，避免上一次的数字冒充这一次。
+        """
+        while self._taskFlow.count():
+            it = self._taskFlow.takeAt(0)
+            w = it.widget()
+            if w is not None:
+                w.deleteLater()
+        self._task_chips = {}
+        if m is None:
+            return
+        f, w, r = m["flow"], m["wip"], m["retry"]
+        dc = f["done_cycle_hours"] or {}
+
+        def hh(x):
+            return "—" if x is None else f"{x:g}h"
+
+        risks = m.get("risks") or []
+        labels = {"lease_stale": "认领超时", "unowned": "无主", "approval_waiting": "等审批",
+                  "overdue": "逾期", "dead_letter": "死信", "retry_storm": "重试≥2"}
+        risk_text = "；".join(f"{labels.get(x['kind'], x['kind'])} {x['count']}" for x in risks) or "无"
+        spec = (
+            ("近 7 天新建", str(f["created"]), ""),
+            ("近 7 天完成", str(f["done"]), ""),
+            ("完成周期·中位", hh(dc.get("p50")), ""),
+            ("完成周期·慢 10%", hh(dc.get("p90")), ""),
+            ("在办", str(w["in_progress"]), ""),
+            ("认领超时", str(w["stale_leases"]), tokens.WARNING if w["stale_leases"] else ""),
+            ("等审批", str(w["approval_waiting"]), tokens.WARNING if w["approval_waiting"] else ""),
+            ("逾期", str(w["overdue"]), tokens.DANGER if w["overdue"] else ""),
+            ("重试过的任务", str(r["tasks_with_attempts"]), ""),
+            ("重试总次数", str(r["attempts_total"]), ""),
+            ("风险", risk_text, tokens.DANGER if risks else ""),
+        )
+        tips = {"完成周期·中位": "一半任务在这个时间内完成",
+                "完成周期·慢 10%": "九成任务在这个时间内完成（P90）",
+                "认领超时": "认领后长时间没有新进展，租约已超时",
+                "重试过的任务": "失败后重试过至少一次的任务数"}
+        for label, value, tone in spec:
+            chip = MetricChip(label, value, tone, self.taskMetrics)
+            if label in tips:
+                chip.setToolTip(tips[label])
+            self._task_chips[label] = chip
+            self._taskFlow.addWidget(chip)
 
     # ---------------------------------------------------------------- 忙态 / 失败占位
 

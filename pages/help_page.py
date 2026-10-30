@@ -42,9 +42,10 @@ def _split_help(content: str):
 
 
 class _TocDelegate(ListItemDelegate):
-    """目录固定 30px 行高：全局 polish_lists 会把行拉到 40px，七节在 920×600 下放不下。"""
+    """目录固定 28px 行高：全局 polish_lists 会拉到 40px；配合标题行的节数，
+    920×600 最小窗下七节全部露出（R790 实机截图：原 30px + 底部计数只能露 6 节半）。"""
 
-    ROW_H = 30
+    ROW_H = 28
 
     def sizeHint(self, option, index):
         hint = super().sizeHint(option, index)
@@ -164,7 +165,17 @@ class HelpPage(QWidget):
         tv = QVBoxLayout(toc)
         tv.setContentsMargins(tokens.PAD_CARD, tokens.PAD_CARD, tokens.PAD_CARD, tokens.PAD_CARD)
         tv.setSpacing(tokens.SPACE_XS)
-        tv.addWidget(section_head("目录", "MENU"))
+        # R790：节数原占列表下方一整行，把第 7 节挤出视口。计数并到标题行右侧，
+        # 列表多出一行高度；过滤时「命中 2 / 7 节」也在同一位置更新。
+        _head_row = QHBoxLayout()
+        _head_row.setContentsMargins(0, 0, 0, 0)
+        _head_row.setSpacing(tokens.SPACE_S)
+        _head_row.addWidget(section_head("目录", "MENU"), 1)
+        self.tocCount = CaptionLabel("")
+        self.tocCount.setProperty("keepWidth", True)
+        self.tocCount.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+        _head_row.addWidget(self.tocCount, 0)
+        tv.addLayout(_head_row)
         self.tocFilter = SearchLineEdit()
         self.tocFilter.setPlaceholderText("搜帮助内容…")
         self.tocFilter.setToolTip("按标题和正文过滤节；清空恢复全部")
@@ -177,9 +188,6 @@ class HelpPage(QWidget):
         self.tocList.setItemDelegate(_TocDelegate(self.tocList))
         self.tocList.currentRowChanged.connect(self._on_toc_row)
         tv.addWidget(self.tocList, 1)
-        self.tocCount = CaptionLabel("")
-        self.tocCount.setProperty("keepWidth", True)
-        tv.addWidget(self.tocCount)
         elevate(toc, "e1")
 
         right = QWidget()

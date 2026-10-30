@@ -255,7 +255,7 @@ class JournalPage(QWidget):
             return
         if not e.get("undo"):
             InfoBar.warning("这条错误没有回滚方式",
-                            "让上报者用 hub_report_error(undo=…) 补齐，或按详情手动处理",
+                            "让上报的人补一句回滚方式（agent 上报时可带 undo 字段），或按详情手动处理",
                             duration=3000, parent=self.win)
             return
         QApplication.clipboard().setText(e["undo"])

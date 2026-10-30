@@ -131,7 +131,7 @@ class SearchPage(QWidget):
             op_failed("读取最近项目", e, parent=self)
             return
         if not rows:
-            InfoBar.info("暂无工作记录", "先用 hub_log_work 或项目页写一条，再来搜索",
+            InfoBar.info("暂无工作记录", "先在项目页写一条工作记录（或让 agent 记一条），再来搜索",
                          parent=self.win)
             return
         proj = (rows[0].get("project") or "").strip()
