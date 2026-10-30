@@ -51,7 +51,7 @@ echo [5/6] publish GitHub Release + push  (log: %PUBLOG%)
 if not exist output mkdir output
 D:\python311\python.exe publish.py --yes --push --log-file "%PUBLOG%"
 if errorlevel 1 (
-  echo [ABORT] publish failed - GitHub state may be a DRAFT (invisible).
+  echo [ABORT] publish failed - GitHub state may be a DRAFT ^(invisible^).
   echo         full output: %PUBLOG%
   echo         recover upload only: D:\python311\python.exe publish.py --upload-only --yes
   exit /b 1
