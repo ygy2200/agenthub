@@ -121,6 +121,40 @@ def _call_retry(opener, url, method=None, data=None, timeout=120):
         time.sleep(NET_BACKOFF * (attempt + 1))
 
 
+def _create_release(opener, base: str, tag: str, payload: dict):
+    """建 Release；网络层抖动时先看是不是已经建出来了，绝不重复建。
+
+    R761：R760 发 v2.41.161 时 POST /releases 撞上 SSL EOF（代理链路抖动），
+    进程直接抛栈退出——此时远端什么都没有，人却以为「发布流程坏了」。
+    这里把「可能已建成功」纳入判断：POST 抛 NetworkError 后先 GET /releases/tags/<tag>，
+    有就沿用（幂等恢复）；没有才重试。若 GitHub 回 422（tag 已存在），同样去取回来。
+    """
+    last = None
+    for attempt in range(NET_RETRIES):
+        try:
+            st, body, _ = _call(opener, f"{base}/releases", method="POST", data=payload)
+        except NetworkError as e:
+            last = e
+            try:
+                st2, rel2, _ = _call(opener, f"{base}/releases/tags/{tag}")
+            except NetworkError:
+                st2 = 0
+            if st2 == 200 and isinstance(rel2, dict) and rel2.get("id"):
+                print(f"（网络抖动，但 Release {tag} 已经建好，继续用它的 id={rel2['id']}）")
+                return 200, rel2, None
+            if attempt == NET_RETRIES - 1:
+                raise
+            time.sleep(NET_BACKOFF * (attempt + 1))
+            continue
+        if st == 422:
+            st2, rel2, _ = _call_retry(opener, f"{base}/releases/tags/{tag}")
+            if st2 == 200 and isinstance(rel2, dict) and rel2.get("id"):
+                print(f"（Release {tag} 已存在，沿用 id={rel2['id']}）")
+                return 200, rel2, None
+        return st, body, None
+    raise last if last else NetworkError("建 Release 失败（未知原因）")
+
+
 def preflight(opener, repo: str) -> dict:
     """发布前预检：token 认不认、能不能写这个仓库。
 
@@ -288,6 +322,33 @@ def main(argv=None) -> int:
 
 
 def _run(args) -> int:
+    """R761：网络层失败不许把 traceback 喷给用户。
+
+    R760 发 v2.41.161 时 POST /releases 撞上 SSL EOF（代理链路抖动），进程直接
+    抛栈退出。此刻远端往往什么都没写、或只留一个访客看不见的草稿，用户看到的
+    却是「发布流程坏了」。这里统一收口：说清代码推没推、远端可能是什么状态、
+    怎么重跑。NetworkError 只可能出现在预检通过之后，token/闸门/说明都无需重做。
+    """
+    try:
+        return _run_inner(args)
+    except NetworkError as e:
+        pushed = ("已推送（不受影响）" if getattr(args, "push", False)
+                  else "本次未执行（没加 --push）")
+        print(f"\n连不上 GitHub API：{e}")
+        print("  发布中止。远端最多留一个草稿 Release——草稿访客看不见，"
+              "不会出现「空附件版本」。")
+        print(f"  代码推送：{pushed}；token / 闸门 / 发布说明均已通过，不用重做。")
+        print("  直接重跑同一条命令即可：已建出来的 Release 会自动沿用，不会重复创建、"
+              "不会撞 tag。")
+        print("  本机实测直连 api.github.com 会 SSL 断，需走代理："
+              "export HTTPS_PROXY=http://127.0.0.1:7890；"
+              "代理节点抖动时换个节点，或先 python publish.py --check 验网络。")
+        if getattr(args, "log_file", None):
+            print(f"  完整日志：{args.log_file}")
+        return 1
+
+
+def _run_inner(args) -> int:
     version = current_version()
     tag = f"v{version}"
     if args.notes_file:
@@ -382,7 +443,7 @@ def _run(args) -> int:
             return rc
 
     base = f"https://api.github.com/repos/{args.repo}"
-    status, rel, _ = _call(opener, f"{base}/releases/tags/{tag}")
+    status, rel, _ = _call_retry(opener, f"{base}/releases/tags/{tag}")
     if status == 200:
         if not args.upload_only:
             sys.exit(f"Release {tag} 已存在（{rel.get('html_url', '?')}），拒绝重复创建；"
@@ -391,7 +452,7 @@ def _run(args) -> int:
     elif status == 404:
         if args.upload_only:
             sys.exit(f"Release {tag} 不存在，--upload-only 无从补传；去掉它先建 Release")
-        status, rel, _ = _call(opener, f"{base}/releases", method="POST", data={
+        status, rel, _ = _create_release(opener, base, tag, {
             "tag_name": tag, "target_commitish": args.target,
             "name": f"AgentHub {tag}", "body": notes,
             # R748：先建草稿，exe 传完再公开。R742 事故是「Release 先公开、附件后传」，
@@ -405,7 +466,7 @@ def _run(args) -> int:
         sys.exit(f"查询现有 Release 失败：HTTP {status} {rel.get('message', '')}")
 
     asset_name = f"AgentHub-{tag}.exe"
-    status, assets, _ = _call(opener, f"{base}/releases/{rel['id']}/assets")
+    status, assets, _ = _call_retry(opener, f"{base}/releases/{rel['id']}/assets")
     if status == 200:
         for a in assets:
             if a.get("name") == asset_name:
@@ -441,7 +502,7 @@ def _run(args) -> int:
         return 1
     print(f"exe 上传：{asset.get('state')}  {asset.get('browser_download_url', '')}")
     if rel.get("draft"):
-        st, pub, _ = _call(opener, f"{base}/releases/{rel['id']}", method="PATCH",
+        st, pub, _ = _call_retry(opener, f"{base}/releases/{rel['id']}", method="PATCH",
                            data={"draft": False})
         if st != 200:
             print(f"exe 已传上，但转正式失败：HTTP {st} {pub.get('message', '')}")
