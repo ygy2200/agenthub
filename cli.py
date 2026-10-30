@@ -76,7 +76,7 @@ _NEED_DB = {
 }
 
 
-def _root_problem(root: str, need_db: bool = False) -> str:
+def _root_problem(root: str, need_db: bool = False, cmd: str = "") -> str:
     """根目录不可用时的可行动说明；可用返回空串。"""
     if not root:
         return ("未找到大脑根目录。\n"
@@ -90,9 +90,18 @@ def _root_problem(root: str, need_db: bool = False) -> str:
     if not p.is_dir():
         return f"大脑根目录不是文件夹：{root}\n  用 --root 指向目录，或 root --set 切换。"
     if need_db and not (p / core.DIR_META).is_dir():
+        # R757：这句是「命令相关」的通用尾巴时，serve 用户会以为不初始化也能起服务
+        # （实测输出「只是查看接入状态/工具清单不需要初始化。」后进程直接退出 rc=2）。
+        if cmd == "serve":
+            tail = ("serve 的接口都要读脑库，没有库起不来；先初始化。"
+                    "只想列工具清单不用起服务：python cli.py tools")
+        elif cmd == "call":
+            tail = "hub_* 工具大多要读脑库，没有库调不通；先初始化（只列清单用 python cli.py tools）。"
+        else:
+            tail = "只是查看接入状态/工具清单不需要初始化。"
         return (f"该目录还不是 AgentHub 大脑：{root}\n"
                 f"  初始化（保留原数据）：python cli.py init --root \"{root}\"\n"
-                "  只是查看接入状态/工具清单不需要初始化。")
+                f"  {tail}")
     return ""
 
 
@@ -1976,7 +1985,7 @@ def main(argv=None) -> int:
             print(_welcome_text(_root(args.root)))
             return 0
         root = _root(args.root)
-        problem = _root_problem(root, args.cmd in _NEED_DB)
+        problem = _root_problem(root, args.cmd in _NEED_DB, args.cmd)
         if problem:
             # R711：--json 是机器契约——出错也必须吐 JSON，否则脚本拿到的是半截人话，
             # 报错变成 json.decoder.JSONDecodeError，真正的原因（路径打错）被吃掉。

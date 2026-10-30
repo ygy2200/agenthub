@@ -253,6 +253,14 @@ def _port_error_text(e: OSError, port: int) -> str:
     return "\n".join(lines)
 
 
+def _serve_banner(port: int, allow_write: bool, token: str) -> list:
+    """R757：起服务后的两行横幅。写关闭时要说清怎么开，否则用户只看到「已关闭」。"""
+    if allow_write:
+        return ["只读为主；写工具已开启（token 见上一行，写请求需带 token=…）"]
+    return ["只读为主；写工具已关闭"
+            "（要用写工具：重启加 --allow-write，会生成一次性 token）"]
+
+
 def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
                   open_browser: bool = False) -> int:
     """CLI 入口：阻塞运行（Ctrl+C / Ctrl+Break 停止）。返回退出码。"""
@@ -282,7 +290,8 @@ def serve_forever(root: str, port: int = 8787, allow_write: bool = False,
         print(_port_error_text(e, port))
         return 1
     print(f"AgentHub REST 服务已启动：http://127.0.0.1:{real_port}/")
-    print("只读为主；写工具" + (f"已开启（token={token}）" if allow_write else "已关闭"))
+    for line in _serve_banner(real_port, allow_write, token):
+        print(line)
     try:
         httpd.serve_forever()
     except KeyboardInterrupt:
