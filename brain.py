@@ -272,6 +272,13 @@ CREATE INDEX IF NOT EXISTS idx_records_status_agent ON records(status, agent);
 CREATE INDEX IF NOT EXISTS idx_records_status_day
     ON records(status, COALESCE(NULLIF(date,''), substr(created,1,10)));
 CREATE INDEX IF NOT EXISTS idx_records_status_date ON records(status, date);
+-- R780：统计页 20 万库 664ms 的两处大头。①extract_todos 取最近 400 条
+-- （WHERE status='active' ORDER BY id DESC）没有 (status,id) 索引，20 万行先排序 63ms；
+-- ②体检的裸标题计数 title GLOB '[0-9]…（*）'（字符类开头）只能全表扫，205ms；
+-- 部分索引只收命中行（正常库近乎空），查询计划可直接命中它。
+CREATE INDEX IF NOT EXISTS idx_records_status_id ON records(status, id);
+CREATE INDEX IF NOT EXISTS idx_records_bare_title ON records(status)
+    WHERE title GLOB '[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9]（*）';
 CREATE TABLE IF NOT EXISTS memories (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     kind TEXT DEFAULT "note",
@@ -11280,14 +11287,18 @@ def restore_project(root: str, name: str, agent: str = "") -> str:
     return ""
 
 
-def health_report(root: str, include_dups: bool = True) -> dict:
+def health_report(root: str, include_dups: bool = True,
+                  stats_cache: dict | None = None) -> dict:
     """大脑体检：汇总各智能维度 + 数据规模，供 hub_health 工具与 GUI 体检摘要。
 
     include_dups=False：跳过重复/矛盾分析（`similar_memories`，真实库 125ms，
     占本报告 75%）。桌面「大脑页」从不渲染这两块，不该为自己的看不见付费。
     此时 dup_* / conflict_* 一律返回 None＝「没算过」——写成 0 组就是在撒谎，
-    调用方要么用默认值，要么显式处理 None（`pages/brain_page.py` 两种都不用）。"""
-    s = stats(root)
+    调用方要么用默认值，要么显式处理 None（`pages/brain_page.py` 两种都不用）。
+
+    stats_cache：调用方已经算好 `stats(root)` 时传进来，省一次全量统计（20 万记录库
+    实测 120ms，统计页本来就要一份 stats）。只读四个计数，传错结构会 KeyError。"""
+    s = stats_cache if stats_cache is not None else stats(root)
     todos = extract_todos(root, limit=50)
     sims = similar_memories(root, limit=20) if include_dups else []
     with db_conn(root) as conn:
@@ -11394,7 +11405,8 @@ def health_report(root: str, include_dups: bool = True) -> dict:
                 "note": (f"use_count 自 {since_txt} 起才同时统计主动检索，此前只含被动推送；"
                          f"读写比分母口径：{era_note}"),
             },
-            "mem_governance": memory_governance_stats(root),
+            "mem_governance": (s["mem_governance"] if "mem_governance" in s
+                               else memory_governance_stats(root)),
             # 0 条记录时记忆/记录无意义（max(1,0) 会报 200%）；返回 None 表示「样本不足」
             "crystallization": round(s["memories"] * 100 / s["records"], 1) if s["records"] else None}
 

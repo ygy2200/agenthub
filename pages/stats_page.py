@@ -72,15 +72,16 @@ class StatsPage(QWidget):
 
     def fetch_db(self, root: str) -> dict:
         """读这一页要的全部数据——不在主线程，禁止在这里碰任何控件。"""
-        return {"stats": brain.stats(root),
-                "health": _read_health(root),
+        st = brain.stats(root)
+        return {"stats": st,
+                "health": _read_health(root, st),
                 "distill": _read_distill(root),
                 "tasks": _read_tasks(root)}
 
     def set_db(self, s: dict):
         """同步渲染入口（smoke/走查工具/旧调用方在用）：补齐剩下的数据再渲染。"""
         root = self.win.root
-        self.apply_db({"stats": s, "health": _read_health(root),
+        self.apply_db({"stats": s, "health": _read_health(root, s),
                        "distill": _read_distill(root), "tasks": _read_tasks(root)})
 
     def apply_db(self, bundle: dict):
@@ -226,11 +227,11 @@ class StatsPage(QWidget):
             box.setGeometry(0, 0, max(self.width(), 320), max(self.height(), 240))
 
 
-def _read_health(root):
+def _read_health(root, stats_cache=None):
     if not root:
         return None
     try:
-        return brain.health_report(root)
+        return brain.health_report(root, stats_cache=stats_cache)
     except Exception:  # noqa: BLE001 体检读不出来时页面其余部分照常
         return None
 
