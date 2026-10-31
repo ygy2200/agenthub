@@ -2855,10 +2855,19 @@ def _brief_hook_health(root: str) -> dict:
     except Exception:  # noqa: BLE001 送达统计失败不影响配置核对
         delivered = {}
     detail = []
+    # 配置里写着脚本名 ≠ 脚本还在盘上：删了脚本钩子会静默失败，比配置丢失更隐蔽。
+    scripts_missing = []
+    for want in (core.HOOK_BRIEF_NAME, core.HOOK_BRIEF_HERMES_SCRIPT):
+        sp = core.hook_brief_script_path().with_name(want)
+        if not sp.is_file():
+            scripts_missing.append(want)
     if unwired:
         detail.append("钩子丢失：" + "、".join(unwired)
                       + "（配置在但没挂简报——python cli.py hook-install "
                       + " ".join(unwired) + " --apply 重装，幂等且写前备份）")
+    if scripts_missing:
+        detail.insert(0, "钩子脚本缺失：" + "、".join(scripts_missing)
+                      + "（配置仍指向它，钩子会静默空转——python cli.py hook-install --apply 会重新部署脚本）")
     if absent:
         detail.append("本机无该配置，跳过：" + "、".join(absent))
     if delivered:
@@ -2870,9 +2879,14 @@ def _brief_hook_health(root: str) -> dict:
                           + "（这些天没开会话属正常；若刚开过，看 ~/.workbuddy/logs/brain-inject.log）")
     else:
         detail.append("近 7 天无简报送达记录（新装或还没开过会话）")
-    if unwired:
+    if unwired or scripts_missing:
+        bits = []
+        if scripts_missing:
+            bits.append("脚本缺 " + "、".join(scripts_missing))
+        if unwired:
+            bits.append("钩子丢失 " + "、".join(unwired))
         return {"ok": False,
-                "summary": f"简报钩子丢失：{'、'.join(unwired)}（{len(inplace)} 家在位）",
+                "summary": f"简报链路异常：{'；'.join(bits)}（{len(inplace)} 家在位）",
                 "fix": CHECK_FIXES["brief_hook_health"], "detail": detail}
     return {"ok": True,
             "summary": f"简报钩子 {len(inplace)} 家在位"

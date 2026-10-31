@@ -178,7 +178,7 @@ def test_doctor_no_machine_passes_subset_and_empty_selection_is_fatal(monkeypatc
 def test_check_list_covers_every_registered_check(capsys):
     assert cli.cmd_check(list_checks=True) == 0
     out = capsys.readouterr().out
-    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 20
+    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 21
     assert all(n in out for n in ops.CHECKS)
     assert "需要 --target" in out and "免 target" in out
 

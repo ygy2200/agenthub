@@ -21,7 +21,7 @@ def _cause_fail(name, summary="大脑库不存在", fix="x"):
 def test_empty_root_collapses_to_single_db_issue(hub_root):
     rep = ops.run_patrol(hub_root)
 
-    assert rep["total"] == len(ops.PATROL_CHECKS) == 20
+    assert rep["total"] == len(ops.PATROL_CHECKS) == 21
     assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 13
 
     db_issues = [i["name"] for i in rep["issues"] if i["name"] in ops.DB_BACKED_CHECKS]
@@ -93,7 +93,7 @@ def test_healthy_root_keeps_all_db_checks(hub_root):
 def test_db_backed_registry_covers_patrol_db_checks():
     non_db = set(ops.PATROL_CHECKS) - ops.DB_BACKED_CHECKS
     assert non_db == {"env", "runtime_health", "backup_health",
-                      "rules_health", "mcp_drift", "inbox"}, non_db
+                      "rules_health", "mcp_drift", "inbox", "brief_hook_health"}, non_db
     assert ops.DB_BACKED_CHECKS <= set(ops.CHECKS)
 
 

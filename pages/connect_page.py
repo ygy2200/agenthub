@@ -98,6 +98,19 @@ class ConnectPage(QWidget):
                                    "可随时移除还原；操作全部进「流水」页可查。"))
         self.pyLabel = CaptionLabel("")
         lay.addWidget(self.pyLabel)
+        # R819：MCP 接入只保证「能用」，简报钩子才保证「不提醒也自动收到上下文」。
+        # 把逐家钩子状态摆到接入页，缺口一键补齐——否则用户只能靠 doctor 或记忆里的命令。
+        self.hookRow = QWidget()
+        _hr = QHBoxLayout(self.hookRow)
+        _hr.setContentsMargins(0, 0, 0, 0)
+        self.hookLabel = CaptionLabel("")
+        self.hookLabel.setWordWrap(True)
+        self.hookBtn = PushButton("安装简报钩子")
+        self.hookBtn.setToolTip("给配置里缺 SessionStart 简报条目的 agent 幂等安装钩子（写前备份原文件）")
+        self.hookBtn.clicked.connect(self.do_install_hooks)
+        _hr.addWidget(self.hookLabel, 1)
+        _hr.addWidget(self.hookBtn)
+        lay.addWidget(self.hookRow)
         # R199：首刷改用**挂在本页上的**单次定时器——`QTimer.singleShot(400, 绑定方法)`
         # 在页面被销毁后仍会到点回调，回调里访问已析构的控件 = access violation
         # （实测：同一进程连开两个窗口跑接入页用例必崩）。父对象定时器随页面一起销毁。
@@ -184,6 +197,7 @@ class ConnectPage(QWidget):
         st, rows = self._rows_data()
         self._update_summary(st, rows)
         self.snippet.setPlainText(self._snippet_text())
+        self._refresh_hook_status()
         # Round 3（配色逻辑）：三态原来共用默认色——「部署失败」和「服务端就绪」长得一模一样，
         # 用户扫一眼判断不出接入是否正常。按语义阶梯着色：缺前提=警告 / 真失败=危险 / 就绪=成功。
         if not st["python"]:
@@ -305,6 +319,76 @@ class ConnectPage(QWidget):
     def do_boot_remove(self, path):
         err = core.remove_bootstrap(path, self.win.root)
         InfoBar.success("引导已移除" if not err else "移除失败", err, duration=3000, parent=self.win)
+        self.refresh_status()
+
+    def _hook_targets(self):
+        t = dict(core.HOOK_BRIEF_TARGETS)
+        t["hermes-cn"] = core.HOOK_BRIEF_HERMES_TARGETS[0][1]
+        return t
+
+    def _refresh_hook_status(self):
+        self._hookStates = {}
+        for agent in self._hook_targets():
+            try:
+                self._hookStates[agent] = core.brief_hook_status(agent)
+            except Exception:  # noqa: BLE001 读坏一家配置不拖垮整页
+                self._hookStates[agent] = {"agent": agent, "state": "bad_schema",
+                                           "path": "", "script": False}
+        inplace = [a for a, s in self._hookStates.items() if s["state"] == "inplace"]
+        unwired = [a for a, s in self._hookStates.items() if s["state"] == "unwired"]
+        broken = [a for a, s in self._hookStates.items() if s["state"] == "bad_schema"]
+        absent = [a for a, s in self._hookStates.items() if s["state"] == "absent"]
+        if unwired:
+            text = (f"简报钩子：{'、'.join(unwired)} 未挂——这些 agent 开新会话不会自动带团队上下文"
+                    "（MCP 握手简报仍可用，但要求客户端已接入且重启过）")
+        else:
+            text = (f"简报钩子：{len(inplace)} 家全部在位——开新会话会自动收到大脑简报，"
+                    "不需要再提醒 AI 读记忆")
+        if broken:
+            text += f"；{'、'.join(broken)} 配置结构不符，需手工处理"
+        if absent:
+            text += f"；本机无配置（跳过）：{'、'.join(absent)}"
+        self.hookLabel.setText(text)
+        self.hookBtn.setEnabled(bool(unwired))
+        tips = [f"{a}：{s['path'] or '未登记'}（{s['state']}）"
+                for a, s in self._hookStates.items()]
+        missing_script = [a for a, s in self._hookStates.items()
+                          if s["state"] == "inplace" and not s["script"]]
+        if missing_script:
+            tips.append("脚本缺失（钩子会空转）：" + "、".join(missing_script)
+                        + "——安装钩子会重新部署脚本")
+        self.hookLabel.setToolTip("\n".join(tips))
+
+    def do_install_hooks(self):
+        states = getattr(self, "_hookStates", {})
+        added, failed = [], []
+        for agent, st in states.items():
+            if st["state"] == "bad_schema":
+                failed.append(f"{agent}（配置结构不符，未改动）")
+                continue
+            if st["state"] != "unwired":
+                continue
+            try:
+                r = (core.install_hermes_brief_hook(agent, apply=True)
+                     if agent.startswith("hermes") else core.install_brief_hook(agent, apply=True))
+            except Exception as e:  # noqa: BLE001 单家失败继续装其余
+                failed.append(f"{agent}（{e}）")
+                continue
+            if r.get("status") in ("added", "already"):
+                added.append(agent)
+            else:
+                failed.append(f"{agent}（{r.get('status') or '失败'}）")
+        if added:
+            core.journal(self.win.root, "user", "brief_hook_install", ",".join(added))
+        if added and not failed:
+            InfoBar.success("简报钩子已安装",
+                            f"{'、'.join(added)}——重启这些 agent 的新会话生效",
+                            duration=4000, parent=self.win)
+        elif added:
+            InfoBar.warning("部分安装", f"已装：{'、'.join(added)}；未成：{'、'.join(failed)}",
+                            duration=6000, parent=self.win)
+        elif failed:
+            InfoBar.error("安装失败", "；".join(failed), duration=6000, parent=self.win)
         self.refresh_status()
 
     def _snippet_text(self):

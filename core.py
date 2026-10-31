@@ -1441,6 +1441,21 @@ def install_hermes_brief_hook(agent: str = "hermes-cn", apply: bool = False, pat
     return out
 
 
+def brief_hook_status(agent: str, path: str = "") -> dict:
+    """只读：某家简报钩子的在位情况（配置条目 + 脚本是否在盘上）。"""
+    key = agent_key(agent) or (agent or "").strip().lower()
+    hermes = key.startswith("hermes")
+    probe = (install_hermes_brief_hook(agent=key, apply=False, path=path, install_script=False)
+             if hermes else
+             install_brief_hook(key, apply=False, path=path, install_script=False))
+    state = {"already": "inplace", "would_add": "unwired", "no_config": "absent",
+             "bad_schema": "bad_schema", "unsupported": "unsupported"}.get(
+                 probe["status"], probe["status"])
+    script = (Path.home() / ".agenthub" / "hooks"
+              / (HOOK_BRIEF_HERMES_SCRIPT if hermes else HOOK_BRIEF_NAME))
+    return {"agent": key, "state": state, "path": probe["path"], "script": script.is_file()}
+
+
 def find_adapter(root: str, agent: str) -> dict:
     """按 agent 名（不区分大小写）找适配器；找不到返回 {}。"""
     want = (agent or "").strip().lower()

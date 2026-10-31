@@ -34,7 +34,8 @@ def test_missing_root_folds_to_one_issue(tmp_path):
     primary = rep["issues"][0]
     assert primary["name"] == "db_integrity"
     assert primary["cause"] == "db_missing"
-    assert set(primary.get("also") or []) == {"backup_health", "mcp_drift", "inbox"}
+    assert set(primary.get("also") or []) == {"backup_health", "mcp_drift", "inbox",
+                                             "brief_hook_health"}
 
 
 def test_empty_dir_without_db_folds_to_one_issue(tmp_path):
