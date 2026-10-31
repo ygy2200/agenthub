@@ -64,20 +64,30 @@ def test_cn_number_is_normalized_to_arabic(hub_root):
     assert "二十" not in terms, terms
 
 
-def test_all_generic_hits_are_flagged_low_confidence(hub_root):
+def test_all_generic_hits_become_a_search_nudge(hub_root):
+    """R826：弱命中不再注入摘要，只留「去查」的指令。
+
+    依据是三条一手材料口径一致：逐句注入有用率 18.2% vs 主动拉取 72.4%（Nlm Memory
+    因此把逐句注入默认关闭）、「nudge once per session, not every turn」（mem9）、
+    弱摘要本身会误导（R825 实测把泛化元记忆顶上 top3）。所以弱命中时**宁可一句不给**，
+    但要给检索词，让模型自己查得到。
+    """
     import brain
     brain.init_db(hub_root)
-    # 池要够大（≥3）才谈得上「泛词」——idf 是相对候选池估的，池太小时任何词都是
-    # 「稀有词」，判据不成立，此时不标注（宁可不说，也别乱说）。内容要各不相同，
-    # 否则 _fold_near_dupes 会把近似重复折成一条，池又缩回去了。
+    # 池要够大（≥5）才谈得上「泛词」——idf 是相对候选池估的，池太小时任何词都是
+    # 「稀有词」，判据不成立，此时照常注入（宁可多说，也别把真答案砍掉）。
     for i in range(6):
         brain.add_memory(hub_root, f"第{i}条：工作显示版本问题要按「显示」和「版本」"
                                    f"分开看，工作信息里的版本显示属于历史显示口径 {i}。",
                          kind="note")
     res = brain.prompt_recall(hub_root, "这个工作显示版本是怎么回事呢",
                               agent="workbuddy", session="s2", update_state=False)
-    assert res["text"], "有命中就该出文本"
-    assert "置信低" in res["text"], res["text"]
+    text = res["text"]
+    assert text, "有候选就该给反应"
+    assert "库里没有能当结论的东西" in text, text
+    assert "hub_search(keyword=" in text, text
+    assert "· #" not in text, "弱命中不该注入任何记忆摘要：" + text
+    assert res["memory_ids"] == [], res["memory_ids"]
 
 
 def test_continue_prompt_still_gets_project_brief(hub_root, tmp_path):

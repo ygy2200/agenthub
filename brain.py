@@ -7896,7 +7896,7 @@ def _normalize_cn_numbers(text: str) -> str:
     return _CN_NUM_RE.sub(repl, text)
 
 
-def _recall_idf(pool_texts: list, terms: list) -> dict:
+def _recall_idf(pool_texts: list, terms: list, weighted: bool = True) -> dict:
     """在候选池上估每个检索词的区分度，返回 {term: 加权分}。
 
     R825 的核心改动。为什么不在停用词表上加词：闭集永远追不完——「围绕/重点/整体」
@@ -7906,17 +7906,28 @@ def _recall_idf(pool_texts: list, terms: list) -> dict:
 
     权重用 BM25 的 idf 形状 log((N+1)/(df+0.5))，再乘抽取时的词权重（整词 2 /
     bigram 1）。池内出现率过半的词压到 0——它们只会把泛化记忆顶上来。
+
+    weighted=False 只返回 log 部分（raw idf），用来判「这条命中里有没有一个真正
+    稀有的词」——R826 的分流门槛不能带权重：整词权重 2 会把「版本」这种泛词
+    乘到门槛之上（实测就是这样漏掉的）。
     """
     n = max(1, len(pool_texts))
     out = {}
     for term, w in terms:
         if not term:
             continue
+        # ASCII 长标识符（pyinstaller / qfluentwidgets / teardown）在中文语料里天然
+        # 精确指代，**不参与 df 压零**：本库所有记忆都跟 AgentHub 有关，"qfluentwidgets"
+        # 的池内 df 当然高，但它是问题的主体不是噪声（2026-10-31 实测：按 df 压掉它
+        # 之后「InfoBar 中文被截断」直接召不回来了）。给一个 2.5 的保底分。
+        ascii_ident = term.isascii() and len(term) >= 5
         df = sum(1 for t in pool_texts if term in t)
-        if df * 2 > n and n >= 4:      # 过半候选都含它 = 泛词
-            out[term] = 0.0
-            continue
-        out[term] = w * math.log((n + 1.0) / (df + 0.5))
+        raw = math.log((n + 1.0) / (df + 0.5))
+        if ascii_ident:
+            raw = max(raw, 2.5)
+        elif df * 2 > n and n >= 4:    # 过半候选都含它 = 泛词
+            raw = 0.0
+        out[term] = w * raw if weighted else raw
     return out
 
 
@@ -7926,6 +7937,10 @@ def _recall_weighted_hit(terms: list, idf: dict, text: str) -> float:
 
 
 _RECALL_OPEN_STATUS = ("pending", "blocked", "in_progress", "claimed", "awaiting_approval")
+# R826：一条记忆要被当「依据」注入，它命中的词里至少要有一个**稀有**的（raw idf ≥ 2.0）。
+# 40 条候选池里 idf=2.0 对应的 df≈5.5（约 14% 的出现率）；低于这个数的词命中什么都说
+# 不明相关性。实测标定：df=2→2.80，df=5→2.01，df=9→1.46，df=20→0.69。
+_RECALL_RARE_IDF = 2.0
 
 
 def _recall_project_block(root: str, pname: str, limit: int = 3) -> list:
@@ -8025,6 +8040,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     mem_texts = [str(r.get("content") or "") + " " + str(r.get("tags") or "")
                  for r in mems]
     mem_idf = _recall_idf(mem_texts, terms)
+    mem_idf_raw = _recall_idf(mem_texts, terms, weighted=False)
     scored = []
     for r in mems:
         if r.get("id") in excluded:
@@ -8034,8 +8050,15 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         if hit < need:
             continue
         wid = _recall_weighted_hit(terms, mem_idf, body)
+        # 这一条命中的词里，最稀有的那个有多稀有（不带权重）——R826 的分流门槛。
+        # 必须用小写体比对：正文里写的是「PyInstaller」，检索词全小写，直接 in 会
+        # 全部判不中，ASCII 标识符等于没参与打分（2026-10-31 实测踩到）。
+        low_body = body.lower()
+        best_raw = max((mem_idf_raw.get(t, 0.0) for t, _ in terms if t in low_body),
+                       default=0.0)
         r["_recall_hit"] = hit
         r["_recall_w"] = wid
+        r["_recall_best"] = best_raw
         kind = r.get("kind") or "note"
         spec = wid * 2.2 + kind_weights.get(kind, 0.4) + (0.8 if r.get("pinned") else 0)
         if pname and (r.get("project") or "") == pname:
@@ -8050,15 +8073,21 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             pass
         scored.append((spec, r))
     scored.sort(key=lambda x: (-x[0], -(x[1].get("use_count") or 0), -x[1].get("id", 0)))
-    picked = [r for _, r in scored[:3]]
+    # R826：**逐条**筛「至少命中一个稀有词」的，而不是整批判弱。
+    # 整批判会误伤：提问里既有泛词也有精确词时（「qfluentwidgets 中文被截断」），
+    # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
+    strong = [(s, r) for s, r in scored
+              if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
+    picked = [r for _, r in strong[:3]]
     try:
         recs = search_records(root, query, limit=30)
     except sqlite3.Error:
         recs = []
     rec_scored = []
     now_dt = datetime.datetime.now()
-    rec_idf = _recall_idf([str(r.get("title") or "") + " " + str(r.get("content") or "")
-                           for r in recs], terms)
+    rec_texts = [str(r.get("title") or "") + " " + str(r.get("content") or "") for r in recs]
+    rec_idf = _recall_idf(rec_texts, terms)
+    rec_idf_raw = _recall_idf(rec_texts, terms, weighted=False)
     for r in recs:
         title = str(r.get("title") or "")
         body = title + " " + str(r.get("content") or "")
@@ -8075,12 +8104,33 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             spec += 1.0 if age <= 3 else (0.5 if age <= 14 else 0.0)
         except (ValueError, TypeError):
             pass
+        r["_recall_best"] = max(
+            (rec_idf_raw.get(t, 0.0) for t, _ in terms if t in body.lower()), default=0.0)
         rec_scored.append((spec, r))
     rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
-    rec_rows = [r for _, r in rec_scored[:2]]
+    rec_rows = [r for _, r in rec_scored
+                if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF][:2]
     proj_lines = _recall_project_block(root, pname)
+    top_terms = [t for t, _ in sorted(terms, key=lambda x: -float(mem_idf.get(x[0]) or 0))[:3]]
+    search_cmd = f"hub_search(keyword=\"{_brief_oneline(' '.join(top_terms), 60)}\")"
     if not picked and not rec_rows:
-        # R825：没命中记忆 ≠ 没有上下文。「继续迭代」抽到「迭代」却在库里查不到，
+        # R826：有候选、但每一条都只命中泛词 —— 这是最该克制的场景。摘要看着像答案、
+        # 实际不相关（实测「这个版本显示有问题怎么办」会端出「接入层通用化」「审批队列」
+        # 三条），模型照着答就是自信地跑偏。此时只给检索词，让模型自己去查。
+        # 依据：逐句注入有用率 18.2% vs 主动拉取 72.4%（Nlm Memory 因此默认关闭逐句注入）；
+        # mem9「nudge once per session, not every turn」——每轮塞同款文字会让模型免疫。
+        if mems:
+            lines = ["【AgentHub 即时回忆 · 库里没有能当结论的东西】",
+                     f"这句只碰上泛词，别把下面当依据——要动这块之前先自己查：{search_cmd}"]
+            if proj_lines:
+                lines.extend(proj_lines)
+            text = "\n".join(lines)
+            if len(text) > max_chars:
+                text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
+            out.update(text=text, project=pname, chars=len(text),
+                       elapsed_ms=int((time.time() - t0) * 1000))
+            return out
+        # R825：连候选都没有 ≠ 没有上下文。「继续迭代」抽到「迭代」却在库里查不到，
         # 结论不该是闭嘴——在项目目录里，本项目最近做到哪比任何记忆都该先说。
         if proj_lines:
             text = "\n".join(
@@ -8093,16 +8143,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             out["terms"] = [t for t, _ in terms]
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
-    # 低置信判定：候选池里 top1 的加权分还是很小，说明这条提问只由泛词命中——把它
-    # 当结论会误导（2026-10-31 实测那次「围绕/重点/不用」正好是这种情况），必须让
-    # 模型看见「这条不靠谱」而不是看见「三条记忆」。池太小时 idf 无从估计，不判。
-    weak = (bool(picked) and len(mems) >= 5
-            and float(picked[0].get("_recall_w") or 0.0) < 1.2)
     lines = ["【AgentHub 即时回忆 · 自动检索，无需提醒】",
              "这是索引不是全文：要动具体命令/路径/参数前先 hub_search 取原文，"
              "别照着摘要复述；与现状冲突时以现状为准，收工时顺手更正。"]
-    if weak:
-        lines.append("⚠ 本节只是「词面碰上」，置信低——别当结论，自己 hub_search 再确认。")
     if proj_lines:
         lines.extend(proj_lines)
     ids = []
@@ -8121,9 +8164,6 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             lines.append(f"- [{_brief_oneline(str(r.get('project') or ''), 22)}] "
                          f"{_brief_oneline(head, 42)}"
                          f"（{r.get('agent') or '其他'} · {r.get('date') or '—'}）")
-    # 出口用「区分度最高的三个词」拼查询式：原先把整串 terms 塞进去，虚词也跟着进去，
-    # 模型照抄这条命令就等于把噪声再检一遍。
-    top_terms = [t for t, _ in sorted(terms, key=lambda x: -float(mem_idf.get(x[0]) or 0))[:3]]
     lines.append(f"更多：hub_memory_read(query=\"{_brief_oneline(' '.join(top_terms) or query, 60)}\")")
     text = "\n".join(lines)
     if len(text) > max_chars:
