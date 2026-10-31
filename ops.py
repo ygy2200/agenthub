@@ -2831,6 +2831,7 @@ def _brief_hook_health(root: str) -> dict:
     targets = dict(core.HOOK_BRIEF_TARGETS)
     targets["hermes-cn"] = core.HOOK_BRIEF_HERMES_TARGETS[0][1]
     inplace, unwired, recall_inplace, recall_unwired, absent = [], [], [], [], []
+    answer_inplace, answer_unwired = [], []   # R828：Stop 采纳回填
     for agent, cfg_s in targets.items():
         p = Path(os.path.expanduser(cfg_s))
         if not p.is_file():
@@ -2847,6 +2848,11 @@ def _brief_hook_health(root: str) -> dict:
         want_recall = core.HOOK_BRIEF_HERMES_SCRIPT if hermes else core.HOOK_RECALL_NAME
         (inplace if want_brief in text else unwired).append(agent)
         (recall_inplace if want_recall in text else recall_unwired).append(agent)
+        # hermes 没有登记 Stop 出口（只有 pre_llm_call），不参与「回填丢失」判定——
+        # 否则它天天被点名，用户会去修一个不存在的东西。
+        if not hermes:
+            (answer_inplace if core.HOOK_ADHERENCE_NAME in text
+             else answer_unwired).append(agent)
     d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
     delivered: dict = {}
     recalled: dict = {}
@@ -2854,7 +2860,8 @@ def _brief_hook_health(root: str) -> dict:
         with _brain.db_conn(root) as conn:
             for r in conn.execute(
                     "SELECT action, agent, COUNT(*) n FROM journal "
-                    "WHERE action IN ('brain_brief','brain_recall') AND ts>=? "
+                    "WHERE action IN ('brain_brief','brain_recall','brain_adherence') "
+                    "AND ts>=? "
                     "GROUP BY action, agent", (d7,)):
                 if not r["agent"]:
                     continue
@@ -2865,12 +2872,18 @@ def _brief_hook_health(root: str) -> dict:
     detail = []
     # 配置里写着脚本名 ≠ 脚本还在盘上：删了脚本钩子会静默失败，比配置丢失更隐蔽。
     scripts_missing = []
-    for want in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT):
+    for want in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT,
+                 core.HOOK_ADHERENCE_NAME):
         sp = core.hook_script_path(want)
         if not sp.is_file():
             scripts_missing.append(want)
-    entries_missing = [name for name in ("brain_brief.py", "brain_recall.py")
+    entries_missing = [name for name in ("brain_brief.py", "brain_recall.py",
+                                        "brain_adherence.py")
                        if not (core.MCP_SERVER_DIR / name).is_file()]
+    if answer_unwired:
+        detail.append("采纳回填钩子丢失：" + "、".join(answer_unwired)
+                      + "（注入账本 recall_adherence 会一直是空的——python cli.py "
+                        "hook-install --events answer --apply 补上）")
     if unwired or recall_unwired:
         lost = sorted(set(unwired) | set(recall_unwired))
         detail.append("钩子丢失：" + "、".join(lost)

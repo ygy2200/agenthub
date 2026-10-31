@@ -17,15 +17,19 @@ def _rows(*names):
              "mcp_path": "", "layout": "", "profile": "", "mcp": True} for n in names]
 
 
-def _states(mapping):
+def _states(mapping, answer=""):
+    """R828：状态里多了 answer（Stop 采纳回填）。hermes 没有 Stop 出口，固定 unsupported。"""
     def _fake(agent, path=""):
         s = mapping.get(agent, "inplace")
+        ans = answer or ("unsupported" if str(agent).startswith("hermes") else "inplace")
         if s == "covered":
-            return {"agent": agent, "session": {"state": "inplace"}, "prompt": {"state": "covered"}}
+            return {"agent": agent, "session": {"state": "inplace"},
+                    "prompt": {"state": "covered"}, "answer": {"state": ans}}
         if s == "unsupported":
             return {"agent": agent, "session": {"state": "unsupported"},
-                    "prompt": {"state": "unsupported"}}
-        return {"agent": agent, "session": {"state": s}, "prompt": {"state": s}}
+                    "prompt": {"state": "unsupported"}, "answer": {"state": ans}}
+        return {"agent": agent, "session": {"state": s}, "prompt": {"state": s},
+                "answer": {"state": ans}}
     return _fake
 
 
@@ -36,10 +40,10 @@ def test_status_prints_hook_column_per_agent(monkeypatch, capsys, tmp_path):
     rc = cli.cmd_status(str(tmp_path))
     out = capsys.readouterr().out
     assert rc == 0, out
-    assert "钩子:✓简报+回忆" in out, out
+    assert "钩子:✓简报+回忆+回填" in out, out
     assert "钩子:—无出口" in out, "ZCode 没有钩子出口，要写清楚而不是留空"
-    # hermes 的回忆由同一 pre_llm_call 覆盖，显示口径应与真的挂了两条一样
-    assert out.count("钩子:✓简报+回忆") == 2, out
+    # hermes 的回忆由同一 pre_llm_call 覆盖、Stop 回填没有出口——两项都要如实体现
+    assert "钩子:✓简报+回忆（回填无出口）" in out, out
 
 
 def test_unwired_hook_turns_status_red(monkeypatch, capsys, tmp_path):
@@ -67,11 +71,17 @@ def test_status_json_carries_hook_state(monkeypatch, capsys, tmp_path):
     monkeypatch.setattr(core, "memory_hook_status", _states({"WorkBuddy": "inplace"}))
     cli.cmd_status(str(tmp_path), as_json=True)
     data = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
-    assert data["agents"][0]["hook"] == {"session": "inplace", "prompt": "inplace"}, data
+    assert data["agents"][0]["hook"] == {"session": "inplace", "prompt": "inplace",
+                                         "answer": "inplace"}, data
     assert data["healthy"] is True, data
 
 
 def test_hook_mark_partial_names_the_missing_side():
     """只挂了简报没挂回忆时，标记要说缺哪条，别只说「异常」。"""
-    st = {"session": {"state": "inplace"}, "prompt": {"state": "unwired"}}
+    # R828：三条钩子各自独立，缺哪条就点名哪条——回填在位时不该被算进「缺」。
+    st = {"session": {"state": "inplace"}, "prompt": {"state": "unwired"},
+          "answer": {"state": "inplace"}}
     assert cli._hook_mark(st) == "✗缺回忆"
+    st2 = {"session": {"state": "inplace"}, "prompt": {"state": "inplace"},
+           "answer": {"state": "unwired"}}
+    assert cli._hook_mark(st2) == "✗缺回填"

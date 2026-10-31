@@ -19,13 +19,14 @@ def _patch(monkeypatch, targets, hermes, tmp_path, with_scripts=True):
     d = tmp_path / "hooks"
     d.mkdir(exist_ok=True)
     if with_scripts:
-        for n in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT):
+        for n in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT,
+                  core.HOOK_ADHERENCE_NAME):
             (d / n).write_text("// stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "hook_script_path", lambda name: d / name)
     mcp = tmp_path / "mcp"
     mcp.mkdir(exist_ok=True)
     if with_scripts:
-        for n in ("brain_brief.py", "brain_recall.py"):
+        for n in ("brain_brief.py", "brain_recall.py", "brain_adherence.py"):
             (mcp / n).write_text("# stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "MCP_SERVER_DIR", mcp)
 
@@ -37,9 +38,11 @@ def _cfg(tmp_path, name, text):
 
 
 def _both(script_brief=core.HOOK_BRIEF_NAME, script_recall=core.HOOK_RECALL_NAME):
+    # R828：三条钩子（简报/回忆/回填）都齐才算「全在位」，否则体检会点名回填缺失。
     return {"hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": script_brief}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": script_recall}]}],
+        "Stop": [{"hooks": [{"type": "command", "command": core.HOOK_ADHERENCE_NAME}]}],
     }}
 
 

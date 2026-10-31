@@ -1233,9 +1233,15 @@ HOOK_BRIEF_DESC = "AgentHub 大脑简报：SessionStart 自动注入团队上下
 # 时仍要提醒 AI 查大脑。UserPromptSubmit 是每句话都会经过的确定入口，按 prompt 检索。
 HOOK_RECALL_NAME = "brain_recall.mjs"
 HOOK_RECALL_DESC = "AgentHub 即时回忆：按每句话检索相关记忆（R820）"
+# 采纳回填（R828）：R827 的账本建好了但采集要人手动 --mark，等于没有。Stop 是
+# 一轮结束的确定出口——那时判一次「注入有没有被用」，最准也最省（PostToolUse 一轮
+# 可能触发几十次，每次都比对指纹纯属浪费）。
+HOOK_ADHERENCE_NAME = "brain_adherence.mjs"
+HOOK_ADHERENCE_DESC = "AgentHub 采纳回填：一轮结束标记哪些注入被用到（R828）"
 HOOK_JSON_EVENTS = {
     "session": ("SessionStart", HOOK_BRIEF_NAME, HOOK_BRIEF_DESC),
     "prompt": ("UserPromptSubmit", HOOK_RECALL_NAME, HOOK_RECALL_DESC),
+    "answer": ("Stop", HOOK_ADHERENCE_NAME, HOOK_ADHERENCE_DESC),
 }
 
 
@@ -1366,6 +1372,17 @@ def install_recall_hook(agent: str, apply: bool = False, path: str = "",
                               install_script=install_script)
 
 
+def install_adherence_hook(agent: str, apply: bool = False, path: str = "",
+                           node: str = "", install_script: bool = True) -> dict:
+    """把 brain_adherence.mjs 挂到 agent 的 Stop（R828，纪律同简报钩子）。
+
+    Stop 是「一轮结束」的确定出口：这时拿产出去比对注入时的指纹，才知道那些
+    记忆到底有没有被用。没有这个钩子，recall_adherence 表永远是空的。
+    """
+    return _install_json_hook(agent, "answer", apply=apply, path=path, node=node,
+                              install_script=install_script)
+
+
 def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
                          node: str = "", install_script: bool = True) -> dict:
     """一次装齐开机简报 + 按句回忆；返回 {"session": …, "prompt": …}，互不阻塞。
@@ -1379,11 +1396,19 @@ def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
                                             install_script=install_script)
         prompt = dict(session)
         prompt.update({"event": "pre_llm_call", "covered": True})
-        return {"session": session, "prompt": prompt}
+        # hermes 的 pre_llm_call 是唯一被登记过的出口；post_llm_call 挂回填脚本
+        # 还没在真机验证过，这里如实标 unsupported 而不是假装装上了（R828）。
+        answer = {"agent": key, "event": "Stop", "status": "unsupported",
+                  "path": str(Path(os.path.expanduser(
+                      "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"))),
+                  "command": "", "backup": "", "copied": False}
+        return {"session": session, "prompt": prompt, "answer": answer}
     return {"session": install_brief_hook(agent, apply=apply, path=path, node=node,
                                           install_script=install_script),
             "prompt": install_recall_hook(agent, apply=apply, path=path, node=node,
-                                          install_script=install_script)}
+                                          install_script=install_script),
+            "answer": install_adherence_hook(agent, apply=apply, path=path, node=node,
+                                             install_script=install_script)}
 
 
 # hermes 没有 SessionStart 出口，只有 pre_llm_call（每次模型调用都触发）——
@@ -1543,10 +1568,11 @@ def _hook_state(probe: dict) -> str:
 
 
 def memory_hook_status(agent: str, path: str = "") -> dict:
-    """只读：某家「开机简报 + 按句回忆」两条钩子的合并状态（R821）。
+    """只读：某家「开机简报 + 按句回忆 + 采纳回填」三条钩子的合并状态（R821/R828）。
 
-    JSON 系两家钩子各挂一个事件；hermes 只有 pre_llm_call 一个出口，同一份
-    脚本先发简报、后续每轮按 prompt 回忆，故 prompt 记为 covered。
+    JSON 系三家钩子各挂一个事件；hermes 只有 pre_llm_call 一个出口，同一份
+    脚本先发简报、后续每轮按 prompt 回忆，故 prompt 记为 covered，Stop 回填
+    尚未在真机验证过，如实记 unsupported。
     """
     key = agent_key(agent) or (agent or "").strip().lower()
     hermes = key.startswith("hermes")
@@ -1564,11 +1590,16 @@ def memory_hook_status(agent: str, path: str = "") -> dict:
             prompt_state = "covered" if "brain_recall.py" in text else "unwired"
         prompt = {"agent": key, "state": prompt_state,
                   "path": session["path"], "script": script.is_file()}
+        answer = {"agent": key, "state": "unsupported", "path": session["path"],
+                  "script": hook_script_path(HOOK_ADHERENCE_NAME).is_file()}
     else:
         probe = install_recall_hook(key, apply=False, path=path, install_script=False)
         prompt = {"agent": key, "state": _hook_state(probe), "path": probe.get("path", ""),
                   "script": hook_script_path(HOOK_RECALL_NAME).is_file()}
-    return {"agent": key, "session": session, "prompt": prompt}
+        aprobe = install_adherence_hook(key, apply=False, path=path, install_script=False)
+        answer = {"agent": key, "state": _hook_state(aprobe), "path": aprobe.get("path", ""),
+                  "script": hook_script_path(HOOK_ADHERENCE_NAME).is_file()}
+    return {"agent": key, "session": session, "prompt": prompt, "answer": answer}
 
 
 def hook_managed_keys() -> set:
@@ -1637,11 +1668,13 @@ MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # 此前两份清单各写各的（core 这份没有 api.py），结果「检查说一致、实际没部署」——
 # 2026-10-13 release playbook 实跑时 deploy_diff 抓到 api.py 不一致，根因即此。
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
-                "api.py", "brain_brief.py", "brain_recall.py", "my/__init__.py", "my/work/__init__.py")
+                "api.py", "brain_brief.py", "brain_recall.py", "brain_adherence.py",
+                "my/__init__.py", "my/work/__init__.py")
 
 # 钩子脚本随 exe 一起打包：安装器要能从运行目录复制到 ~/.agenthub/hooks/，
 # 只有 .py 进了 PYZ 而脚本没进 datas，打包版的「安装钩子」会复制 0 个文件。
-HOOK_SCRIPT_FILES = ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs")
+HOOK_SCRIPT_FILES = ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs",
+                    "brain_adherence.mjs")
 
 
 def bundle_files() -> tuple:
