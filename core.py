@@ -1203,6 +1203,108 @@ BOOTSTRAP_ONLY = [{"agent": a["agent"], "path": _boot_path(a)} for a in AGENT_AD
 BOOTSTRAP_TARGETS = [{"agent": a["agent"], "path": _boot_path(a)} for a in AGENT_ADAPTERS if _boot_path(a)]
 
 
+# ---------------------------------------------------------------- 大脑简报钩子安装（R814）
+# 简报送进会话有两条通道：钩子（SessionStart additionalContext）与 MCP 握手（initialize）。
+# 握手由服务端自动带，无需安装；钩子必须逐家写配置。此前 Qoder 是手工改的 settings.json——
+# 手工步骤既会漏（claude/codex/workbuddy/dsh 都没装），也无法幂等重放（重装会重复挂）。
+# 本表是「哪家挂哪份配置」的单一事实来源；安装器只追加 SessionStart 条目、其余原样保留。
+HOOK_BRIEF_NAME = "brain_inject.mjs"
+HOOK_BRIEF_TARGETS = {
+    "claude": "~/.claude/settings.json",
+    "codex": "~/.codex/hooks.json",
+    "workbuddy": "~/.workbuddy/settings.json",
+    "dsh": "~/.dsh/hooks.json",
+}
+HOOK_BRIEF_DESC = "AgentHub 大脑简报：SessionStart 自动注入团队上下文（R814）"
+
+
+def hook_brief_script_path() -> Path:
+    return Path.home() / ".agenthub" / "hooks" / HOOK_BRIEF_NAME
+
+
+def _hook_node() -> str:
+    for cand in ("D:/node/node.exe", shutil.which("node") or ""):
+        if cand and Path(cand).is_file():
+            return str(cand)
+    return "node"
+
+
+def install_brief_hook(agent: str, apply: bool = False, path: str = "",
+                       node: str = "", install_script: bool = True) -> dict:
+    """把 brain_inject.mjs 挂到 agent 的 SessionStart（幂等；写前备份；默认只预演）。
+
+    status: already（已在位）/ would_add（预演）/ added（已写入）/ no_config（配置文件不存在，
+    不去凭空造壳）/ unsupported（未登记该家钩子位置）/ bad_schema（hooks 结构不是对象/数组）。
+    只增 SessionStart 一条，不改其它事件、不动已有条目——用户配置是生产数据。
+    """
+    key = agent_key(agent) or (agent or "").strip().lower()
+    out = {"agent": key, "path": "", "status": "", "command": "", "backup": "",
+           "copied": False}
+    dest = hook_brief_script_path()
+    if install_script:
+        src = Path(__file__).with_name(HOOK_BRIEF_NAME)
+        if src.is_file():
+            out["copied"] = True
+            if apply:
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    old = dest.read_bytes() if dest.is_file() else b""
+                    if old != src.read_bytes():
+                        if old:
+                            shutil.copy2(dest, dest.with_name(
+                                dest.name + f".bak-agenthub-{time.strftime('%Y%m%d-%H%M%S')}"))
+                        shutil.copy2(src, dest)
+                except OSError:
+                    out["copied"] = False
+    cfg_s = path or HOOK_BRIEF_TARGETS.get(key, "")
+    if not cfg_s:
+        out["status"] = "unsupported"
+        return out
+    cfg = Path(os.path.expanduser(cfg_s))
+    out["path"] = str(cfg)
+    if not cfg.is_file():
+        out["status"] = "no_config"
+        return out
+    try:
+        data = json.loads(read_text(cfg))
+    except (OSError, ValueError):
+        out["status"] = "bad_schema"
+        return out
+    hooks = data.get("hooks")
+    if not isinstance(hooks, dict):
+        out["status"] = "bad_schema"
+        return out
+    sess = hooks.get("SessionStart")
+    if sess is None:
+        sess = hooks["SessionStart"] = []
+    if not isinstance(sess, list):
+        out["status"] = "bad_schema"
+        return out
+    out["command"] = f'"{node or _hook_node()}" "{dest}" --agent {key}'
+    for grp in sess:
+        for h in (grp.get("hooks") or []) if isinstance(grp, dict) else []:
+            if HOOK_BRIEF_NAME in str(h.get("command", "")):
+                out["status"] = "already"
+                return out
+    if not apply:
+        out["status"] = "would_add"
+        return out
+    sess.append({"hooks": [{"type": "command", "command": out["command"],
+                            "timeout": 10, "description": HOOK_BRIEF_DESC}]})
+    backup = cfg.with_name(cfg.name + f".bak-agenthub-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        shutil.copy2(cfg, backup)
+        tmp = cfg.with_name(cfg.name + ".tmp-agenthub")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        os.replace(tmp, cfg)
+    except OSError:
+        out["status"] = "write_failed"
+        return out
+    out["backup"] = str(backup)
+    out["status"] = "added"
+    return out
+
+
 def find_adapter(root: str, agent: str) -> dict:
     """按 agent 名（不区分大小写）找适配器；找不到返回 {}。"""
     want = (agent or "").strip().lower()

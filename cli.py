@@ -1340,6 +1340,34 @@ def cmd_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
     return 0
 
 
+def cmd_hook_install(agents=None, apply: bool = False, node: str = "",
+                     as_json: bool = False) -> int:
+    """大脑简报钩子安装（R814）：把 SessionStart → brain_inject.mjs 写进各家配置。
+
+    幂等：已在位只报 already；默认预演，--apply 才改（改前自动备份）。
+    """
+    import core  # noqa: PLC0415
+    names = list(agents or core.HOOK_BRIEF_TARGETS)
+    rows = [core.install_brief_hook(a, apply=apply, node=node) for a in names]
+    if as_json:
+        print(json.dumps({"apply": apply, "rows": rows}, ensure_ascii=False))
+    else:
+        word = {"already": "已在位", "would_add": "将新增（预演，加 --apply 生效）",
+                "added": "已新增", "no_config": "跳过：配置文件不存在",
+                "unsupported": "跳过：未登记该家钩子位置",
+                "bad_schema": "失败：hooks 结构不符合预期", "write_failed": "失败：写入出错"}
+        for r in rows:
+            line = f"{r['agent']:<10} {word.get(r['status'], r['status'])}"
+            if r.get("path"):
+                line += f" · {r['path']}"
+            if r.get("backup"):
+                line += f" · 备份 {Path(r['backup']).name}"
+            print(line)
+        if not apply and any(r["status"] == "would_add" for r in rows):
+            print("预演完成：以上未改动任何文件；确认后加 --apply。")
+    return 1 if any(r["status"] in ("bad_schema", "write_failed") for r in rows) else 0
+
+
 def cmd_claim(root: str, task_id, agent: str) -> int:
     """认领任务（原子；前置未完成/被他人持有会明确拒绝）。"""
     import brain  # noqa: PLC0415
@@ -1891,6 +1919,12 @@ def main(argv=None) -> int:
     p_brief.add_argument("--max-chars", type=int, default=0, help="字符预算，默认 3600")
     p_brief.add_argument("--json", action="store_true", dest="as_json",
                          help="输出 {text, project, stats, elapsed_ms} 便于测试/脚本")
+    p_hook = _cmd("hook-install",
+                  help="给 claude/codex/workbuddy/dsh 挂大脑简报 SessionStart 钩子（默认预演，幂等）")
+    p_hook.add_argument("agents", nargs="*", help="agent 名；留空=全部已登记的家")
+    p_hook.add_argument("--apply", action="store_true", help="真正写入（默认只预演；写前自动备份）")
+    p_hook.add_argument("--node", default="", help="node 可执行文件路径（默认自动找 D:/node 或 PATH）")
+    p_hook.add_argument("--json", action="store_true", dest="as_json", help="机器可读输出")
     p_claim = _cmd("claim", help="认领任务（原子；前置未完成会拒绝）")
     p_claim.add_argument("task_id", type=int)
     p_claim.add_argument("--agent", required=True)
@@ -2059,6 +2093,8 @@ def main(argv=None) -> int:
         if args.cmd == "brief":
             return cmd_brief(root, args.agent, args.cwd, args.project,
                              args.max_chars, as_json=args.as_json)
+        if args.cmd == "hook-install":
+            return cmd_hook_install(args.agents, args.apply, args.node, args.as_json)
         if args.cmd == "claim":
             return cmd_claim(root, args.task_id, args.agent)
         if args.cmd == "update":
