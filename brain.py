@@ -471,6 +471,27 @@ CREATE TABLE IF NOT EXISTS signal_reads (
     read_at TEXT DEFAULT "",
     PRIMARY KEY (signal_id, agent)
 );
+-- R827 注入采纳跟踪：一条记忆被注入上下文后，到底有没有被用。
+-- 为什么要有这张表：R825/R826 把「召回准不准」量化到了 Recall@3，但「模型用没用」
+-- 一直是空白——而三份一手材料都说逐句注入的有用率只有 ~18%（见 R826 台账）。
+-- 判据不用「让模型引用 #id」（Grimoire 实测 agent 只有 14% 会写），用内容指纹：
+-- 注入时抽 1–6 个独特 token 存 fp，后续在同一会话里出现即记 used。
+-- 表要**有界**：30 天保留、行数封顶，别又长成一张只增不减的大表。
+CREATE TABLE IF NOT EXISTS recall_adherence (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT "",
+    session TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    memory_id INTEGER,
+    project TEXT DEFAULT "",
+    strength TEXT DEFAULT "strong",   -- strong / weak（R826 的分档，用来验证分流判断）
+    fp TEXT DEFAULT "",               -- JSON 数组；空数组 = 这条抽不出指纹（不进分母）
+    cited INTEGER DEFAULT 0,
+    used INTEGER DEFAULT 0,
+    decided_at TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_adherence_session ON recall_adherence(session, ts);
+CREATE INDEX IF NOT EXISTS idx_adherence_ts ON recall_adherence(ts);
 -- M11 决策回路（2026-10-12）：决策记录写了没人回顾=白写。写决策时挂 review_date，
 -- 到期进「待验证」队列（心跳开工推送第三段），回顾时记 verdict（right/wrong/partial）。
 -- AgDR 决策本身还是记录尾段（不重构），本表只挂「到期-回顾」闭环。
@@ -7942,6 +7963,204 @@ _RECALL_OPEN_STATUS = ("pending", "blocked", "in_progress", "claimed", "awaiting
 # 不明相关性。实测标定：df=2→2.80，df=5→2.01，df=9→1.46，df=20→0.69。
 _RECALL_RARE_IDF = 2.0
 
+# R827：fingeprint 抽取。思路照 Grimoire 的实测结论——「让 agent 写引用标签没用
+# （qwen 即使被要求也只有 14% 会写）」，所以判「这条记忆有没有被用」只能靠**内容里
+# 那些独一无二的 token** 有没有在后续动作里冒出来。token 只取「一眼能认出来源」的
+# 形态：路径 / URL / IP / --flag / ENV_VAR / 版本号 / 标识符 / 带扩展名的文件名。
+_FP_PATTERNS = (
+    re.compile(r"[A-Za-z]:\\[^\s\"'<>|*?]+"),                  # Windows 绝对路径
+    # 相对路径**不单独抽**：`if/for`、`0/168` 这类比值也会被"两段带斜杠"匹配上
+    # （2026-10-31 实测，抽出来的指纹根本没法当招牌）。文件名由下面的扩展名规则管。
+    re.compile(r"https?://[^\s\"'<>）)，。]+"),                  # URL
+    # 带扩展名的文件名排在 snake_case 之前：否则 `test_x_r802.py` 会先被 snake_case
+    # 吃掉后半截成 `test_x_r802`，扩展名丢了（实测）。
+    re.compile(r"\b[\w.-]+\.(?:py|mjs|js|json|exe|md|bat|spec|db|sqlite|txt|log|yaml|yml|toml)\b"),
+    re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"),       # IP[:port]
+    re.compile(r"(?<![\w-])--[a-z][\w-]{2,}"),                  # --flag
+    re.compile(r"\b[A-Z][A-Z0-9_]{3,}\b"),                      # ENV_VAR
+    re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b"),                    # 版本号
+    re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b"),           # snake_case
+    # camelCase / PascalCase：必须允许大写开头——`CArchiveReader` 正是这类招牌词，
+    # 只写 [a-z]+ 会一个都抽不到（2026-10-31 实测）。
+    re.compile(r"\b[A-Za-z]+(?:[A-Z][a-z0-9]+)+\b"),
+)
+_FP_STOP = {"true", "false", "none", "null", "utf-8", "utf8", "sha256", "md5"}
+ADHERENCE_KEEP_DAYS = 30  # 采纳跟踪表的保留窗口（照 Grimoire 的 30 天 bounded table）
+
+
+def _days_ago(days: int) -> str:
+    return (datetime.datetime.now() - datetime.timedelta(days=max(0, int(days)))
+            ).strftime("%Y-%m-%dT%H:%M:%S")
+
+
+def recall_fingerprints(text: str, pool_texts: list = None, prompt: str = "",
+                        limit: int = 6) -> list:
+    """从一条记忆里抽 1–6 个「独特 token」，用来事后判它到底有没有被用。
+
+    为什么不用「让模型引用 #id」：Grimoire 实测 agent 很少写引用标签（qwen 只有 14%），
+    标签不能当主信号。内容指纹可以——记忆里写了 `--add-data`、`brain_recall.mjs`、
+    `v2.41.179`，agent 真照它干活时这些串必然出现在命令或回答里。
+
+    三个过滤：
+      ① 长度 <4 / 纯停用词（true/false/utf-8 这类到处都有）；
+      ② 已在**这句提问里**出现过的（答案复述提问，证明不了什么）；
+      ③ 在候选池里出现超过 2 条（池内 df > 2）——那是通用写法不是招牌。
+    同一段最多取 2 个，总数封顶 limit。
+    """
+    if not text:
+        return []
+    low_prompt = (prompt or "").lower()
+    pool = [str(t).lower() for t in (pool_texts or [])]
+    cands, seen = [], set()
+    for pat in _FP_PATTERNS:
+        for m in pat.finditer(text):
+            tok = m.group(0).strip().rstrip(".,;:)）】」")
+            low = tok.lower()
+            if len(low) < 4 or low in seen or low in _FP_STOP:
+                continue
+            if low_prompt and low in low_prompt:
+                continue
+            if pool:
+                df = sum(1 for t in pool if low in t)
+                if df > 2:              # 池内 3 条以上都有 = 通用写法
+                    continue
+            seen.add(low)
+            cands.append(low)
+    # 越靠前的模式越“招牌”（路径/文件名比版本号更独特），按出现顺序取即可。
+    # 总长上限 100 而不是 60：60 只能装两三个长文件名，第三个之后的招牌词会被整段
+    # 砍掉（实测 CArchiveReader / v2.41.170 就是这样丢的，而它们恰恰最能证明被用）。
+    out, total = [], 0
+    for tok in cands:
+        if total + len(tok) > 160:
+            break
+        out.append(tok)
+        total += len(tok)
+        if len(out) >= max(1, min(int(limit), 6)):
+            break
+    return out
+
+
+def _record_adherence(root: str, session: str, agent: str, picked: list,
+                      project: str, strength: str, prompt: str,
+                      pool_texts: list = None) -> int:
+    """把「这次注入了哪些记忆、各自的指纹是什么」记一笔。返回写入行数。
+
+    抽不出指纹的记忆也照记（fp="[]"）——它们是**分母的诚实部分**：采纳率要拿
+    「可指纹的」当分母，不能把无法判定的悄悄算成「被忽略」。
+    """
+    if not picked:
+        return 0
+    now = _now()
+    rows = []
+    for r in picked:
+        fp = recall_fingerprints(str(r.get("content") or "") + " " + str(r.get("tags") or ""),
+                                 pool_texts=pool_texts, prompt=prompt)
+        rows.append((now, session, agent or "", int(r.get("id") or 0), project or "",
+                     strength, json.dumps(fp, ensure_ascii=False)))
+    with db_conn(root) as conn:
+        conn.executemany(
+            "INSERT INTO recall_adherence(ts, session, agent, memory_id, project, strength, fp)"
+            " VALUES(?,?,?,?,?,?,?)", rows)
+        # 有界：只留最近 ADHERENCE_KEEP_DAYS 天，行数超上限时删最旧的
+        conn.execute("DELETE FROM recall_adherence WHERE ts < ?",
+                     (_days_ago(ADHERENCE_KEEP_DAYS),))
+    return len(rows)
+
+
+def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> dict:
+    """给一段 agent 产出（回答正文、执行的命令、改的文件路径），标记被用到的注入。
+
+    调用时机（由 agent 侧或钩子决定）：一轮结束后拿这一轮的产出文本喂进来即可。
+    只匹配**同一会话**、window_h 小时内、尚未判定的记录——跨会话比对会把「碰巧
+    提到同一个文件名」算成采纳，那是假信号。
+    """
+    out = {"checked": 0, "matched": 0, "memory_ids": []}
+    if not session or not (text or "").strip():
+        return out
+    low = text.lower()
+    since = (datetime.datetime.now() - datetime.timedelta(hours=max(1, int(window_h)))
+             ).strftime("%Y-%m-%dT%H:%M:%S")
+    hit_ids, rows = [], []
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, memory_id, fp FROM recall_adherence"
+            " WHERE session=? AND used=0 AND ts>=?", (session, since))]
+        for r in rows:
+            try:
+                fp = json.loads(r.get("fp") or "[]")
+            except ValueError:
+                fp = []
+            if not fp:
+                continue
+            if any(tok and tok in low for tok in fp):
+                hit_ids.append(r["id"])
+                out["memory_ids"].append(r["memory_id"])
+        if hit_ids:
+            now = _now()
+            conn.executemany(
+                "UPDATE recall_adherence SET used=1, decided_at=? WHERE id=?",
+                [(now, i) for i in hit_ids])
+    out["checked"] = len(rows)
+    out["matched"] = len(hit_ids)
+    return out
+
+
+def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
+    """注入采纳率的账：分强/弱两档给「可指纹数 / 被用数 / 采纳率」，附平均记忆年龄。
+
+    口径（为什么这么算）：
+      · 分母只算**可指纹**的行（fp 非空数组）——抽不出指纹的记忆无法判定，算进分母
+        就是把「测不了」当成「没被用」；
+      · 采纳率 = used / 可指纹数，对照行业区间 40%–70%（sheratonhq 的实测口径）；
+      · 平均记忆年龄 = 被注入记忆的创建时间均值，对照 7–30 天（太短=只靠近期记忆，
+        太长=旧结论权重过高）。
+    """
+    since = _days_ago(max(1, int(days)))
+    out = {"window_days": days, "injected": 0, "fingerprintable": 0, "used": 0,
+           "rate": 0.0, "by_strength": {}, "avg_memory_age_days": None}
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT strength, fp, used, memory_id FROM recall_adherence WHERE ts>=?",
+            (since,))]
+    if not rows:
+        return out
+    out["injected"] = len(rows)
+    buckets = {}
+    ids = []
+    for r in rows:
+        try:
+            fp = json.loads(r.get("fp") or "[]")
+        except ValueError:
+            fp = []
+        s = r.get("strength") or "strong"
+        b = buckets.setdefault(s, {"injected": 0, "fingerprintable": 0, "used": 0})
+        b["injected"] += 1
+        if not fp:
+            continue
+        b["fingerprintable"] += 1
+        if r.get("used"):
+            b["used"] += 1
+        ids.append(r.get("memory_id"))
+    for s, b in buckets.items():
+        b["rate"] = round(b["used"] / b["fingerprintable"] * 100, 1) if b["fingerprintable"] else 0.0
+        out["fingerprintable"] += b["fingerprintable"]
+        out["used"] += b["used"]
+    out["by_strength"] = buckets
+    if out["fingerprintable"]:
+        out["rate"] = round(out["used"] / out["fingerprintable"] * 100, 1)
+    if ids:
+        marks = ",".join("?" * len(ids))
+        try:
+            with db_conn(root) as conn:
+                row = conn.execute(
+                    f"SELECT AVG(julianday('now') - julianday(substr(created,1,10)))"
+                    f" FROM memories WHERE id IN ({marks})", ids).fetchone()
+            if row and row[0] is not None:
+                out["avg_memory_age_days"] = round(float(row[0]), 1)
+        except sqlite3.Error:
+            pass
+    return out
+
 
 def _recall_project_block(root: str, pname: str, limit: int = 3) -> list:
     """本项目近况：最近几条工作记录 + 未完成任务数。
@@ -8176,6 +8395,14 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             _bump_access(root, out["memory_ids"])
         except sqlite3.Error:
             pass
+        # R827：记一笔「这次注入了什么、指纹是什么」，后续 mark_recall_used 才能判采纳。
+        # 存**原始 session**而不是去重键 skey（`agent|session`）：判定方（agent 自己或
+        # 钩子）手里只有 session，让它去拼 agent 前缀迟早对不上（实测踩过）。
+        if session:
+            try:
+                _record_adherence(root, session, who, picked, pname, "strong", prompt, mem_texts)
+            except sqlite3.Error:
+                pass
     try:
         log_search(root, "prompt_recall", query[:200], len(out["memory_ids"]), agent=who)
     except sqlite3.Error:
