@@ -403,9 +403,12 @@ def main():
     # 陈旧可见：一条 60 天前写入且零唤起的 fact
     # 注意：created/updated 都要回拨——R4 的 reference=max(created,updated,confirmed,last_hit)，
     # 只拨 updated 会被「今天写的 created」压住，测不出陈旧（R4 语义：取最新信号）
+    # 用相对日期：写死 2026-08-01 会随时间跨过 fact 的 expire_days(90) 变成 expired
+    # （2026-10-31 实测已越过），测试就成了定时炸弹。45 天稳定落在 stale 档(14~90)。
+    _old_ts = (datetime.datetime.now() - datetime.timedelta(days=45)).isoformat(timespec="seconds")
     _old = _b3.add_memory(stale_root, "环境事实：旧端口是 7000（历史配置）", kind="fact", agent="zcode")
     with _b3.db_conn(stale_root) as _c3:
-        _c3.execute("UPDATE memories SET created='2026-08-01T00:00:00', updated='2026-08-01T00:00:00' WHERE id=?", (_old,))
+        _c3.execute("UPDATE memories SET created=?, updated=? WHERE id=?", (_old_ts, _old_ts, _old))
     r = ops.run_check("stale_health", root=stale_root)
     check("stale_health 陈旧 fact 可见（只报不裁，ok 仍为 True）",
           r["ok"] and "stale 1" in r["summary"] and f"#{_old}" in "".join(r["detail"]),

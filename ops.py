@@ -2722,6 +2722,16 @@ def _usage_health(root: str) -> dict:
             # 空库（无任何工作记录）没有「使用」语义——临时库/测试库里内置适配器
             # 零调用是常态，按闲置报全是误报；闲置检测只在有使用历史的库上跑。
             has_history = conn.execute("SELECT EXISTS(SELECT 1 FROM records)").fetchone()[0]
+            # R813 简报采纳：R811/R812 把上下文送到会话里（钩子/MCP 握手/hub_brief），
+            # 但「送到了」不等于「用上了」——收到简报却一次记忆/检索都不查的 agent
+            # 正是主人抱怨的「不提醒就不读」。这里只报信息行，不改整体健康判定。
+            brief_rows = conn.execute(
+                "SELECT agent, target, COUNT(*) n FROM journal "
+                "WHERE action='brain_brief' AND ts>=? GROUP BY agent, target", (d7,)).fetchall()
+            recall_rows = conn.execute(
+                "SELECT agent, COUNT(*) n FROM tool_calls WHERE ts>=? AND tool IN "
+                "('hub_memory_read','hub_search','hub_get_record') GROUP BY agent",
+                (d7,)).fetchall()
         configured = {core.agent_key(r["agent"]) for r in core.agent_bootstrap_status(root)
                       if r.get("mcp") is True}
         registered = set(core.agent_known_names(root))
@@ -2751,6 +2761,22 @@ def _usage_health(root: str) -> dict:
                           "确认还需要吗：不用就 python cli.py offboard <agent> --apply 下线接入"
                           "（默认预演），避免配置漂移无人发现）")
             issues.extend(idle)
+    brief_by_target: dict = {}
+    brief_agents: set = set()
+    for r in brief_rows:
+        brief_by_target[r["target"] or "?"] = brief_by_target.get(r["target"] or "?", 0) + int(r["n"])
+        if r["agent"]:
+            brief_agents.add(core.agent_key(r["agent"]))
+    recall = {core.agent_key(r["agent"]): int(r["n"]) for r in recall_rows if r["agent"]}
+    cold = sorted(a for a in brief_agents if recall.get(a, 0) == 0)
+    if brief_agents:
+        label = {"session": "钩子", "initialize": "握手", "mcp_tool": "工具"}
+        seg = " / ".join(f"{label.get(k, k)} {v}" for k, v in sorted(brief_by_target.items()))
+        detail.append(
+            f"简报采纳：近 7 天送达 {sum(brief_by_target.values())} 次（{seg}）"
+            + (f"；{'、'.join(cold)} 收到简报但零记忆/检索调用——简报被看到却没转成查询，"
+               "先查该会话是否真收到了简报，再看 instructions 是否被客户端截断"
+               if cold else "；收到简报的 agent 都有记忆/检索调用"))
     bits = []
     if gap:
         bits.append(f"mcp 空归属 {gap} 次（归属缺口，核查未锁 --agent 的接入）")
