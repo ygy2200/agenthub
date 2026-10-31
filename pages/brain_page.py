@@ -4,6 +4,24 @@ from __future__ import annotations
 
 from uikit import *  # noqa: F401,F403
 import uikit  # noqa: F401  （AGENT_CN/_AGENT_DISP2ID 等运行期重绑名请用 uikit.X 动态取）
+
+
+def preview_text(text: str, limit: int = 72) -> str:
+    """记忆正文的单行预览（R807）：去掉源 markdown 粗体记号，超长在标点处收尾加省略号。
+
+    真实库实测：`[:72]` 硬切会停在半个词上，行尾直接露出「①**」这种源记号；
+    而 flex_label 是 Ignored 硬裁、本身不带省略号，用户看不出「还有下文」。
+    全文始终在 tooltip，这里只负责截得体面。
+    """
+    flat = " ".join((text or "").replace("**", "").split())
+    if len(flat) <= limit:
+        return flat
+    cut = flat[:limit]
+    for sep in ("；", "。", "，", "、", "：", " "):
+        pos = cut.rfind(sep)
+        if pos >= limit // 2:
+            return cut[:pos].rstrip("，、；： ") + "…"
+    return cut.rstrip() + "…"
 class BrainPage(QWidget):
     """大脑页（v2.7）：唤起排行 / 使用分布 / 待办看板 / 置顶记忆——
     把"写多读少"变得可见：use_count、推送与检索计数直接对应大脑验收四条标准。"""
@@ -188,14 +206,25 @@ class BrainPage(QWidget):
         rows = sorted(merged.items(), key=lambda x: -x[1])
         rows.sort(key=lambda kv: 1 if kv[0] == "probe" else 0)
         for k, v in rows:
-            r = QHBoxLayout()
+            # R807：原先 addLayout 裸布局，真实库 7 家时整行右移 24px，数值标签
+            # （178/112/61/38/6/1）全被推到可视区外——截图看得到条、读不出次数。
+            # 改装进行容器由布局裁剪，数值定宽右对齐成一列，probe 注记缩短、全文进 tooltip。
+            row = QWidget()
+            r = QHBoxLayout(row)
+            r.setContentsMargins(0, 0, 0, 0)
+            r.setSpacing(tokens.SPACE_S)
             r.addWidget(badge(k, k))
             bar = ProgressBar()
             bar.setValue(round(v / total * 100))
             r.addWidget(bar, 1)
-            name = f"{v}（探针，非真实使用）" if k == "probe" else str(v)
-            r.addWidget(BodyLabel(name))
-            self.useBox.addLayout(r)
+            num = BodyLabel(f"{v}（探针）" if k == "probe" else str(v))
+            num.setMinimumWidth(34)
+            num.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            if k == "probe":
+                num.setToolTip("闸门探针会话的自检流量，不是谁在用大脑——"
+                               "置底展示，不计入「谁在用」的判断")
+            r.addWidget(num)
+            self.useBox.addWidget(row)
         if not merged:
             self.useBox.addWidget(empty_state(
                 "TILES", "暂无检索/推送记录",
@@ -449,7 +478,8 @@ class BrainPage(QWidget):
     def _mem_row(head: str, m: dict) -> QWidget:
         """唤起/置顶行：类型徽章 + 编号·次数 + 正文单行截断，全文进 tooltip。
         两端平衡（R120）：最早是灰小字 [:66]「看不清」→ 改 [:100] 可换行后 top10
-        每条 2-3 行、列表占满半屏（真实库走查实测）。单行 [:72] + 悬停看全文。"""
+        每条 2-3 行、列表占满半屏（真实库走查实测）。单行 72 字 + 悬停看全文。
+        R807：72 字硬切改成 preview_text——去粗体星号、在标点处收尾加省略号。"""
         w = QWidget()
         h = QHBoxLayout(w)
         h.setContentsMargins(0, 0, 0, 0)
@@ -457,7 +487,7 @@ class BrainPage(QWidget):
         h.addWidget(kind_badge(m["kind"]))
         # 920×600 实测：固定取 72 字仍会超出可用宽度，QLabel 直接硬切（无省略号，
         # 行尾停在半个词上）。改用按实际宽度省略的标签，全文仍进 tooltip。
-        body = ClickBodyLabel(f"{head}  {m['content'][:72]}")
+        body = ClickBodyLabel(f"{head}  {preview_text(m['content'])}")
         body.setWordWrap(False)
         body.setToolTip(f"{head}\n{m['content']}")
         h.addWidget(flex_label(body), 1)

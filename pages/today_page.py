@@ -56,6 +56,12 @@ def _human_hint(text: str) -> str:
     return text
 
 
+def _clip_reason(text: str, limit: int = 18) -> str:
+    """外部阻塞原因的行内摘要（R806）：压掉换行、超长截断，全文始终留在 tooltip。"""
+    flat = " ".join((text or "").split())
+    return flat if len(flat) <= limit else flat[:limit - 1] + "…"
+
+
 class TodayPage(QWidget):
     """工作台：前沿队列四段一屏看全 + 管理通道标记完成。"""
 
@@ -66,7 +72,7 @@ class TodayPage(QWidget):
         lay = QVBoxLayout(self)
         set_page_margins(lay)
         lay.addWidget(_page_head(
-            "工作台", "今天该干什么——可认领按优先级排队，进行中 / 可接管 / 等待依赖 / 退避 / 延后分段列清；"
+            "工作台", "今天该干什么——可认领按优先级排队，进行中 / 可接管 / 等待依赖或外部阻塞 / 退避 / 延后分段列清；"
                       "标记完成走管理通道（自动归档为成果记录）"))
 
         top = QHBoxLayout()
@@ -226,7 +232,7 @@ class TodayPage(QWidget):
         c = nxt["counts"]
         # 主四段恒显示（0 也显示，便于确认「真的没有」）；退避/延后只在有量时追加，
         # 避免常态下摘要在窄窗换行。R176 前这两组完全不出现在 GUI。
-        parts = [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[:4]]
+        parts = [self._group_count_label(k, c) for k in _GROUP_ORDER[:4]]
         parts += [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[4:] if c.get(k)]
         self.sumLabel.setText(" · ".join(parts))
         hidden_n = 0
@@ -239,7 +245,7 @@ class TodayPage(QWidget):
             if total > shown:
                 hidden_n += total - shown
             label = f"{total}，显示前 {shown}" if total > shown else str(total)
-            head = QListWidgetItem(f"── {brain.TASK_GROUP_CN[key]}（{label}）")
+            head = QListWidgetItem(f"── {self._group_head_name(key, items)}（{label}）")
             head.setFlags(Qt.ItemFlag.NoItemFlags)  # 分组标题不可选
             f = head.font()
             f.setBold(True)
@@ -256,6 +262,10 @@ class TodayPage(QWidget):
                     meta.append(due_label)
                 if key == "waiting" and t.get("_wait"):
                     meta.append("等待:" + ",".join(f"#{w}" for w in self._wait_ids(t["_wait"])))
+                elif key == "waiting" and (t.get("blocked_by") or "").strip():
+                    # R806：外部阻塞的原因本来就在库里（「用户决策」），行内先给一眼，
+                    # 全文留给 tooltip——原来这行只写「等待依赖」，等什么没人知道。
+                    meta.append("等:" + _clip_reason(t["blocked_by"]))
                 if key == "takeover" and t.get("_takeover"):
                     meta.append(f"原因:{t['_takeover']}")
                 if key == "backoff":
@@ -314,6 +324,33 @@ class TodayPage(QWidget):
         return f"截止:{due}"
 
     @staticmethod
+    def _group_count_label(key: str, counts: dict) -> str:
+        """页头摘要的一段（R806）：waiting 按成因分说，别把外部阻塞算成等待依赖。"""
+        if key != "waiting":
+            return f"{brain.TASK_GROUP_CN[key]} {counts.get(key) or 0}"
+        deps = int(counts.get("waiting_deps") or 0)
+        blocked = int(counts.get("waiting_blocked") or 0)
+        if deps and blocked:
+            return f"等待依赖 {deps} · 外部阻塞 {blocked}"
+        if blocked:
+            return f"外部阻塞 {blocked}"
+        return f"{brain.TASK_GROUP_CN['waiting']} {deps}"
+
+    @staticmethod
+    def _group_head_name(key: str, items: list) -> str:
+        """分组标题（R806）：waiting 段全是外部阻塞时，别写成「等待依赖」。"""
+        name = brain.TASK_GROUP_CN.get(key, key)
+        if key != "waiting" or not items:
+            return name
+        kinds = {(t.get("_wait_kind") or ("deps" if t.get("_wait") else "blocked"))
+                 for t in items}
+        if kinds == {"blocked"}:
+            return "外部阻塞"
+        if kinds == {"deps", "blocked"}:
+            return "等待依赖 / 外部阻塞"
+        return name
+
+    @staticmethod
     def _wait_ids(wait) -> list:
         """依赖等待可能是 id 列表，也可能是任务行 dict 列表（brain 两种历史形态）。"""
         return [str(w.get("id") if isinstance(w, dict) else w) for w in (wait or [])]
@@ -342,6 +379,9 @@ class TodayPage(QWidget):
         elif t.get("deps"):
             lines.append("前置任务：" + "、".join(
                 f"#{d.lstrip('#')}" for d in re.split(r"[,\s，、;；]+", t["deps"]) if d.strip()))
+        if key == "waiting" and not t.get("_wait") and (t.get("blocked_by") or "").strip():
+            lines.append("阻塞原因：" + t["blocked_by"].strip())
+            lines.append("下一步：解开挡住它的那件事（等人拍板/等环境就绪），再让 agent 推进")
         if key == "takeover" and t.get("_takeover"):
             lines.append(f"可接管原因：{t['_takeover']}")
         if key == "backoff":

@@ -4035,7 +4035,9 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
     排序：priority（0 急 → 3 低）→ id（先来先做）。纯只读。返回结构化 dict 供 MCP 层排版。
     R727：`hidden`（{"control": n, "skills": n}）记录被管控状态/能力声明挡掉的条数——
     counts 在过滤之后才算，调用方需要它才能区分「前沿真的空」与「活有但接不住」。
-    R803：limit 上限放宽到 200——GUI 需要「显示更多」逐段展开；MCP 默认仍是 5。"""
+    R803：limit 上限放宽到 200——GUI 需要「显示更多」逐段展开；MCP 默认仍是 5。
+    R806：waiting 段带 `_wait_kind`（deps=等前置任务 / blocked=被外部挡住），
+    counts 同步给 `waiting_deps`/`waiting_blocked`——两者混报成「等待依赖」会误导。"""
     try:
         lim = max(1, min(int(limit or 5), 200))
     except (TypeError, ValueError):
@@ -4050,6 +4052,8 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
         cutoff = _claim_cutoff()
         me = _norm_agent(owner) or ""
         ready, doing, takeover, waiting, backoff, deferred = [], [], [], [], [], []
+        # R806：waiting 段混着两种完全不同的「在等」，计数要分开，摘要才说得准。
+        n_wait_deps = n_wait_blocked = 0
         for r in rows:
             try:
                 r["_priority"] = int(r.get("priority"))
@@ -4087,7 +4091,16 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
             wait = _task_deps_waiting(conn, r)
             if r["status"] == "blocked" or wait or (r["blocked_by"] or "").strip():
                 r["_wait"] = wait
+                # R806：等前置任务（deps 里还有没做完的 id）与被外部挡住是两件事——
+                # 后者 blocked_by 写了人能看懂的原因（用户决策/需要真机复测），旧实现
+                # 一律叫「等待依赖」，真实库 #6/#8 deps 为空时页头报「等待依赖 2」且
+                # 原因一个字都不露，等于把「等谁」这条唯一有用的信息丢了。
+                r["_wait_kind"] = "deps" if wait else "blocked"
                 waiting.append(r)
+                if wait:
+                    n_wait_deps += 1
+                else:
+                    n_wait_blocked += 1
             else:
                 ready.append(r)
     ctrl = agent_control_get(root, me) if me else {"agent": "", "state": "active", "note": ""}
@@ -4121,7 +4134,10 @@ def task_next(root: str, project: str = "", owner: str = "", limit: int = 5) -> 
             "hidden": hidden, "skills": list(have_skills),
             "counts": {"ready": len(ready), "doing": len(doing),
                        "takeover": len(takeover), "waiting": len(waiting),
-                       "backoff": len(backoff), "deferred": len(deferred)}}
+                       "backoff": len(backoff), "deferred": len(deferred),
+                       # R806：waiting 按成因拆分，供摘要/段标题如实分说
+                       "waiting_deps": n_wait_deps,
+                       "waiting_blocked": n_wait_blocked}}
 
 
 def _age_hours(stamp: str, now: datetime.datetime):
