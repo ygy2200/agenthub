@@ -74,4 +74,4 @@ def test_bad_schema_fails_without_overwrite(tmp_path):
 
 
 def test_all_json_agents_are_registered():
-    assert set(core.HOOK_BRIEF_TARGETS) == {"qoder", "claude", "codex", "workbuddy", "dsh"}
+    assert set(core.HOOK_BRIEF_TARGETS) == {"qoder", "claude", "codex", "workbuddy", "dsh", "zcode"}

@@ -18,15 +18,19 @@ def _cfg(tmp_path, name, data):
 
 
 def _hooked(tmp_path, name="hooked.json"):
-    return _cfg(tmp_path, name, {"hooks": {"SessionStart": [
-        {"hooks": [{"type": "command", "command": "node brain_inject.mjs --agent x"}]}]}})
+    return _cfg(tmp_path, name, {"hooks": {
+        "SessionStart": [
+            {"hooks": [{"type": "command", "command": "node brain_inject.mjs --agent x"}]}],
+        "UserPromptSubmit": [
+            {"hooks": [{"type": "command", "command": "node brain_recall.mjs --agent x"}]}],
+    }})
 
 
 def _plain(tmp_path, name="plain.json"):
     return _cfg(tmp_path, name, {"hooks": {}})
 
 
-def _build(qapp, hub_root, monkeypatch, targets, hermes):
+def _build(qapp, hub_root, monkeypatch, targets, hermes, tmp_path=None):
     import core
     from pages.connect_page import ConnectPage
 
@@ -37,6 +41,12 @@ def _build(qapp, hub_root, monkeypatch, targets, hermes):
         "diff": [], "absent": [], "same": 11})
     monkeypatch.setattr(core, "HOOK_BRIEF_TARGETS", targets)
     monkeypatch.setattr(core, "HOOK_BRIEF_HERMES_TARGETS", hermes)
+    if tmp_path is not None:
+        hooks = tmp_path / "hooks"
+        hooks.mkdir(exist_ok=True)
+        for n in ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs"):
+            (hooks / n).write_text("// brain_recall.py\n", encoding="utf-8")
+        monkeypatch.setattr(core, "hook_script_path", lambda name: hooks / name)
     win = QWidget()
     win.root = str(hub_root)
     track_window(win)
@@ -50,7 +60,7 @@ def test_unwired_agent_is_named_and_button_enabled(qapp, hub_root, tmp_path, mon
     win, page = _build(
         qapp, hub_root, monkeypatch,
         {"qoder": str(_hooked(tmp_path)), "dsh": str(_plain(tmp_path))},
-        (("hermes-cn", str(tmp_path / "none.yaml")),))
+        (("hermes-cn", str(tmp_path / "none.yaml")),), tmp_path)
     try:
         text = page.hookLabel.text()
         assert "dsh 未挂" in text, text
@@ -67,7 +77,7 @@ def test_all_in_place_says_automatic_context(qapp, hub_root, tmp_path, monkeypat
     h.write_text("hooks:\n  pre_llm_call:\n    - command: 'node brain_inject_hermes.mjs'\n",
                  encoding="utf-8")
     win, page = _build(qapp, hub_root, monkeypatch,
-                       {"qoder": str(_hooked(tmp_path))}, (("hermes-cn", str(h)),))
+                       {"qoder": str(_hooked(tmp_path))}, (("hermes-cn", str(h)),), tmp_path)
     try:
         text = page.hookLabel.text()
         assert "全部在位" in text and "不需要再提醒" in text, text
@@ -80,30 +90,25 @@ def test_install_only_touches_unwired_agents(qapp, hub_root, tmp_path, monkeypat
     import core
 
     calls = []
-    real_json = core.install_brief_hook
-    real_yaml = core.install_hermes_brief_hook
 
-    def fake_json(agent, apply=False, **kw):
+    def fake_install(agent, apply=False, **kw):
         if not apply:
-            return real_json(agent, apply=False, **kw)
-        calls.append(("json", agent, apply))
-        return {"agent": agent, "status": "added", "path": "x"}
+            return {"session": {"status": "would_add"}, "prompt": {"status": "would_add"}}
+        calls.append((agent, apply))
+        if agent.startswith("hermes"):
+            return {"session": {"agent": agent, "status": "added"},
+                    "prompt": {"agent": agent, "status": "covered"}}
+        return {"session": {"agent": agent, "status": "added"},
+                "prompt": {"agent": agent, "status": "added"}}
 
-    def fake_yaml(agent="hermes-cn", apply=False, **kw):
-        if not apply:
-            return real_yaml(agent, apply=False, **kw)
-        calls.append(("yaml", agent, apply))
-        return {"agent": agent, "status": "added", "path": "x"}
-
-    monkeypatch.setattr(core, "install_brief_hook", fake_json)
-    monkeypatch.setattr(core, "install_hermes_brief_hook", fake_yaml)
+    monkeypatch.setattr(core, "install_memory_hooks", fake_install)
     win, page = _build(
         qapp, hub_root, monkeypatch,
         {"qoder": str(_hooked(tmp_path)), "dsh": str(_plain(tmp_path))},
-        (("hermes-cn", str(tmp_path / "none.yaml")),))
+        (("hermes-cn", str(tmp_path / "none.yaml")),), tmp_path)
     try:
         assert page.hookBtn.isEnabled()
         page.do_install_hooks()
-        assert calls == [("json", "dsh", True)], calls
+        assert calls == [("dsh", True)], calls
     finally:
         win.close()

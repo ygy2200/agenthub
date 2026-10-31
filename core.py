@@ -33,6 +33,16 @@ RULES_NAME = "rules.md"
 CONFIG_DIR = Path.home() / ".agenthub"
 CONFIG_FILE = CONFIG_DIR / "config.json"
 
+
+def _runtime_dir() -> Path:
+    """运行时随包资源目录：源码运行=本文件目录；PyInstaller onefile=_MEIPASS。
+
+    exe 里 __file__ 指向解包临时目录，只有 --add-data 带进去的文件才在盘上。
+    部署服务端与安装钩子都要从这里取源文件，否则打包版复制不到东西、静默空转。
+    """
+    base = getattr(sys, "_MEIPASS", "")
+    return Path(base) if base else Path(__file__).resolve().parent
+
 # R24：运行中 MCP 进程的标记目录。serve() 启动时写一份并每 30s 刷新心跳；
 # 非 MCP 进程（CLI/GUI/doctor）据此观测长驻服务是否在跑旧代码。
 # 心跳停超过 TTL 的标记视为遗留、不参与判定——宁可 unknown，不猜。
@@ -1215,12 +1225,26 @@ HOOK_BRIEF_TARGETS = {
     "codex": "~/.codex/hooks.json",
     "workbuddy": "~/.workbuddy/settings.json",
     "dsh": "~/.dsh/hooks.json",
+    "zcode": "~/.zcode/cli/config.json",
 }
 HOOK_BRIEF_DESC = "AgentHub 大脑简报：SessionStart 自动注入团队上下文（R814）"
+
+# 即时回忆（R820）：SessionStart 只在开局注入一次；用户后来说「上次那个脚本怎么修的」
+# 时仍要提醒 AI 查大脑。UserPromptSubmit 是每句话都会经过的确定入口，按 prompt 检索。
+HOOK_RECALL_NAME = "brain_recall.mjs"
+HOOK_RECALL_DESC = "AgentHub 即时回忆：按每句话检索相关记忆（R820）"
+HOOK_JSON_EVENTS = {
+    "session": ("SessionStart", HOOK_BRIEF_NAME, HOOK_BRIEF_DESC),
+    "prompt": ("UserPromptSubmit", HOOK_RECALL_NAME, HOOK_RECALL_DESC),
+}
 
 
 def hook_brief_script_path() -> Path:
     return Path.home() / ".agenthub" / "hooks" / HOOK_BRIEF_NAME
+
+
+def hook_script_path(name: str) -> Path:
+    return Path.home() / ".agenthub" / "hooks" / name
 
 
 def _hook_node() -> str:
@@ -1230,20 +1254,16 @@ def _hook_node() -> str:
     return "node"
 
 
-def install_brief_hook(agent: str, apply: bool = False, path: str = "",
+def _install_json_hook(agent: str, event_key: str, apply: bool = False, path: str = "",
                        node: str = "", install_script: bool = True) -> dict:
-    """把 brain_inject.mjs 挂到 agent 的 SessionStart（幂等；写前备份；默认只预演）。
-
-    status: already（已在位）/ would_add（预演）/ added（已写入）/ no_config（配置文件不存在，
-    不去凭空造壳）/ unsupported（未登记该家钩子位置）/ bad_schema（hooks 结构不是对象/数组）。
-    只增 SessionStart 一条，不改其它事件、不动已有条目——用户配置是生产数据。
-    """
+    """把某个钩子脚本挂到 agent 的某个事件（幂等；写前备份；默认只预演）。"""
+    event, script_name, desc = HOOK_JSON_EVENTS[event_key]
     key = agent_key(agent) or (agent or "").strip().lower()
-    out = {"agent": key, "path": "", "status": "", "command": "", "backup": "",
-           "copied": False}
-    dest = hook_brief_script_path()
+    out = {"agent": key, "event": event, "path": "", "status": "", "command": "",
+           "backup": "", "copied": False}
+    dest = Path.home() / ".agenthub" / "hooks" / script_name
     if install_script:
-        src = Path(__file__).with_name(HOOK_BRIEF_NAME)
+        src = _runtime_dir() / script_name
         if src.is_file():
             out["copied"] = True
             if apply:
@@ -1275,23 +1295,44 @@ def install_brief_hook(agent: str, apply: bool = False, path: str = "",
     if not isinstance(hooks, dict):
         out["status"] = "bad_schema"
         return out
-    sess = hooks.get("SessionStart")
-    if sess is None:
-        sess = hooks["SessionStart"] = []
-    if not isinstance(sess, list):
+    # zcode 的钩子表在 hooks.events.<Event> 下一层，且配置钩子默认禁用，
+    # 必须显式 hooks.enabled=true 才会跑（R822；探针实测 10-25 起 Stop 就因此静默失效过）。
+    zcode = key == "zcode"
+    if zcode:
+        events = hooks.get("events")
+        if not isinstance(events, dict):
+            out["status"] = "bad_schema"
+            return out
+        groups = events.get(event)
+    else:
+        groups = hooks.get(event)
+    if groups is None:
+        groups = []
+    if not isinstance(groups, list):
         out["status"] = "bad_schema"
         return out
     out["command"] = f'"{node or _hook_node()}" "{dest}" --agent {key}'
-    for grp in sess:
+    for grp in groups:
         for h in (grp.get("hooks") or []) if isinstance(grp, dict) else []:
-            if HOOK_BRIEF_NAME in str(h.get("command", "")):
+            if script_name in str(h.get("command", "")):
                 out["status"] = "already"
                 return out
     if not apply:
         out["status"] = "would_add"
         return out
-    sess.append({"hooks": [{"type": "command", "command": out["command"],
-                            "timeout": 10, "description": HOOK_BRIEF_DESC}]})
+    # zcode 的 schema 是严格白名单：command 条目混入 description 会被整条丢弃，
+    # 只带 statusMessage（R822）；其他家沿用 description。
+    entry = {"type": "command", "command": out["command"], "timeout": 10}
+    if zcode:
+        entry["statusMessage"] = desc
+    else:
+        entry["description"] = desc
+    groups.append({"hooks": [entry]})
+    if zcode:
+        hooks.setdefault("events", {})[event] = groups
+        hooks["enabled"] = True
+    else:
+        hooks[event] = groups
     backup = cfg.with_name(cfg.name + f".bak-agenthub-{time.strftime('%Y%m%d-%H%M%S')}")
     try:
         shutil.copy2(cfg, backup)
@@ -1304,6 +1345,45 @@ def install_brief_hook(agent: str, apply: bool = False, path: str = "",
     out["backup"] = str(backup)
     out["status"] = "added"
     return out
+
+
+def install_brief_hook(agent: str, apply: bool = False, path: str = "",
+                       node: str = "", install_script: bool = True) -> dict:
+    """把 brain_inject.mjs 挂到 agent 的 SessionStart（幂等；写前备份；默认只预演）。
+
+    status: already（已在位）/ would_add（预演）/ added（已写入）/ no_config（配置文件不存在，
+    不去凭空造壳）/ unsupported（未登记该家钩子位置）/ bad_schema（hooks 结构不是对象/数组）。
+    只增 SessionStart 一条，不改其它事件、不动已有条目——用户配置是生产数据。
+    """
+    return _install_json_hook(agent, "session", apply=apply, path=path, node=node,
+                              install_script=install_script)
+
+
+def install_recall_hook(agent: str, apply: bool = False, path: str = "",
+                        node: str = "", install_script: bool = True) -> dict:
+    """把 brain_recall.mjs 挂到 agent 的 UserPromptSubmit（R820，纪律同简报钩子）。"""
+    return _install_json_hook(agent, "prompt", apply=apply, path=path, node=node,
+                              install_script=install_script)
+
+
+def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
+                         node: str = "", install_script: bool = True) -> dict:
+    """一次装齐开机简报 + 按句回忆；返回 {"session": …, "prompt": …}，互不阻塞。
+
+    hermes 的 pre_llm_call 是唯一出口，同一脚本先发简报、之后每轮回忆：
+    prompt 行复用 session 结果并标 covered，不写第二份配置。
+    """
+    key = agent_key(agent) or (agent or "").strip().lower()
+    if key.startswith("hermes"):
+        session = install_hermes_brief_hook(agent=key, apply=apply, path=path, node=node,
+                                            install_script=install_script)
+        prompt = dict(session)
+        prompt.update({"event": "pre_llm_call", "covered": True})
+        return {"session": session, "prompt": prompt}
+    return {"session": install_brief_hook(agent, apply=apply, path=path, node=node,
+                                          install_script=install_script),
+            "prompt": install_recall_hook(agent, apply=apply, path=path, node=node,
+                                          install_script=install_script)}
 
 
 # hermes 没有 SessionStart 出口，只有 pre_llm_call（每次模型调用都触发）——
@@ -1355,7 +1435,7 @@ def install_hermes_brief_hook(agent: str = "hermes-cn", apply: bool = False, pat
            "copied": False}
     dest = Path.home() / ".agenthub" / "hooks" / HOOK_BRIEF_HERMES_SCRIPT
     if install_script:
-        src = Path(__file__).with_name(HOOK_BRIEF_HERMES_SCRIPT)
+        src = _runtime_dir() / HOOK_BRIEF_HERMES_SCRIPT
         if src.is_file():
             out["copied"] = True
             if apply:
@@ -1456,6 +1536,66 @@ def brief_hook_status(agent: str, path: str = "") -> dict:
     return {"agent": key, "state": state, "path": probe["path"], "script": script.is_file()}
 
 
+def _hook_state(probe: dict) -> str:
+    return {"already": "inplace", "would_add": "unwired", "no_config": "absent",
+            "bad_schema": "bad_schema", "unsupported": "unsupported"}.get(
+                probe.get("status", ""), probe.get("status", ""))
+
+
+def memory_hook_status(agent: str, path: str = "") -> dict:
+    """只读：某家「开机简报 + 按句回忆」两条钩子的合并状态（R821）。
+
+    JSON 系两家钩子各挂一个事件；hermes 只有 pre_llm_call 一个出口，同一份
+    脚本先发简报、后续每轮按 prompt 回忆，故 prompt 记为 covered。
+    """
+    key = agent_key(agent) or (agent or "").strip().lower()
+    hermes = key.startswith("hermes")
+    session = brief_hook_status(key, path=path)
+    if hermes:
+        script = hook_script_path(HOOK_BRIEF_HERMES_SCRIPT)
+        text = ""
+        try:
+            text = read_text(script) if script.is_file() else ""
+        except OSError:
+            text = ""
+        if session["state"] in ("absent", "bad_schema", "unsupported"):
+            prompt_state = session["state"]   # 配置都没有，谈不上「回忆未挂」
+        else:
+            prompt_state = "covered" if "brain_recall.py" in text else "unwired"
+        prompt = {"agent": key, "state": prompt_state,
+                  "path": session["path"], "script": script.is_file()}
+    else:
+        probe = install_recall_hook(key, apply=False, path=path, install_script=False)
+        prompt = {"agent": key, "state": _hook_state(probe), "path": probe.get("path", ""),
+                  "script": hook_script_path(HOOK_RECALL_NAME).is_file()}
+    return {"agent": key, "session": session, "prompt": prompt}
+
+
+def hook_managed_keys() -> set:
+    """已被记忆钩子覆盖的客户端 key（JSON 系 + hermes 的 YAML 出口）。"""
+    keys = {agent_key(k) for k in HOOK_BRIEF_TARGETS}
+    keys |= {agent_key(n) for n, _ in HOOK_BRIEF_HERMES_TARGETS}
+    return {k for k in keys if k}
+
+
+def hook_unmanaged_agents(root: str = "") -> list:
+    """已接入、却没有任何记忆钩子出口的客户端（R822）。
+
+    钩子只覆盖 HOOK_BRIEF_TARGETS/HOOK_BRIEF_HERMES_TARGETS 登记过的那几家。没登记的
+    （ZCode 不提供 SessionStart/UserPromptSubmit 事件）在「简报 N 家在位」里彻底消失——
+    接入清单 7 家、钩子 6 家，第 7 家既不算在位也不算缺失，用户只能猜。这里显式点名，
+    让体检/接入页/CLI 三面都能说清「不是坏了，是这家没这个口子」。
+    """
+    managed = hook_managed_keys()
+    out = []
+    for a in load_agent_adapters(root):
+        name = (a.get("agent") or "").strip()
+        k = agent_key(name)
+        if name and k and k not in managed and name not in out:
+            out.append(name)
+    return out
+
+
 def find_adapter(root: str, agent: str) -> dict:
     """按 agent 名（不区分大小写）找适配器；找不到返回 {}。"""
     want = (agent or "").strip().lower()
@@ -1497,7 +1637,16 @@ MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # 此前两份清单各写各的（core 这份没有 api.py），结果「检查说一致、实际没部署」——
 # 2026-10-13 release playbook 实跑时 deploy_diff 抓到 api.py 不一致，根因即此。
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
-                "api.py", "brain_brief.py", "my/__init__.py", "my/work/__init__.py")
+                "api.py", "brain_brief.py", "brain_recall.py", "my/__init__.py", "my/work/__init__.py")
+
+# 钩子脚本随 exe 一起打包：安装器要能从运行目录复制到 ~/.agenthub/hooks/，
+# 只有 .py 进了 PYZ 而脚本没进 datas，打包版的「安装钩子」会复制 0 个文件。
+HOOK_SCRIPT_FILES = ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs")
+
+
+def bundle_files() -> tuple:
+    """build.bat 需要打进 exe 的随包文件：MCP 服务端 + 钩子脚本。"""
+    return tuple(SERVER_FILES) + tuple(HOOK_SCRIPT_FILES)
 
 
 def find_python() -> str:
@@ -1524,7 +1673,7 @@ def deploy_server(src_dir: str = "", dst_dir: str = "") -> tuple:
     不符时旧部署原样保留。此前逐文件 copy2 中途失败会留下 brain.py 新、server
     旧的混版，MCP 进程下次启动即崩。src_dir/dst_dir 仅供回归注入，生产不传。
     """
-    src = Path(src_dir) if src_dir else Path(__file__).resolve().parent
+    src = Path(src_dir) if src_dir else _runtime_dir()
     dst = Path(dst_dir) if dst_dir else MCP_SERVER_DIR
     stage = None
     try:
@@ -1575,7 +1724,7 @@ def deploy_status(src_dir: str = "", dst_dir: str = "") -> dict:
     if not py:
         return {"python": "", "server": "", "state": "no-python",
                 "diff": [], "absent": [], "same": 0}
-    src = Path(src_dir) if src_dir else Path(__file__).resolve().parent
+    src = Path(src_dir) if src_dir else _runtime_dir()
     dst = Path(dst_dir) if dst_dir else MCP_SERVER_DIR
     if not (dst / "agenthub_mcp.py").is_file():
         return {"python": py, "server": "", "state": "missing",

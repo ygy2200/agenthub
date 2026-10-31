@@ -19,8 +19,10 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import json
 import os
+import shutil
 import sqlite3
 import sys
 from pathlib import Path
@@ -143,6 +145,24 @@ def cmd_help(ap, topic: str) -> int:
     return 2
 
 
+def _hook_mark(st: dict) -> str:
+    """记忆钩子的单行标记（R823）：与 brief_hook_health / 接入页同一套状态码。"""
+    sess = (st.get("session") or {}).get("state", "")
+    prom = (st.get("prompt") or {}).get("state", "")
+    if prom == "covered":
+        prom = "inplace"
+    if sess == "unsupported":
+        return "—无出口"
+    if sess == "inplace" and prom == "inplace":
+        return "✓简报+回忆"
+    if sess == "absent":
+        return "—无配置"
+    if "bad_schema" in (sess, prom):
+        return "✗结构不符"
+    lacking = [n for n, v in (("简报", sess), ("回忆", prom)) if v != "inplace"]
+    return "✗缺" + "+".join(lacking)
+
+
 def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
     rows = core.agent_bootstrap_status(root)
     if agent:
@@ -150,6 +170,16 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
     cfg_root = _root("")
     mismatch = bool(cfg_root and not _same_dir(cfg_root, root))
     problems = []
+    hook_states = {}
+    for r in rows:
+        # R823：headless 值班看不到桌面接入页，钩子缺口此前只在 GUI/doctor 可见。
+        try:
+            st = core.memory_hook_status(r["agent"])
+        except Exception:  # noqa: BLE001 读坏一家配置不拖垮整张表
+            st = {}
+        hook_states[r["agent"]] = st
+        r["hook"] = {"session": (st.get("session") or {}).get("state", ""),
+                     "prompt": (st.get("prompt") or {}).get("state", "")}
     for r in rows:
         issues = []
         if r["mcp"] is False:
@@ -158,6 +188,11 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
             issues.append("引导过期")
         if not r.get("boot") and r.get("instr_path"):
             issues.append("引导未注入")
+        hv = r["hook"]
+        if "bad_schema" in (hv["session"], hv["prompt"]):
+            issues.append("记忆钩子配置结构不符")
+        elif "unwired" in (hv["session"], hv["prompt"]):
+            issues.append("记忆钩子未挂")
         if issues:
             problems.append({"agent": r["agent"], "issues": issues})
     if as_json:
@@ -183,7 +218,9 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
         prof = r.get("profile", "")
         if mcp == "✓" and prof:  # P3-1：显示工具面切片（缺省 admin=全量不显示）
             mcp = f"✓({prof})"
-        print(f"  {r['agent']:12} [{r['channel']:10}] 引导:{_boot_mark(r):9} MCP:{mcp}  {r['instr_path']}")
+        mark = _hook_mark(hook_states.get(r["agent"]) or {})
+        print(f"  {r['agent']:12} [{r['channel']:10}] 引导:{_boot_mark(r):9} MCP:{mcp}  "
+              f"钩子:{mark}  {r['instr_path']}")
     if problems:
         print(f"\n{len(problems)} 个 agent 需要处理——修好后重跑：python cli.py onboard <agent>")
     return 1 if problems else 0
@@ -391,6 +428,37 @@ def cmd_release(root: str) -> int:
     for line in r["detail"]:
         print("  ", line)
     return 0 if r["ok"] else 1
+
+
+def cmd_bundle(out: str = "") -> int:
+    """把 MCP 服务端与钩子脚本复制到 build/bundle，供 build.bat 打进 exe。
+
+    exe 是 PyInstaller onefile：运行时的 __file__ 在临时解包目录，只有 --add-data
+    带进去的文件才在盘上。不打包这些文件，桌面版的「部署服务端 / 安装钩子」会
+    复制 0 个文件而静默失效。
+    """
+    import core  # noqa: PLC0415
+    src = core._runtime_dir()
+    dst = Path(out) if out else Path(__file__).resolve().parent / "build" / "bundle"
+    if dst.exists():
+        shutil.rmtree(dst)
+    dst.mkdir(parents=True, exist_ok=True)
+    missing = []
+    for rel in core.bundle_files():
+        s = src / rel
+        if not s.is_file():
+            missing.append(rel)
+            continue
+        t = dst / rel
+        t.parent.mkdir(parents=True, exist_ok=True)
+        shutil.copy2(s, t)
+        if hashlib.md5(s.read_bytes()).digest() != hashlib.md5(t.read_bytes()).digest():
+            missing.append(rel)
+    print(f"已打包 {len(core.bundle_files()) - len(missing)}/{len(core.bundle_files())} 个文件 -> {dst}")
+    if missing:
+        print("  缺失/校验失败：" + "、".join(missing))
+        return 1
+    return 0
 
 
 SLOW_ROWS_DEFAULT = 5
@@ -1341,29 +1409,43 @@ def cmd_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
 
 
 def cmd_hook_install(agents=None, apply: bool = False, node: str = "",
-                     as_json: bool = False) -> int:
-    """大脑简报钩子安装（R814）：把 SessionStart → brain_inject.mjs 写进各家配置。
+                     as_json: bool = False, events: str = "all") -> int:
+    """大脑记忆钩子安装（R814/R820）：SessionStart 简报 + UserPromptSubmit 即时回忆。
 
     幂等：已在位只报 already；默认预演，--apply 才改（改前自动备份）。
+    events=all/session/prompt 可只装一类；hermes 走 pre_llm_call，
+    同一脚本先发简报、之后每轮回忆，故回忆行报 covered 而不是 unsupported。
     """
     import core  # noqa: PLC0415
     names = list(agents or (list(core.HOOK_BRIEF_TARGETS) + ["hermes-cn"]))
+    specs = ["session", "prompt"] if events == "all" else [events]
     rows = []
     for a in names:
         k = core.agent_key(a) or (a or "").strip().lower()
         if k in ("hermes", "hermes-cn"):
-            rows.append(core.install_hermes_brief_hook(k, apply=apply, node=node))
-        else:
-            rows.append(core.install_brief_hook(a, apply=apply, node=node))
+            if "session" in specs:
+                rows.append(core.install_hermes_brief_hook(k, apply=apply, node=node))
+            if "prompt" in specs:
+                cfg = next((p for n, p in core.HOOK_BRIEF_HERMES_TARGETS
+                            if core.agent_key(n) == k), "")
+                rows.append({"agent": k, "event": "UserPromptSubmit", "path": cfg,
+                             "status": "covered",
+                             "command": "", "backup": "", "copied": False})
+            continue
+        for ev in specs:
+            fn = core.install_brief_hook if ev == "session" else core.install_recall_hook
+            rows.append(fn(a, apply=apply, node=node))
     if as_json:
         print(json.dumps({"apply": apply, "rows": rows}, ensure_ascii=False))
     else:
         word = {"already": "已在位", "would_add": "将新增（预演，加 --apply 生效）",
                 "added": "已新增", "no_config": "跳过：配置文件不存在",
-                "unsupported": "跳过：未登记该家钩子位置",
+                "unsupported": "跳过：未登记该事件钩子",
+                "covered": "由 pre_llm_call 同一脚本覆盖（无需第二条配置）",
                 "bad_schema": "失败：hooks 结构不符合预期", "write_failed": "失败：写入出错"}
         for r in rows:
-            line = f"{r['agent']:<10} {word.get(r['status'], r['status'])}"
+            ev = {"SessionStart": "简报", "UserPromptSubmit": "回忆"}.get(r.get("event"), r.get("event") or "")
+            line = f"{r['agent']:<10} {ev:<2} {word.get(r['status'], r['status'])}"
             if r.get("path"):
                 line += f" · {r['path']}"
             if r.get("backup"):
@@ -1839,6 +1921,8 @@ def main(argv=None) -> int:
     p_root.add_argument("--set", dest="root_set", default="", metavar="目录",
                         help="把全局根目录切到该目录（需已 init）")
     _cmd("deploy", help="部署 MCP server 到 ~/.agenthub/mcp_server/")
+    p_bun = _cmd("bundle", help="把 MCP 服务端与钩子脚本打包到 build/bundle（build.bat 用）")
+    p_bun.add_argument("--out", default="", help="输出目录（默认 build/bundle）")
     _cmd("release", help="发布一致性检查（exe 与构建清单/源码/桌面副本比对）")
     p_bp = _cmd("backup-prune", help="备份盘点与清理（默认预演，--apply 才删）")
     p_cp = _cmd("config-prune",
@@ -1926,10 +2010,12 @@ def main(argv=None) -> int:
     p_brief.add_argument("--json", action="store_true", dest="as_json",
                          help="输出 {text, project, stats, elapsed_ms} 便于测试/脚本")
     p_hook = _cmd("hook-install",
-                  help="给 claude/codex/workbuddy/dsh/hermes 挂大脑简报钩子（默认预演，幂等）")
+                  help="给 qoder/claude/codex/workbuddy/dsh/zcode/hermes 挂大脑记忆钩子（默认预演，幂等）")
     p_hook.add_argument("agents", nargs="*", help="agent 名；留空=全部已登记的家")
     p_hook.add_argument("--apply", action="store_true", help="真正写入（默认只预演；写前自动备份）")
     p_hook.add_argument("--node", default="", help="node 可执行文件路径（默认自动找 D:/node 或 PATH）")
+    p_hook.add_argument("--events", choices=["all", "session", "prompt"], default="all",
+                        help="装哪类钩子：session=开工简报 / prompt=按句回忆 / all=两者（默认）")
     p_hook.add_argument("--json", action="store_true", dest="as_json", help="机器可读输出")
     p_claim = _cmd("claim", help="认领任务（原子；前置未完成会拒绝）")
     p_claim.add_argument("task_id", type=int)
@@ -2078,6 +2164,8 @@ def main(argv=None) -> int:
             return cmd_refresh(root)
         if args.cmd == "deploy":
             return cmd_deploy(root)
+        if args.cmd == "bundle":
+            return cmd_bundle(args.out)
         if args.cmd == "call":
             return cmd_call(root, args.tool, args.kv)
         if args.cmd == "serve":
@@ -2100,7 +2188,8 @@ def main(argv=None) -> int:
             return cmd_brief(root, args.agent, args.cwd, args.project,
                              args.max_chars, as_json=args.as_json)
         if args.cmd == "hook-install":
-            return cmd_hook_install(args.agents, args.apply, args.node, args.as_json)
+            return cmd_hook_install(args.agents, args.apply, args.node, args.as_json,
+                                    args.events)
         if args.cmd == "claim":
             return cmd_claim(root, args.task_id, args.agent)
         if args.cmd == "update":

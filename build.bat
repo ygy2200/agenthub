@@ -17,8 +17,17 @@ if errorlevel 1 (
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
+rem 随包运行时文件：MCP 服务端 + 钩子脚本。exe 的 __file__ 在临时解包目录，
+rem 不 --add-data 进去，桌面版的部署服务端/安装钩子会复制 0 个文件而静默失效。
+echo [1.5/4] 打包运行时文件到 build\bundle...
+D:\python311\python.exe cli.py bundle
+if errorlevel 1 (
+  echo 运行时文件打包失败
+  if not defined AGENTHUB_NOPAUSE pause
+  exit /b 1
+)
 D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx --name AgentHub ^
-  --icon assets\agenthub.ico --add-data "assets\agenthub.ico;." ^
+  --icon assets\agenthub.ico --add-data "assets\agenthub.ico;." --add-data "build\bundle;." ^
   --exclude-module aiohttp --exclude-module aiohappyeyeballs --exclude-module aiosignal --exclude-module yarl --exclude-module multidict --exclude-module frozenlist --exclude-module propcache ^
   --exclude-module PIL --exclude-module numpy --exclude-module pandas --exclude-module matplotlib --exclude-module scipy --exclude-module sklearn ^
   --exclude-module sphinx --exclude-module alabaster --exclude-module babel --exclude-module snowballstemmer --exclude-module sphinxcontrib --exclude-module docutils ^

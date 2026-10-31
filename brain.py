@@ -7676,6 +7676,481 @@ def infer_project_from_cwd(root: str, cwd: str) -> str:
         return ""
 
 
+# ---------------------------------------------------------------- 即时回忆（R820）
+
+RECALL_MAX_CHARS = 900
+RECALL_TERM_CAP = 8
+RECALL_STATE_TTL_H = 24
+# 短句里最常见的虚词/套话。留着会把「提醒」这类常见词当无关命中，稀释真正相关的记忆。
+RECALL_STOP_TERMS = {
+    "我们", "你们", "他们", "这个", "那个", "什么", "怎么", "如何", "可以", "需要",
+    "现在", "还是", "就是", "因为", "所以", "但是", "已经", "没有", "一个", "不是",
+    "然后", "如果", "以及", "这些", "那些", "帮我", "一下", "看看", "是否", "进行",
+    "使用", "东西", "事情", "时候", "地方", "问题", "情况", "继续", "好的", "谢谢",
+    "收到", "明白", "还是", "要不", "有点", "比较", "非常", "真的", "应该", "可能",
+    # R825：实测漏网。journal#8421（2026-10-31 用户原句「围绕刚完成 agenthub 目标
+    # 整体使用体验，重点…不用我提醒」）抽出 10 个词，其中「围绕/重点/整体/不用」
+    # 四个纯虚词，直接把 #50/#9/#286 三条泛化元记忆顶上 top3——召回在跑，召回的
+    # 不是用户问的那件事。闭集补词永远追不完，真正的解法是下面的池内区分度重排
+    # （_recall_idf），这里只补最常见的口语壳。
+    "不用", "不要", "不能", "不会", "围绕", "重点", "整体", "方面", "直接",
+    "目前", "当前", "具体", "相关", "主要", "一次", "一点", "一样", "内容",
+    "请问", "麻烦", "帮忙", "有没有", "是不是", "能不能", "对不对", "怎么样",
+}
+RECALL_ASCII_STOP = {
+    "the", "and", "for", "with", "this", "that", "you", "are", "was", "can", "please",
+    "from", "have", "has", "not", "but", "all", "any", "how", "what", "why", "when",
+    "will", "would", "should", "could", "into", "about", "there", "their", "them",
+}
+# 长中文串在这些字/词处断开：既保住「失败分支」「退出码」这类短语，又避免
+# 「支的」「的退」这种跨词 bigram 混进查询（R820 实测会把真正相关的教训挤下去）。
+# R825：切分点直接由 RECALL_STOP_TERMS 生成——原先只硬编码十来个，改词表时两处
+# 要手动同步，实测「围绕刚完成」原样进了检索式（停用词表里有「围绕」，但它只是
+# 一条 5 字 chunk 的一部分，永远命中不了 add() 里的相等判断）。合成一处之后，
+# 加词就自动变成切分点。
+_STOP_ALT = "|".join(sorted(RECALL_STOP_TERMS, key=len, reverse=True))
+RECALL_CHUNK_SPLIT = re.compile(
+    r"(?:" + _STOP_ALT + r"|[的了是在和与就也都把被给对从到为等我你他这那吗呢吧啊呀么])")
+# 意图权重：问「怎么修」时教训比泛化偏好有用；问「要不要/偏好」时反过来。
+RECALL_INTENT_WORDS = {
+    "howto": ("怎么", "如何", "为什么", "报错", "错误", "失败", "修复", "解决", "实现",
+              "原理", "方法", "步骤", "排查", "崩溃", "异常", "怎么修", "为什么"),
+    "pref": ("喜欢", "偏好", "要不要", "该不该", "以后", "记得", "习惯", "风格", "口味",
+             "可不可以", "行不行"),
+    "status": ("进度", "做到", "上次", "最近", "现在", "怎么样", "状态", "完成", "做到哪"),
+}
+RECALL_KIND_WEIGHTS = {
+    "howto": {"lesson": 1.6, "fact": 1.2, "project": 1.0, "note": 0.4, "preference": 0.2},
+    "pref": {"preference": 2.0, "fact": 1.0, "lesson": 0.6, "project": 0.4, "note": 0.6},
+    "status": {"project": 1.5, "fact": 1.0, "lesson": 0.9, "preference": 0.5, "note": 0.5},
+    "general": {"preference": 1.0, "lesson": 1.0, "fact": 0.9, "project": 0.8, "note": 0.4},
+}
+
+
+def _recall_intent(prompt: str) -> str:
+    low = (prompt or "").lower()
+    for name in ("howto", "pref", "status"):
+        if any(w in low for w in RECALL_INTENT_WORDS[name]):
+            return name
+    return "general"
+
+
+def _recall_state_file(state_path: str = "") -> Path:
+    return (Path(state_path) if state_path
+            else Path.home() / ".workbuddy" / "state" / "brain-recall.json")
+
+
+def _load_recall_state(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("sessions"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"v": 1, "sessions": {}}
+
+
+def _save_recall_state(path: Path, state: dict, now: "datetime.datetime | None" = None) -> None:
+    """按会话记「已经送过哪些记忆」，避免同一会话反复注入同一条。
+
+    只做尽力而为：写失败不影响本次召回（钩子 fail-open 优先）。
+    """
+    now = now or datetime.datetime.now()
+    cutoff = now - datetime.timedelta(hours=RECALL_STATE_TTL_H)
+    kept = {}
+    for key, val in (state.get("sessions") or {}).items():
+        try:
+            ts = datetime.datetime.fromisoformat(str(val.get("ts") or ""))
+        except (ValueError, TypeError):
+            continue
+        if ts >= cutoff:
+            kept[key] = val
+    state["sessions"] = kept
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_name(path.name + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, path)
+    except OSError:
+        pass
+
+
+def extract_prompt_terms(prompt: str, max_terms: int = RECALL_TERM_CAP) -> list:
+    """把一句自然语言压成检索词：短中文串保留整词，长中文串切 bigram，英文保留标识符。
+
+    这不是「智能分词」，但比把整句当一个 LIKE 模式可靠：中文整句几乎永远匹配不到，
+    而 bigram 召回在真实库上已被 search_memories 的放宽重试验证过。返回 [(term, weight)]，
+    整词/长标识符权重 2（更具体），bigram 权重 1。
+    """
+    text = (prompt or "").strip()
+    if not text or text.startswith("/"):
+        return []
+    text = re.sub(r"```.*?```", " ", text, flags=re.S)
+    text = _normalize_cn_numbers(text)
+    out, seen = [], set()
+
+    def add(term: str, weight: int) -> None:
+        term = (term or "").strip().lower()
+        if len(term) < 2 or term in seen or term in RECALL_STOP_TERMS:
+            return
+        if term.isascii() and term in RECALL_ASCII_STOP:
+            return
+        if term.isdigit() and not (2 <= len(term) <= 4):
+            # R825：保留 2–4 位数字（「20 万条」这类量级词有检索价值），
+            # 单字符已被上面的 len 拦掉，超长数字串（时间戳/哈希）是噪声
+            return
+        seen.add(term)
+        out.append((term, weight))
+
+    for seg in _WORD_RE.findall(text.lower()):
+        # 中英混排（如 dlss文件删掉）会被 \w 连成一段：先拆出 ASCII 标识符，
+        # 否则 DLSS 会被切成 dl/ls/ss 三个无意义 bigram。
+        for part in re.findall(r"[a-z0-9]+|[^\x00-\x7f]+", seg):
+            if part.isascii():
+                add(part, 2 if len(part) >= 4 else 1)
+                continue
+            for chunk in RECALL_CHUNK_SPLIT.split(part):
+                if not chunk:
+                    continue
+                if len(chunk) <= 6:
+                    add(chunk, 2)
+                    for i in range(0, len(chunk) - 1, 2):
+                        add(chunk[i:i + 2], 1)   # 整词不命中时用不重叠 bigram 兜底
+                else:
+                    for i in range(len(chunk) - 1):
+                        add(chunk[i:i + 2], 1)
+    out.sort(key=lambda t: -t[1])  # 稳定排序：整词优先，其余按出现顺序
+    return out[:max(1, min(int(max_terms), 12))]
+
+
+def _recall_hit_score(terms: list, text: str) -> int:
+    low = (text or "").lower()
+    return sum(w for term, w in terms if term in low)
+
+
+# R825：中文数字规范化。实测「工作台每组只显示二十条没有出口」抽出
+# ['出口','工作','作台','台每','组只','只显','显示']——"二十条"整个丢了，而记忆里
+# 写的是「20 条」，同一件事两种写法就检索不到。只转带单位的（十/百/千/万），
+# 「一样」「一致」里的「一」不碰。
+_CN_DIGITS = {"零": 0, "一": 1, "二": 2, "两": 2, "三": 3, "四": 4,
+              "五": 5, "六": 6, "七": 7, "八": 8, "九": 9}
+_CN_UNITS = {"十": 10, "百": 100, "千": 1000, "万": 10000}
+_CN_NUM_RE = re.compile(r"[零一二两三四五六七八九]?[十百千万][零一二两三四五六七八九十百千万]*")
+
+
+def _cn_to_int(s: str) -> int:
+    total = section = num = 0
+    for ch in s:
+        if ch in _CN_DIGITS:
+            num = _CN_DIGITS[ch]
+        elif ch in _CN_UNITS:
+            unit = _CN_UNITS[ch]
+            if unit == 10000:
+                total += (section + num) * unit
+                section = 0
+            else:
+                section += (num or 1) * unit
+            num = 0
+    return total + section + num
+
+
+_SYS_ENVELOPE_KEYS = ("tool call", "tool_call", "tool_use", "tool_result",
+                      "status completed", "task notification", "assistant message",
+                      "system-reminder", "task-notification")
+_SYS_XML_RE = re.compile(r"^\s*<[a-z][\w:.-]*[\s>/]")
+
+
+def _looks_like_system_message(text: str) -> bool:
+    """判断这段「提示」是不是宿主塞进来的系统消息，而不是用户真说的话。
+
+    R825 实证：journal#8422 记了一次 `terms=task notification 2shlbg tool call
+    gm6mv6s4rfriho0iut9y2774 status completed`——一条后台任务完成通知被 UserPromptSubmit
+    钩子当成用户提问检索了一遍，白跑一次还带回三条无关记忆。系统消息对「按这句话
+    回忆」毫无意义，越早拦越省。
+
+    判据从严：要么是 XML 信封开头，要么**同时命中两个以上**英文工具信封特征词。
+    宁可漏拦也不能误杀——用户的英文提问里出现一个 `tool call` 是正常的。
+    """
+    t = (text or "").strip()
+    if not t:
+        return False
+    if _SYS_XML_RE.match(t):
+        return True
+    low = t.lower()
+    return sum(1 for k in _SYS_ENVELOPE_KEYS if k in low) >= 2
+
+
+def _normalize_cn_numbers(text: str) -> str:
+    if not text:
+        return text
+
+    def repl(m):
+        s = m.group(0)
+        if len(s) < 2:          # 单字「十」「万」多半是语气/量词，不动
+            return s
+        try:
+            return str(_cn_to_int(s))
+        except Exception:       # noqa: BLE001 规范化失败原样返回，不影响抽词
+            return s
+
+    return _CN_NUM_RE.sub(repl, text)
+
+
+def _recall_idf(pool_texts: list, terms: list) -> dict:
+    """在候选池上估每个检索词的区分度，返回 {term: 加权分}。
+
+    R825 的核心改动。为什么不在停用词表上加词：闭集永远追不完——「围绕/重点/整体」
+    补完还会冒出「大致/顺便/顺带」。而**区分度是可以用数据量的**：一个词如果在
+    候选池的 30/40 条里都出现（「工作」「问题」「版本」），它命中什么都不能说明
+    相关性；只在 1-2 条里出现的词（「teardown」「infobar」）命中就是强信号。
+
+    权重用 BM25 的 idf 形状 log((N+1)/(df+0.5))，再乘抽取时的词权重（整词 2 /
+    bigram 1）。池内出现率过半的词压到 0——它们只会把泛化记忆顶上来。
+    """
+    n = max(1, len(pool_texts))
+    out = {}
+    for term, w in terms:
+        if not term:
+            continue
+        df = sum(1 for t in pool_texts if term in t)
+        if df * 2 > n and n >= 4:      # 过半候选都含它 = 泛词
+            out[term] = 0.0
+            continue
+        out[term] = w * math.log((n + 1.0) / (df + 0.5))
+    return out
+
+
+def _recall_weighted_hit(terms: list, idf: dict, text: str) -> float:
+    low = (text or "").lower()
+    return sum(idf.get(term, 0.0) for term, _ in terms if term in low)
+
+
+_RECALL_OPEN_STATUS = ("pending", "blocked", "in_progress", "claimed", "awaiting_approval")
+
+
+def _recall_project_block(root: str, pname: str, limit: int = 3) -> list:
+    """本项目近况：最近几条工作记录 + 未完成任务数。
+
+    R825 新增，补的是「按词召回」结构性覆盖不到的那一半。实测 2026-10-31：用户在
+    项目目录里问「继续迭代」，召回 top3 是三条泛化元记忆，而这个项目「上一轮做到
+    哪、还剩什么」一条都没有——它们在 records / tasks 表里，压根不走记忆检索那条
+    路。判断依据是 cwd 推断出的项目名（已经在算，此前只用来加 1.0 的分），这里直接
+    把它变成一条独立的上下文块：**进了项目目录，先知道这个项目在哪。**
+    """
+    if not pname:
+        return []
+    try:
+        recs = list_records(root, project=pname, limit=max(1, int(limit)))
+    except sqlite3.Error:
+        recs = []
+    open_n = 0
+    try:
+        with db_conn(root) as conn:
+            marks = ",".join("?" * len(_RECALL_OPEN_STATUS))
+            open_n = conn.execute(
+                f"SELECT COUNT(*) FROM tasks WHERE project=? AND status IN ({marks})",
+                (pname, *_RECALL_OPEN_STATUS)).fetchone()[0]
+    except sqlite3.Error:
+        open_n = 0
+    if not recs and not open_n:
+        return []
+    lines = [f"【本项目近况 · {_brief_oneline(pname, 26)}】"]
+    for r in recs:
+        day = str(r.get("date") or "")[5:10] or "—"
+        who = str(r.get("agent") or "").strip()
+        head = _brief_oneline(str(r.get("title") or ""), 46)
+        lines.append(f"· {day} {who}：{head}" if who else f"· {day}：{head}")
+    if open_n:
+        lines.append(f"· 未完成 {open_n} 项（hub_next 可认领）")
+    return lines
+
+
+def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
+                  project: str = "", max_chars: int = RECALL_MAX_CHARS,
+                  session: str = "", state_path: str = "",
+                  update_state: bool = True) -> dict:
+    """按用户这一句话自动回忆（UserPromptSubmit 钩子入口）。
+
+    与 session_brief 分工：简报解决「开局知道团队在干什么」，本函数解决「说到某件事时
+    自动想起相关记忆」。只在真命中时返回文本——每句话都塞一段「无相关记忆」纯属噪声。
+    记忆与历史记录分开取：记忆给结论，记录给过程；都受字符预算约束。
+    """
+    t0 = time.time()
+    out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
+           "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False}
+    if not root or not os.path.isdir(root):
+        return out
+    if _looks_like_system_message(prompt):
+        # 系统信封（task-notification / tool_result 之类）不是用户提问，按它回忆是空转
+        out["system_message"] = True
+        return out
+    who = _norm_agent(agent) or (agent or "").strip()
+    pname = (project or "").strip() or infer_project_from_cwd(root, cwd)
+    terms = extract_prompt_terms(prompt)
+    if not terms:
+        # R825：「继续」「接着弄」「下一步」这类推进语整句都是停用词，抽不出检索词——
+        # 而这恰恰是最需要上下文的时候（用户没说清干啥，就是让 AI 自己接上）。此前
+        # 这里直接 return，等于在最该开口的一句话上闭嘴。现在只出项目近况。
+        proj_only = _recall_project_block(root, pname)
+        if proj_only:
+            head = ["【AgentHub 即时回忆 · 只说项目近况（这句没抽到检索词）】"]
+            text = "\n".join(head + proj_only)
+            if len(text) > max_chars:
+                text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
+            out.update(text=text, project=pname, chars=len(text),
+                       elapsed_ms=int((time.time() - t0) * 1000))
+        return out
+    state = {"v": 1, "sessions": {}}
+    skey = f"{who or '?'}|{session}" if session else ""
+    excluded: set = set()
+    state_file = _recall_state_file(state_path)
+    if skey:
+        state = _load_recall_state(state_file)
+        raw_ids = (state["sessions"].get(skey) or {}).get("ids") or []
+        excluded = {int(x) for x in raw_ids if str(x).lstrip("-").isdigit()}
+    query = " ".join(term for term, _ in terms)
+    need = 2 if len(terms) >= 2 else 1
+    intent = _recall_intent(prompt)
+    kind_weights = RECALL_KIND_WEIGHTS.get(intent, RECALL_KIND_WEIGHTS["general"])
+    try:
+        # gate=False：覆盖度闸门按「查询词命中比例」删候选，对一句自然语言太严——
+        # 真实库实测会把 #487（批处理括号教训，命中 8 分）直接删掉，只留 3 条泛化记忆。
+        # 召回层有自己的命中阈值与重排，宽召回 + 严重排比窄召回更可靠。
+        mems = search_memories(root, query, limit=40, count_hits=False,
+                               semantic=False, gate=False)
+    except sqlite3.Error:
+        return out
+    # R825：先算池内区分度，再打分。这一步不动召回集（谁会进候选），只动排序——
+    # 把「命中了一堆泛词」和「命中了一个精确词」区分开。
+    mem_texts = [str(r.get("content") or "") + " " + str(r.get("tags") or "")
+                 for r in mems]
+    mem_idf = _recall_idf(mem_texts, terms)
+    scored = []
+    for r in mems:
+        if r.get("id") in excluded:
+            continue
+        body = str(r.get("content") or "") + " " + str(r.get("tags") or "")
+        hit = _recall_hit_score(terms, body)
+        if hit < need:
+            continue
+        wid = _recall_weighted_hit(terms, mem_idf, body)
+        r["_recall_hit"] = hit
+        r["_recall_w"] = wid
+        kind = r.get("kind") or "note"
+        spec = wid * 2.2 + kind_weights.get(kind, 0.4) + (0.8 if r.get("pinned") else 0)
+        if pname and (r.get("project") or "") == pname:
+            spec += 1.0
+        elif not r.get("project"):
+            spec += 0.2
+        spec += min(int(r.get("use_count") or 0), 10) * 0.04
+        try:
+            spec += {"fresh": 0.6, "stale": 0.0, "expired": -1.0}.get(
+                memory_freshness(r).get("state"), 0.0)
+        except Exception:  # noqa: BLE001 新鲜度异常不影响召回
+            pass
+        scored.append((spec, r))
+    scored.sort(key=lambda x: (-x[0], -(x[1].get("use_count") or 0), -x[1].get("id", 0)))
+    picked = [r for _, r in scored[:3]]
+    try:
+        recs = search_records(root, query, limit=30)
+    except sqlite3.Error:
+        recs = []
+    rec_scored = []
+    now_dt = datetime.datetime.now()
+    rec_idf = _recall_idf([str(r.get("title") or "") + " " + str(r.get("content") or "")
+                           for r in recs], terms)
+    for r in recs:
+        title = str(r.get("title") or "")
+        body = title + " " + str(r.get("content") or "")
+        hit = _recall_hit_score(terms, body)
+        if hit < need:
+            continue
+        spec = _recall_weighted_hit(terms, rec_idf, body) * 2.2 \
+            + _recall_hit_score(terms, title)
+        if pname and (r.get("project") or "") == pname:
+            spec += 1.5
+        try:
+            age = (now_dt - datetime.datetime.strptime(str(r.get("date"))[:10],
+                                                       "%Y-%m-%d")).total_seconds() / 86400
+            spec += 1.0 if age <= 3 else (0.5 if age <= 14 else 0.0)
+        except (ValueError, TypeError):
+            pass
+        rec_scored.append((spec, r))
+    rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
+    rec_rows = [r for _, r in rec_scored[:2]]
+    proj_lines = _recall_project_block(root, pname)
+    if not picked and not rec_rows:
+        # R825：没命中记忆 ≠ 没有上下文。「继续迭代」抽到「迭代」却在库里查不到，
+        # 结论不该是闭嘴——在项目目录里，本项目最近做到哪比任何记忆都该先说。
+        if proj_lines:
+            text = "\n".join(
+                ["【AgentHub 即时回忆 · 没检索到相关记忆，只给项目近况】"] + proj_lines)
+            if len(text) > max_chars:
+                text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
+            out.update(text=text, project=pname, chars=len(text),
+                       elapsed_ms=int((time.time() - t0) * 1000))
+        else:
+            out["terms"] = [t for t, _ in terms]
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
+    # 低置信判定：候选池里 top1 的加权分还是很小，说明这条提问只由泛词命中——把它
+    # 当结论会误导（2026-10-31 实测那次「围绕/重点/不用」正好是这种情况），必须让
+    # 模型看见「这条不靠谱」而不是看见「三条记忆」。池太小时 idf 无从估计，不判。
+    weak = (bool(picked) and len(mems) >= 5
+            and float(picked[0].get("_recall_w") or 0.0) < 1.2)
+    lines = ["【AgentHub 即时回忆 · 自动检索，无需提醒】",
+             "这是索引不是全文：要动具体命令/路径/参数前先 hub_search 取原文，"
+             "别照着摘要复述；与现状冲突时以现状为准，收工时顺手更正。"]
+    if weak:
+        lines.append("⚠ 本节只是「词面碰上」，置信低——别当结论，自己 hub_search 再确认。")
+    if proj_lines:
+        lines.extend(proj_lines)
+    ids = []
+    for r in picked:
+        ids.append(r.get("id"))
+        used = int(r.get("use_count") or 0)
+        lines.append(f"· #{r.get('id')} [{r.get('kind') or 'note'}] "
+                     f"{_brief_oneline(str(r.get('content') or ''), 150)}"
+                     f"（命中 {r.get('_recall_hit') or 0}；"
+                     f"用过 {used} 次）")
+    if rec_rows:
+        lines.append("相关历史：")
+        for r in rec_rows:
+            head = _brief_title(str(r.get("title") or "")) or _brief_oneline(
+                str(r.get("content") or ""), 40)
+            lines.append(f"- [{_brief_oneline(str(r.get('project') or ''), 22)}] "
+                         f"{_brief_oneline(head, 42)}"
+                         f"（{r.get('agent') or '其他'} · {r.get('date') or '—'}）")
+    # 出口用「区分度最高的三个词」拼查询式：原先把整串 terms 塞进去，虚词也跟着进去，
+    # 模型照抄这条命令就等于把噪声再检一遍。
+    top_terms = [t for t, _ in sorted(terms, key=lambda x: -float(mem_idf.get(x[0]) or 0))[:3]]
+    lines.append(f"更多：hub_memory_read(query=\"{_brief_oneline(' '.join(top_terms) or query, 60)}\")")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
+    out.update(text=text, memory_ids=[i for i in ids if i is not None],
+               record_ids=[r.get("id") for r in rec_rows], terms=[t for t, _ in terms],
+               project=pname, chars=len(text))
+    if out["memory_ids"]:
+        try:
+            _bump_access(root, out["memory_ids"])
+        except sqlite3.Error:
+            pass
+    try:
+        log_search(root, "prompt_recall", query[:200], len(out["memory_ids"]), agent=who)
+    except sqlite3.Error:
+        pass
+    if skey and update_state and out["memory_ids"]:
+        entry = (state["sessions"].get(skey) or {"ids": []})
+        entry["ids"] = list(dict.fromkeys(list(entry.get("ids") or [])
+                                          + [str(i) for i in out["memory_ids"]]))[-200:]
+        entry["ts"] = _now()
+        state["sessions"][skey] = entry
+        _save_recall_state(state_file, state)
+    out["elapsed_ms"] = int((time.time() - t0) * 1000)
+    return out
+
+
 def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                   max_chars: int = BRIEF_MAX_CHARS, source: str = "session") -> dict:
     """会话启动简报：无需用户提醒，AI 一开局就看到的上下文快照。

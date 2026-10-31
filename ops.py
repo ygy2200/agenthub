@@ -59,7 +59,7 @@ CHECKS = {
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
     "mcp_drift": ("接入参数漂移巡检（R103）：配了 agenthub 但配得不对的入口——--agent 被删（未锁身份，署名闸会持续拦写）/锁名与注册名不符（归属分裂）/server 脚本路径失效（MCP 起不来）/--root 指向别库。这些事后只在越权拦截流水露痕迹，这里事前点名", False),
     "usage_health": ("用量异常巡检（R105）：多 agent 共用大脑的行为异常检测——单 agent 近 1h 调用量失控嫌疑（速率限制硬拦前的软信号）、单工具 10 分钟循环调用嫌疑、MCP 已配置但近 7 天零调用的接入闲置、空归属调用计数（归因缺口）。只读不动手", False),
-    "brief_hook_health": ("简报钩子体检（R816）：逐家核对大脑简报的 SessionStart 钩子是否仍在配置里（被改配置/重装客户端会静默丢失），并给出近 7 天各 agent 的简报送达次数——「该送到却没送」要比等用户报「又不读记忆」更早发现", False),
+    "brief_hook_health": ("记忆钩子体检（R816 简报 / R821 回忆）：逐家核对 SessionStart 简报与 UserPromptSubmit 回忆钩子是否仍在配置里（被改配置/重装客户端会静默丢失），脚本与 Python 入口是否还在盘上，并给出近 7 天各 agent 的简报/回忆送达次数——「该送到却没送」要比等用户报「又不读记忆」更早发现", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计 / 零触发按 agent 活性分级）——检测规则有没有被真正执行，而非只写在纸面", False),
     "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
     "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
@@ -102,7 +102,7 @@ CHECK_FIXES = {
     "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门；零触发且有记录的 agent 去其会话实测一次写工具调用，确认钩子加载",
     "mcp_drift": "按点名项修对应 agent 的 MCP 配置（args）：缺 --agent / 锁名不符 → cli.py onboard <agent> 重写；server 脚本不存在 → cli.py deploy 后改配置路径；--root 指向别库 → 改回 config.root 或删掉 --root（serve 会动态跟随）",
     "usage_health": "失控/循环：先用 hub_usage_timeline(agent/tool 过滤) 看是否同一调用在反复打——是循环就修触发方（agent 端脚本的 retry 上限），速率限制 AGENTHUB_RATE_* 可临时收紧；接入闲置：确认该 agent 是否还需要，不用就下线接入（防配置漂移无人发现），还用就让它的会话跑一次真实调用",
-    "brief_hook_health": "钩子丢失：python cli.py hook-install <agent> --apply 重装（幂等、写前备份）；配置缺失的机器跳过不算故障；有钩子但零送达：开一次该 agent 的会话看日志 ~/.workbuddy/logs/brain-inject.log",
+    "brief_hook_health": "钩子丢失/文件缺失：python cli.py deploy 补 Python 入口，python cli.py hook-install <agent> --apply 重装脚本与配置（幂等、写前备份）；配置缺失的机器跳过不算故障；有钩子但零送达：开一次该 agent 的会话看日志 ~/.workbuddy/logs/brain-inject.log 与 brain-recall.log",
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
@@ -2817,11 +2817,12 @@ def _usage_health(root: str) -> dict:
 
 
 def _brief_hook_health(root: str) -> dict:
-    """简报钩子体检（R816）：配置在不在 + 近 7 天送没送。
+    """记忆钩子体检（R816 简报 / R821 回忆）：配置在不在 + 脚本在不在 + 近 7 天送没送。
 
-    与 rules_health 分工：那边看「收工记大脑」的守卫，这边看「开工有上下文」的注入。
-    客户端升级/重装会静默清掉 hooks 条目，而症状要等用户说「又不读记忆」才暴露——
-    配置缺失当场点名，有钩子零送达只作信息行（可能只是这些天没开会话）。
+    与 rules_health 分工：那边看「收工记大脑」的守卫，这边看「开工有上下文」和
+    「每句话自动回忆」的注入。客户端升级/重装会静默清掉 hooks 条目，脚本或
+    Python 入口被删则钩子静默空转——两类都要当场点名，不能等用户再说「又不读记忆」。
+    有钩子零送达只作信息行（可能只是这些天没开会话）。
     """
     if err := _need_root(root):
         return err
@@ -2829,7 +2830,7 @@ def _brief_hook_health(root: str) -> dict:
     import brain as _brain  # noqa: PLC0415
     targets = dict(core.HOOK_BRIEF_TARGETS)
     targets["hermes-cn"] = core.HOOK_BRIEF_HERMES_TARGETS[0][1]
-    inplace, unwired, absent = [], [], []
+    inplace, unwired, recall_inplace, recall_unwired, absent = [], [], [], [], []
     for agent, cfg_s in targets.items():
         p = Path(os.path.expanduser(cfg_s))
         if not p.is_file():
@@ -2840,57 +2841,88 @@ def _brief_hook_health(root: str) -> dict:
         except OSError:
             absent.append(agent)
             continue
-        want = (core.HOOK_BRIEF_HERMES_SCRIPT
-                if core.agent_key(agent).startswith("hermes") else core.HOOK_BRIEF_NAME)
-        (inplace if want in text else unwired).append(agent)
+        key = core.agent_key(agent)
+        hermes = key.startswith("hermes")
+        want_brief = core.HOOK_BRIEF_HERMES_SCRIPT if hermes else core.HOOK_BRIEF_NAME
+        want_recall = core.HOOK_BRIEF_HERMES_SCRIPT if hermes else core.HOOK_RECALL_NAME
+        (inplace if want_brief in text else unwired).append(agent)
+        (recall_inplace if want_recall in text else recall_unwired).append(agent)
     d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
     delivered: dict = {}
+    recalled: dict = {}
     try:
         with _brain.db_conn(root) as conn:
             for r in conn.execute(
-                    "SELECT agent, COUNT(*) n FROM journal WHERE action='brain_brief' "
-                    "AND ts>=? GROUP BY agent", (d7,)):
-                if r["agent"]:
-                    delivered[core.agent_key(r["agent"])] = int(r["n"])
+                    "SELECT action, agent, COUNT(*) n FROM journal "
+                    "WHERE action IN ('brain_brief','brain_recall') AND ts>=? "
+                    "GROUP BY action, agent", (d7,)):
+                if not r["agent"]:
+                    continue
+                bucket = delivered if r["action"] == "brain_brief" else recalled
+                bucket[core.agent_key(r["agent"])] = int(r["n"])
     except Exception:  # noqa: BLE001 送达统计失败不影响配置核对
-        delivered = {}
+        delivered, recalled = {}, {}
     detail = []
     # 配置里写着脚本名 ≠ 脚本还在盘上：删了脚本钩子会静默失败，比配置丢失更隐蔽。
     scripts_missing = []
-    for want in (core.HOOK_BRIEF_NAME, core.HOOK_BRIEF_HERMES_SCRIPT):
-        sp = core.hook_brief_script_path().with_name(want)
+    for want in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT):
+        sp = core.hook_script_path(want)
         if not sp.is_file():
             scripts_missing.append(want)
-    if unwired:
-        detail.append("钩子丢失：" + "、".join(unwired)
-                      + "（配置在但没挂简报——python cli.py hook-install "
-                      + " ".join(unwired) + " --apply 重装，幂等且写前备份）")
-    if scripts_missing:
-        detail.insert(0, "钩子脚本缺失：" + "、".join(scripts_missing)
-                      + "（配置仍指向它，钩子会静默空转——python cli.py hook-install --apply 会重新部署脚本）")
+    entries_missing = [name for name in ("brain_brief.py", "brain_recall.py")
+                       if not (core.MCP_SERVER_DIR / name).is_file()]
+    if unwired or recall_unwired:
+        lost = sorted(set(unwired) | set(recall_unwired))
+        detail.append("钩子丢失：" + "、".join(lost)
+                      + "（配置在但没挂全——python cli.py hook-install "
+                      + " ".join(lost) + " --apply 重装，幂等且写前备份）")
+    if scripts_missing or entries_missing:
+        missing = scripts_missing + entries_missing
+        detail.insert(0, "钩子文件缺失：" + "、".join(missing)
+                      + "（配置仍指向它，钩子会静默空转——python cli.py hook-install --apply "
+                        "重装脚本，python cli.py deploy 补 Python 入口）")
     if absent:
         detail.append("本机无该配置，跳过：" + "、".join(absent))
+    # R822：钩子只覆盖登记过的那几家，没登记的（ZCode）此前从计数里彻底消失。
+    unmanaged = core.hook_unmanaged_agents(root)
+    if unmanaged:
+        detail.append("无记忆钩子出口：" + "、".join(unmanaged)
+                      + "（该客户端不提供会话开始/每句话事件，只能靠 MCP 握手带一次简报，"
+                        "逐句回忆用不上——不是故障，别按「钩子丢失」去修）")
     if delivered:
-        detail.append("近 7 天送达：" + " / ".join(
+        detail.append("近 7 天简报送达：" + " / ".join(
             f"{a} {n}" for a, n in sorted(delivered.items())))
         cold = [a for a in inplace if delivered.get(core.agent_key(a), 0) == 0]
         if cold:
-            detail.append("钩子在位但近 7 天零送达：" + "、".join(cold)
+            detail.append("简报钩子在位但近 7 天零送达：" + "、".join(cold)
                           + "（这些天没开会话属正常；若刚开过，看 ~/.workbuddy/logs/brain-inject.log）")
     else:
         detail.append("近 7 天无简报送达记录（新装或还没开过会话）")
-    if unwired or scripts_missing:
+    if recalled:
+        detail.append("近 7 天回忆送达：" + " / ".join(
+            f"{a} {n}" for a, n in sorted(recalled.items())))
+        cold = [a for a in recall_inplace if recalled.get(core.agent_key(a), 0) == 0]
+        if cold:
+            detail.append("回忆钩子在位但近 7 天零送达：" + "、".join(cold)
+                          + "（可能这些天没说话，或每句都没命中记忆；看 ~/.workbuddy/logs/brain-recall.log）")
+    else:
+        detail.append("近 7 天无回忆送达记录（新装、还没说过需要回忆的话，或都没命中）")
+    if unwired or recall_unwired or scripts_missing or entries_missing:
         bits = []
-        if scripts_missing:
-            bits.append("脚本缺 " + "、".join(scripts_missing))
+        if scripts_missing or entries_missing:
+            bits.append("文件缺 " + "、".join(scripts_missing + entries_missing))
         if unwired:
-            bits.append("钩子丢失 " + "、".join(unwired))
+            bits.append("简报丢失 " + "、".join(unwired))
+        if recall_unwired:
+            bits.append("回忆丢失 " + "、".join(recall_unwired))
         return {"ok": False,
-                "summary": f"简报链路异常：{'；'.join(bits)}（{len(inplace)} 家在位）",
+                "summary": f"记忆钩子异常：{'；'.join(bits)}"
+                           f"（简报 {len(inplace)} 家 / 回忆 {len(recall_inplace)} 家在位）",
                 "fix": CHECK_FIXES["brief_hook_health"], "detail": detail}
     return {"ok": True,
-            "summary": f"简报钩子 {len(inplace)} 家在位"
-                       + (f"；{len(absent)} 家本机无配置" if absent else ""),
+            "summary": f"记忆钩子：简报 {len(inplace)} 家、回忆 {len(recall_inplace)} 家在位"
+                       + (f"；{len(absent)} 家本机无配置" if absent else "")
+                       + (f"；{len(unmanaged)} 家无钩子出口" if unmanaged else ""),
             "detail": detail}
 
 

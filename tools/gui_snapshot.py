@@ -186,10 +186,17 @@ def capture(update_shots: bool = False) -> dict:
     core.bootstrap_status = lambda path: bool(path) and "seed-a" in path
     core.deploy_status = lambda: {"python": "<python>", "server": "<server>",
                                   "state": "ready", "diff": [], "absent": []}
-    # 简报钩子状态也读本机真实配置（R819）：固定为「全部在位」，基线不随安装漂移。
+    # 简报/回忆钩子状态也读本机真实配置（R819/R821）：固定为「全部在位」，基线不随安装漂移。
     _orig_hook_status = core.brief_hook_status
+    _orig_memory_status = core.memory_hook_status
     core.brief_hook_status = lambda agent, path="": {
         "agent": agent, "state": "inplace", "path": f"<seed-hooks>/{agent}", "script": True}
+
+    def _fake_memory_status(agent, path=""):
+        st = {"agent": agent, "state": "inplace", "path": f"<seed-hooks>/{agent}", "script": True}
+        return {"agent": agent, "session": dict(st), "prompt": dict(st)}
+
+    core.memory_hook_status = _fake_memory_status
 
     out = {"_meta": {"theme": THEME, "size": [WIN_W, WIN_H], "font": font_src}, "pages": {}}
     w = ui.AgentHubWindow()
@@ -260,6 +267,7 @@ def capture(update_shots: bool = False) -> dict:
         core.get_root = _orig_get_root
         core.save_config = _orig_save_config
         core.brief_hook_status = _orig_hook_status
+        core.memory_hook_status = _orig_memory_status
         agentscore.detect_agents = _orig_detect
         (core.load_agent_adapters, core.mcp_has_agenthub,
          core.bootstrap_status, core.deploy_status) = _orig

@@ -330,30 +330,50 @@ class ConnectPage(QWidget):
         self._hookStates = {}
         for agent in self._hook_targets():
             try:
-                self._hookStates[agent] = core.brief_hook_status(agent)
+                self._hookStates[agent] = core.memory_hook_status(agent)
             except Exception:  # noqa: BLE001 读坏一家配置不拖垮整页
-                self._hookStates[agent] = {"agent": agent, "state": "bad_schema",
-                                           "path": "", "script": False}
-        inplace = [a for a, s in self._hookStates.items() if s["state"] == "inplace"]
-        unwired = [a for a, s in self._hookStates.items() if s["state"] == "unwired"]
-        broken = [a for a, s in self._hookStates.items() if s["state"] == "bad_schema"]
-        absent = [a for a, s in self._hookStates.items() if s["state"] == "absent"]
+                st = {"agent": agent, "state": "bad_schema", "path": "", "script": False}
+                self._hookStates[agent] = {"agent": agent, "session": st, "prompt": dict(st)}
+
+        def _st(row, ev):
+            return (row.get(ev) or {}).get("state", "")
+
+        inplace = [a for a, s in self._hookStates.items()
+                   if _st(s, "session") == "inplace" and _st(s, "prompt") in ("inplace", "covered")]
+        gaps = [a for a, s in self._hookStates.items()
+                if a not in inplace and _st(s, "session") != "absent"]
+        unwired = [a for a, s in self._hookStates.items()
+                   if _st(s, "session") == "unwired" or _st(s, "prompt") == "unwired"]
+        broken = [a for a, s in self._hookStates.items()
+                  if "bad_schema" in (_st(s, "session"), _st(s, "prompt"))]
+        absent = [a for a, s in self._hookStates.items() if _st(s, "session") == "absent"]
         if unwired:
-            text = (f"简报钩子：{'、'.join(unwired)} 未挂——这些 agent 开新会话不会自动带团队上下文"
-                    "（MCP 握手简报仍可用，但要求客户端已接入且重启过）")
+            text = (f"记忆钩子：{'、'.join(unwired)} 未挂——这些 agent 开新会话不会自动带团队上下文，"
+                    "说话时也不会自动回忆（MCP 握手简报仍可用，但要求客户端已接入且重启过）")
         else:
-            text = (f"简报钩子：{len(inplace)} 家全部在位——开新会话会自动收到大脑简报，"
-                    "不需要再提醒 AI 读记忆")
+            text = (f"记忆钩子：{len(inplace)} 家全部在位——开新会话自动收到大脑简报，"
+                    "每句话自动检索相关记忆，不需要再提醒 AI 读记忆")
         if broken:
             text += f"；{'、'.join(broken)} 配置结构不符，需手工处理"
         if absent:
             text += f"；本机无配置（跳过）：{'、'.join(absent)}"
+        # R822：没登记钩子出口的客户端（ZCode）此前从「6 家全部在位」里静默消失。
+        unmanaged = core.hook_unmanaged_agents(getattr(self.win, "root", "") or "")
+        if unmanaged:
+            text += (f"；{'、'.join(unmanaged)} 无钩子出口"
+                     "（该客户端没有会话开始/每句话事件，只靠 MCP 握手带简报）")
         self.hookLabel.setText(text)
-        self.hookBtn.setEnabled(bool(unwired))
-        tips = [f"{a}：{s['path'] or '未登记'}（{s['state']}）"
-                for a, s in self._hookStates.items()]
+        self.hookBtn.setEnabled(bool(gaps))
+        tips = []
+        for a, s in self._hookStates.items():
+            sess, prom = s.get("session") or {}, s.get("prompt") or {}
+            tips.append(f"{a}：{sess.get('path') or '未登记'}（简报 {sess.get('state')} / "
+                        f"回忆 {prom.get('state')}）")
         missing_script = [a for a, s in self._hookStates.items()
-                          if s["state"] == "inplace" and not s["script"]]
+                          if ((s.get("session") or {}).get("state") in ("inplace", "unwired")
+                              and not (s.get("session") or {}).get("script"))
+                          or ((s.get("prompt") or {}).get("state") == "unwired"
+                              and not (s.get("prompt") or {}).get("script"))]
         if missing_script:
             tips.append("脚本缺失（钩子会空转）：" + "、".join(missing_script)
                         + "——安装钩子会重新部署脚本")
@@ -363,25 +383,30 @@ class ConnectPage(QWidget):
         states = getattr(self, "_hookStates", {})
         added, failed = [], []
         for agent, st in states.items():
-            if st["state"] == "bad_schema":
+            sess = st.get("session") or {}
+            prom = st.get("prompt") or {}
+            if "bad_schema" in (sess.get("state"), prom.get("state")):
                 failed.append(f"{agent}（配置结构不符，未改动）")
                 continue
-            if st["state"] != "unwired":
+            if not (sess.get("state") == "unwired" or prom.get("state") == "unwired"):
                 continue
             try:
-                r = (core.install_hermes_brief_hook(agent, apply=True)
-                     if agent.startswith("hermes") else core.install_brief_hook(agent, apply=True))
+                r = core.install_memory_hooks(agent, apply=True)
             except Exception as e:  # noqa: BLE001 单家失败继续装其余
                 failed.append(f"{agent}（{e}）")
                 continue
-            if r.get("status") in ("added", "already"):
+            ok = (r.get("session", {}).get("status") in ("added", "already")
+                  and r.get("prompt", {}).get("status") in ("added", "already", "covered"))
+            if ok:
                 added.append(agent)
             else:
-                failed.append(f"{agent}（{r.get('status') or '失败'}）")
+                bad = [x.get("status") or "失败"
+                       for x in (r.get("session"), r.get("prompt")) if isinstance(x, dict)]
+                failed.append(f"{agent}（{'/'.join(bad)}）")
         if added:
-            core.journal(self.win.root, "user", "brief_hook_install", ",".join(added))
+            core.journal(self.win.root, "user", "memory_hook_install", ",".join(added))
         if added and not failed:
-            InfoBar.success("简报钩子已安装",
+            InfoBar.success("记忆钩子已安装",
                             f"{'、'.join(added)}——重启这些 agent 的新会话生效",
                             duration=4000, parent=self.win)
         elif added:
