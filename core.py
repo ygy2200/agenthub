@@ -1210,6 +1210,7 @@ BOOTSTRAP_TARGETS = [{"agent": a["agent"], "path": _boot_path(a)} for a in AGENT
 # 本表是「哪家挂哪份配置」的单一事实来源；安装器只追加 SessionStart 条目、其余原样保留。
 HOOK_BRIEF_NAME = "brain_inject.mjs"
 HOOK_BRIEF_TARGETS = {
+    "qoder": "~/.qoder-cn/settings.json",
     "claude": "~/.claude/settings.json",
     "codex": "~/.codex/hooks.json",
     "workbuddy": "~/.workbuddy/settings.json",

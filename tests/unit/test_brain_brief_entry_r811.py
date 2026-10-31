@@ -33,6 +33,17 @@ def test_python_entry_prints_brief(hub_root, capsys):
     assert "AgentHub 大脑简报" in out and "演示-简报" in out
 
 
+def test_python_entry_journal_lands_in_db(hub_root):
+    """R816：钩子流水必须与 MCP 同位（brain.db journal）。此前 core 无 sink，
+    只写进旧版 _hub/journal.jsonl，采纳度统计永远是 0（实测踩过）。"""
+    _seed(hub_root)
+    rc = brain_brief.main(["--root", hub_root, "--agent", "qoder", "--cwd",
+                           f"{hub_root}/演示-简报"])
+    assert rc == 0
+    rows = [r for r in brain.journal_list(hub_root) if r["action"] == "brain_brief"]
+    assert rows and rows[0]["target"] == "session", rows
+
+
 def test_python_entry_is_silent_on_bad_root(hub_root, capsys):
     rc = brain_brief.main(["--root", f"{hub_root}/不存在", "--agent", "qoder", "--no-journal"])
     out = capsys.readouterr().out

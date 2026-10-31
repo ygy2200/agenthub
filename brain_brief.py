@@ -20,6 +20,10 @@ except Exception:  # noqa: BLE001
 import brain  # noqa: E402
 import core  # noqa: E402
 
+# 钩子侧流水必须和 MCP 侧同口径落库：core 默认无 sink 会写进旧版 _hub/journal.jsonl，
+# 那样 usage_health/brief_hook_health 数不到「钩子送过简报」，采纳度就成了瞎的（R816 实测）。
+core.JOURNAL_SINK = brain.journal_add
+
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="AgentHub 会话简报（SessionStart 钩子入口）")
