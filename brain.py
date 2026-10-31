@@ -7677,11 +7677,14 @@ def infer_project_from_cwd(root: str, cwd: str) -> str:
 
 
 def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
-                  max_chars: int = BRIEF_MAX_CHARS) -> dict:
+                  max_chars: int = BRIEF_MAX_CHARS, source: str = "session") -> dict:
     """会话启动简报：无需用户提醒，AI 一开局就看到的上下文快照。
 
     给 SessionStart 钩子与 hub_brief 共用。只读、失败不抛（钩子必须 fail-open），
     整体有字符预算——注入的长上下文会挤掉真正的工作内容，简报只负责「知道去哪查」。
+
+    source="initialize" 用于 MCP 握手注入：握手没有 cwd，标题与来源说明随之改写，
+    避免在 agent 里声称「钩子注入」而实际来自 initialize（口径不能骗人）。
 
     返回 {"text", "project", "truncated", "elapsed_ms", "stats"}；空根目录返回空 text。
     """
@@ -7732,10 +7735,11 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
         tasks = task_next(root, owner=who, limit=2) if who else {"counts": {}}
         tcounts = tasks.get("counts") or {}
 
+        via = "MCP 握手" if source == "initialize" else "SessionStart 钩子"
         lines = [f"【AgentHub 大脑简报 · 会话启动自动生成 · {who or '未署名'} · "
                  f"{now:%Y-%m-%d %H:%M}】",
                  f"根目录 {root} ｜ {n_proj} 项目 · {n_rec} 条活跃记录 · {n_mem} 条记忆",
-                 "（这份简报由 SessionStart 钩子自动注入，无需用户提醒；细节按下面入口再查，别凭空开工）"]
+                 f"（这份简报由{via}自动送达，无需用户提醒；细节按下面入口再查，别凭空开工）"]
         if progress:
             lines.append("")
             lines.append("▸ 团队最近进展")

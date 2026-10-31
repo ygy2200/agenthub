@@ -233,6 +233,11 @@ SERVER_INSTRUCTIONS = (
     "改共享文件前 hub_lock(action=\"acquire\", path=..., agent=...) 占位，干完 release；冲突先协调。"
     "写工具可先 dry_run=true 预演；需人工批准时传 confirm=false 拿回 input_required（不执行），批准后带 confirm=true 重发。出错用 hub_report_error(title, detail, undo)。"
 )
+# R812：握手也带一份精简简报。SessionStart 钩子只覆盖能挂钩子的 agent（Qoder/WorkBuddy/Claude），
+# Codex/DSH/hermes 没有钩子通道；initialize 是每个 MCP 客户端必经的握手点，把简报放这里才能让
+# 「不用用户提醒就看到团队上下文」覆盖全部接入方。预算比钩子小：instructions 过长会挤占工具描述。
+INIT_BRIEF_MAX_CHARS = 1400
+INIT_BRIEF_MARK = "【大脑简报 · MCP 握手自动注入】"
 HELP_TOPICS = {
     "start": (
         "开工：会话启动钩子会自动注入大脑简报（团队进展/项目记忆/未读信号/我的任务）；"
@@ -4263,6 +4268,12 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
                                   cwd=str(arguments.get("cwd", "") or ""),
                                   project=str(arguments.get("project", "") or ""),
                                   max_chars=budget)
+        if root and res["text"]:
+            try:
+                core.journal(root, CLIENT_NAME or str(arguments.get("agent", "")) or "unknown",
+                             "brain_brief", "mcp_tool", note=f"{len(res['text'])} chars")
+            except Exception:  # noqa: BLE001 流水失败不影响返回
+                pass
         return res["text"] or (
             f"（未生成简报：根目录不可用或数据库未初始化：{root or '未设置'}。"
             f"先 python cli.py init --root <目录> 或 python cli.py doctor）")
@@ -6051,9 +6062,22 @@ def handle_message(msg: dict, root: str, session: bool = False,
             # 避免 "Qoder"/"qoder-cli" 在不同客户端里裂成多个身份。
             CLIENT_NAME = core.agent_key(raw_client)[:64]
         req_ver = params.get("protocolVersion", PROTOCOL_VERSION)
+        instructions = SERVER_INSTRUCTIONS
+        try:
+            _b = brain.session_brief(root, agent=CLIENT_NAME, max_chars=INIT_BRIEF_MAX_CHARS,
+                                     source="initialize")
+            if _b["text"]:
+                instructions = SERVER_INSTRUCTIONS + "\n\n" + INIT_BRIEF_MARK + "\n" + _b["text"]
+                try:
+                    core.journal(root, CLIENT_NAME or "unknown", "brain_brief", "initialize",
+                                 note=f"{len(_b['text'])} chars")
+                except Exception:  # noqa: BLE001 流水失败不影响握手
+                    pass
+        except Exception:  # noqa: BLE001 简报失败退回静态规程——握手绝不能因此失败
+            pass
         return {"jsonrpc": "2.0", "id": mid,
                 "result": {"protocolVersion": req_ver, "capabilities": {"tools": {}},
-                           "serverInfo": SERVER_INFO, "instructions": SERVER_INSTRUCTIONS}}
+                           "serverInfo": SERVER_INFO, "instructions": instructions}}
     if method == "server/discover":
         # P3-1 版本协商：未知版本 → -32022；已知/未传 → 返回能力面（dual-era：initialize 握手保留）
         pv = params.get("protocolVersion")

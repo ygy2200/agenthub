@@ -298,21 +298,30 @@ def t_protocol(root):
 
 
 def t_initialize_instructions(root):
-    """R4：握手即拿到最小作业规程；说明不能提到不存在的工具（防改名后文案腐烂）。"""
+    """R4：握手即拿到最小作业规程；说明不能提到不存在的工具（防改名后文案腐烂）。
+
+    R812 起握手附带一份有界大脑简报（无钩子的 agent 也能看到团队上下文）：
+    静态规程仍是单段 ≤900 字符、幽灵工具检查只看静态段；简报段单独设总预算，
+    且不允许被记录正文里的伪工具名拖累（那是用户数据，不是文案腐烂）。"""
     r = resp_ok(m.handle_message(rpc("initialize", {"protocolVersion": "2024-11-05"}), str(root)))
     ins = r.get("instructions")
     assert isinstance(ins, str) and ins.strip(), f"initialize 缺少 instructions：{r.keys()}"
-    assert len(ins) <= 900, f"instructions 超预算：{len(ins)} 字符"
+    static, _, brief = ins.partition(m.INIT_BRIEF_MARK)
+    static = static.rstrip()
+    assert len(static) <= 900, f"静态规程超预算：{len(static)} 字符"
+    if brief:
+        assert len(ins) <= len(static) + 4 + len(m.INIT_BRIEF_MARK) + m.INIT_BRIEF_MAX_CHARS, \
+            f"握手简报超预算：{len(ins)} 字符"
     must = ["hub_brief", "hub_get_progress", "hub_memory_read", "hub_log_work", "hub_memory_write",
             "hub_ops_run", "hub_memory_confirm", "hub_memory_supersede",
             "hub_search_tools", "hub_call_tool", "hub_report_error"]
-    missing = [t for t in must if t not in ins]
+    missing = [t for t in must if t not in static]
     assert not missing, f"instructions 未覆盖核心流程：{missing}"
     known = {t["name"] for t in m.TOOLS}
-    ghosts = sorted(set(re.findall(r"hub_[a-z_]+", ins)) - known)
+    ghosts = sorted(set(re.findall(r"hub_[a-z_]+", static)) - known)
     assert not ghosts, f"instructions 提到不存在的工具：{ghosts}"
-    # 协议字段是纯文本：不夹带 markdown 代码块/多段结构
-    assert "```" not in ins and ins.count("\n") == 0, "instructions 应为单段纯文本"
+    # 协议字段是纯文本：静态规程不夹带 markdown 代码块/多段结构
+    assert "```" not in static and static.count("\n") == 0, "instructions 应为单段纯文本"
 
 
 def t_protocol_encoding(root):
