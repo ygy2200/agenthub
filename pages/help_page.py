@@ -111,6 +111,8 @@ class HelpPage(QWidget):
     <li><code>python cli.py doctor --json</code> / <code>--only a,b</code> / <code>--skip a</code> / <code>--no-machine</code> / <code>--slow 8</code>：单行 JSON 给脚本读、只跑白名单项、跳过某项、摘掉与根目录无关的机器级项、强制列出耗时榜</li>
     <li><code>python cli.py check --list</code> / <code>python cli.py check deploy_diff --target 目录</code>：自检清单之外的单项检查（回归、部署一致性等）从这里进；需要 target 的项不会给你默认值，填错目录直接是用法错误退出码，不会被当成「检查发现问题」</li>
     <li><code>python cli.py next --agent 名字</code>：按优先级看待认领 / 进行中 / 等待中（等前置任务或外部阻塞，原因随行给出）</li>
+    <li><code>python cli.py brief --agent 名字</code>：看一次会话简报（团队进展/当前项目/置顶记忆/未读信号/我的任务），与开工自动注入同源；中途接手或换项目时刷新用它</li>
+    <li><code>python cli.py hook-install</code> / <code>python cli.py hook-install --apply</code>：给已接入的 agent 挂「开工自动注入大脑简报」的钩子（默认只预演；幂等、写前备份；客户端重装后钩子丢了就跑它）</li>
     <li><code>python cli.py deploy</code> / <code>python cli.py release</code>：部署 MCP server（部署后自动跑一致性校验，不一致非零退出）/ 发布一致性检查</li>
     <li><code>python tools/real_walkthrough.py 根目录 dark --size 920x600 --pages stats_page</code>：
     最小窗真实库截图走查（<code>--pages</code> 只拍指定页）</li>

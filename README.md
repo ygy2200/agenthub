@@ -58,13 +58,14 @@ AgentHub 内置一个零依赖的 MCP server（`agenthub_mcp.py`），任何支�
 **可编程数据包**（3.4 HPI 模式 + 3.6 目录树轨道）：数据本来就是普通文件和 SQLite——项目目录可直接 `ls`/`grep`（工作记录.md 为唯一真理）；写脚本分析自己则把本目录加入 sys.path 后 `import my.work`：`records(since="5d")` / `memories(kind=)` / `todos()` / `profile()`，全只读、不计入检索统计。
 
 接入方式：软件「接入中心」一键写入，或命令行 `python cli.py onboard <agent>`（**一条命令**：外科式写 MCP 配置 + 注入引导）。
+再跑 `python cli.py hook-install --apply` 给各 agent 挂「开工自动注入大脑简报」的 SessionStart 钩子（hermes 走首轮注入；幂等、写前备份，客户端升级后钩子丢了重跑即可）——不依赖模型自觉，一开局就带着团队进展/项目记忆/未读信号/我的任务。
 `python cli.py discover` 扫本机有哪些 agent 配置（含未登记的）；`python cli.py status` 查各 agent 接入状态；`python cli.py refresh` 刷新引导；
 `python cli.py offboard <agent> --apply` 下线接入（引导块与 MCP 条目都先备份，默认只预演）。
 agent 名单在**大脑根目录的 `config.agents.json`**（改它即增删 agent、**零改码**）。**配置格式通吃 JSON / TOML / YAML**（外科式编辑，保注释）。
 
 ## 版本演进
 
-当前版本 **v2.41.173**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
+当前版本 **v2.41.174**。完整版本历史（含设计依据、缺陷根因与验证方式）已拆分到 [CHANGELOG.md](CHANGELOG.md)，便于查阅与全文检索。版本号是单一来源：`agenthub_mcp.py` 的 `SERVER_INFO`，本行与 CHANGELOG 首行由 `tests/unit/test_tool_docs.py` 看守。
 
 ## 设计原则
 
@@ -115,7 +116,7 @@ unified project records, input/output file management, a public memory, capabili
 
 Download the single-file `AgentHub.exe` from [Releases](https://github.com/ygy2200/agenthub/releases), pick your records folder, and connect your agents in the "Connect" page.
 
-Current version **v2.41.173** — full version history in [CHANGELOG.md](CHANGELOG.md).
+Current version **v2.41.174** — full version history in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 
