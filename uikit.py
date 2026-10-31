@@ -1509,6 +1509,11 @@ class TaskDetailDialog(MessageBoxBase):
             meta.append(f"前置：{self.task['deps']}")
         self.metaLabel = CaptionLabel(" · ".join(meta))
         self.metaLabel.setWordWrap(True)
+        # R808：技能要求 / 交付物证据 / 完成审批都是 agent 侧早就在用的字段，
+        # 桌面详情一直只字未提——接手前该知道的「要什么、交什么、谁放行」。
+        self.reqLabel = CaptionLabel(self._requirement_line())
+        self.reqLabel.setWordWrap(True)
+        self.reqLabel.setToolTip(self._requirement_tip())
         self.detailEdit = TextEdit()
         self.detailEdit.setPlaceholderText("这单要做什么、验收标准、卡在哪——接手的人先看这里")
         self.detailEdit.setPlainText((self.task.get("detail") or "").strip())
@@ -1521,20 +1526,65 @@ class TaskDetailDialog(MessageBoxBase):
         self.depsEdit = LineEdit()
         self.depsEdit.setText((self.task.get("deps") or "").strip())
         self.depsEdit.setPlaceholderText("前置任务号，逗号分隔（例如 12,15；清空即取消依赖）")
+        # R809：阻塞原因（R806 已在行内露出）原先只能由 agent 写；等人拍板/等环境
+        # 这类原因恰恰是用户在桌面最清楚的。只对 status=blocked 开放，且不许清空——
+        # «阻塞但没原因» 比不填更糟；解除阻塞仍由 agent 把状态转回待办。
+        self.blockedEdit = None
+        if status == "blocked":
+            self.blockedEdit = LineEdit()
+            self.blockedEdit.setText((self.task.get("blocked_by") or "").strip())
+            self.blockedEdit.setPlaceholderText("阻塞原因（必填，例如：等用户拍板 / 等真机复测）")
         self.hint = CaptionLabel("改完点保存；状态、负责人仍由 agent 流转")
         self.hint.setWordWrap(True)
         self.viewLayout.addWidget(self.titleLabel)
         self.viewLayout.addWidget(self.titleView)
         self.viewLayout.addWidget(self.metaLabel)
+        self.viewLayout.addWidget(self.reqLabel)
         self.viewLayout.addWidget(self.detailEdit)
         self.viewLayout.addWidget(self.dueEdit)
         self.viewLayout.addWidget(self.depsEdit)
+        if self.blockedEdit is not None:
+            self.viewLayout.addWidget(self.blockedEdit)
         self.viewLayout.addWidget(self.hint)
         self.yesButton.setText("保存")
         self.cancelButton.setText("取消")
         self.dueEdit.textChanged.connect(self._check)
         self.depsEdit.textChanged.connect(self._check)
+        if self.blockedEdit is not None:
+            self.blockedEdit.textChanged.connect(self._check)
         self._check()
+
+    @staticmethod
+    def _split_list(value) -> list:
+        return [x.strip() for x in re.split(r"[\n,，;；]+", str(value or "")) if x.strip()]
+
+    def _requirement_line(self) -> str:
+        skills = self._split_list(self.task.get("skills"))
+        dels = self._split_list(self.task.get("deliverables"))
+        bits = ["技能 " + "、".join(skills) if skills else "无技能要求"]
+        bits.append(f"交付物 {len(dels)} 项" if dels else "无交付物")
+        if int(self.task.get("approval_required") or 0):
+            by = (self.task.get("approved_by") or "").strip()
+            bits.append(f"完成需审批（已由 {by} 批准）" if by else "完成需审批（待批准）")
+        else:
+            bits.append("无需审批")
+        return "要求：" + " · ".join(bits)
+
+    def _requirement_tip(self) -> str:
+        skills = self._split_list(self.task.get("skills"))
+        dels = self._split_list(self.task.get("deliverables"))
+        lines = ["技能要求：" + ("、".join(skills) + "（认领时比对 agent 声明，未声明则放行）"
+                                if skills else "未声明（不按技能拦截）")]
+        if dels:
+            lines.append("交付物（标记完成时逐条核验：存在且不早于建任务）：")
+            lines += [f"- {d}" for d in dels]
+        else:
+            lines.append("交付物：未声明（完成时不核验产物）")
+        if int(self.task.get("approval_required") or 0):
+            by = (self.task.get("approved_by") or "").strip()
+            lines.append("完成审批：" + (f"已由 {by} 批准"
+                                     if by else "需他人在管理面批准后才能标记完成"))
+        return "\n".join(lines)
 
     @staticmethod
     def parse_deps(text: str) -> list:
@@ -1566,17 +1616,22 @@ class TaskDetailDialog(MessageBoxBase):
                 err = "前置任务号要写成正整数，用逗号分隔（例如 12,15）"
             elif int(self.task.get("id") or 0) in ids:
                 err = "不能依赖自己"
+        if self.blockedEdit is not None and not self.blockedEdit.text().strip() and not err:
+            err = "阻塞任务必须写明原因；要解除阻塞，请让 agent 把状态转回待办"
         self.hint.setText(err or "改完点保存；状态、负责人仍由 agent 流转")
         self.hint.setStyleSheet(f"color:{tokens.C(tokens.DANGER)};" if err else "")
         self.yesButton.setEnabled(not err)
 
     def values(self) -> dict:
         ids = self.parse_deps(self.depsEdit.text())
-        return {
+        out = {
             "detail": self.detailEdit.toPlainText().strip(),
             "due": self.dueEdit.text().strip(),
             "deps": ",".join(str(i) for i in ids) if ids is not None else self.depsEdit.text().strip(),
         }
+        if self.blockedEdit is not None:
+            out["blocked_by"] = self.blockedEdit.text().strip()
+        return out
 
 
 class ReasonDialog(MessageBoxBase):
