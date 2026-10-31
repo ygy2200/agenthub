@@ -1347,8 +1347,14 @@ def cmd_hook_install(agents=None, apply: bool = False, node: str = "",
     幂等：已在位只报 already；默认预演，--apply 才改（改前自动备份）。
     """
     import core  # noqa: PLC0415
-    names = list(agents or core.HOOK_BRIEF_TARGETS)
-    rows = [core.install_brief_hook(a, apply=apply, node=node) for a in names]
+    names = list(agents or (list(core.HOOK_BRIEF_TARGETS) + ["hermes-cn"]))
+    rows = []
+    for a in names:
+        k = core.agent_key(a) or (a or "").strip().lower()
+        if k in ("hermes", "hermes-cn"):
+            rows.append(core.install_hermes_brief_hook(k, apply=apply, node=node))
+        else:
+            rows.append(core.install_brief_hook(a, apply=apply, node=node))
     if as_json:
         print(json.dumps({"apply": apply, "rows": rows}, ensure_ascii=False))
     else:
@@ -1920,7 +1926,7 @@ def main(argv=None) -> int:
     p_brief.add_argument("--json", action="store_true", dest="as_json",
                          help="输出 {text, project, stats, elapsed_ms} 便于测试/脚本")
     p_hook = _cmd("hook-install",
-                  help="给 claude/codex/workbuddy/dsh 挂大脑简报 SessionStart 钩子（默认预演，幂等）")
+                  help="给 claude/codex/workbuddy/dsh/hermes 挂大脑简报钩子（默认预演，幂等）")
     p_hook.add_argument("agents", nargs="*", help="agent 名；留空=全部已登记的家")
     p_hook.add_argument("--apply", action="store_true", help="真正写入（默认只预演；写前自动备份）")
     p_hook.add_argument("--node", default="", help="node 可执行文件路径（默认自动找 D:/node 或 PATH）")

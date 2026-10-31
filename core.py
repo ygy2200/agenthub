@@ -1305,6 +1305,141 @@ def install_brief_hook(agent: str, apply: bool = False, path: str = "",
     return out
 
 
+# hermes 没有 SessionStart 出口，只有 pre_llm_call（每次模型调用都触发）——
+# 用独立脚本按 session 只注入一次，避免每轮都重复烧上下文（R815）。
+HOOK_BRIEF_HERMES_SCRIPT = "brain_inject_hermes.mjs"
+HOOK_BRIEF_HERMES_TARGETS = (
+    ("hermes-cn", "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"),
+    ("hermes", "~/AppData/Local/hermes/config.yaml"),
+)
+
+
+def _yaml_hook_block(lines: list, event: str):
+    """定位 hooks.<event> 的列表块：返回 (start, end) 插入点（end 为块内最后一行之后）。"""
+    top = next((i for i, ln in enumerate(lines) if ln.rstrip() == "hooks:"), None)
+    if top is None:
+        return None
+    want = f"  {event}:"
+    start = None
+    for i in range(top + 1, len(lines)):
+        ln = lines[i]
+        if ln.strip() and not ln.startswith(" "):
+            break                       # hooks 段结束，没找到该事件
+        if ln.rstrip() == want:
+            start = i
+            break
+    if start is None:
+        return None
+    end = start + 1
+    for i in range(start + 1, len(lines)):
+        ln = lines[i]
+        if not ln.strip():
+            continue
+        indent = len(ln) - len(ln.lstrip(" "))
+        if indent <= 2:
+            break                       # 下一个事件/下一个顶层键
+        end = i + 1
+    return start, end
+
+
+def install_hermes_brief_hook(agent: str = "hermes-cn", apply: bool = False, path: str = "",
+                              node: str = "", install_script: bool = True) -> dict:
+    """给 hermes 的 hooks.pre_llm_call 追加首轮简报注入（幂等；写前备份；YAML 校验）。
+
+    与 JSON 版不同，这里必须做文本插入（codec 不引 pyyaml、也不该为一次安装引入）。
+    有 yaml 模块时用它做「改前可解析、改后多一条且命令正确」的校验，解析失败就回滚。
+    """
+    key = agent_key(agent) or (agent or "").strip().lower()
+    out = {"agent": key, "path": "", "status": "", "command": "", "backup": "",
+           "copied": False}
+    dest = Path.home() / ".agenthub" / "hooks" / HOOK_BRIEF_HERMES_SCRIPT
+    if install_script:
+        src = Path(__file__).with_name(HOOK_BRIEF_HERMES_SCRIPT)
+        if src.is_file():
+            out["copied"] = True
+            if apply:
+                try:
+                    dest.parent.mkdir(parents=True, exist_ok=True)
+                    old = dest.read_bytes() if dest.is_file() else b""
+                    if old != src.read_bytes():
+                        if old:
+                            shutil.copy2(dest, dest.with_name(
+                                dest.name + f".bak-agenthub-{time.strftime('%Y%m%d-%H%M%S')}"))
+                        shutil.copy2(src, dest)
+                except OSError:
+                    out["copied"] = False
+    cfg_s = path
+    if not cfg_s:
+        for name, p in HOOK_BRIEF_HERMES_TARGETS:
+            if agent_key(name) == key:
+                cfg_s = p
+                break
+    if not cfg_s:
+        out["status"] = "unsupported"
+        return out
+    cfg = Path(os.path.expanduser(cfg_s))
+    out["path"] = str(cfg)
+    if not cfg.is_file():
+        out["status"] = "no_config"
+        return out
+    try:
+        text = read_text(cfg)
+    except OSError:
+        out["status"] = "bad_schema"
+        return out
+    if HOOK_BRIEF_HERMES_SCRIPT in text:
+        out["status"] = "already"
+        return out
+    out["command"] = (f'"{node or _hook_node()}" "{dest}" --agent {key}')
+    # 命令自带双引号，YAML 里再用双引号包会解析失败（R815 实测）——改用单引号标量。
+    _q = (f"'{out['command']}'" if "'" not in out["command"]
+          else '"' + out["command"].replace('"', '\\"') + '"')
+    item = [f"    - command: {_q}", "      timeout: 10"]
+    lines = text.splitlines()
+    blk = _yaml_hook_block(lines, "pre_llm_call")
+    if blk is not None:
+        lines = lines[:blk[1]] + item + lines[blk[1]:]
+    else:
+        top = next((i for i, ln in enumerate(lines) if ln.rstrip() == "hooks:"), None)
+        if top is None:
+            lines += ["hooks:", "  pre_llm_call:", *item]
+        else:  # hooks 段在、缺该事件：紧贴段首插入，避免出现第二个 hooks: 键
+            lines = lines[:top + 1] + ["  pre_llm_call:", *item] + lines[top + 1:]
+    new_text = "\n".join(lines) + ("\n" if text.endswith("\n") else "")
+    if not apply:
+        out["status"] = "would_add"
+        return out
+    backup = cfg.with_name(cfg.name + f".bak-agenthub-{time.strftime('%Y%m%d-%H%M%S')}")
+    try:
+        shutil.copy2(cfg, backup)
+        try:  # 有 PyYAML 就做前后结构校验；没有就跳过（保持零依赖运行）
+            import yaml  # noqa: PLC0415
+            try:
+                before = yaml.safe_load(text) or {}
+                after = yaml.safe_load(new_text) or {}
+            except yaml.YAMLError:
+                out["status"] = "bad_schema"   # 原文件坏 / 插入后坏：都不落盘
+                return out
+            want = (after.get("hooks") or {}).get("pre_llm_call") or []
+            had = (before.get("hooks") or {}).get("pre_llm_call") or []
+            ok = (isinstance(want, list) and len(want) == len(had) + 1
+                  and HOOK_BRIEF_HERMES_SCRIPT in json.dumps(want, ensure_ascii=False))
+            if not ok:
+                out["status"] = "bad_schema"
+                return out
+        except ImportError:
+            pass
+        tmp = cfg.with_name(cfg.name + ".tmp-agenthub")
+        tmp.write_text(new_text, encoding="utf-8")
+        os.replace(tmp, cfg)
+    except OSError:
+        out["status"] = "write_failed"
+        return out
+    out["backup"] = str(backup)
+    out["status"] = "added"
+    return out
+
+
 def find_adapter(root: str, agent: str) -> dict:
     """按 agent 名（不区分大小写）找适配器；找不到返回 {}。"""
     want = (agent or "").strip().lower()
