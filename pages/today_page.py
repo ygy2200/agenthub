@@ -75,6 +75,16 @@ class TodayPage(QWidget):
             "工作台", "今天该干什么——可认领按优先级排队，进行中 / 可接管 / 等待依赖或外部阻塞 / 退避 / 延后分段列清；"
                       "标记完成走管理通道（自动归档为成果记录）"))
 
+        # R807：任务一多，「找那一条」只能肉眼扫六段列表；顶部给一个即时筛选框，
+        # 输入即过滤（标题/项目/#编号/负责人/阻塞原因），清空即还原。
+        self.filterEdit = SearchLineEdit()
+        self.filterEdit.setPlaceholderText("筛选任务：标题 / 项目 / #编号 / 负责人 / 阻塞原因")
+        self.filterEdit.setToolTip("输入即筛选，多个关键词用空格分开（同时满足）；点右侧 × 或按 Esc 清空")
+        self.filterEdit.textChanged.connect(lambda *_: self._fill())
+        _esc = QShortcut(QKeySequence("Esc"), self.filterEdit)
+        _esc.activated.connect(self.filterEdit.clear)
+        lay.addWidget(self.filterEdit)
+
         top = QHBoxLayout()
         self.sumLabel = CaptionLabel("")
         self.sumLabel.setWordWrap(True)
@@ -201,10 +211,24 @@ class TodayPage(QWidget):
         # R799：详情/截止日同理——列表只收非终态，但选中态可能滞后于刷新。
         self.detailBtn.setEnabled(bool(t) and t.get("status") not in brain.TASK_TERMINAL)
 
+    def _filter_tokens(self) -> list:
+        """筛选词（R807）：空格分隔多词，全都要命中（AND），大小写不敏感。"""
+        return [w for w in (self.filterEdit.text() or "").lower().split() if w]
+
+    @staticmethod
+    def _match(t: dict, tokens: list) -> bool:
+        hay = " ".join(str(x or "") for x in (
+            f"#{t.get('id')}", t.get("title"), t.get("project"), t.get("owner"),
+            t.get("blocked_by"), t.get("detail"), t.get("deps"))).lower()
+        return all(w in hay for w in tokens)
+
     def _fill(self):
         self.listw.clear()
         self._item2task.clear()
         self.moreBtn.hide()
+        tokens = self._filter_tokens()
+        loaded_total = 0
+        self._match_total = 0
         if not self.win.root:
             self.sumLabel.setText("未配置数据根目录")
             self.digestLine.setText("")
@@ -230,21 +254,43 @@ class TodayPage(QWidget):
         except Exception as e:  # noqa: BLE001  日结失败不该拖垮工作台
             self.digestLine.setText(f"近 24h 日结读取失败：{e}")
         c = nxt["counts"]
+        # R807：先算好每段「加载了多少 / 命中多少」，摘要与分组标题才能说同一口径。
+        loaded_total = sum(len(nxt.get(k) or []) for k in _GROUP_ORDER)
+        visible = {}
+        self._match_total = 0
+        for k in _GROUP_ORDER:
+            items = nxt.get(k) or []
+            if tokens:
+                items = [t for t in items if self._match(t, tokens)]
+                self._match_total += len(items)
+            visible[k] = items
         # 主四段恒显示（0 也显示，便于确认「真的没有」）；退避/延后只在有量时追加，
         # 避免常态下摘要在窄窗换行。R176 前这两组完全不出现在 GUI。
         parts = [self._group_count_label(k, c) for k in _GROUP_ORDER[:4]]
         parts += [f"{brain.TASK_GROUP_CN[k]} {c[k]}" for k in _GROUP_ORDER[4:] if c.get(k)]
-        self.sumLabel.setText(" · ".join(parts))
+        summary = " · ".join(parts)
+        if tokens:
+            total_all = sum(int(c.get(k) or 0) for k in _GROUP_ORDER)
+            scope = (f"{self._match_total}/{loaded_total}（已加载）"
+                     if total_all > loaded_total else str(self._match_total))
+            summary += f" · 筛选命中 {scope}"
+        self.sumLabel.setText(summary)
         hidden_n = 0
         for key in _GROUP_ORDER:
-            items = nxt.get(key) or []
-            if not items:
+            all_items = nxt.get(key) or []
+            if not all_items:
                 continue
             total = int(c.get(key) or 0)
-            shown = len(items)
+            shown = len(all_items)
             if total > shown:
                 hidden_n += total - shown
-            label = f"{total}，显示前 {shown}" if total > shown else str(total)
+            items = visible[key]
+            if tokens:
+                if not items:
+                    continue
+                label = f"匹配 {len(items)} · 共 {total}" + ("（仅查已加载）" if total > shown else "")
+            else:
+                label = f"{total}，显示前 {shown}" if total > shown else str(total)
             head = QListWidgetItem(f"── {self._group_head_name(key, items)}（{label}）")
             head.setFlags(Qt.ItemFlag.NoItemFlags)  # 分组标题不可选
             f = head.font()
@@ -281,6 +327,11 @@ class TodayPage(QWidget):
                 it.setToolTip(self._task_tip(t, key, title))
                 self._item2task[id(it)] = t
                 self.listw.addItem(it)
+        if tokens and loaded_total and not self._match_total:
+            miss = QListWidgetItem(f"── 没有匹配「{self.filterEdit.text().strip()}」的任务"
+                                   "——换关键词，或点右侧 × 清空筛选")
+            miss.setFlags(Qt.ItemFlag.NoItemFlags)
+            self.listw.addItem(miss)
         if hidden_n:
             capped = self._page_limit >= _PAGE_MAX
             self.moreBtn.setVisible(True)
