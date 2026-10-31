@@ -63,7 +63,7 @@ class HelpPage(QWidget):
     <h2>各页面怎么用</h2>
     <ul>
     <li><b>总览</b>：今天谁在干活、待处理数量、agent 阵容与当前活跃会话，一眼全局。</li>
-    <li><b>工作台</b>：任务前沿（可认领/进行中/阻塞/等待）与近 24h 团队日结（风险与首要建议），可在桌面新建任务、标记完成、记录失败重试、取消、调优先级、补详情/截止日/前置依赖（认领仍由 agent 做，桌面端不代理 agent 身份）。</li>
+    <li><b>工作台</b>：任务前沿（可认领/进行中/阻塞/等待）与近 24h 团队日结（风险与首要建议），可在桌面新建任务、标记完成、记录失败重试、取消、调优先级、补详情/截止日/前置依赖、补改阻塞原因，顶部可即时筛选（标题/项目/#编号/负责人/阻塞原因）；任务详情里还能看到技能要求、交付物与完成审批（认领仍由 agent 做，桌面端不代理 agent 身份）。</li>
     <li><b>信号中心</b>：agent 之间的广播与提醒（开工/撞车/交接），未读集中处理，可回复或标记已读。</li>
     <li><b>编排中心</b>：把多步工作编排成流程（触发器 / 图谱 / 跑一次 / 断点续跑），适合重复性交付。</li>
     <li><b>随记</b>：主人第一人称的想法/顿悟（Ctrl+Alt+N 随时记），与工作记忆分层但检索互通。</li>
@@ -110,7 +110,7 @@ class HelpPage(QWidget):
     <li><code>python cli.py doctor [--full]</code>：一键自检（与设置页那颗按钮同一套检查）；默认精简输出，<code>--full</code> 展开完整修复口径</li>
     <li><code>python cli.py doctor --json</code> / <code>--only a,b</code> / <code>--skip a</code> / <code>--no-machine</code> / <code>--slow 8</code>：单行 JSON 给脚本读、只跑白名单项、跳过某项、摘掉与根目录无关的机器级项、强制列出耗时榜</li>
     <li><code>python cli.py check --list</code> / <code>python cli.py check deploy_diff --target 目录</code>：自检清单之外的单项检查（回归、部署一致性等）从这里进；需要 target 的项不会给你默认值，填错目录直接是用法错误退出码，不会被当成「检查发现问题」</li>
-    <li><code>python cli.py next --agent 名字</code>：按优先级看待认领 / 进行中 / 等待依赖</li>
+    <li><code>python cli.py next --agent 名字</code>：按优先级看待认领 / 进行中 / 等待中（等前置任务或外部阻塞，原因随行给出）</li>
     <li><code>python cli.py deploy</code> / <code>python cli.py release</code>：部署 MCP server（部署后自动跑一致性校验，不一致非零退出）/ 发布一致性检查</li>
     <li><code>python tools/real_walkthrough.py 根目录 dark --size 920x600 --pages stats_page</code>：
     最小窗真实库截图走查（<code>--pages</code> 只拍指定页）</li>
