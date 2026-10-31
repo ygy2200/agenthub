@@ -12,6 +12,8 @@ sys.path.insert(0, str(ROOT))
 sys.path.insert(0, str(ROOT / "tests" / "gui"))
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+import _console  # noqa: E402,F401  统一 UTF-8 控制台（R222）
+
 from PySide6.QtWidgets import QApplication, QLabel  # noqa: E402
 
 import window  # noqa: E402
