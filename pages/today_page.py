@@ -506,9 +506,9 @@ class TodayPage(QWidget):
         if not dlg.exec():
             return
         v = dlg.values()
-        self.save_details(v["detail"], v["due"], v.get("deps"))
+        self.save_details(v["detail"], v["due"], v.get("deps"), v.get("blocked_by"))
 
-    def save_details(self, detail, due, deps=None):
+    def save_details(self, detail, due, deps=None, blocked_by=None):
         """保存详情/截止日/依赖（R799/R805）：只写变化的字段，清空落库成空（brain 认 "-"）。
 
         对话框与用例共用同一入口；空 agent＝管理面，别人持有的任务也能补说明。
@@ -524,6 +524,7 @@ class TodayPage(QWidget):
         detail = (detail or "").strip()
         due = (due or "").strip()
         deps = None if deps is None else (deps or "").strip()
+        blocked_by = None if blocked_by is None else (blocked_by or "").strip()
         changed = {}
         if detail != (t.get("detail") or "").strip():
             changed["detail"] = detail or "-"
@@ -531,6 +532,12 @@ class TodayPage(QWidget):
             changed["due"] = due or "-"
         if deps is not None and deps != (t.get("deps") or "").strip():
             changed["deps"] = deps or "-"
+        if blocked_by is not None and blocked_by != (t.get("blocked_by") or "").strip():
+            if not blocked_by:
+                InfoBar.warning("阻塞原因不能为空",
+                                "要解除阻塞，请让 agent 把任务状态转回待办", parent=self)
+                return
+            changed["blocked_by"] = blocked_by
         if not changed:
             InfoBar.info("没有改动", f"#{t['id']} 的详情、截止日与依赖都没变",
                          duration=2000, parent=self)
@@ -550,6 +557,8 @@ class TodayPage(QWidget):
             bits.append(f"截止 {due}" if due else "截止日已清空")
         if "deps" in changed:
             bits.append(f"前置 {deps}" if deps else "前置依赖已清空")
+        if "blocked_by" in changed:
+            bits.append("阻塞原因已更新")
         InfoBar.success("任务已更新", f"#{t['id']} " + "，".join(bits),
                         duration=2500, parent=self)
         self.reload()
