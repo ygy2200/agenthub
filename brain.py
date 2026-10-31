@@ -7637,6 +7637,171 @@ def get_progress(root: str, limit: int = 30) -> list:
             "ORDER BY date DESC, id DESC LIMIT ?", (max(1, min(limit, 200)),))]
 
 
+# ---------------------------------------------------------------- 会话简报（R811）
+
+BRIEF_MAX_CHARS = 3600
+
+
+def _brief_oneline(text: str, limit: int) -> str:
+    s = " ".join((text or "").split())
+    return s if len(s) <= limit else s[: max(1, limit - 1)] + "…"
+
+
+def _brief_title(text: str) -> str:
+    """记录标题去掉「2026-10-30（qoder）· 」前缀——日期与作者已在行尾列出，重复只占预算。"""
+    raw = (text or "").strip()
+    return re.sub(r"^\d{4}-\d{2}-\d{2}(?:（[^）]*）)?(?:\s*[·:：\-]\s*|\s*$)", "", raw)
+
+
+def infer_project_from_cwd(root: str, cwd: str) -> str:
+    """从工作目录推断项目：目录位于大脑根下、首段是已登记项目时才认，其余返回 ""。
+
+    只认已登记项目——路径里随手一段目录名不等于项目，猜错会让简报把别人的
+    记忆推到当前会话（比不给更糟）。
+    """
+    if not root or not cwd:
+        return ""
+    try:
+        rel = Path(cwd).resolve().relative_to(Path(root).resolve())
+    except (OSError, ValueError):
+        return ""
+    if not rel.parts:
+        return ""
+    name = rel.parts[0]
+    if name.startswith(("_", ".")) or name in ("00_Inbox", "99_Archive"):
+        return ""
+    try:
+        return name if project_exists(root, name) else ""
+    except sqlite3.Error:
+        return ""
+
+
+def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
+                  max_chars: int = BRIEF_MAX_CHARS) -> dict:
+    """会话启动简报：无需用户提醒，AI 一开局就看到的上下文快照。
+
+    给 SessionStart 钩子与 hub_brief 共用。只读、失败不抛（钩子必须 fail-open），
+    整体有字符预算——注入的长上下文会挤掉真正的工作内容，简报只负责「知道去哪查」。
+
+    返回 {"text", "project", "truncated", "elapsed_ms", "stats"}；空根目录返回空 text。
+    """
+    t0 = time.time()
+    out = {"text": "", "project": "", "truncated": False, "elapsed_ms": 0,
+           "stats": {}}
+    if not root or not os.path.isdir(root):
+        return out
+    try:
+        who = _norm_agent(agent) or (agent or "").strip()
+        pname = (project or "").strip() or infer_project_from_cwd(root, cwd)
+        now = datetime.datetime.now()
+        with db_conn(root) as conn:
+            n_proj = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
+            n_rec = conn.execute("SELECT COUNT(*) FROM records WHERE status='active'").fetchone()[0]
+            n_mem = conn.execute("SELECT COUNT(*) FROM memories WHERE " + _live_sql()).fetchone()[0]
+            pinned = [dict(r) for r in conn.execute(
+                "SELECT id,kind,content FROM memories WHERE " + _live_sql()
+                + " AND pinned=1 ORDER BY updated DESC, id DESC LIMIT 3")]
+            proj = None
+            proj_recs, proj_mem = [], []
+            if pname:
+                proj = conn.execute(
+                    "SELECT name, (SELECT MAX(date) FROM records WHERE project=? AND status='active') AS last_active,"
+                    " (SELECT COUNT(*) FROM records WHERE project=? AND status='active') AS n_records"
+                    " FROM projects WHERE name=?", (pname, pname, pname)).fetchone()
+                if not proj:
+                    pname = ""
+                else:
+                    proj = dict(proj)
+                    proj_recs = [dict(r) for r in conn.execute(
+                        "SELECT date,agent,title,content FROM records WHERE project=? AND status='active'"
+                        " ORDER BY date DESC, id DESC LIMIT 2", (pname,))]
+                    like = f"%{_like_escape(pname)}%"
+                    proj_mem = [dict(r) for r in conn.execute(
+                        "SELECT id,kind,content FROM memories WHERE " + _live_sql()
+                        + " AND (project=? OR tags LIKE ? ESCAPE '\\' OR content LIKE ? ESCAPE '\\')"
+                        " ORDER BY pinned DESC, updated DESC, id DESC LIMIT 4",
+                        (pname, like, like))]
+        progress = recent_diverse(root, 5, pool=120)
+        seen: set = set()
+        sig = signal_unread_breakdown(root, who) if who else {"fresh": 0, "stale": 0, "total": 0}
+        sig_rows = []
+        if who and sig["fresh"]:
+            sig_rows = [r for r in signal_inbox(root, who, unread_only=True, limit=6,
+                                                exclude_stale=True)
+                        if (r.get("from_agent") or "") != who][:2]
+        tasks = task_next(root, owner=who, limit=2) if who else {"counts": {}}
+        tcounts = tasks.get("counts") or {}
+
+        lines = [f"【AgentHub 大脑简报 · 会话启动自动生成 · {who or '未署名'} · "
+                 f"{now:%Y-%m-%d %H:%M}】",
+                 f"根目录 {root} ｜ {n_proj} 项目 · {n_rec} 条活跃记录 · {n_mem} 条记忆",
+                 "（这份简报由 SessionStart 钩子自动注入，无需用户提醒；细节按下面入口再查，别凭空开工）"]
+        if progress:
+            lines.append("")
+            lines.append("▸ 团队最近进展")
+            for r in progress:
+                head = _brief_title(r["title"]) or record_outline(r.get("content", ""))
+                lines.append(f"- [{_brief_oneline(r['project'], 26)}] "
+                             f"{_brief_oneline(head, 42)}"
+                             f"（{r['agent'] or '其他'} · {r['date']}）")
+        if pname and proj:
+            lines.append("")
+            lines.append(f"▸ 当前项目：{pname}")
+            lines.append(f"  {proj['n_records']} 条活跃记录，最近 {proj['last_active'] or '—'}；"
+                         f"开工前先看最近记录再动手。")
+            for r in proj_recs:
+                head = _brief_title(r["title"]) or record_outline(r.get("content", ""))
+                lines.append(f"  - {_brief_oneline(head, 40)}"
+                             f"（{r['agent'] or '其他'} · {r['date']}）")
+            seen = set()
+            for m in proj_mem:
+                if m["id"] in seen:
+                    continue
+                seen.add(m["id"])
+                lines.append(f"  · #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 90)}")
+            if proj_recs or proj_mem:
+                lines.append(f"  更多：hub_memory_read(query=\"{pname} 关键词\") / hub_search(keyword=…)")
+        if pinned:
+            lines.append("")
+            lines.append("▸ 置顶记忆（主人/团队重点）")
+            for m in pinned:
+                if m["id"] in seen:
+                    continue
+                lines.append(f"- #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 110)}")
+        todo = []
+        if sig["fresh"]:
+            todo.append(f"- 未读信号 {sig['fresh']} 条"
+                        + (f"（另有陈旧 {sig['stale']} 条）" if sig["stale"] else ""))
+            for r in sig_rows:
+                todo.append(f"  · 来自 {r.get('from_agent') or '广播'}：{_brief_oneline(r.get('content'), 70)}")
+            todo.append("  处理：hub_signals() 看全量，读完 hub_signal_read")
+        for t in (tasks.get("doing") or [])[:2]:
+            todo.append(f"- 我在办 #{t['id']} {_brief_oneline(t.get('title'), 40)}"
+                        f"（{t.get('status')}）")
+        if tcounts.get("ready"):
+            todo.append(f"- 可认领 {tcounts['ready']} 条：hub_next(agent=\"{who}\")")
+        if todo:
+            lines.append("")
+            lines.append("▸ 待你处理")
+            lines.extend(todo)
+        lines.append("")
+        lines.append("▸ 收工约定")
+        lines.append("- hub_log_work(project, agent, content)：目的/做了什么/验证结果/如何回滚；"
+                     "有跨会话价值的知识再 hub_memory_write；收尾 hub_ops_run 自检。"
+                     "钩子会拦截「干了活却没记录」。")
+        text = "\n".join(lines)
+        truncated = len(text) > max_chars
+        if truncated:
+            text = text[: max_chars - 24].rstrip() + "\n…（简报超预算，已截断）"
+        out.update({"text": text, "project": pname, "truncated": truncated,
+                    "elapsed_ms": int((time.time() - t0) * 1000),
+                    "stats": {"projects": n_proj, "records": n_rec, "memories": n_mem,
+                              "unread": sig["fresh"], "ready": tcounts.get("ready", 0)}})
+        return out
+    except (sqlite3.Error, OSError, ValueError):
+        return out
+
+
 def search_tasks(root: str, kw: str, limit: int = 20) -> list:
     """任务检索（多词 AND）：标题/详情/项目/负责人/最近错误任一字段命中。
     排序：在办 → 阻塞 → 待办 → 完成 → 终态，同状态按优先级与 id。"""

@@ -1244,7 +1244,7 @@ MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # 此前两份清单各写各的（core 这份没有 api.py），结果「检查说一致、实际没部署」——
 # 2026-10-13 release playbook 实跑时 deploy_diff 抓到 api.py 不一致，根因即此。
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
-                "api.py", "my/__init__.py", "my/work/__init__.py")
+                "api.py", "brain_brief.py", "my/__init__.py", "my/work/__init__.py")
 
 
 def find_python() -> str:

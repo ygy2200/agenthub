@@ -223,7 +223,8 @@ SERVER_INFO = {"name": "agenthub", "version": "2.41.173"}  # .193=R806 工作台
 # MCP 2024-11-05 initialize 的 instructions 字段：客户端握手即可拿到「开工/收工」最小作业规程，
 # 不必先读 77 个工具描述。只写主干与路由，细节仍由各工具描述/hub_help 承担（防两套口径漂移）。
 SERVER_INSTRUCTIONS = (
-    "AgentHub 是多个 agent 共享的大脑（记录/记忆/项目/体检）。开工先 hub_get_progress(limit=15) "
+    "AgentHub 是多个 agent 共享的大脑（记录/记忆/项目/体检）。会话启动时钩子会注入大脑简报；"
+    "若没看到自动简报，先 hub_brief() 再开工，别等用户提醒。开工还要 hub_get_progress(limit=15) "
     "对齐团队进度；查背景用 hub_memory_read(query=具体关键词) 或 hub_search，重要结论用 hub_get_record 精读。"
     "收工必做三步：① hub_log_work(project, agent, content)，content 含目的/做了什么/验证结果/如何回滚；"
     "② 有跨会话价值的知识 hub_memory_write(content, kind, tags)；③ hub_ops_run 自检。"
@@ -234,7 +235,8 @@ SERVER_INSTRUCTIONS = (
 )
 HELP_TOPICS = {
     "start": (
-        "开工：hub_heartbeat(project, agent) 先报到（同项目撞车预警 + 相关记忆自动推送）；"
+        "开工：会话启动钩子会自动注入大脑简报（团队进展/项目记忆/未读信号/我的任务）；"
+        "没看到或中途接手，先 hub_brief(cwd=...) 刷新；hub_heartbeat(project, agent) 先报到（同项目撞车预警 + 相关记忆自动推送）。",
         "hub_get_progress(limit=15) 看团队进度；hub_memory_read(query=\"项目名 具体词\") 查背景。",
         "干活：hub_log_work(project, agent, content)——content 四段式：目的/做了什么/验证结果/如何回滚。",
         "收工：hub_memory_write 沉淀跨会话知识（kind=fact/lesson/project/preference）；hub_ops_run 自检。",
@@ -4249,6 +4251,22 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
         lines += [f"  {d}" for d in r.get("detail", [])[:8]]
         return "\n".join(lines)
 
+    if name == "hub_brief":
+        # R811：与会话启动注入同一份内容（brain.session_brief），避免「钩子看到的」与
+        # 「agent 主动刷到的」两套口径。空根目录不报错——返回一句可执行的下一步。
+        try:
+            budget = int(arguments.get("max_chars", brain.BRIEF_MAX_CHARS))
+        except (TypeError, ValueError):
+            budget = brain.BRIEF_MAX_CHARS
+        budget = max(400, min(budget, 8000))
+        res = brain.session_brief(root, agent=str(arguments.get("agent", "")),
+                                  cwd=str(arguments.get("cwd", "") or ""),
+                                  project=str(arguments.get("project", "") or ""),
+                                  max_chars=budget)
+        return res["text"] or (
+            f"（未生成简报：根目录不可用或数据库未初始化：{root or '未设置'}。"
+            f"先 python cli.py init --root <目录> 或 python cli.py doctor）")
+
     if name == "hub_get_progress":
         try:
             limit = int(arguments.get("limit", 30))
@@ -4914,6 +4932,10 @@ TOOLS = [
                      "required": ["record_id"]}},
     {"name": "hub_get_progress", "description": "获取所有 agent 最近的工作时间线（进度对齐）。开工三连之一：看别人在干什么、防止撞车；limit 控制条数。例：hub_get_progress(limit=15)",
      "inputSchema": {"type": "object", "properties": {"limit": {"type": "integer", "description": "条数，默认30"}}}},
+    {"name": "hub_brief", "description": "会话简报（开工自动对齐）：一次拿到团队最近进展、当前项目相关记录与记忆、置顶记忆、未读信号、我的任务；带字符预算。SessionStart 钩子会自动注入同一份内容——中途刷新或换项目时再调。例：hub_brief(cwd=\"D:/.../项目目录\")",
+     "inputSchema": {"type": "object", "properties": {
+         "cwd": {"type": "string", "description": "工作目录（位于大脑根下的项目目录时自动关联项目）"},
+         "project": {"type": "string", "description": "显式指定项目（优先于 cwd 推断）"}}}},
     {"name": "hub_status",
      "description": "大脑状态：view=now（默认）看谁在线/活跃项目/今日变更/未关闭错误/待办；view=digest 看近 N 天日结——流动、风险（租约/审批/死信/错误/零命中/越权拦截）、按 agent 记分卡与建议；view=security 看近 N 天越权拦截明细（按工具聚合、区分未锁身份/角色越权）。开工对齐用 now；复盘/交接用 digest；安全巡检用 security。例：hub_status() / hub_status(view=\"digest\", days=7) / hub_status(view=\"security\")",
      "inputSchema": {"type": "object",
@@ -5518,7 +5540,7 @@ def _fmt_playbook_run(res: dict) -> str:
 # ---------------------------------------------------------------- P3-1 profile 切片 / 写工具清单
 
 # 任何 profile 都可见的最小面（hub_help 是发现入口）
-PROFILE_ALWAYS = ("hub_help", "hub_status", "hub_heartbeat")
+PROFILE_ALWAYS = ("hub_help", "hub_status", "hub_heartbeat", "hub_brief")
 # reader：最小只读切片（约 3~8 个：总览/检索/精读/规范/发现）
 PROFILE_READER = PROFILE_ALWAYS + ("hub_get_rules", "hub_search", "hub_get_record",
                                    "hub_search_tools")

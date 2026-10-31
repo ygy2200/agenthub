@@ -1322,6 +1322,24 @@ def cmd_next(root: str, project: str = "", agent: str = "", limit: int = 5,
     return 0
 
 
+def cmd_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
+              max_chars: int = 0, as_json: bool = False) -> int:
+    """会话简报（headless）：SessionStart 钩子注入的同一份内容，便于手工刷新与回归。"""
+    import brain  # noqa: PLC0415
+    agent = (agent or os.environ.get("AGENTHUB_AGENT", "") or "").strip()
+    cwd = cwd or os.getcwd()
+    res = brain.session_brief(root, agent=agent, cwd=cwd, project=project,
+                              **({"max_chars": max_chars} if max_chars > 0 else {}))
+    if as_json:
+        print(json.dumps({"ok": bool(res["text"]), **res}, ensure_ascii=False))
+        return 0 if res["text"] else 1
+    if not res["text"]:
+        print(f"（未生成简报：根目录无效或数据库不可读：{root or '未设置'}）")
+        return 1
+    print(res["text"])
+    return 0
+
+
 def cmd_claim(root: str, task_id, agent: str) -> int:
     """认领任务（原子；前置未完成/被他人持有会明确拒绝）。"""
     import brain  # noqa: PLC0415
@@ -1866,6 +1884,13 @@ def main(argv=None) -> int:
     p_next.add_argument("--limit", type=int, default=5, help="每组最多几条，默认 5")
     p_next.add_argument("--json", action="store_true", dest="as_json",
                         help="机器可读输出（counts + 六组任务原样字段）")
+    p_brief = _cmd("brief", help="会话简报（进度/项目/置顶记忆/未读信号/我的任务；SessionStart 钩子同源）")
+    p_brief.add_argument("--agent", default="", help="本次会话的 agent 名（默认取 AGENTHUB_AGENT 或 PATH 猜测）")
+    p_brief.add_argument("--cwd", default="", help="工作目录；位于大脑根下的项目目录时自动关联项目")
+    p_brief.add_argument("--project", default="", help="显式指定项目（优先于 --cwd 推断）")
+    p_brief.add_argument("--max-chars", type=int, default=0, help="字符预算，默认 3600")
+    p_brief.add_argument("--json", action="store_true", dest="as_json",
+                         help="输出 {text, project, stats, elapsed_ms} 便于测试/脚本")
     p_claim = _cmd("claim", help="认领任务（原子；前置未完成会拒绝）")
     p_claim.add_argument("task_id", type=int)
     p_claim.add_argument("--agent", required=True)
@@ -2031,6 +2056,9 @@ def main(argv=None) -> int:
         if args.cmd == "next":
             return cmd_next(root, args.project, args.agent, args.limit,
                             as_json=args.as_json)
+        if args.cmd == "brief":
+            return cmd_brief(root, args.agent, args.cwd, args.project,
+                             args.max_chars, as_json=args.as_json)
         if args.cmd == "claim":
             return cmd_claim(root, args.task_id, args.agent)
         if args.cmd == "update":

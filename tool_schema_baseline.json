@@ -57,6 +57,14 @@
   },
   "required": []
  },
+ "hub_brief": {
+  "props": {
+   "cwd": "string",
+   "max_chars": "integer",
+   "project": "string"
+  },
+  "required": []
+ },
  "hub_call_tool": {
   "props": {
    "arguments": "object",
@@ -754,6 +762,20 @@
   },
   "required": []
  },
+ "hub_task_reject": {
+  "props": {
+   "agent": "string",
+   "confirm": "boolean",
+   "dry_run": "boolean",
+   "max_chars": "integer",
+   "reason": "string",
+   "task_id": "integer"
+  },
+  "required": [
+   "task_id",
+   "reason"
+  ]
+ },
  "hub_task_retry": {
   "props": {
    "agent": "string",
@@ -873,19 +895,5 @@
    "scope_value": "string"
   },
   "required": []
- },
- "hub_task_reject": {
-  "props": {
-   "task_id": "integer",
-   "reason": "string",
-   "agent": "string",
-   "max_chars": "integer",
-   "dry_run": "boolean",
-   "confirm": "boolean"
-  },
-  "required": [
-   "task_id",
-   "reason"
-  ]
  }
 }

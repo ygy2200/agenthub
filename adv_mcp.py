@@ -276,7 +276,7 @@ def t_protocol(root):
             "hub_skill_match", "hub_skill_sync"} <= names, names
     # 工具数守卫：数字每变一次都要**显式改这里并说明**——它是「工具面无声膨胀」的闸门
     # （与 ops 检查项 profile_surface 的被动上下文预算互为补充：那个看体积，这个看个数）
-    assert len(names) == 79  # ...；79=+hub_task_reject（R100：审批退回——four-eyes 闭环的「不通过」出口）；78=+hub_freeze（R48：全局写入冻结——事故止损先停写，读面照常）；77=+hub_task_approve（R45：完成审批 four-eyes）；76=+hub_task_retry（R42/R43：失败重试指数退避 + 死信复活——失败不是静默消失）；75=+hub_task_quality（R40：完成质量体检——done 不只是状态，还要看关得扎不扎实）；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
+    assert len(names) == 80  # ...；80=+hub_brief（R811：会话启动简报——把开工上下文直接送到会话，不再靠提醒）；79=+hub_task_reject（R100：审批退回——four-eyes 闭环的「不通过」出口）；78=+hub_freeze（R48：全局写入冻结——事故止损先停写，读面照常）；77=+hub_task_approve（R45：完成审批 four-eyes）；76=+hub_task_retry（R42/R43：失败重试指数退避 + 死信复活——失败不是静默消失）；75=+hub_task_quality（R40：完成质量体检——done 不只是状态，还要看关得扎不扎实）；72=+hub_agent（2026-10-20 R6：接入状态机——七项核对+验证快照，「装上了」与「真接上」不再是同一句话）；73=+hub_memory_confirm（第五轮 R2：记忆复核闭环——stale 从「只标注」到「可确认」，不重写 updated）；74=+hub_lock（R11：文件租约——任务租约防撞任务，文件租约防撞文件）
     # 未知方法
     msg = m.handle_message(rpc("no/such"), str(root))
     assert msg["error"]["code"] == -32601
@@ -303,7 +303,7 @@ def t_initialize_instructions(root):
     ins = r.get("instructions")
     assert isinstance(ins, str) and ins.strip(), f"initialize 缺少 instructions：{r.keys()}"
     assert len(ins) <= 900, f"instructions 超预算：{len(ins)} 字符"
-    must = ["hub_get_progress", "hub_memory_read", "hub_log_work", "hub_memory_write",
+    must = ["hub_brief", "hub_get_progress", "hub_memory_read", "hub_log_work", "hub_memory_write",
             "hub_ops_run", "hub_memory_confirm", "hub_memory_supersede",
             "hub_search_tools", "hub_call_tool", "hub_report_error"]
     missing = [t for t in must if t not in ins]
@@ -5673,7 +5673,7 @@ def main():
     build_hub(root)
     print(f"临时目录：{tmp}\n")
     case("交接协议工具（create/list/claim/重复认领拒绝/空态）", lambda: t_handoff_tool(root))
-    case("MCP协议（握手/78工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
+    case("MCP协议（握手/80工具/未知方法/异常自动登记/ping）", lambda: t_protocol(root))
     case("R4·初始化说明渐进披露（instructions 非空/核心流程覆盖/无幽灵工具名/单段预算内）",
          lambda: t_initialize_instructions(root))
     case("isError 正确性（成功=False / 缺参·未知工具·claim缺agent=True）", lambda: t_iserror_correctness(root))
