@@ -501,12 +501,21 @@ def t_plasticity(tmp):
     assert rows[0]["id"] == les_id, rows[0]
     assert sum(1 for r in rows if r["pinned"] == 1) <= 3, [r["id"] for r in rows]
     assert all("无关项目记忆" not in r["content"] for r in rows)
-    assert by_id[les_id]["use_count"] == 1 and by_id[les_id]["last_hit"], by_id[les_id]
+    # R829：推送记的是曝光（inject_count/last_inject），不再是唤起——被推出去不等于被用上
+    assert by_id[les_id]["use_count"] == 0, by_id[les_id]
+    assert by_id[les_id]["inject_count"] == 1 and by_id[les_id]["last_inject"], by_id[les_id]
     again = brain.recall_for(root, "可塑项目")
     by_id2 = {r["id"]: r for r in again}
-    assert by_id2[les_id]["use_count"] == by_id[les_id]["use_count"] + 1, by_id2[les_id]
-    assert by_id2[pin_id]["use_count"] == by_id[pin_id]["use_count"] + 1, by_id2[pin_id]
-    assert all(r["last_hit"] for r in by_id2.values())
+    assert (by_id2[les_id]["inject_count"] == by_id[les_id]["inject_count"] + 1
+            and by_id2[pin_id]["inject_count"] == by_id[pin_id]["inject_count"] + 1), by_id2
+    assert all(r["inject_count"] > 0 for r in by_id2.values())
+    # 被动推送不碰主动检索时间戳。口径要限定在本用例自己写的两条上：tmp hub 是
+    # 多用例共用的，by_id2 里会混进别的用例早已主动检索命中过的记忆（last_hit
+    # 本来就非空），拿「全空」当判据测的是邻居用例的脏数据，不是推送的语义。
+    assert not by_id2[les_id]["last_hit"] and not by_id2[pin_id]["last_hit"], by_id2
+    hits_before = {r["id"]: r["last_hit"] for r in by_id.values()}
+    assert all(hits_before[i] == by_id2[i]["last_hit"] for i in hits_before if i in by_id2), \
+        "被动推送改写了主动检索时间戳"
     # 免推窗口：同 agent+project 窗口内不重推；换 agent / 换项目不受影响
     brain.heartbeat_touch(root, "推送Robot", "可塑项目")
     assert brain.should_push(root, "推送Robot", "可塑项目") is False
@@ -967,13 +976,14 @@ def t_recall_blindspots(tmp):
     root = str(Path(tmp) / "hub_bs")
     Path(root).mkdir()  # 独立临时 hub：init_db 不建根目录（约定），先手工建
     assert brain.init_db(root) == ""
-    # ① 项目层轮换：同项目两条记忆，一条 5 次唤起一条零唤起——零唤起优先曝光
+    # ① 项目层轮换：同项目两条记忆，一条推过 5 次一条从没推过——零曝光优先（R829 起
+    # 轮换读 inject_count：推送不再改 use_count，若仍按唤起排就永远卡在同一批）
     hot = brain.add_memory(root, "热点记忆甲", kind="lesson", project="轮换项目", agent="X")
     cold = brain.add_memory(root, "冷门记忆乙", kind="lesson", project="轮换项目", agent="X")
     with brain.db_conn(root) as conn:
-        conn.execute("UPDATE memories SET use_count=5 WHERE id=?", (hot,))
+        conn.execute("UPDATE memories SET inject_count=5 WHERE id=?", (hot,))
     rows = brain.recall_for(root, "轮换项目", agent="rot1")
-    assert rows[0]["id"] == cold, [(r["id"], r["use_count"]) for r in rows]
+    assert rows[0]["id"] == cold, [(r["id"], r["inject_count"]) for r in rows]
     # ② 全局记忆联想：project 空、不置顶的全局 lesson 靠语义命中被想起
     g = brain.add_memory(root, "GitBash转义反斜杠坑多层转义", kind="lesson", agent="X")
     brain.add_record(root, "轮换项目", "X", brain._now()[:10], "t",

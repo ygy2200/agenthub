@@ -90,7 +90,7 @@ class BrainPage(QWidget):
         # 整段推到首屏之外；前 5 条足以判断推送质量，需要时一键展开全部。
         lay.addSpacing(16)
         _topHead = QHBoxLayout()
-        _topHeadWidget = section_head("记忆唤起排行（开工推送反射弧记数）", "VIEW")
+        _topHeadWidget = section_head("记忆曝光排行（推了几次 / 证实采了几次）", "VIEW")
         self._section_heads["top"] = _topHeadWidget
         _topHead.addWidget(_topHeadWidget, 1)  # stretch 给标题：guard_overflow 把它设 Ignored 后，
         # 无 stretch 的行只会按 0 宽分配（实测标题只剩 6 个字）；stretch 让它吃满剩余宽度。
@@ -397,14 +397,18 @@ class BrainPage(QWidget):
         self._clear(self.topBox)
         shown = tops if self._top_expanded else tops[:5]
         for m in shown:
-            self.topBox.addWidget(self._mem_row(f"#{m['id']} ×{m['use_count']}", m))
+            # R829：两个数分开摆——「推了几次」是曝光，「采了几次」是事后指纹证实真被用上。
+            # 旧写法 ×use_count 把两者混为一谈，实测 #9 靠每次心跳被推 84 次霸榜、真采纳 0。
+            self.topBox.addWidget(self._mem_row(
+                f"#{m['id']} 推{int(m.get('inject_count') or 0)}·采{int(m.get('adopt_count') or 0)}",
+                m))
         self.topToggle.setVisible(len(tops) > 5)
         self.topToggle.setText(
             "收起" if self._top_expanded else f"展开全部 {len(tops)} 条")
         if not tops:
             self.topBox.addWidget(empty_state(
-                "HISTORY", "还没有记忆被唤起",
-                "agent 每次开工报到时会自动推送相关记忆；这里累计被推送的次数"))
+                "HISTORY", "还没有记忆被推送过",
+                "agent 每次开工报到时会自动推送相关记忆；这里累计被推送/被证实采纳的次数"))
 
     @staticmethod
     def _clear(box):

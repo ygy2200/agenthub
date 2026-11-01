@@ -41,6 +41,67 @@ def test_delete_memory_follows_selection(qapp, hub_root):
         w.hide()
 
 
+def test_deferred_scan_keeps_selection(qapp, hub_root):
+    """后台探测完成重填列表时，不许把用户正选中的那条抢走（R829 撞到的竞态）。
+
+    真机路径：`rescan()` 起 FnWorker 探 agent，回调 `_on_scan` → `fill_memories()` →
+    `clear()` 把当前项置空 → 按 R784 收回动作按钮。回调什么时候到达取决于机器负载，
+    所以本文件上面两条用例在满负载时会红（HEAD 实测复现，与 R829 的分账改动无关）。
+    这里手动走同一条路把时序钉死，不靠 sleep 赌运气。
+    """
+    import brain
+    from helpers import boot_window, settle
+
+    brain.init_db(hub_root)
+    mid = brain.add_memory(hub_root, "R829 后台重填时要保住选中", agent="zcode")
+    w = boot_window(qapp, hub_root)
+    try:
+        page = w.hub_page
+        w.switchTo(page)
+        page.viewCombo.setCurrentIndex(2)
+        settle(qapp, 0.8)
+        page.memList.setCurrentRow(0)
+        settle(qapp, 0.4)
+        assert page.delMemBtn.isEnabled(), "用例前提：先要处于已选中态"
+
+        page._on_scan(page.agents)   # 探测回调在「已选中之后」才到达
+        settle(qapp, 0.6)
+        assert page.delMemBtn.isEnabled(), "后台重填把选中抢走了，删除按钮凭空变灰"
+        assert page.cur_path == f"mem:{mid}", f"选中应还在这条记忆上：{page.cur_path!r}"
+    finally:
+        w.hide()
+
+
+def test_deferred_scan_drops_selection_when_item_gone(qapp, hub_root):
+    """重填时选中条目已不在库里（被删）——必须作废，这是 R784 的底线，不能为了保选中回退。"""
+    import brain
+    from PySide6.QtCore import Qt
+    from helpers import boot_window, settle
+
+    brain.init_db(hub_root)
+    gone = brain.add_memory(hub_root, "R829 选中后会被删掉的那条", agent="zcode")
+    brain.add_memory(hub_root, "R829 留在列表里的另一条", agent="zcode")
+    w = boot_window(qapp, hub_root)
+    try:
+        page = w.hub_page
+        w.switchTo(page)
+        page.viewCombo.setCurrentIndex(2)
+        settle(qapp, 0.8)
+        for i in range(page.memList.count()):
+            if page.memList.item(i).data(Qt.UserRole) == f"mem:{gone}":
+                page.memList.setCurrentRow(i)
+        settle(qapp, 0.4)
+        assert page.cur_path == f"mem:{gone}", "用例前提：选中的是要删的那条"
+
+        brain.delete_memory(hub_root, gone, agent="zcode")
+        page._on_scan(page.agents)   # 后台重填这一回没有那条了
+        settle(qapp, 0.6)
+        assert page.cur_path is None, "条目消失后不许继续认旧选中"
+        assert not page.delMemBtn.isEnabled(), "删除按钮必须收回，否则下一刀打到别处"
+    finally:
+        w.hide()
+
+
 def test_list_clear_resets_actions(qapp, hub_root):
     import brain
 

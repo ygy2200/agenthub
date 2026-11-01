@@ -49,6 +49,12 @@ def main() -> int:
     ap.add_argument("--root", default="")
     a = ap.parse_args()
     root = a.root or _root()
+    if not root:
+        print("× 找不到大脑根：设 AGENTHUB_ROOT 或 ~/.agenthub/config.json")
+        return 2
+    # 报表脚本跑在 MCP 服务进程之外，老库可能还没补过列（2026-11-01 实测直接
+    # OperationalError: no such column: inject_count）。init_db 幂等，先补schema再查。
+    brain.init_db(root)
 
     if a.mark:
         if not a.text:
@@ -78,6 +84,32 @@ def main() -> int:
                 continue
             print(f"  {s:<6} 注入 {b['injected']:>4}  可指纹 {b['fingerprintable']:>4}  "
                   f"被用 {b['used']:>3}  采纳率 {b['rate']}%")
+
+    # R829：曝光与采纳是两本账。只看采纳率回答不了「该动谁」——这两张榜才是动作清单。
+    ev = brain.exposure_vs_adoption(root)
+    print(f"\n全库累计：曝光 {ev['inject_total']} 次 · 证实采纳 {ev['adopt_total']} 次")
+    if ev["most_adopted"]:
+        print("真被用上的（该升）：")
+        for m in ev["most_adopted"]:
+            print(f"  #{m['id']:<4} 采 {m['adopt_count']:<3} 推 {m['inject_count']:<4} "
+                  f"[{m['kind'] or 'note'}] {str(m['project'] or '全局')[:20]}")
+    else:
+        print("真被用上的：还没有一条——采纳率账本还没跑起来，先确认 Stop 回填钩子在位"
+              "（cli.py doctor --only brief_hook_health）")
+    if ev["most_injected_never_adopted"]:
+        print("反复推送却从没被用上的（降权候选，继续推只会让模型对整块注入免疫）：")
+        for m in ev["most_injected_never_adopted"][:8]:
+            body = str(m.get("head") or "")[:46].replace("\n", " ")
+            mark = "⏸ 已冷却" if m.get("muted") else "  待观察"
+            print(f"  #{m['id']:<4} 推 {m['inject_count']:<4} 采 0  {mark}  "
+                  f"[{m['kind'] or 'note'}] {body}")
+    # R830：光列清单没用——断路器有没有真的在挡，要能一眼看见「现在挡了几条」。
+    print(f"\n免疫断路器（推 ≥5 次零采纳 + 30 天内）：冷却中 {ev['muted_total']} 条"
+          "（主动检索不受影响，30 天后自动放行一次）")
+    for m in ev["muted"][:6]:
+        pin = " ·置顶" if m.get("pinned") else ""
+        body = str(m.get("head") or "")[:40].replace("\n", " ")
+        print(f"  ⏸ #{m['id']:<4} 推 {m['inject_count']:<4}{pin}  [{m['kind'] or 'note'}] {body}")
     return 0
 
 

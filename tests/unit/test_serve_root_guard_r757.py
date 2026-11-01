@@ -69,8 +69,12 @@ def test_banner_read_only_says_how_to_enable():
     assert "token" in text
 
 
-def test_banner_write_enabled_keeps_token_out_of_screen():
+def test_banner_write_enabled_prints_token_r829b():
+    """R829b 推翻 R757 的这条断言：原断言要求「token 不出现在横幅里」，理由是
+    「token 只印在启动横幅上一行」——可上一行是纯 URL，从来没有第二行印 token。
+    于是它守住的不是「别重复」，而是「永远别告诉用户 token」（写工具恒 403，
+    adv_cli 在等 token 行时整条链挂死）。现在横幅必须自带可解析的 token=。"""
     lines = api._serve_banner(8787, True, "deadbeefdeadbeef")
     text = "\n".join(lines)
     assert "已开启" in text
-    assert "deadbeef" not in text, "token 只印在启动横幅上一行，别再复制一份"
+    assert "token=deadbeefdeadbeef" in text, "写开启必须把 token 印出来，否则用户拿不到"

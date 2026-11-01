@@ -213,6 +213,16 @@ class HubPage(QWidget):
 
     def fill_memories(self):
         """大脑记忆视图：SQLite memories 表（条目 data = mem:<id>），支持内容/标签过滤。"""
+        # R829：重填前记下「当前选中的是哪条记忆」。后台探测（rescan→_on_scan）完成时
+        # 会再跑一次本方法，clear() 把当前项置空 → R784 的收回逻辑把动作按钮全灭，
+        # 用户正在看的那条凭空失去选中（实测撞掉 test_hub_action_state_r784 两条用例）。
+        # 条目这次没了（被删/被过滤掉）就不恢复——那是 R784 要防的「打到旧对象」。
+        keep = ""
+        cur = self.memList.currentItem()
+        if cur is not None:
+            d = cur.data(Qt.UserRole)
+            if isinstance(d, str) and d.startswith("mem:"):
+                keep = d
         self.memList.clear()
         self._mem_rows = []
         self._mem_fresh = {}
@@ -250,6 +260,11 @@ class HubPage(QWidget):
         elif not self.memList.count():
             self.memList.addItem("（无匹配记忆）")
             self.memList.item(0).setData(Qt.UserRole, "")
+        if keep and self.viewCombo.currentIndex() == 2:
+            for i in range(self.memList.count()):
+                if self.memList.item(i).data(Qt.UserRole) == keep:
+                    self.memList.setCurrentRow(i)
+                    break
 
     def fill_env(self):
         """环境档案视图：本机配置结构化登记（brain.env_items）。"""

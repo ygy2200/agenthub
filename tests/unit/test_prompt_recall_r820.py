@@ -90,21 +90,98 @@ def test_same_session_dedupes_but_new_session_recalls_again(hub_root, tmp_path):
     assert lesson in third["memory_ids"], "换会话应重新可用"
 
 
-def test_use_count_counts_only_injected_rows(hub_root, tmp_path):
+def test_injection_counts_exposure_not_adoption(hub_root, tmp_path):
+    """R829 改口径：被动注入只记曝光（inject_count），不再冒充唤起（use_count）。
+
+    旧断言「注入 → use_count+1」正是被定罪的缺陷：use_count 驱动排序加分、maturity
+    晋升与新鲜度弱确认，而真实库实测全库 use_count 6306、指纹证实的采纳只有 2 条，
+    霸榜的 #9 靠每次心跳被推 84 次而真采纳 0——曝光把自己洗成了「被用过」。
+    """
     import brain
     lesson, pref, _, _ = _seed(hub_root)
 
-    def counts():
+    def rows():
         with brain.db_conn(hub_root) as conn:
-            return {r["id"]: int(r["use_count"] or 0) for r in conn.execute(
-                "SELECT id, use_count FROM memories")}
+            return {r["id"]: (int(r["use_count"] or 0), int(r["inject_count"] or 0))
+                    for r in conn.execute(
+                        "SELECT id, use_count, inject_count FROM memories")}
 
-    before = counts()
+    before = rows()
     brain.prompt_recall(hub_root, "release.bat 失败分支怎么修", agent="qoder",
                         session="u", state_path=str(tmp_path / "u.json"))
-    after = counts()
-    assert after[lesson] == before[lesson] + 1
-    assert after[pref] == before[pref], "没被注入的记忆不该计唤起"
+    after = rows()
+    assert after[lesson][1] == before[lesson][1] + 1, "注入该记一次曝光"
+    assert after[lesson][0] == before[lesson][0], "注入不该记唤起（那是主动检索的账）"
+    assert after[pref] == before[pref], "没被注入的记忆两本账都不该动"
+
+
+def test_active_search_still_counts_and_promotes(hub_root):
+    """主动检索是另一本账：命中仍 +use_count，并按老规则晋升 maturity。"""
+    import brain
+    lesson, _pref, _a, _b = _seed(hub_root)
+    with brain.db_conn(hub_root) as conn:
+        conn.execute("UPDATE memories SET maturity='draft', use_count=0 WHERE id=?", (lesson,))
+    rows = brain.search_memories(hub_root, "release.bat", limit=5, count_hits=True,
+                                 semantic=False)
+    assert any(r["id"] == lesson for r in rows), [r["id"] for r in rows]
+    with brain.db_conn(hub_root) as conn:
+        m = conn.execute("SELECT use_count, inject_count FROM memories WHERE id=?",
+                         (lesson,)).fetchone()
+    assert int(m["use_count"]) == 1 and int(m["inject_count"]) == 0, tuple(m)
+
+
+def test_push_rotates_on_exposure_and_never_promotes(hub_root):
+    """开工推送（recall_for）只加曝光：既不涨 use_count，也不把 draft 顶成 validated。
+    轮换排序改读 inject_count——否则 R829 之后推送不再改任何计数，「零唤起优先」会
+    永久卡在同一批上（马太固化的反向版本）。"""
+    import brain
+    _lesson, pref, _o, _r = _seed(hub_root)
+    pref2 = brain.add_memory(hub_root, "置顶二：交付要带证据。", kind="preference", pinned=True)
+    with brain.db_conn(hub_root) as conn:
+        conn.execute("UPDATE memories SET maturity='draft', use_count=0, inject_count=0")
+        conn.execute("UPDATE memories SET inject_count=9 WHERE id=?", (pref,))
+    pushed = [r["id"] for r in brain.recall_for(hub_root, "别的项目", agent="qoder")]
+    assert pref2 in pushed and pref in pushed, pushed
+    assert pushed.index(pref2) < pushed.index(pref), ("零曝光的置顶该先上", pushed)
+    with brain.db_conn(hub_root) as conn:
+        rows = {r["id"]: (int(r["use_count"]), int(r["inject_count"]), r["maturity"])
+                for r in conn.execute(
+                    "SELECT id, use_count, inject_count, maturity FROM memories")}
+    for mid in pushed:
+        assert rows[mid][0] == 0, (mid, rows[mid])          # 推送不涨唤起
+        assert rows[mid][2] == "draft", (mid, rows[mid])    # 推送不晋升
+    assert rows[pref2][1] == 1 and rows[pref][1] == 10, rows
+    # 返回的行是 UPDATE 之前的快照，两个曝光字段都必须对齐库里的真值：adv_brain 实测
+    # 撞到过「库里 last_inject 有时间、返回行还是空串」，消费方会当成「这条从没被推过」。
+    again = {r["id"]: r for r in brain.recall_for(hub_root, "别的项目", agent="qoder")}
+    assert again[pref2]["inject_count"] == 2, again[pref2]
+    assert again[pref2]["last_inject"], again[pref2]
+    with brain.db_conn(hub_root) as conn:
+        db_last = conn.execute("SELECT last_inject FROM memories WHERE id=?",
+                               (pref2,)).fetchone()[0]
+    assert db_last == again[pref2]["last_inject"], (db_last, again[pref2]["last_inject"])
+
+
+def test_adoption_is_written_by_mark_only(hub_root, tmp_path):
+    """adopt_count 唯一的写入口是 mark_recall_used（指纹证实），注入本身不算。"""
+    import brain
+    brain.init_db(hub_root)
+    mid = brain.add_memory(
+        hub_root, "打包体检跑 tools/exe_bundle_check.py，缺失项用 --no-journal 复现。",
+        kind="lesson", tags="打包,exe", agent="qoder")
+    res = brain.prompt_recall(hub_root, "exe_bundle_check 怎么复现", agent="qoder",
+                              session="s1", state_path=str(tmp_path / "s1.json"))
+    assert mid in res["memory_ids"], (mid, res["text"])
+    with brain.db_conn(hub_root) as conn:
+        assert int(conn.execute("SELECT adopt_count FROM memories WHERE id=?",
+                                (mid,)).fetchone()[0]) == 0, "注入即算采纳 = 老缺陷"
+        n = conn.execute("SELECT COUNT(*) FROM recall_adherence WHERE session='s1'").fetchone()[0]
+    assert n >= 1, "注入没落采纳账，后面无从判定"
+    got = brain.mark_recall_used(hub_root, "s1", "跑了 tools/exe_bundle_check.py，缺两个文件")
+    assert mid in got["memory_ids"], got
+    with brain.db_conn(hub_root) as conn:
+        assert int(conn.execute("SELECT adopt_count FROM memories WHERE id=?",
+                                (mid,)).fetchone()[0]) == 1
 
 
 def test_budget_is_hard_and_no_hit_is_silent(hub_root, tmp_path):

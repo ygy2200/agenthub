@@ -23,6 +23,9 @@ def _hooked(tmp_path, name="hooked.json"):
             {"hooks": [{"type": "command", "command": "node brain_inject.mjs --agent x"}]}],
         "UserPromptSubmit": [
             {"hooks": [{"type": "command", "command": "node brain_recall.mjs --agent x"}]}],
+        # R831：三条钩子都要在，否则「全部在位」这句不成立（回填缺口会被点名）
+        "Stop": [
+            {"hooks": [{"type": "command", "command": "node brain_adherence.mjs --agent x"}]}],
     }})
 
 

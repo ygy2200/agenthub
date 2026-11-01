@@ -254,9 +254,14 @@ def _port_error_text(e: OSError, port: int) -> str:
 
 
 def _serve_banner(port: int, allow_write: bool, token: str) -> list:
-    """R757：起服务后的两行横幅。写关闭时要说清怎么开，否则用户只看到「已关闭」。"""
+    """R757：起服务后的两行横幅。写关闭时要说清怎么开，否则用户只看到「已关闭」。
+
+    R829b：写开着时**这一行必须自带 token=**——R757 把原来那行 `token={token}` 改成了
+    「token 见上一行」，可上一行是纯 URL，根本没有 token：用户按提示找不到 token，
+    写请求永远 403（--allow-write 形同虚设），adv_cli 也是在这里等 token 行等到挂死。
+    这句文案是被机器读的（adv 用 `token=([0-9a-fA-F]+)` 解析），不是修辞。"""
     if allow_write:
-        return ["只读为主；写工具已开启（token 见上一行，写请求需带 token=…）"]
+        return [f"只读为主；写工具已开启（token={token}，写请求需带 token=…）"]
     return ["只读为主；写工具已关闭"
             "（要用写工具：重启加 --allow-write，会生成一次性 token）"]
 

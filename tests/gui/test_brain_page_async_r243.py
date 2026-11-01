@@ -34,15 +34,21 @@ def window(qapp, hub_root):
 
 
 def _seed_pushed(root, n=10):
-    """灌 n 条被打过的记忆（use_count>0）→ 唤起排行有内容，可测展开。"""
+    """灌 n 条推过的记忆（R829 起曝光榜读 inject_count，不再读混账的 use_count）。
+
+    故意让 adopt_count 只有前两条非零：曝光榜与采纳榜分开之后，「推得多」和「真有用」
+    本来就该长得不一样——2026-11-01 真实库实测 use_count Top10 的指纹证实采纳全为 0。
+    """
     import brain
     with brain.db_conn(root) as conn:
         for i in range(n):
             conn.execute(
                 "INSERT INTO memories(kind,content,project,agent,pinned,status,created,"
-                "updated,use_count,maturity) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                "updated,use_count,inject_count,adopt_count,maturity) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
                 ("fact", f"被推送的记忆 {i}", "P1", "qoder", 0, "active",
-                 "2026-10-20T10:00:00", "2026-10-20T10:00:00", n - i, "draft"))
+                 "2026-10-20T10:00:00", "2026-10-20T10:00:00", 0, n - i,
+                 1 if i < 2 else 0, "draft"))
 
 
 def _busy(page):
@@ -138,6 +144,16 @@ def test_toggle_reads_no_database(window, qapp, hub_root, monkeypatch):
             return real(*a, **kw)
         return inner
 
+    # 兄弟页（Agent 中心）有一趟延后的探测回调，落地时正好落进本用例的 processEvents
+    # 里——先等它**真的完成**再装探针，否则测的是别的页面读库。
+    # 上一轮这里用 settle() 是错的：settle 的退出条件是「事件队列安静」，而 FnWorker
+    # 的 done 信号是跨线程 queued 投递，安静 ≠ 已到（R829 改曝光榜后 seed 行数一变，
+    # 逐文件子进程门禁里就 3/3 红）。`_workers.remove(w)` 挂在 worker 的 finished 上，
+    # 列表空 = 回调已经跑完，这个条件是真完成（记忆 #475 的口径）。
+    hub = window.hub_page
+    assert pump(qapp, lambda: not getattr(hub, "_workers", []), 20.0), \
+        "Agent 中心的延后扫描 20s 没落地，本用例的隔离前提不成立"
+    settle(qapp)
     for n in ("health_report", "list_pinned_memories", "search_memories",
               "task_list", "task_annotate", "file_lease_list", "event_list"):
         monkeypatch.setattr(brain, n, spy(n, getattr(brain, n)))

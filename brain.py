@@ -1297,6 +1297,21 @@ def _migrate_columns(root: str) -> None:
         # 但列和写入路径一直缺失（只能靠 last_hit 弱确认）。补列纯增量，旧行默认空。
         if "confirmed" not in cols:
             conn.execute("ALTER TABLE memories ADD COLUMN confirmed TEXT DEFAULT ''")
+        # R829（2026-11-01）曝光与采纳分账。此前被动注入也加 use_count，而 use_count
+        # 同时驱动排序加分、maturity 晋升、新鲜度弱确认与「用过 N 次」文案——真实库实测
+        # 全库 use_count 合计 6306，recall_adherence 证实采纳只有 2 条，Top10 真采纳全为 0
+        # （#9 靠每次心跳被推 84 次霸榜，而它正文自带的复查期限 2026-10-14 早已过期）。
+        # 曝光冒充「被用过」，大脑就越推越热、越热越像对的。三列：推了几次 / 证实用了几次 /
+        # 最后一次被推的时点。use_count 从今往后只记主动检索命中（口径锚见 meta）。
+        for col, ddl in (("inject_count", "INTEGER DEFAULT 0"),
+                         ("adopt_count", "INTEGER DEFAULT 0"),
+                         ("last_inject", "TEXT DEFAULT ''")):
+            if col not in cols:
+                conn.execute(f"ALTER TABLE memories ADD COLUMN {col} {ddl}")
+        conn.execute(
+            "INSERT OR IGNORE INTO meta(key, value) VALUES('use_count_semantics', ?)",
+            ("2026-11-01 R829 起 use_count 只记主动检索命中；被动注入记 inject_count，"
+             "指纹证实采纳记 adopt_count。此前的历史值混有被动曝光，不可当作采纳证据",))
         # P1-1（2026-10-11）records 双时相版本列：valid_from/valid_until/superseded_by
         # 「失效 ≠ 删除」——旧版本行保留可追溯，检索只认现行有效（_rec_live_sql）。
         rcols = {r["name"] for r in conn.execute("PRAGMA table_info(records)")}
@@ -6009,23 +6024,56 @@ PUSH_LIMIT_RELATED = 2   # 记忆推送：跨项目语义联想最多条数（�
 PUSH_CHAR_CAP = 600      # 记忆推送：输出总字数封顶
 PUSH_THROTTLE_MIN = 10   # 同 agent+project 重复心跳的免推窗口（分钟）——推送内容还在会话上下文里
 
+# R830 曝光免疫：推了 ≥5 次、一次都没被证实采纳，且最近一次曝光还在 30 天内 → 停止被动注入。
+# 「30 天内」是自愈窗口：真的凉够 30 天，它重新获得一次机会；被推一次后 last_inject 刷新，
+# 又进入冷却。于是最坏情况从「每次心跳都推」降到「30 天推一次」，不再喂模型同款文字。
+# 置顶不豁免：pin 决定候选优先级，不是「永远出现」的通行证（真实库 #9 正是置顶却推了 84 次
+# 零采纳的过期验收记忆）。主动检索与 hub_memory_read 完全不受影响——那才是「要用时自己查」。
+IMMUNE_INJECT_MIN = 5
+IMMUNE_WINDOW_DAYS = 30
+
+
+def is_exposure_immune(mem: dict, now: "datetime.datetime | None" = None) -> bool:
+    """纯函数：这条记忆是不是「推了也没用」的（R830）。给 SQL 之外的通道复用。"""
+    if int(mem.get("adopt_count") or 0) > 0:
+        return False                       # 被证实采纳过 → 它是有效结论，不冷却
+    if int(mem.get("inject_count") or 0) < IMMUNE_INJECT_MIN:
+        return False                       # 样本还不够，别急着判死
+    last = _parse_ts(mem.get("last_inject"))
+    if not last:
+        return False                       # 没有曝光时间戳 → 不猜
+    return (now or datetime.datetime.now()) - last <= datetime.timedelta(days=IMMUNE_WINDOW_DAYS)
+
+
+def _immune_sql() -> tuple:
+    """「推了没用」的免疫**条件**（R830，正向）：返回 (cond, args)。
+    要排除这些行的那一侧自己加 NOT——`NOT(cond)` 才只挡免疫行；反过来若把 NOT 写进本函数，
+    `NOT(a AND b AND c)` 在 a 为假时结果是真，等于把全库都判成免疫（2026-11-01 实测：
+    505 条里 477 条被判冷却，正是这么来的）。
+    COALESCE(last_inject,'') 不能省：NULL>=x 在 SQLite 里是 NULL，整行会被 WHERE 当假丢掉。"""
+    cutoff = (datetime.datetime.now()
+              - datetime.timedelta(days=IMMUNE_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
+    return ("(inject_count>=? AND adopt_count=0 AND COALESCE(last_inject,'')>=?)",
+            [IMMUNE_INJECT_MIN, cutoff])
+
 
 def recall_for(root: str, project: str, agent: str = "") -> list:
     """开工记忆推送（反射弧）三层：本项目相关 → 全局置顶 → 跨项目语义联想
     （该项目最近记录的 bigram 词集与其他记忆算 Jaccard，撞到别处踩过的坑自动想起）。
-    命中即记一次唤起（use_count+1）——只对实际推送出去的条目计数（用进废退）。
-    项目层与置顶层同款轮换排序（零唤起优先曝光）：纯 use_count 排序会让头部记忆
+    推送只记曝光（inject_count+1，R829 起不再算唤起）——推进去 ≠ 用上。
+    项目层与置顶层同款轮换排序（零曝光优先）：纯计数排序会让头部记忆
     越推越热、46 条记忆 39 条永远零唤起（2026-10-03 真实库实测的马太固化）。"""
     with db_conn(root) as conn:
+        imm_sql, imm_args = _immune_sql()
         proj = [dict(r) for r in conn.execute(
-            "SELECT * FROM memories WHERE " + _live_sql() + " AND project=? "
-            "ORDER BY (use_count=0) DESC, use_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
-            (project or "", PUSH_LIMIT_PROJECT))]
+            "SELECT * FROM memories WHERE " + _live_sql() + " AND project=? AND NOT " + imm_sql +
+            " ORDER BY (inject_count=0) DESC, inject_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
+            (project or "", *imm_args, PUSH_LIMIT_PROJECT))]
         pins = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE " + _live_sql() + " AND pinned=1 "
-            "AND (project='' OR project IS NULL OR project!=?) "
-            "ORDER BY (use_count=0) DESC, use_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
-            (project or "", PUSH_LIMIT_PINNED))]
+            "AND (project='' OR project IS NULL OR project!=?) AND NOT " + imm_sql +
+            " ORDER BY (inject_count=0) DESC, inject_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
+            (project or "", *imm_args, PUSH_LIMIT_PINNED))]
         # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他记忆。
         # 全局记忆（project 空）也入联想池——它们不置顶就三层全捞不到（2026-10-03 实测
         # 10 条全局 lesson/fact 零唤起的结构盲区），语义撞上就该想起
@@ -6040,6 +6088,8 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
                 "AND (project IS NULL OR project='' OR project!=?) LIMIT 300", (project or "",))]
             scored = []
             for om in others:
+                if is_exposure_immune(om):
+                    continue          # R830：推了 5 次零采纳的，别再从联想层绕回来
                 ot = _tokens(om["content"])
                 if not ot:
                     continue
@@ -6062,13 +6112,12 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
             rows.append(r)
         now = _now()
         for r in rows:
-            conn.execute("UPDATE memories SET use_count=use_count+1, last_hit=?, "
-                         "maturity=CASE WHEN pinned=1 AND use_count+1>=? THEN 'core' "
-                         "WHEN maturity='draft' AND use_count+1>=? THEN 'validated' "
-                         "ELSE maturity END WHERE id=?",
-                         (now, CORE_AT, VALIDATE_AT, r["id"]))
-            r["use_count"] = (r["use_count"] or 0) + 1  # 返回值反映本次唤起后的计数
-            r["last_hit"] = now
+            conn.execute("UPDATE memories SET inject_count=inject_count+1, last_inject=? "
+                         "WHERE id=?", (now, r["id"]))
+            # 返回的行是 UPDATE **之前**取出来的快照：两个数都得手动对齐库里的真值，
+            # 否则消费方（GUI/adv/MCP）看到 last_inject='' 会以为「这条从没被推过」。
+            r["inject_count"] = (r.get("inject_count") or 0) + 1
+            r["last_inject"] = now
     # 推送落检索日志（tool=recall_push）：推送可观测，"推送 top10 是工作知识"才可验收
     log_search(root, "recall_push", (project or "")[:200], len(rows), agent=agent)
     # 推送内也要做矛盾标记（2026-10-13）：开工即见的记忆里若有互斥对，agent 会同时收到
@@ -6130,8 +6179,32 @@ def _memories_query(root: str, words: list, kind: str, limit: int) -> list:
         return [dict(r) for r in conn.execute(q, args)]
 
 
+def _memory_counters(root: str, ids: list) -> dict:
+    """按 id 批量取账本 {id: {use_count, inject_count, adopt_count, last_inject}}（R829/R830）。
+    检索管线有 LIKE/BM25/语义三条通道，各通道 SELECT 的列不完全一致，注入文案要
+    引用计数就必须回查一次——否则某条通道少带一列，就会把「采纳过 3 次」显示成 0。
+    R830 起多带 last_inject：免疫判定要「最近一次曝光在 30 天内」，缺这一列就没法判。"""
+    want = [int(i) for i in (ids or []) if str(i).lstrip("-").isdigit()]
+    if not want:
+        return {}
+    marks = ",".join("?" * len(want))
+    out: dict = {}
+    with db_conn(root) as conn:
+        for r in conn.execute(
+                f"SELECT id, use_count, inject_count, adopt_count, last_inject FROM memories "
+                f"WHERE id IN ({marks})", want):
+            out[int(r["id"])] = {"use_count": int(r["use_count"] or 0),
+                                 "inject_count": int(r["inject_count"] or 0),
+                                 "adopt_count": int(r["adopt_count"] or 0),
+                                 "last_inject": r["last_inject"] or ""}
+    return out
+
+
 def _bump_access(root: str, ids: list, now: str = "") -> None:
-    """命中即记一次唤起（与 recall_for 同款语义）：use_count+1 + last_hit。
+    """命中即记一次唤起（use_count+1 + last_hit）——**只给主动检索用**（R829 口径切分）。
+    主动拉取（hub_search / 拦截命中）才是「这条记忆有用」的证据，被动推给对方看一眼不是：
+    行业实测同一 judge，逐句注入 18.2% 有用 vs 主动拉取 72.4% 有用，两者记在同一列等于
+    用 18% 的信号污染 72% 的信号。被动曝光走 _bump_inject，证实采纳走 mark_recall_used。
     只对实际返回给调用方的条目计数——用进废退。空列表直接返回，不发 SQL。
     同时幂等埋一个口径锚：首次主动检索的时点（meta.active_recall_since），
     供体检报告说明 use_count 语义；仅作说明性记录，不参与任何判断。"""
@@ -6146,6 +6219,21 @@ def _bump_access(root: str, ids: list, now: str = "") -> None:
                          "WHEN maturity='draft' AND use_count+1>=? THEN 'validated' "
                          "ELSE maturity END WHERE id=?",
                          (now, CORE_AT, VALIDATE_AT, mid))
+
+
+def _bump_inject(root: str, ids: list, now: str = "") -> int:
+    """被动曝光记账（R829）：推出去/注入进去了，只加 inject_count + last_inject。
+    刻意**不碰** use_count / last_hit / maturity：那三样是「这条记忆被认可」的证据链，
+    被推 84 次而一次没被用上（真实库 #9 的实际情形）不该换来任何晋升与新鲜度。
+    空列表直接返回，不发 SQL；返回写入条数供流水/测试断言。"""
+    if not ids:
+        return 0
+    now = now or _now()
+    with db_conn(root) as conn:
+        for mid in ids:
+            conn.execute("UPDATE memories SET inject_count=inject_count+1, last_inject=? "
+                         "WHERE id=?", (now, mid))
+    return len(ids)
 
 
 def _parse_ts(ts) -> datetime.datetime | None:
@@ -8100,6 +8188,11 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
             conn.executemany(
                 "UPDATE recall_adherence SET used=1, decided_at=? WHERE id=?",
                 [(now, i) for i in hit_ids])
+            # R829：指纹证实「这一条真的被用上了」。adopt_count 只有这一个写入口，
+            # 因此它是全库唯一不被曝光污染的有用性信号（被动注入只进 inject_count）。
+            for mid in sorted({int(m) for m in out["memory_ids"] if m}):
+                conn.execute("UPDATE memories SET adopt_count=adopt_count+1 WHERE id=?",
+                             (mid,))
     out["checked"] = len(rows)
     out["matched"] = len(hit_ids)
     return out
@@ -8162,6 +8255,45 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
     return out
 
 
+def exposure_vs_adoption(root: str, limit: int = 8) -> dict:
+    """曝光榜 vs 采纳榜对照（R829）：谁在被反复推出去却从没被用上。
+
+    `most_injected_never_adopted` 是**降权候选清单**——注入 5 次以上、一次都没证实用上，
+    继续推只会训练模型忽略整块注入（mem9：每轮塞同款文字会让模型免疫）。
+    `most_adopted` 是真正该升的。两张榜分开，才看得出「大脑以为自己很有用」和
+    「大脑真的有用」之间差多少。"""
+    n = max(1, min(int(limit), 50))
+    out = {"most_injected_never_adopted": [], "most_adopted": [], "muted": [],
+           "inject_total": 0, "adopt_total": 0, "muted_total": 0}
+    with db_conn(root) as conn:
+        live = _live_sql()
+        out["most_injected_never_adopted"] = [dict(r) for r in conn.execute(
+            "SELECT id, kind, project, pinned, inject_count, adopt_count, use_count, last_inject, "
+            "substr(content,1,60) AS head "
+            f"FROM memories WHERE {live} AND inject_count>=5 "
+            "AND adopt_count=0 ORDER BY inject_count DESC, id DESC LIMIT ?", (n,))]
+        out["most_adopted"] = [dict(r) for r in conn.execute(
+            "SELECT id, kind, project, pinned, inject_count, adopt_count, use_count, last_inject "
+            f"FROM memories WHERE {live} AND adopt_count>0 "
+            "ORDER BY adopt_count DESC, inject_count DESC, id DESC LIMIT ?", (n,))]
+        imm_sql, imm_args = _immune_sql()
+        out["muted"] = [dict(r) for r in conn.execute(
+            "SELECT id, kind, project, pinned, inject_count, adopt_count, last_inject, "
+            "substr(content,1,60) AS head "
+            f"FROM memories WHERE {live} AND " + imm_sql +
+            " ORDER BY inject_count DESC, id DESC LIMIT ?", (*imm_args, n))]
+        out["muted_total"] = conn.execute(
+            "SELECT COUNT(*) FROM memories WHERE " + live + " AND " + imm_sql, imm_args).fetchone()[0]
+        row = conn.execute(
+            "SELECT COALESCE(SUM(inject_count),0) i, COALESCE(SUM(adopt_count),0) a "
+            f"FROM memories WHERE {live}").fetchone()
+        out["inject_total"], out["adopt_total"] = int(row["i"]), int(row["a"])
+    for m in out["most_injected_never_adopted"]:
+        m["muted"] = is_exposure_immune(m)     # 现在是不是真被断路器挡着（不是清单上就一定挡）
+    out["muted_total"] = int(out["muted_total"])
+    return out
+
+
 def _recall_project_block(root: str, pname: str, limit: int = 3) -> list:
     """本项目近况：最近几条工作记录 + 未完成任务数。
 
@@ -8211,7 +8343,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     """
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
-           "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False}
+           "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False, "muted": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -8260,9 +8392,26 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                  for r in mems]
     mem_idf = _recall_idf(mem_texts, terms)
     mem_idf_raw = _recall_idf(mem_texts, terms, weighted=False)
+    # R830：免疫判定要 inject/adopt/last_inject 三个值，行里带没带取决于走了哪条检索
+    # 通道（BM25/语义的 SELECT 列不全），所以统一回查一次，不信行里带的。
+    try:
+        acct = _memory_counters(root, [r.get("id") for r in mems])
+    except sqlite3.Error:
+        acct = {}
+    muted = 0
     scored = []
     for r in mems:
         if r.get("id") in excluded:
+            continue
+        cnt = acct.get(int(r.get("id") or 0), {})
+        if cnt:
+            r["inject_count"] = cnt["inject_count"]
+            r["adopt_count"] = cnt["adopt_count"]
+            r["last_inject"] = cnt["last_inject"]
+        if is_exposure_immune(r):
+            # 推了 ≥5 次、零采纳、还在 30 天窗口内 → 这条进来只会稀释整块注入的可信度。
+            # 只是不「主动塞给」模型：它照旧能被 hub_search 检索到（主动拉取那条路）。
+            muted += 1
             continue
         body = str(r.get("content") or "") + " " + str(r.get("tags") or "")
         hit = _recall_hit_score(terms, body)
@@ -8285,19 +8434,24 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         elif not r.get("project"):
             spec += 0.2
         spec += min(int(r.get("use_count") or 0), 10) * 0.04
+        # R830 采纳回流：被证实用上过，是比「被检索到」强得多的相关性证据（权重 3 倍）。
+        # 封顶 5 次，防一条老记忆靠历史采纳量永久霸榜——那也是另一种马太。
+        spec += min(int(r.get("adopt_count") or 0), 5) * 0.12
         try:
             spec += {"fresh": 0.6, "stale": 0.0, "expired": -1.0}.get(
                 memory_freshness(r).get("state"), 0.0)
         except Exception:  # noqa: BLE001 新鲜度异常不影响召回
             pass
         scored.append((spec, r))
-    scored.sort(key=lambda x: (-x[0], -(x[1].get("use_count") or 0), -x[1].get("id", 0)))
+    scored.sort(key=lambda x: (-x[0], -(x[1].get("adopt_count") or 0),
+                               -(x[1].get("use_count") or 0), -x[1].get("id", 0)))
     # R826：**逐条**筛「至少命中一个稀有词」的，而不是整批判弱。
     # 整批判会误伤：提问里既有泛词也有精确词时（「qfluentwidgets 中文被截断」），
     # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
     strong = [(s, r) for s, r in scored
               if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
     picked = [r for _, r in strong[:3]]
+    out["muted"] = muted      # 本轮被免疫挡掉的条数（报表/单测据此看断路器有没有在动）
     try:
         recs = search_records(root, query, limit=30)
     except sqlite3.Error:
@@ -8368,13 +8522,21 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     if proj_lines:
         lines.extend(proj_lines)
     ids = []
+    # R829：上墙的计数必须是「被认可过」的证据，不是「被推过几次」。检索回来的行有
+    # 一部分走 BM25/语义通道、列不全，所以这里按 id 回查一次三本账，不信行里带没带。
+    try:
+        proof = _memory_counters(root, [r.get("id") for r in picked])
+    except sqlite3.Error:
+        proof = {}   # 计数只是可信度注脚，查不到宁可少一句话也不闭嘴
     for r in picked:
         ids.append(r.get("id"))
-        used = int(r.get("use_count") or 0)
+        pc = proof.get(int(r.get("id") or 0), {})
+        adopt, used = int(pc.get("adopt_count") or 0), int(pc.get("use_count") or 0)
+        tag = (f"采纳 {adopt} 次" if adopt
+               else (f"检索命中 {used} 次" if used else "首次想起"))
         lines.append(f"· #{r.get('id')} [{r.get('kind') or 'note'}] "
                      f"{_brief_oneline(str(r.get('content') or ''), 150)}"
-                     f"（命中 {r.get('_recall_hit') or 0}；"
-                     f"用过 {used} 次）")
+                     f"（命中 {r.get('_recall_hit') or 0}；{tag}）")
     if rec_rows:
         lines.append("相关历史：")
         for r in rec_rows:
@@ -8392,7 +8554,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                project=pname, chars=len(text))
     if out["memory_ids"]:
         try:
-            _bump_access(root, out["memory_ids"])
+            _bump_inject(root, out["memory_ids"])
         except sqlite3.Error:
             pass
         # R827：记一笔「这次注入了什么、指纹是什么」，后续 mark_recall_used 才能判采纳。
@@ -12247,9 +12409,18 @@ def health_report(root: str, include_dups: bool = True,
             "SELECT agent, COUNT(*) FROM searches WHERE tool!='recall_push' GROUP BY agent ORDER BY 2 DESC")}
         tool_breakdown = {r[0]: r[1] for r in conn.execute(
             "SELECT tool, COUNT(*) FROM searches GROUP BY tool ORDER BY 2 DESC")}
+        # R829：这一栏叫「唤起排行（开工推送反射弧记数）」，那就按真实推送数排。
+        # 旧实现排的是 use_count，而当时 use_count 混着被动推送的 +1——等于自己给自己
+        # 排名。现在曝光榜（inject_count）与采纳榜（adopt_count）各排各的，两头都带上了，
+        # 「推得多」和「真有用」在同一个视图里对照，而不是混成一个数。
         top_pushed = [dict(r) for r in conn.execute(
-            "SELECT id, kind, content, use_count, last_hit FROM memories "
-            "WHERE status='active' AND use_count>0 ORDER BY use_count DESC, id DESC LIMIT 10")]
+            "SELECT id, kind, content, use_count, inject_count, adopt_count, last_hit "
+            "FROM memories WHERE status='active' AND inject_count>0 "
+            "ORDER BY inject_count DESC, id DESC LIMIT 10")]
+        top_adopted = [dict(r) for r in conn.execute(
+            "SELECT id, kind, content, use_count, inject_count, adopt_count, last_hit "
+            "FROM memories WHERE status='active' AND adopt_count>0 "
+            "ORDER BY adopt_count DESC, id DESC LIMIT 10")]
         archived = conn.execute(
             "SELECT COUNT(*) FROM projects WHERE status='archived'").fetchone()[0]
         # 验收达成度（2026-09-30 定四条可验证标准，2026-10-14 复查）

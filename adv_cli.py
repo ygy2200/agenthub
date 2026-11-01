@@ -356,13 +356,23 @@ def _free_port() -> int:
     return port
 
 
+def _local_opener():
+    """本机服务的直连 opener。
+
+    本机注册了系统代理（ProxyEnable=1 且 BypassList 为空）时，urllib 默认连
+    `http://127.0.0.1:xxx` 也甩给代理绕一圈——测的是本地服务，红绿却取决于加速器
+    在不在、通不通。测本地就该直连。"""
+    return urllib.request.build_opener(urllib.request.ProxyHandler({}))
+
+
 def _wait_http(url: str, timeout: float = 20.0) -> int:
     """轮询等待 HTTP 端点就绪；超时抛 AssertionError。返回状态码。"""
+    opener = _local_opener()
     deadline = time.time() + timeout
     last = None
     while time.time() < deadline:
         try:
-            with urllib.request.urlopen(url, timeout=5) as r:
+            with opener.open(url, timeout=5) as r:
                 return r.status
         except urllib.error.HTTPError as e:
             return e.code  # 服务已起（哪怕是 4xx/5xx），交给调用方判读
@@ -370,6 +380,41 @@ def _wait_http(url: str, timeout: float = 20.0) -> int:
             last = e
             time.sleep(0.2)
     raise AssertionError(f"HTTP 服务 {timeout}s 未就绪：{last}")
+
+
+def _read_lines(p, pred, timeout: float = 10.0):
+    """带**硬超时**读子进程 stdout，直到 pred 在某行命中；返回 (命中, 已读全文)。
+
+    主线程直接 `readline()` 是无限阻塞的：deadline 只在迭代间隙检查，挡不住阻塞读
+    本身（本文件上面那条 `-u` 注释就是这个坑，当时只补了无缓冲）。R829b 踩到升级版
+    ——serve 的 token 行被 R757 改没之后，adv 在这里等一行永远不会来的输出，
+    整条 adv 链停在 adv_cli 上不动（今天三条链都这么卡住）。取数搬进 daemon 线程，
+    主线程只等 deadline：等不到就返回 None 让断言正常红，绝不把回归挂死。"""
+    import queue
+    import threading
+
+    q: queue.Queue = queue.Queue()
+
+    def drain():
+        for line in iter(p.stdout.readline, ""):
+            q.put(line)
+        q.put(None)  # EOF 哨兵
+
+    threading.Thread(target=drain, daemon=True).start()
+    seen: list = []
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            line = q.get(timeout=max(0.05, deadline - time.time()))
+        except queue.Empty:
+            break
+        if line is None:
+            break
+        seen.append(line)
+        hit = pred(line)
+        if hit:
+            return hit, "".join(seen)
+    return None, "".join(seen)
 
 
 def _fake_adapter_hub(tmp, name="hub_onboard", agent="测试甲", with_mcp=True,
@@ -525,16 +570,17 @@ def t_serve_subprocess(tmp):
                          text=True, encoding="utf-8", env=env, cwd=str(Path(__file__).parent))
     try:
         base = f"http://127.0.0.1:{port}"
+        op = _local_opener()
         assert _wait_http(base + "/") in (200,), "仪表盘未就绪"
-        with urllib.request.urlopen(base + "/", timeout=5) as r:
+        with op.open(base + "/", timeout=5) as r:
             assert "text/html" in r.headers["Content-Type"], r.headers["Content-Type"]
-        with urllib.request.urlopen(base + "/api/status", timeout=5) as r:
+        with op.open(base + "/api/status", timeout=5) as r:
             assert r.status == 200
-        with urllib.request.urlopen(base + "/api/tools", timeout=5) as r:
+        with op.open(base + "/api/tools", timeout=5) as r:
             assert b"hub_health" in r.read()
         req = urllib.request.Request(base + "/api/call?name=hub_heartbeat", method="GET")
         try:
-            urllib.request.urlopen(req, timeout=5)
+            op.open(req, timeout=5)
             raise AssertionError("只读默认下写工具必须 403")
         except urllib.error.HTTPError as e:
             assert e.code == 403, e.code
@@ -550,31 +596,24 @@ def t_serve_subprocess(tmp):
                           text=True, encoding="utf-8", env=env, cwd=str(Path(__file__).parent))
     try:
         base2 = f"http://127.0.0.1:{port2}"
+        op2 = _local_opener()
         assert _wait_http(base2 + "/") == 200
-        # 读启动行拿 token（读到你想要的那行为止，行式协议不会堵死）。
+        # 读启动行拿 token：**必须带硬超时**（见 _read_lines）——R757 把 token 行改没
+        # 之后，这里等的是一行永远不会来的输出，readline() 直接把整条 adv 链挂死。
         # 正则取十六进制 token——启动行用全角括号「（token=xxx）」，按 ascii ')' 切
         # 会把「）」带进 token，URL 混入全角字符直接 ascii 编码炸（实测踩过）。
-        token = ""
-        deadline = time.time() + 10
-        while time.time() < deadline and not token:
-            if p2.poll() is not None:
-                break  # 进程已退出：读干剩余输出找 token，别阻塞
-            line = p2.stdout.readline()
-            if not line:
-                break
-            mtok = re.search(r"token=([0-9a-fA-F]+)", line)
-            if mtok:
-                token = mtok.group(1)
-        assert token, "allow-write 启动行必须给出 token"
+        mtok, seen = _read_lines(p2, lambda ln: re.search(r"token=([0-9a-fA-F]+)", ln), 10)
+        assert mtok, f"allow-write 启动行必须给出可解析的 token，实读到：{seen[-300:]!r}"
+        token = mtok.group(1)
         # 不带 token → 403
         req = urllib.request.Request(base2 + "/api/call?name=hub_heartbeat", method="GET")
         try:
-            urllib.request.urlopen(req, timeout=5)
+            op2.open(req, timeout=5)
             raise AssertionError("allow-write 下不带 token 的写工具仍须 403")
         except urllib.error.HTTPError as e:
             assert e.code == 403, e.code
         # 带 token → 写成功（200；业务失败会是 422，都不算闸门失效）
-        with urllib.request.urlopen(
+        with op2.open(
                 base2 + f"/api/call?name=hub_heartbeat&agent=adv-cli&token={token}", timeout=5) as r:
             assert r.status in (200, 422), r.status
     finally:

@@ -58,7 +58,8 @@ def test_brain_memory_rows_elide_instead_of_hard_clip(qapp, hub_root):
     content = "长记忆预览" * 40
     brain.init_db(hub_root)
     mid = brain.add_memory(hub_root, content, kind="lesson", agent="zcode")
-    brain._bump_access(hub_root, [mid])  # top10 只收 use_count>0 的记忆
+    # R829 分账后排行看的是曝光：inject_count>0（use_count 只代表主动检索命中，不再上榜）
+    brain._bump_inject(hub_root, [mid])
     tokens.apply_theme("dark")
     w = boot_window(qapp, hub_root)
     try:
@@ -104,7 +105,7 @@ def test_brain_top_ranking_collapses_to_five_and_expands(qapp, hub_root):
     for i in range(8):
         mid = brain.add_memory(hub_root, f"第 {i} 条被唤起的长记忆内容" * 4,
                                kind="lesson", agent="zcode")
-        brain._bump_access(hub_root, [mid])
+        brain._bump_inject(hub_root, [mid])
     brain.log_search(hub_root, "search", "记忆", 8, agent="zcode")
     tokens.apply_theme("dark")
     w = boot_window(qapp, hub_root)
@@ -114,7 +115,7 @@ def test_brain_top_ranking_collapses_to_five_and_expands(qapp, hub_root):
         page = w.brain_page
         page.reload(force=True)
         settle(qapp, max_s=2.0)
-        assert page.topBox.count() == 5, "默认应只显示前 5 条唤起排行"
+        assert page.topBox.count() == 5, "默认应只显示前 5 条曝光排行"
         assert page.topToggle.isVisible()
         assert "展开全部 8 条" in page.topToggle.text()
         usage = page.useBox.itemAt(0)

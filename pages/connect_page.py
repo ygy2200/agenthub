@@ -344,15 +344,24 @@ class ConnectPage(QWidget):
                 if a not in inplace and _st(s, "session") != "absent"]
         unwired = [a for a, s in self._hookStates.items()
                    if _st(s, "session") == "unwired" or _st(s, "prompt") == "unwired"]
+        # R831：第三条钩子（Stop 回填）此前只存在于 tooltip 之外的世界——接入页一句不提，
+        # 桌面用户既看不到「我这台的注入账本是不是断流」，也没有补它的入口。
+        fill_gap = [a for a, s in self._hookStates.items() if _st(s, "answer") == "unwired"]
+        gaps = list(dict.fromkeys(gaps + fill_gap))
         broken = [a for a, s in self._hookStates.items()
-                  if "bad_schema" in (_st(s, "session"), _st(s, "prompt"))]
+                  if "bad_schema" in (_st(s, "session"), _st(s, "prompt"), _st(s, "answer"))]
         absent = [a for a, s in self._hookStates.items() if _st(s, "session") == "absent"]
         if unwired:
             text = (f"记忆钩子：{'、'.join(unwired)} 未挂——这些 agent 开新会话不会自动带团队上下文，"
                     "说话时也不会自动回忆（MCP 握手简报仍可用，但要求客户端已接入且重启过）")
+        elif fill_gap:
+            text = (f"记忆钩子：{len(inplace)} 家简报与回忆在位，但 {'、'.join(fill_gap)} "
+                    "没接采纳回填——注入账本会停在「不知道有没有用」，点按钮可一次补齐")
         else:
             text = (f"记忆钩子：{len(inplace)} 家全部在位——开新会话自动收到大脑简报，"
-                    "每句话自动检索相关记忆，不需要再提醒 AI 读记忆")
+                    "每句话自动检索相关记忆，一轮结束自动回填采纳，不需要再提醒 AI 读记忆")
+        if unwired and fill_gap:
+            text += f"；{'、'.join(fill_gap)} 还缺采纳回填"
         if broken:
             text += f"；{'、'.join(broken)} 配置结构不符，需手工处理"
         if absent:
@@ -367,13 +376,16 @@ class ConnectPage(QWidget):
         tips = []
         for a, s in self._hookStates.items():
             sess, prom = s.get("session") or {}, s.get("prompt") or {}
+            ans = s.get("answer") or {}
             tips.append(f"{a}：{sess.get('path') or '未登记'}（简报 {sess.get('state')} / "
-                        f"回忆 {prom.get('state')}）")
+                        f"回忆 {prom.get('state')} / 回填 {ans.get('state') or '—'}）")
         missing_script = [a for a, s in self._hookStates.items()
                           if ((s.get("session") or {}).get("state") in ("inplace", "unwired")
                               and not (s.get("session") or {}).get("script"))
                           or ((s.get("prompt") or {}).get("state") == "unwired"
-                              and not (s.get("prompt") or {}).get("script"))]
+                              and not (s.get("prompt") or {}).get("script"))
+                          or ((s.get("answer") or {}).get("state") == "unwired"
+                              and not (s.get("answer") or {}).get("script"))]
         if missing_script:
             tips.append("脚本缺失（钩子会空转）：" + "、".join(missing_script)
                         + "——安装钩子会重新部署脚本")
@@ -385,10 +397,13 @@ class ConnectPage(QWidget):
         for agent, st in states.items():
             sess = st.get("session") or {}
             prom = st.get("prompt") or {}
-            if "bad_schema" in (sess.get("state"), prom.get("state")):
+            ans = st.get("answer") or {}
+            if "bad_schema" in (sess.get("state"), prom.get("state"), ans.get("state")):
                 failed.append(f"{agent}（配置结构不符，未改动）")
                 continue
-            if not (sess.get("state") == "unwired" or prom.get("state") == "unwired"):
+            # R831：三条钩子任一缺就补——只缺回填的那家，此前点按钮什么也不会发生。
+            if not (sess.get("state") == "unwired" or prom.get("state") == "unwired"
+                    or ans.get("state") == "unwired"):
                 continue
             try:
                 r = core.install_memory_hooks(agent, apply=True)
@@ -397,11 +412,14 @@ class ConnectPage(QWidget):
                 continue
             ok = (r.get("session", {}).get("status") in ("added", "already")
                   and r.get("prompt", {}).get("status") in ("added", "already", "covered"))
+            if isinstance(r.get("answer"), dict):   # 老实现不返回 answer，不当作失败
+                ok = ok and r["answer"].get("status") in ("added", "already", "covered", "unsupported")
             if ok:
                 added.append(agent)
             else:
                 bad = [x.get("status") or "失败"
-                       for x in (r.get("session"), r.get("prompt")) if isinstance(x, dict)]
+                       for x in (r.get("session"), r.get("prompt"), r.get("answer"))
+                       if isinstance(x, dict)]
                 failed.append(f"{agent}（{'/'.join(bad)}）")
         if added:
             core.journal(self.win.root, "user", "memory_hook_install", ",".join(added))
