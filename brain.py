@@ -6930,6 +6930,15 @@ _ST_CLS = None
 #    无 top5 回归。仍是「剪噪声底」而非分离器——不要再用单个阈值追求语义精度。
 _SEM_MIN_SIM = 0.58
 _SEM_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
+# R832（2026-11-01 黑屏复盘）：语义路会把 torch 拉进常驻内存——实测单进程 commit ≈2.19GB
+# （torch_cpu.dll 254MB + 权重，工作集只 583MB；启动 2 分钟即 2.09GB，77 分钟后 2.19GB，
+# 增量仅 100MB ⇒ 不是泄漏，是 torch 的固定底座）。每个 agent 会话各起一个 MCP 进程，
+# 四家同时在线 ≈9GB commit，落在 2GB 页面文件的机器上足以顶穿 commit、让 DWM 连崩黑屏。
+# 开关：AGENTHUB_SEMANTIC=0/false/no/off 关掉整条语义路（读、写、后台预热一起关），
+# 检索降级为 LIKE+BM25 两路——语义本就是可选第三路，全程 fail-open，关掉不掉功能。
+# 定位：MCP/CLI 长驻会话建议关（省 2GB/进程），GUI 单进程可保留（用户可见召回收益）。
+_SEM_ENABLED = str(os.environ.get("AGENTHUB_SEMANTIC", "1")).strip().lower() not in (
+    "0", "false", "no", "off")
 
 
 def _st_cls():
@@ -6979,6 +6988,8 @@ def _ensure_emb() -> bool:
     """懒加载语义模型（进程级只试一次）。任何失败 → False，调用方降级到词法两路。
     双检锁：并发写路径首调用只加载一次，避免 8 线程压测重复加载 torch 拖垮。"""
     global _EMB, _EMB_DIM, _EMB_READY
+    if not _SEM_ENABLED:
+        return False   # R832 开关关闭：连 write 路径也不加载模型（fail-open 静默降级，向量不落库）
     if _EMB_READY is not None:
         return _EMB_READY
     with _EMB_LOCK:
@@ -7032,6 +7043,8 @@ def _emb_ready_now() -> bool:
     当场落库，否则新写入的数据在语义路上长期缺席，比慢 9 秒更糟。
     """
     global _EMB_BG_THREAD
+    if not _SEM_ENABLED:
+        return False   # R832 开关关闭：连后台预热线程都不许起，否则照样把 torch 拖进常驻内存
     if _EMB_READY is not None:
         return _EMB_READY
     with _EMB_BG_LOCK:
@@ -7133,7 +7146,7 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     R252：窄取结果按库文件指纹缓存成矩阵（见 _SEM_MAT_CACHE）——稳态命中时只剩
     余弦 + 回表，把 14.6ms 里最大的 13.9ms 抹掉；指纹变化（任何跨进程写入/checkpoint）
     即重建，语义与「每次现查」等价。"""
-    if not query or not _SEM_CJK_RE.search(query):
+    if not _SEM_ENABLED or not query or not _SEM_CJK_RE.search(query):
         return []
     try:
         import numpy as np
