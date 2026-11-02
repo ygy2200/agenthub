@@ -6100,17 +6100,21 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
     （该项目最近记录的 bigram 词集与其他记忆算 Jaccard，撞到别处踩过的坑自动想起）。
     推送只记曝光（inject_count+1，R829 起不再算唤起）——推进去 ≠ 用上。
     项目层与置顶层同款轮换排序（零曝光优先）：纯计数排序会让头部记忆
-    越推越热、46 条记忆 39 条永远零唤起（2026-10-03 真实库实测的马太固化）。"""
+    越推越热、46 条记忆 39 条永远零唤起（2026-10-03 真实库实测的马太固化）。
+    R835 采纳正信号：已曝光的里面，被指纹证实采纳过的排前（prompt_recall 侧
+    R830 已有同款，封顶防霸榜靠布尔档天然成立——这里只分「证实过/没证实过」）。"""
     with db_conn(root) as conn:
         imm_sql, imm_args = _immune_sql()
         proj = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE " + _live_sql() + " AND project=? AND NOT " + imm_sql +
-            " ORDER BY (inject_count=0) DESC, inject_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
+            " ORDER BY (inject_count=0) DESC, (adopt_count>0) DESC, inject_count DESC,"
+            " (maturity='draft') ASC, id DESC LIMIT ?",
             (project or "", *imm_args, PUSH_LIMIT_PROJECT))]
         pins = [dict(r) for r in conn.execute(
             "SELECT * FROM memories WHERE " + _live_sql() + " AND pinned=1 "
             "AND (project='' OR project IS NULL OR project!=?) AND NOT " + imm_sql +
-            " ORDER BY (inject_count=0) DESC, inject_count DESC, (maturity='draft') ASC, id DESC LIMIT ?",
+            " ORDER BY (inject_count=0) DESC, (adopt_count>0) DESC, inject_count DESC,"
+            " (maturity='draft') ASC, id DESC LIMIT ?",
             (project or "", *imm_args, PUSH_LIMIT_PINNED))]
         # 跨项目语义联想：本项目最近 3 条记录的词集 vs 其他记忆。
         # 全局记忆（project 空）也入联想池——它们不置顶就三层全捞不到（2026-10-03 实测
@@ -6134,7 +6138,8 @@ def recall_for(root: str, project: str, agent: str = "") -> list:
                 sim = len(cur_toks & ot) / len(cur_toks | ot)
                 if sim >= 0.12:
                     scored.append((sim, om))
-            scored.sort(key=lambda x: (x[0], x[1]["maturity"] != "draft",
+            scored.sort(key=lambda x: (x[0], x[1]["adopt_count"] or 0,
+                                       x[1]["maturity"] != "draft",
                                        x[1]["use_count"] or 0), reverse=True)
             for sim, om in scored[:PUSH_LIMIT_RELATED]:
                 om["related_project"] = om["project"]
