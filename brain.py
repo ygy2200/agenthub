@@ -9418,7 +9418,10 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
                         path=budget_path or (
                             str(Path(state_path).with_name("nudge-budget.json"))
                             if state_path else ""))
-    if not budget["allowed"]:
+    if not budget["allowed"] and not err_rows:
+        # 额度只约束「有记忆但没现成修法」的那种注入。**errors 表里登记过的同类故障
+        # 是现成修法**——它是这条通道存在的理由，第 7 次撞上也照样要给，不然最该看见
+        # 的那一条会被前面几条泛泛的「相关记忆」挤掉（R834 的回环用例就是撞在这条上）。
         out["skipped"] = "budget"
         out["budget"] = {k: budget[k] for k in ("used", "limit", "channel")}
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
@@ -9428,6 +9431,9 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         except sqlite3.Error:
             pass
         return out
+    if not budget["allowed"]:
+        out["budget"] = {"used": budget["used"], "limit": budget["limit"],
+                         "channel": "error", "bypass": "error_row"}
     shown = _error_headline(_error_voice(error_text), high)
     lines = ["【AgentHub 报错即时回忆 · 自动匹配，没人提醒你查大脑】",
              f"这次失败：{shown}"]
