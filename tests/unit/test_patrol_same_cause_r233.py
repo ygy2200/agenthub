@@ -21,8 +21,10 @@ def _cause_fail(name, summary="大脑库不存在", fix="x"):
 def test_empty_root_collapses_to_single_db_issue(hub_root):
     rep = ops.run_patrol(hub_root)
 
-    assert rep["total"] == len(ops.PATROL_CHECKS) == 21
-    assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 13
+    # 计数守卫（改 PATROL_CHECKS / DB_BACKED_CHECKS 必须同步这里并说明）：
+    # 21→22、13→14 = R834 +error_debt（报错欠账账本，依赖大脑库 → 同因折叠也少跑一次 LIKE 扫描）
+    assert rep["total"] == len(ops.PATROL_CHECKS) == 22
+    assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 14
 
     db_issues = [i["name"] for i in rep["issues"] if i["name"] in ops.DB_BACKED_CHECKS]
     assert db_issues == ["db_integrity"], f"同因库检查应只剩一条：{db_issues}"
@@ -33,7 +35,7 @@ def test_empty_root_collapses_to_single_db_issue(hub_root):
     assert "unable to open database file" not in blob, "裸 sqlite 错误文案不该出现在问题里"
 
     primary = next(i for i in rep["issues"] if i["name"] == "db_integrity")
-    assert primary["skipped_same_cause"] == 13
+    assert primary["skipped_same_cause"] == 14
     assert primary.get("fix_brief"), "根因条目仍要带可执行修复口径"
 
     skipped = {s["name"]: s["why"] for s in rep["skipped"]}

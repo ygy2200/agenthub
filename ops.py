@@ -55,6 +55,7 @@ CHECKS = {
     "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
     "stalled": ("停滞项目清单（R20）：按最后工作记录/任务活动算真实闲置天数；显式标记属待决策不算故障，活跃项目超 90 天无活动=状态漏标才失败——归档清理供用户拍板", False),
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
+    "error_debt": ("报错欠账账本（R834）：近 7 天工具失败撞过、但大脑答不上来的签名清单——报错即时回忆的空转率与「解决了却没登记」的漏账都在这里显形；同一签名重复撞 ≥3 次仍没答案才报红，一次性失败只报数不催（长期噪音会把通道教成没人看的检查项）。库里已有答案的签名自动收编，不用谁手动销账", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
     "mcp_drift": ("接入参数漂移巡检（R103）：配了 agenthub 但配得不对的入口——--agent 被删（未锁身份，署名闸会持续拦写）/锁名与注册名不符（归属分裂）/server 脚本路径失效（MCP 起不来）/--root 指向别库。这些事后只在越权拦截流水露痕迹，这里事前点名", False),
@@ -89,7 +90,7 @@ CHECKS = {
 # 不是「请检查」这类把活推回人的废话）。巡检项刻意不含需要 target 的（回归/部署比对）。
 PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_chain", "security_health",
                  "backup_health", "rules_health", "brief_hook_health", "mcp_drift", "usage_health",
-                 "stale_health", "ghost_memory", "dup_mem", "record_quality",
+                 "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
                  "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
     "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
@@ -106,6 +107,7 @@ CHECK_FIXES = {
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
+    "error_debt": "把已解决的修法写回来：hub_report_error(title=报错原文那行, detail=完整报错, undo=怎么修的)——下次同签名自动命中，账本自己收编；没解决别登记（假答案比没答案更贵）。反复撞却没解决的，先看 detail 里那条签名是不是同类问题换了张皮（B046 残缺词元）",
     "record_quality": "hub_log_work 的 content 按四段式写：目的/做了什么/验证结果/如何回滚",
     "date_health": "把 date/valid_until/截止日改成 YYYY-MM-DD（格式歪了到期提醒会静默失效）",
     "tasks_health": "过期/失联持有者：确认后 hub_claim 接管；不再做则 hub_task_update 改派或释放；逾期任务重排截止日；待办饥饿：hub_next 认领，或改优先级/关单；交付物证据不全：补交付，或用 hub_task_update(deliverables=...) 修正声明；完成声明未关单：核对记录后 hub_task_update(status=\"done\") 关单，或用 hub_log_work(task=id) 绑定后续报；死信：看 last_error 后 hub_task_retry 复活，或 hub_task_update(status=\"cancelled\") 放弃",
@@ -143,6 +145,7 @@ DB_BACKED_CHECKS = frozenset({
     "db_integrity", "db_health", "audit_chain", "security_health",
     "usage_health", "stale_health", "ghost_memory", "dup_mem", "record_quality",
     "date_health", "tasks_health", "governance_health", "lease_health", "stalled",
+    "error_debt",
 })
 _CAUSE_DB_SKIP_WHY = "大脑库不存在（同因跳过，建库/指对根目录后重跑）"
 
@@ -356,6 +359,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _stalled(root)
     elif name == "dup_mem":
         r = _dup_mem(root)
+    elif name == "error_debt":
+        r = _error_debt(root)
     elif name == "compress":
         r = _compress(root)
     elif name == "agents":
@@ -3605,6 +3610,39 @@ def _dup_mem(root: str) -> dict:
             "summary": f"{len(pairs)} 组疑似重复——合并方式见记忆卫生约定（新记忆标「取代记忆#N」，全员裁决旧条目）",
             "detail": [f"#{d['a']}~#{d['b']} 相似{d['sim']} [{d.get('verdict', '')}]：{d['content_a'][:36]}"
                        for d in pairs[:8]]}
+
+
+# 报错欠账（R834）：同一签名重复撞 N 次仍没答案才算「反复撞的坑」并标红。
+# 一次性 miss 不报红——大多数报错本来就只撞一次，据此报红等于长期噪音，
+# 而长期噪音会把这条通道教会成「又一个没人看的检查项」。
+DEBT_REPEAT_FAIL = 3
+
+
+def _error_debt(root: str) -> dict:
+    """报错欠账账本：近 7 天「撞过但大脑没答案」的失败签名（R834）。"""
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        debt = brain.error_debt(root, days=getattr(brain, "ERROR_DEBT_DAYS", 7), limit=8)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
+    rows, asked, answered = debt["rows"], debt["asked"], debt["answered"]
+    rate = f"· 命中率 {answered * 100 // asked}%" if asked else ""
+    head = (f"近 {debt['window_days']} 天报错回忆被问 {asked} 次{rate}，"
+            f"没答案 {debt['open']} 条 / 已收编 {debt['resolved']} 条")
+    if debt["skipped_legacy"]:
+        head += f"（口径变更前 {debt['skipped_legacy']} 行不计入）"
+    detail = [f"×{r['count']} [{r['status']}] " + " ".join(r["terms"][:4])[:70]
+              for r in rows[:8]]
+    if not rows:
+        return {"ok": True, "summary": head + "——没有欠账，撞过的报错库里都有答案", "detail": []}
+    nag = [r for r in rows if r["status"] == "open" and r["count"] >= DEBT_REPEAT_FAIL]
+    if not nag:
+        return {"ok": True, "summary": head + "（都是一次性撞的，不催）", "detail": detail}
+    return {"ok": False,
+            "summary": head + f"——其中 {len(nag)} 条重复撞 ≥{DEBT_REPEAT_FAIL} 次仍没答案",
+            "detail": detail}
 
 
 # 冷记忆压缩的事实抽取（1.2，先做窄）：四类窄正则，只抽明确可沉淀的持久事实

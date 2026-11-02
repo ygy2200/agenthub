@@ -1337,8 +1337,10 @@ def _migrate_columns(root: str) -> None:
         # M1（2026-10-12）任务工作图：priority(0急~3低,默认2) / deps(前置任务 id,逗号分隔) / due(截止日)
         # R261 错误重复计数：同一 (agent, 项目, 标题) 的 open 错误再发生时累加而不是新增行
         ecols = {r["name"] for r in conn.execute("PRAGMA table_info(errors)")}
+        # R834 B041 签名沉淀：登记时就把签名词存成结构化字段（与 _error_sig_key 同键），
+        # 下次同签名报错按 sig 精确匹配——靠 title/detail 的中文 prose 碰运气不是沉淀。
         for col, ddl in (("repeat_count", "INTEGER DEFAULT 1"), ("last_ts", "TEXT DEFAULT ''"),
-                         ("last_detail", "TEXT DEFAULT ''")):
+                         ("last_detail", "TEXT DEFAULT ''"), ("sig", "TEXT DEFAULT ''")):
             if col not in ecols:
                 conn.execute(f"ALTER TABLE errors ADD COLUMN {col} {ddl}")
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
@@ -1457,6 +1459,12 @@ def _migrate_columns(root: str) -> None:
             _journal_seal_backlog(conn)
         elif "prev_hash" not in jcols:
             conn.execute("ALTER TABLE journal ADD COLUMN prev_hash TEXT DEFAULT ''")
+        # R834 口径锚点：`searches.hits` 自 R833 起包含记录/错误命中，历史行不改写。
+        # 没有这个锚点，任何跨变更点的比率都会把「修前只命中记录被记成 0」的历史行
+        # 当成空转——本轮开工就先被 55.6% 那个假数字带偏了一次（台账 §一①）。
+        # 只在缺失时锚定为「本次建库/升级时刻」，已有锚点绝不覆盖（覆盖=历史重新进分母）。
+        conn.execute("INSERT OR IGNORE INTO meta(key,value)"
+                     " VALUES('caliber:searches_error_hits',?)", (_now(),))
 
 
 # ---------------------------------------------------------------- 工作记录
@@ -5973,6 +5981,36 @@ def memory_trace(root: str, mid: int) -> list:
     return out
 
 
+MEMORY_SIG_TAG_MAX = 4   # 一条记忆最多沉淀几个签名词：tag 库是人维护的，塞满报错碎片就没人用了
+
+
+def _sediment_tags(content: str, tags: str) -> str:
+    """把正文里的错误签名词补进 tags（R834 B041）——`search_memories` 已给 tags 计分，
+    所以写的时候沉一次，下次同签名报错就是**确定命中**，而不是碰运气。
+
+    三条边界（都是主人「别造成其他问题」那一问的具体化）：
+      · 只在正文真含错误形状（抽出得出 w≥3 招牌）时才动——偏好类记忆逐字不变；
+      · 只沉 ASCII 单词形（unicodeencodeerror / brain_error_recall），带空格的路径串、
+        `t encode character` 这类残缺词元不进标签库（残缺词元的根治在 B046）；
+      · 显式 tag 排在前面，沉淀词封顶 4 个，`_norm_tags` 再去重截断。
+    """
+    sig = error_sig_of(content or "")
+    if not sig:
+        return tags or ""
+    have = [t.strip() for t in re.split(r"[,，]", str(tags or "")) if t.strip()]
+    lower = {h.lower() for h in have}
+    added = 0
+    for t in sig.split("|"):
+        if added >= MEMORY_SIG_TAG_MAX:
+            break
+        if not t or " " in t or not t.isascii() or t.lower() in lower:
+            continue
+        have.append(t)
+        lower.add(t.lower())
+        added += 1
+    return ",".join(have)
+
+
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
                project: str = "", agent: str = "", pinned: bool = False,
                supersedes: int = 0, valid_until: str = "",
@@ -6003,7 +6041,7 @@ def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
             raise ValueError(f"被取代的记忆 #{old} 不存在")
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
-        tags = _register_tags(conn, _norm_tags(tags))  # P1-2：标签规约 + 注册（大小写归一）
+        tags = _register_tags(conn, _norm_tags(_sediment_tags(content, tags)))  # P1-2 + R834 签名沉淀
         cur = conn.execute(
             "INSERT INTO memories(kind,content,tags,project,agent,pinned,created,updated,"
             "valid_until,confidence,evidence,maturity) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)",
@@ -6139,13 +6177,17 @@ def should_push(root: str, agent: str, project: str) -> bool:
     return age >= PUSH_THROTTLE_MIN * 60
 
 
+def _search_insert(conn, tool: str, query: str, hits: int, agent: str = "") -> None:
+    conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
+                 (_now(), _norm_agent(agent), tool, (query or "")[:200], max(0, int(hits or 0))))
+
+
 def log_search(root: str, tool: str, query: str, hits: int, agent: str = "") -> None:
     """检索日志（反馈回路）：谁/何时/用什么工具/查什么/命中几条。失败不影响检索本身。
     agent 过 _norm_agent——大小写/空白双身份会让检索统计分裂（实测 ZCode/zcode 各算各的）。"""
     try:
         with db_conn(root) as conn:
-            conn.execute("INSERT INTO searches(ts,agent,tool,query,hits) VALUES(?,?,?,?,?)",
-                         (_now(), _norm_agent(agent), tool, (query or "")[:200], max(0, int(hits or 0))))
+            _search_insert(conn, tool, query, hits, agent)
     except sqlite3.Error:
         pass
 
@@ -8595,6 +8637,11 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
 
 
 ERROR_RECALL_MAX_CHARS = 700
+# R834 报错欠账提示的预算：只在「有签名 + 真 miss + 本会话第一次」时说一句，
+# 上限比召回本身还小——答不上来的时候给模型看的越短越好，剩下的交给账本（hub_search/ops）。
+ERROR_DEBT_DAYS = 7
+ERROR_DEBT_HINT_TOP = 2
+ERROR_DEBT_HINT_CHARS = 320
 
 # 报错签名里「一眼认得出来源」的形态。与自然语言检索词（extract_prompt_terms）不同：
 # 报错的区分度全在标识符上——异常类名、错误码、被点名的列/文件/包。拿「报错」「失败」
@@ -8741,6 +8788,219 @@ def _error_sig_key(terms: list) -> str:
     return "|".join(top[:4])
 
 
+def error_sig_of(text: str) -> str:
+    """任何含错误形状的正文 → 签名键。登记（errors.sig / memories.tags）与召回
+    （error_recall 的去重键）必须走同一个函数，否则「登记一次下次秒命中」就是空话。"""
+    terms = error_signature_terms(_error_voice(text or ""))
+    if not terms or not any(w >= 3 for _, w in terms):
+        return ""
+    return _error_sig_key(terms)
+
+
+def _err_accept(terms: list, low: str) -> bool:
+    """上墙判定：必须被「独一份的招牌」钉住，泛词命中一律不上墙。
+
+    三条实测教训拧成的口径：
+      · 成语短语拆出来的普通词（"no such column" 里的 count）到处都在，拿它凑第二条
+        信号等于没有第二条（R833 冒烟：#3607 就这样被 operationalerror + count 蒙过）；
+      · 泛类型名互相凑数也不行——TypeError + NoneType 是 Python 报错的常态，两条都不
+        能证明是同一件事，照上次的修法改就是自信地跑偏（R826「弱命中不注入」）；
+      · 能单独钉住这条报错的词（带编号/带点划线/被点名的标识符/报错成语）才算招牌。
+    R834 提出来当模块级函数：欠账账本判「库里现在是否已有答案」要用**同一把尺子**，
+    两处各写一遍必然漂移（闸门本身判据一字未改）。
+    """
+    high = [t for t, w in terms if w >= 3]
+    if not high or not any(h in low for h in high):
+        return False
+    if any(_err_distinctive(h) and h in low for h in high):
+        return True                      # 招牌词独一份，一条就够定身份
+    return sum(1 for t, w in terms if w >= 2 and _err_distinctive(t) and t in low) >= 2
+
+
+CALIBER_PREFIX = "caliber:"        # 口径变更锚点前缀（R834·R833 遗留 #7 的机制化解法）
+
+
+def mark_caliber(root: str, key: str, note: str = "") -> str:
+    """给「统计口径变了」这件事落一个可比对的锚点，返回锚定时间。
+
+    为什么需要：R833 改了 `searches.hits` 的算法（要含记录/错误），历史行不改写，于是
+    本轮开工先按「零命中率 55.6%」定了方向——那 20 条全是修前的假零行（台账 §一①）。
+    口径变更只写在 CHANGELOG 里等于没写：算比率的人不会先读发布说明。
+    幂等：已有锚点不覆盖（锚点被改写 = 历史行重新被算进分母）。
+    """
+    ck = f"{CALIBER_PREFIX}{key}"
+    with db_conn(root) as conn:
+        row = conn.execute("SELECT value FROM meta WHERE key=?", (ck,)).fetchone()
+        if row and (row["value"] or "").strip():
+            return row["value"]
+        ts = _now()
+        conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                     (ck, ts))
+        if note:
+            conn.execute("INSERT OR REPLACE INTO meta(key,value) VALUES(?,?)",
+                         (f"{ck}:note", note[:200]))
+    return ts
+
+
+def caliber_ts(root: str, key: str) -> str:
+    """读锚点；没有锚点返回空串（调用方回退全量口径，别默默当 0）。"""
+    try:
+        with db_conn(root) as conn:
+            row = conn.execute("SELECT value FROM meta WHERE key=?",
+                               (f"{CALIBER_PREFIX}{key}",)).fetchone()
+        return (row["value"] or "") if row else ""
+    except sqlite3.Error:
+        return ""
+
+
+def _log_error_miss(root: str, agent: str, sig: str, terms: list) -> None:
+    """大脑被问到了但答不上——这一次问答必须留下证据，否则永远算不出空转率。
+
+    两张账分工（R834）：`searches` 每次失败一行（分母/重复次数），`journal` 只在**签名
+    第一次出现**时一行——审计链只追加不回改，把「×N」写进 note 再 UPDATE 会当场断链。
+    两条写句走**同一个事务**：分开了会出现「有流水没账本」的孤儿 miss，欠账算不平
+    还查不出是谁丢的；要么都记下，要么整条不记（调用方 except 后静默，不拖累召回）。
+    """
+    q = sig or "(no_signature)"
+    try:
+        with db_conn(root) as conn:
+            if _begin_write(conn):      # 抢不到写锁：先保分母，账本行留给下次首见判定
+                _search_insert(conn, "error_recall_miss", q, 0, agent)
+                return
+            _search_insert(conn, "error_recall_miss", q, 0, agent)
+            if not sig:
+                return                  # 没签名可追：只进分母，不挂账本行
+            if conn.execute("SELECT id FROM journal WHERE action='brain_error_miss'"
+                            " AND target=?", (sig,)).fetchone():
+                return                  # 同签名已欠账：只加流水，不再挂新行
+            note = "签名 " + " ".join(t for t, w in terms if w >= 3)[:120]
+            _journal_append(conn, _now(), agent or "", "brain_error_miss", sig, "", note)
+    except sqlite3.Error:
+        pass
+
+
+def _error_covered(root: str, terms: list, cap: int = 300) -> bool:
+    """库里现在是否已有一条能过精度闸门的答案（欠账的收编判定）。
+
+    判定必须与召回同一把尺子（`_err_accept`），但**不能**把三张表整个捞进 Python——
+    R834 探针在全库（3.7k 记录）上这么干过，一条用例 ~10s，放进钩子路径就是每次失败
+    卡住会话。改成 SQL 侧先用招牌词 LIKE 收窄，再把候选交给闸门复核。
+
+    先走「签名逐字相同」这一道：`errors.sig` 是登记时用同一个 `_error_sig_key` 算出来的
+    键，两边相等是**同一条报错**的身份证据，不是模糊匹配——闸门管的是「LIKE 捞来的 prose
+    像不像」，拿它去否掉一个自己算出来的等式，就把 R834 的承诺（登记一次下次秒命中）
+    否掉了。实锤：`Error: connect ECONNREFUSED 127.0.0.1:7890` 登记成 errors#20 后，
+    `econnrefused` 无编号无点划不算招牌，模糊判定 False，账本仍报欠账（探针 ③ open 6→6）。
+    """
+    key = _error_sig_key(terms)
+    if key:
+        try:
+            with db_conn(root) as conn:
+                if conn.execute(
+                        "SELECT 1 FROM errors WHERE sig=? AND (COALESCE(detail,'')<>''"
+                        " OR COALESCE(undo,'')<>'') LIMIT 1", (key,)).fetchone():
+                    return True
+        except sqlite3.Error:
+            pass                      # 旧库还没迁出 sig 列：退回模糊判定
+    high = [t for t, w in terms if w >= 3]
+    if not high:
+        return False
+    tables = (("memories", ("content", "tags")), ("records", ("title", "content")),
+              ("errors", ("title", "detail", "sig")))
+    try:
+        with db_conn(root) as conn:
+            for tbl, cols in tables:
+                conds, args = [], []
+                for c in cols:
+                    for t in high:
+                        conds.append(f"{c} LIKE ? ESCAPE '\\'")
+                        args.append(f"%{_like_escape(t)}%")
+                try:
+                    rows = conn.execute(
+                        f"SELECT {', '.join(cols)} FROM {tbl} WHERE {' OR '.join(conds)}"
+                        f" LIMIT {int(cap)}", args).fetchall()
+                except sqlite3.Error:
+                    continue          # errors.sig 列在旧库可能还没迁出来
+                for r in rows:
+                    if _err_accept(terms, " ".join(str(r[c] or "")
+                                                   for c in cols).lower()):
+                        return True
+    except sqlite3.Error:
+        return False
+    return False
+
+
+def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> dict:
+    """报错欠账账本：近 N 天「撞过但大脑没答案」的失败签名，按重复次数排序。
+
+    这是 R834 复盘②的直接产物——12 条线上形状用例里 A_absent=5、B_gate=0、C_trunc=0：
+    检索侧没漏，缺的是**把解决过的报错写回来**。账本让这件事从「靠自觉」变成「看得见、
+    能查、解决了自动收编」。只读：不写库、不注入。
+
+    收编判定用与召回同一把尺子（`_err_accept`）＋逐字 sig 相等的强通道，不需要谁手动销账。
+    统计口径双重闸门：时间窗口 + 口径锚点（`caliber:searches_error_hits`），
+    锚点之前的历史行只计入 `skipped_legacy`，不再有能力污染比率（台账 §一①）。
+    **锚点还没落的时候不假装校准过**：窗口内 `hits=0` 的旧口径行既进不了分子也进不了分母，
+    直接把这种库报成「命中率 100% · 没有欠账」是分母静默低估（台账 §四④ 就是被我自己的
+    生产库读数抓出来的）。这类行同样计入 `skipped_legacy`，并置 `calibrated=False`，
+    由调用方（ops 检查项）据此**拒绝报命中率**——数字难看比数字假有用。
+    """
+    out = {"rows": [], "open": 0, "resolved": 0, "asked": 0, "answered": 0,
+           "miss_rows": 0, "skipped_legacy": 0, "since": "", "window_days": days,
+           "calibrated": False}
+    if not root or not os.path.isdir(root):
+        return out
+    since = caliber_ts(root, "searches_error_hits")
+    win = datetime.datetime.now() - datetime.timedelta(days=max(0, int(days)))
+    win_ts = win.strftime("%Y-%m-%dT%H:%M:%S")
+    floor = max(win_ts, since) if since else win_ts     # 双闸门：窗口 + 口径锚点
+    who = _norm_agent(agent) if agent else ""
+    try:
+        with db_conn(root) as conn:
+            counts = [(str(r["query"]), int(r["n"] or 0)) for r in conn.execute(
+                "SELECT query, COUNT(*) AS n FROM searches"
+                " WHERE tool='error_recall_miss' AND ts>=? AND (?='' OR agent=?)"
+                " GROUP BY query ORDER BY MAX(ts) DESC LIMIT ?",
+                (floor, who, who, max(1, min(int(limit), 200))))]
+            miss_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM searches WHERE tool='error_recall_miss'"
+                " AND ts>=? AND (?='' OR agent=?)", (floor, who, who)).fetchone()["n"]
+            answered = conn.execute(
+                "SELECT COUNT(*) AS n FROM searches WHERE tool='error_recall' AND hits>0"
+                " AND ts>=? AND (?='' OR agent=?)", (floor, who, who)).fetchone()["n"]
+            legacy = conn.execute(
+                "SELECT COUNT(*) AS n FROM searches WHERE tool IN ('error_recall',"
+                " 'error_recall_miss') AND ts<?", (since or "0",)).fetchone()["n"]
+            # 没有锚点 = 这些零命中行到底是「知识缺失」还是「旧口径把只命中记录写成 0」，
+            # 事后无法分辨；如实标成未锚定，让它们 counted 而不是蒸发。
+            unanchored = 0 if since else conn.execute(
+                "SELECT COUNT(*) AS n FROM searches WHERE tool='error_recall' AND hits=0"
+                " AND ts>=? AND (?='' OR agent=?)", (win_ts, who, who)).fetchone()["n"]
+    except sqlite3.Error:
+        return out
+    out["answered"] = int(answered or 0)
+    out["miss_rows"] = int(miss_rows or 0)
+    out["asked"] = out["answered"] + out["miss_rows"]
+    out["skipped_legacy"] = int(legacy or 0) + int(unanchored or 0)
+    out["calibrated"] = bool(since)
+    for sig, n in counts:
+        if not sig or sig == "(no_signature)":
+            continue          # 没签名可追的失败不进欠账（无从登记）
+        terms = error_signature_terms(sig)
+        if not terms:
+            terms = [(t, 3) for t in sig.split("|") if t]
+        covered = _error_covered(root, terms)
+        out["rows"].append({
+            "sig": sig, "count": n, "status": "resolved" if covered else "open",
+            "terms": [t for t, _ in terms],
+            "hint": ("库里已有答案，下次同签名会自动命中" if covered else
+                     "解决了就 hub_report_error(title, detail=报错原文, undo=修法)")})
+        out["resolved" if covered else "open"] += 1
+    out["rows"].sort(key=lambda r: (-r["count"], r["sig"]))
+    out["since"] = since
+    return out
+
+
 def _error_headline(text: str, high: list, limit: int = 96) -> str:
     """摘要挑「说清这是哪条报错」的那一行，而不是整段拼接的头 90 字。
 
@@ -8791,6 +9051,11 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     if not terms or not any(w >= 3 for _, w in terms):
         # 抽不出高价值签名词 = 这条报错没有可比对的招牌（「命令失败」这种），闭嘴
         out["skipped"] = "no_signature"
+        if count:   # 进分母（大脑确实被问过），不进欠账（没有签名可追）
+            try:
+                _log_error_miss(root, _norm_agent(agent) or (agent or "").strip(), "", [])
+            except sqlite3.Error:
+                pass
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
     sig = _error_sig_key(terms)
@@ -8815,31 +9080,22 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     skey = f"{who or '?'}|{session}" if session else ""
     state_file = _recall_state_file(state_path) if state_path else \
         Path.home() / ".workbuddy" / "state" / "brain-error-recall.json"
-    if skey:
-        state = _load_recall_state(state_file)
-        entry = (state.get("sessions") or {}).get(skey) or {}
-        if sig in {str(x) for x in (entry.get("sigs") or [])}:
-            out["skipped"] = "seen_this_session"
-            out["elapsed_ms"] = int((time.time() - t0) * 1000)
-            return out
+    if skey and _error_sig_seen(state_file, skey, sig):
+        out["skipped"] = "seen_this_session"
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
     query = " ".join(t for t, w in terms if w >= 2)[:180] or " ".join(t for t, _ in terms)
     high = [t for t, w in terms if w >= 3]
+    # 两本去重账（R834·钩子与主人各指出同一处漏洞，最终口径）：
+    #   sigs      = 这条签名的**召回**已经说过 → 后续同签名闭嘴（省查询，R833 原语义不动）；
+    #   debt_sigs = 这条签名的**欠账提示**已经说过 → 不再重复催，但绝不占用召回额度，
+    #               否则「撞上→登记→再撞」这条最需要看见回环的路径会被自己闭嘴。
+    hint_ok = bool(session) and count and not _error_sig_seen(state_file, skey, sig,
+                                                              key="debt_sigs")
 
     def _accept(low: str) -> bool:
-        """上墙判定：必须被「独一份的招牌」钉住，泛词命中一律不上墙。
-
-        三条实测教训拧成的口径：
-          · 成语短语拆出来的普通词（"no such column" 里的 count）到处都在，拿它凑第二条
-            信号等于没有第二条（R833 冒烟：#3607 就这样被 operationalerror + count 蒙过）；
-          · 泛类型名互相凑数也不行——TypeError + NoneType 是 Python 报错的常态，两条都不
-            能证明是同一件事，照上次的修法改就是自信地跑偏（R826「弱命中不注入」）；
-          · 能单独钉住这条报错的词（带编号/带点划线/被点名的标识符/报错成语）才算招牌。
-        """
-        if not any(h in low for h in high):
-            return False
-        if any(_err_distinctive(h) and h in low for h in high):
-            return True                      # 招牌词独一份，一条就够定身份
-        return sum(1 for t, w in terms if w >= 2 and _err_distinctive(t) and t in low) >= 2
+        # 判据本体在模块级 `_err_accept`（R834 提出去：欠账账本要用同一把尺子判收编）
+        return _err_accept(terms, low)
 
     try:
         mems = search_memories(root, query, limit=25, count_hits=False,
@@ -8890,34 +9146,87 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
     rec_rows = [r for _, r in rec_scored[:2]]
 
-    err_rows = []
-    # 种子词只用「独一份」的招牌词（带编号/带点/成语短语）；全泛词时不查 errors 表——
-    # 否则 errors 里每一条「MCP 工具 xx 执行异常」都会被 OperationalError/TypeError 捞出来，
-    # 给出一句毫不相干的「上次登记过同类故障」（R833 冒烟实测连中两条这种）。
+    err_rows: list = []
+    # 两道查法，强弱分明（R834 探针实锤后定）：
+    #   ① sig 逐字相同 = 「同一条报错」的身份证据，直接采信，不过模糊闸门；
+    #   ② 招牌词 LIKE 捞来的只是「像」，必须过 `_err_accept`——否则 errors 里每一条
+    #      「MCP 工具 xx 执行异常」都会被 OperationalError/TypeError 捞出来，给出一句
+    #      毫不相干的「上次登记过同类故障」（R833 冒烟实测连中两条这种）。
+    # R834 B041：连 sig 列一起查。sig 是登记时用同一个 `error_sig_of` 沉淀下来的签名键，
+    # 与这里的 seeds 同源，所以「中文标题 + 原始 detail」登记过的坑不必靠 prose 里
+    # 恰好留着英文词才捞得回——这是「登记一次，下次秒命中」从口号变成机制的那一步。
+    # ①必须在 seeds 之外：ECONNREFUSED 这类全大写错误常量既不带编号也不带点划，
+    # 拿不到招牌词时整条 errors 查询根本不发起，刚登记的坑照样答不上（线上形状探针 ④）。
     seeds = [t for t in high if _err_distinctive(t)][:3]
-    if seeds:
-        cond = " OR ".join(["(title LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')"]
-                           * len(seeds))
-        args: list = []
-        for s in seeds:
-            like = f"%{_like_escape(s)}%"
-            args.extend([like, like])
-        try:
-            with db_conn(root) as conn:
+    _ecols = "id, title, detail, status, undo, last_ts, COALESCE(sig,'') AS sig"
+    _has_body = " AND (COALESCE(detail,'')<>'' OR COALESCE(undo,'')<>'')"
+    exact: list = []
+    fuzzy: list = []
+    try:
+        with db_conn(root) as conn:
+            if sig:
+                exact = [dict(r) for r in conn.execute(
+                    f"SELECT {_ecols} FROM errors WHERE sig=?{_has_body}"
+                    " ORDER BY last_ts DESC, id DESC LIMIT 2", (sig,))]
+            seen_ids = {int(r.get("id") or 0) for r in exact}
+            if seeds:
+                cond = " OR ".join(["(title LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\'"
+                                    " OR sig LIKE ? ESCAPE '\\')"] * len(seeds))
+                args: list = []
+                for s in seeds:
+                    like = f"%{_like_escape(s)}%"
+                    args.extend([like, like, like])
                 raw = [dict(r) for r in conn.execute(
-                    "SELECT id, title, detail, status, undo, last_ts FROM errors"
-                    f" WHERE {cond} ORDER BY last_ts DESC, id DESC LIMIT 6", args)]
-        except sqlite3.Error:
-            raw = []
-        for r in raw:
-            body = (str(r.get("title") or "") + " "
-                    + str(r.get("detail") or "")).lower()
-            if _accept(body):
-                err_rows.append(r)
-        err_rows = err_rows[:2]
+                    f"SELECT {_ecols} FROM errors WHERE {cond}"
+                    " ORDER BY last_ts DESC, id DESC LIMIT 6", args)]
+                for r in raw:
+                    if int(r.get("id") or 0) in seen_ids:
+                        continue
+                    body = (str(r.get("title") or "") + " " + str(r.get("detail") or "") + " "
+                            + str(r.get("sig") or "")).lower()
+                    if _accept(body):
+                        fuzzy.append(r)
+    except sqlite3.Error:
+        exact, fuzzy = [], []
+    err_rows = (exact + fuzzy)[:2]
 
     if not picked and not rec_rows and not err_rows:
-        out["skipped"] = "no_match"
+        # 大脑被问到、答不上：这一次问答要留证据（欠账账本），并在**原来提醒的那个位置**
+        # 说一句就收——不开新入口、不进简报、同签名同会话只说一次（下面的去重分支已生效）。
+        # 只对有签名的 miss 开口：「命令失败了」这种没招牌的，说一句纯属噪音。
+        if count:
+            try:
+                _log_error_miss(root, who, sig, terms)
+            except sqlite3.Error:
+                pass
+        if hint_ok:
+            debt = error_debt(root, days=ERROR_DEBT_DAYS, agent=who)
+            others = [r for r in debt["rows"]
+                      if r["status"] == "open" and r["sig"] != sig][:ERROR_DEBT_HINT_TOP]
+            shown = _error_headline(_error_voice(error_text), high, limit=64)
+            lines = ["【AgentHub 报错欠账 · 大脑没有这条的答案，只在第一次撞上时说一次】",
+                     f"刚撞的：{shown}",
+                     "解决后顺手一句 hub_report_error(title, detail=报错原文, undo=修法)，"
+                     "下次同签名就自动命中；没解决别记——欠账在有答案后会自己收编。",
+                     "账本全貌：hub_ops_run(name=\"error_debt\")"]
+            if others:
+                lines.append(f"近 {ERROR_DEBT_DAYS} 天另有 {debt['open'] - 1} 条失败签名没答案：" +
+                             "；".join(_brief_oneline(" ".join(r["terms"][:2]), 40) +
+                                       f"×{r['count']}" for r in others))
+            text = "\n".join(lines)
+            if len(text) > ERROR_DEBT_HINT_CHARS:
+                text = text[: ERROR_DEBT_HINT_CHARS - 12].rstrip() + "\n…（欠账提示截断）"
+            out["text"] = text
+            out["chars"] = len(text)
+            out["debt_open"] = debt["open"]
+            if update_state:
+                # 只进 debt_sigs：欠账说过一次就闭嘴，但**不占用召回额度**——
+                # 同会话里「登记 → 再撞 → 真命中」这一串必须还能说话，那是要看的回环。
+                _remember_error_sig(state_file, skey, sig, key="debt_sigs")
+        # skipped 分两种：真·没说话(no_match) / 说了但只说欠账(debt_hint)。
+        # 调用方（CLI 钩子、hub_call）靠这个区分决定「算不算一次真投递」——
+        # 提示混进投递，送达率与采纳回填的账就假了。
+        out["skipped"] = "debt_hint" if out["text"] else "no_match"
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
 
@@ -8971,17 +9280,32 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
             pass
     if count and skey and update_state and (out["memory_ids"] or out["record_ids"]
                                             or out["error_ids"]):
-        try:
-            st = _load_recall_state(state_file)
-            ent = (st["sessions"].get(skey) or {"ids": []})
-            ent["sigs"] = list(dict.fromkeys(list(ent.get("sigs") or []) + [sig]))[-60:]
-            ent["ts"] = _now()
-            st["sessions"][skey] = ent
-            _save_recall_state(state_file, st)
-        except Exception:  # noqa: BLE001 去重状态写失败不影响本次召回
-            pass
+        _remember_error_sig(state_file, skey, sig)
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
     return out
+
+
+def _error_sig_seen(state_file, skey: str, sig: str, key: str = "sigs") -> bool:
+    """本会话这条签名是不是已经说过（key 选哪本账：sigs=召回额度 / debt_sigs=欠账额度）。"""
+    if not skey or not sig:
+        return False
+    entry = (_load_recall_state(state_file).get("sessions") or {}).get(skey) or {}
+    return sig in {str(x) for x in (entry.get(key) or [])}
+
+
+def _remember_error_sig(state_file, skey: str, sig: str, key: str = "sigs") -> None:
+    """把这条签名记进「本会话已经说过」的名单——命中要说一次，欠账提示也只能说一次。"""
+    if not skey or not sig:
+        return
+    try:
+        st = _load_recall_state(state_file)
+        ent = (st["sessions"].get(skey) or {"ids": []})
+        ent[key] = list(dict.fromkeys(list(ent.get(key) or []) + [sig]))[-60:]
+        ent["ts"] = _now()
+        st["sessions"][skey] = ent
+        _save_recall_state(state_file, st)
+    except Exception:  # noqa: BLE001 去重状态写失败不影响本次召回
+        pass
 
 
 def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
@@ -9930,6 +10254,10 @@ def error_add(root: str, agent: str, title: str, detail: str = "",
     if not title or not title.strip():
         return "title 必填"
     title = title.strip()[:200]
+    # R834 B041 签名沉淀：登记那一刻就把签名抽成结构化键（detail 优先，正文里常有原始报错；
+    # detail 太干净时退回 title）。召回侧的 seeds 用同一个 `error_sig_of`，所以同一条报错
+    # 的键**必然**逐字相同——这是「登记一次，下次同签名秒命中」的实现，不是概率。
+    sig = error_sig_of(detail or "") or error_sig_of(title or "")
     with db_conn(root) as conn:
         agent = _norm_agent(agent)
         _upsert_agent(conn, agent, project)
@@ -9944,17 +10272,19 @@ def error_add(root: str, agent: str, title: str, detail: str = "",
             detail = (detail or "")[:4000]
             conn.execute(
                 "UPDATE errors SET repeat_count=COALESCE(repeat_count,1)+1, last_ts=?, "
-                "last_detail=CASE WHEN ?<>'' THEN ? ELSE COALESCE(last_detail,'') END WHERE id=?",
-                (_now(), detail, detail, dup["id"]))
+                "last_detail=CASE WHEN ?<>'' THEN ? ELSE COALESCE(last_detail,'') END, "
+                "sig=CASE WHEN COALESCE(sig,'')='' THEN ? ELSE sig END WHERE id=?",
+                (_now(), detail, detail, sig, dup["id"]))
             n = conn.execute("SELECT repeat_count FROM errors WHERE id=?",
                              (dup["id"],)).fetchone()["repeat_count"]
             if return_info:
                 return {"id": dup["id"], "merged": True, "repeat_count": int(n or 2)}
             return ""
         cur = conn.execute("INSERT INTO errors(ts,agent,project,title,detail,undo,status,"
-                           "repeat_count,last_ts,last_detail) VALUES(?,?,?,?,?,?,'open',1,?,?)",
+                           "repeat_count,last_ts,last_detail,sig) VALUES(?,?,?,?,?,?,'open',1,?,?,?)",
                            (_now(), agent or "unknown", project or "", title,
-                            (detail or "")[:4000], undo or "", _now(), (detail or "")[:4000]))
+                            (detail or "")[:4000], undo or "", _now(), (detail or "")[:4000],
+                            sig))
         new_id = cur.lastrowid
     if return_info:
         return {"id": new_id, "merged": False, "repeat_count": 1}

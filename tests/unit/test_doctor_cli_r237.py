@@ -178,7 +178,9 @@ def test_doctor_no_machine_passes_subset_and_empty_selection_is_fatal(monkeypatc
 def test_check_list_covers_every_registered_check(capsys):
     assert cli.cmd_check(list_checks=True) == 0
     out = capsys.readouterr().out
-    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 21
+    # 巡检项数量守卫：动了 PATROL_CHECKS 必须显式改这里并说明（防「自检悄悄多/少一项」）
+    # 21→22 = R834 +error_debt（报错欠账账本：撞过却没答案的签名要在收尾自检里看得见）
+    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 22
     assert all(n in out for n in ops.CHECKS)
     assert "需要 --target" in out and "免 target" in out
 

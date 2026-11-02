@@ -66,12 +66,22 @@ def main(argv=None) -> int:
         if not res["text"]:
             return 0
         if root and not args.no_journal:
+            # 两条路分开记账（R834）：真命中 = brain_error_recall（送达率、采纳回填都吃它），
+            # 欠账提示 = brain_error_debt_hint。混成一类会把「大脑没答案」算成「大脑答对了」，
+            # 而这两个数恰恰是相反的结论。
+            debt_hint = res.get("skipped") == "debt_hint"
+            note = (f"{len(res['text'])} chars · tool={args.tool or '?'} "
+                    f"· sig={res['sig'][:80]}")
+            if debt_hint:
+                note = (f"欠账提示 · {note} · open={res.get('debt_open')}")
+            else:
+                note = (f"{note} · mem={res['memory_ids']} · rec={res['record_ids']}"
+                        f" · err={res['error_ids']}")
             try:
                 core.journal(
-                    root, agent or "unknown", "brain_error_recall", "tool_failure",
-                    note=(f"{len(res['text'])} chars · tool={args.tool or '?'} "
-                          f"· mem={res['memory_ids']} · rec={res['record_ids']} "
-                          f"· err={res['error_ids']} · sig={res['sig'][:80]}"))
+                    root, agent or "unknown",
+                    "brain_error_debt_hint" if debt_hint else "brain_error_recall",
+                    "debt_hint" if debt_hint else "tool_failure", note=note)
             except Exception:  # noqa: BLE001 流水失败不影响召回
                 pass
         if args.json:
