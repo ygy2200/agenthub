@@ -9502,6 +9502,73 @@ def _remember_error_sig(state_file, skey: str, sig: str, key: str = "sigs") -> N
         pass
 
 
+STATE_CARD_FILES = ("迭代状态.json", "state.json")
+
+
+def project_state_card(root: str, project: str) -> dict:
+    """项目「续跑点」：读 `<项目>/output/迭代状态.json` 这类状态卡。
+
+    为什么要有它（R838）：轮次、版本、下一批候选这些「我该从哪儿接上」的事实，
+    此前只躺在台账文件里——每个新会话都得先手动翻台账才敢动手，翻不到就只能重新盘点。
+    简报的职责本来就是回答「我是谁、现在在哪、下一步」，缺了这一段，模型只能靠用户提醒。
+
+    约定优于配置：不认识的字段一律忽略，只认 round/current_round、version、
+    next_candidates、last_round.theme、updated。读不到/坏 JSON 一律返回 {}——简报
+    必须 fail-open，绝不能因为一张状态卡写坏了就整篇不出现。
+    """
+    out = {}
+    if not root or not project:
+        return out
+    for name in STATE_CARD_FILES:
+        path = Path(root) / project / "output" / name
+        if not path.is_file():
+            continue
+        try:
+            data = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            continue
+        rnd = data.get("current_round") or data.get("round")
+        last = data.get("last_round") if isinstance(data.get("last_round"), dict) else {}
+        # 两种写法都认：候选可能挂在顶层，也可能挂在 last_round 里（本机台账就是后者）
+        nxt = data.get("next_candidates") or last.get("next_candidates") or []
+        if not isinstance(nxt, list):
+            nxt = []
+        out = {"path": f"{project}/output/{name}",
+               "round": str(rnd) if rnd not in (None, "") else "",
+               "version": str(data.get("version") or ""),
+               "updated": str(data.get("updated") or ""),
+               "theme": str(last.get("theme") or ""),
+               "next": [str(x) for x in nxt if str(x).strip()][:3]}
+        break
+    return out
+
+
+def _state_card_lines(card: dict) -> list:
+    if not card:
+        return []
+    head = []
+    if card.get("round"):
+        head.append(f"R{card['round']}" if not str(card["round"]).upper().startswith("R")
+                    else str(card["round"]))
+    if card.get("version"):
+        head.append(str(card["version"]))
+    if card.get("updated"):
+        head.append(f"更新 {card['updated']}")
+    lines = ["", f"▸ 续跑点（{card.get('path') or ''}）"]
+    if head:
+        lines.append("  " + " · ".join(head))
+    if card.get("theme"):
+        lines.append(f"  上轮：{_brief_oneline(card['theme'], 60)}")
+    if card.get("next"):
+        lines.append("  下一批：" + "；".join(_brief_oneline(x, 44) for x in card["next"]))
+    if len(lines) <= 2:
+        # 只有路径、没有任何可用字段——宁可不出这一段，也别占着版面说废话
+        return []
+    return lines
+
+
 def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                   max_chars: int = BRIEF_MAX_CHARS, source: str = "session") -> dict:
     """会话启动简报：无需用户提醒，AI 一开局就看到的上下文快照。
@@ -9551,6 +9618,7 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                         " ORDER BY pinned DESC, updated DESC, id DESC LIMIT 4",
                         (pname, like, like))]
         progress = recent_diverse(root, 5, pool=120)
+        state_card = project_state_card(root, pname) if pname else {}
         seen: set = set()
         sig = signal_unread_breakdown(root, who) if who else {"fresh": 0, "stale": 0, "total": 0}
         sig_rows = []
@@ -9591,6 +9659,8 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                 lines.append(f"  · #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 90)}")
             if proj_recs or proj_mem:
                 lines.append(f"  更多：hub_memory_read(query=\"{pname} 关键词\") / hub_search(keyword=…)")
+            # R838：把「干到哪了」摆到简报里，别让每个新会话都从头翻台账
+            lines.extend(_state_card_lines(state_card))
         if pinned:
             lines.append("")
             lines.append("▸ 置顶记忆（主人/团队重点）")
