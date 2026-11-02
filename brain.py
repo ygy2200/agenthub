@@ -8843,7 +8843,9 @@ _ERR_NAMED_RE = re.compile(r"(?i)\b(?:no such (?:column|table|function|view|inde
                            r"|command not found|file not found|not found|missing"
                            r"|invalid (?:value|argument|state|path)"
                            r"|exceeds|corrupt|denied|refused)\b[^\n\"']{0,44}")
-_ERR_QUOTED_RE = re.compile(r"[\"'`\u2018\u201c]([^\"'`\u2019\u201d\n]{3,48})[\"'`\u2019\u201d]")
+_ERR_QUOTED_RE = re.compile(r"(?<![A-Za-z0-9])[\"'`\u2018\u201c]([^\"'`\u2019\u201d\n]{3,48})[\"'`\u2019\u201d]")
+# 纯转义/单字符的「问题字符」本体（`\u2018`、`\x00`、`‘`）——位置噪声，不是身份（R839）
+_ERR_ESCAPE_ONLY_RE = re.compile(r"(?:(?:\\u[0-9a-f]{4}|\\x[0-9a-f]{2})|[\u2018\u2019\u201c\u201d])+")
 _ERR_FILE_RE = re.compile(r"\b[\w.-]+\.(?:py|mjs|js|json|exe|dll|so|db|sqlite|md|bat|cmd"
                           r"|spec|txt|log|yaml|yml|toml|cpp|cc|c|h|hpp|ps1|sh)\b")
 _ERR_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]{2,}(?:[_-][a-z0-9]+)+\b")
@@ -8917,6 +8919,10 @@ def error_signature_terms(text: str, cap: int = 24) -> list:
     def add(term: str, weight: int) -> None:
         term = re.sub(r"\s+", " ", (term or "").strip().strip(":.,;!?«»“”")).lower()
         if len(term) < 3 or term in seen or term in _ERR_STOP or term.isdigit():
+            return
+        # R839：`'\u2018'` 这类「出问题的那个字符」不是身份，是位置。它每换一个字符
+        # 就让去重键漂一次，`seen_this_session` 于是失效——同一会话把同一条报错注两遍。
+        if _ERR_ESCAPE_ONLY_RE.fullmatch(term):
             return
         seen.add(term)
         out.append((term, weight))
