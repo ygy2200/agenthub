@@ -25,6 +25,7 @@ core.JOURNAL_SINK = brain.journal_add
 
 
 def main(argv=None) -> int:
+    brain.set_via("hook")  # R845：即时回忆钩子进来的流水标 via=hook
     ap = argparse.ArgumentParser(description="AgentHub 即时回忆（UserPromptSubmit 钩子入口）")
     ap.add_argument("--root", default="", help="大脑根目录；默认读 ~/.agenthub/config.json")
     ap.add_argument("--agent", default="", help="会话 agent 名")

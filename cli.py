@@ -1923,6 +1923,13 @@ def main(argv=None) -> int:
             pass
     # 语义检索懒加载模型时 transformers 会往 stderr 打进度条；CLI 输出要保持可读，
     # 默认关掉（用户显式设了别的值则尊重）。
+    # R845：命令行兜底进来的流水标 via=cli。**这是「MCP 通道断了」能被看出来的前提**——
+    # 兜底和 MCP 会写出同名的 log_work / memory_append 行，只有这一列分得开。
+    try:
+        import brain as _brain  # noqa: PLC0415  延迟导入，纯参数解析类命令不必付加载成本
+        _brain.set_via("cli")
+    except Exception:  # noqa: BLE001  口径是旁路，绝不挡主流程
+        pass
     os.environ.setdefault("HF_HUB_DISABLE_PROGRESS_BARS", "1")
     os.environ.setdefault("TRANSFORMERS_VERBOSITY", "error")
     if argv is not None:

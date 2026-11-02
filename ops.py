@@ -61,6 +61,7 @@ CHECKS = {
     "mcp_drift": ("接入参数漂移巡检（R103）：配了 agenthub 但配得不对的入口——--agent 被删（未锁身份，署名闸会持续拦写）/锁名与注册名不符（归属分裂）/server 脚本路径失效（MCP 起不来）/--root 指向别库。这些事后只在越权拦截流水露痕迹，这里事前点名", False),
     "usage_health": ("用量异常巡检（R105）：多 agent 共用大脑的行为异常检测——单 agent 近 1h 调用量失控嫌疑（速率限制硬拦前的软信号）、单工具 10 分钟循环调用嫌疑、MCP 已配置但近 7 天零调用的接入闲置、空归属调用计数（归因缺口）。只读不动手", False),
     "brief_hook_health": ("记忆钩子体检（R816 简报 / R821 回忆）：逐家核对 SessionStart 简报与 UserPromptSubmit 回忆钩子是否仍在配置里（被改配置/重装客户端会静默丢失），脚本与 Python 入口是否还在盘上，并给出近 7 天各 agent 的简报/回忆送达次数——「该送到却没送」要比等用户报「又不读记忆」更早发现", False),
+    "link_health": ("通道账（R846）：逐家按流水里的 via（stdio/cli/hook/ops）分清三条路哪条真在走——MCP 工具 / 会话钩子 / 命令行兜底。改过 MCP 配置后客户端不再拉起服务时，账本上照样有 log_work 行（全走兜底），只有这一项能把「工具通道断了」点出来", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计 / 零触发按 agent 活性分级）——检测规则有没有被真正执行，而非只写在纸面", False),
     "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
     "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
@@ -89,7 +90,7 @@ CHECKS = {
 # R8 一键自检：巡哪些项 + 每项失败时「下一步怎么做」（修复建议必须可执行，
 # 不是「请检查」这类把活推回人的废话）。巡检项刻意不含需要 target 的（回归/部署比对）。
 PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_chain", "security_health",
-                 "backup_health", "rules_health", "brief_hook_health", "mcp_drift", "usage_health",
+                 "backup_health", "rules_health", "brief_hook_health", "link_health", "mcp_drift", "usage_health",
                  "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
                  "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
@@ -104,6 +105,7 @@ CHECK_FIXES = {
     "mcp_drift": "按点名项修对应 agent 的 MCP 配置（args）：缺 --agent / 锁名不符 → cli.py onboard <agent> 重写；server 脚本不存在 → cli.py deploy 后改配置路径；--root 指向别库 → 改回 config.root 或删掉 --root（serve 会动态跟随）",
     "usage_health": "失控/循环：先用 hub_usage_timeline(agent/tool 过滤) 看是否同一调用在反复打——是循环就修触发方（agent 端脚本的 retry 上限），速率限制 AGENTHUB_RATE_* 可临时收紧；接入闲置：确认该 agent 是否还需要，不用就下线接入（防配置漂移无人发现），还用就让它的会话跑一次真实调用",
     "brief_hook_health": "钩子丢失/文件缺失：python cli.py deploy 补 Python 入口，python cli.py hook-install <agent> --apply 重装脚本与配置（幂等、写前备份）；配置缺失的机器跳过不算故障；有钩子但零送达：开一次该 agent 的会话看日志 ~/.workbuddy/logs/brain-inject.log 与 brain-recall.log",
+    "link_health": "工具通道断=该客户端的 MCP 没被拉起（最常见：改过 mcp.json 之后客户端要重新授权/Trust 一次，改配置不会自动继承授权）。修法：①去客户端的连接器/自定义 MCP 页把 agenthub 重新信任并重启该会话；②确认配置里的 python 与服务脚本路径仍有效（cli.py doctor 的 mcp_drift 会点名）；③兜底不是长久之计——钩子只在开场和每句话给上下文，主动检索与写库仍要靠工具",
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
@@ -371,6 +373,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _usage_health(root)
     elif name == "brief_hook_health":
         r = _brief_hook_health(root)
+    elif name == "link_health":
+        r = _link_health(root)
     elif name == "rules_health":
         r = _rules_health(root)
     elif name == "agent_onboard":
@@ -2865,23 +2869,30 @@ def _brief_hook_health(root: str) -> dict:
     delivered: dict = {}
     recalled: dict = {}
     errored: dict = {}
+    self_calls: dict = {}
     try:
         with _brain.db_conn(root) as conn:
+            # R846（解 B050）：带上 via——`cli.py call` 每条命令都在进程内握一次手记一行
+            # brain_brief/target=initialize，agent 名就是服务名 agenthub。不剔除的话，
+            # 报告里会多出「第 8 家 agent 收到简报」，读的人会把管理面自调当成送达。
             for r in conn.execute(
-                    "SELECT action, agent, COUNT(*) n FROM journal "
+                    "SELECT action, agent, COALESCE(via,'') v, COUNT(*) n FROM journal "
                     "WHERE action IN ('brain_brief','brain_recall','brain_adherence',"
                     "'brain_error_recall') "
                     "AND ts>=? "
-                    "GROUP BY action, agent", (d7,)):
+                    "GROUP BY action, agent, COALESCE(via,'')", (d7,)):
                 if not r["agent"]:
                     continue
                 act = r["action"]
+                key = core.agent_key(r["agent"])
+                if (r["v"] or "").strip().lower() == "cli":
+                    self_calls[key] = self_calls.get(key, 0) + int(r["n"])
+                    continue
                 bucket = (delivered if act == "brain_brief"
                           else errored if act == "brain_error_recall" else recalled)
-                key = core.agent_key(r["agent"])
                 bucket[key] = bucket.get(key, 0) + int(r["n"])
     except Exception:  # noqa: BLE001 送达统计失败不影响配置核对
-        delivered, recalled, errored = {}, {}, {}
+        delivered, recalled, errored, self_calls = {}, {}, {}, {}
     detail = []
     # 配置里写着脚本名 ≠ 脚本还在盘上：删了脚本钩子会静默失败，比配置丢失更隐蔽。
     scripts_missing = []
@@ -2942,6 +2953,10 @@ def _brief_hook_health(root: str) -> dict:
             f"{a} {n}" for a, n in sorted(errored.items())))
     else:
         detail.append("近 7 天无报错回忆送达（新装、这几家没遇到过工具失败，或都没命中）")
+    if self_calls:
+        detail.append("管理面自调（不计送达）：" + " / ".join(
+            f"{a} {n}" for a, n in sorted(self_calls.items()))
+            + "——cli.py 每条命令都在进程内握一次手，不是这家 agent 收到简报")
     if unwired or recall_unwired or scripts_missing or entries_missing:
         bits = []
         if scripts_missing or entries_missing:
@@ -2959,6 +2974,98 @@ def _brief_hook_health(root: str) -> dict:
                        f"、报错回忆 {len(error_inplace)} 家在位"
                        + (f"；{len(absent)} 家本机无配置" if absent else "")
                        + (f"；{len(unmanaged)} 家无钩子出口" if unmanaged else ""),
+            "detail": detail}
+
+
+def _link_health(root: str = "") -> dict:
+    """通道账（R846）：逐家看三条路哪条真在走——钩子 / MCP 工具 / 命令行兜底。
+
+    为什么值得单列一项（2026-11-02 实锤）：11-01 19:33 给 `~/.workbuddy/mcp.json` 的
+    agenthub 条目加了 `AGENTHUB_SEMANTIC=0`（R832 防 torch 常驻 2GB）。配置一变，客户端
+    记着的「已授权」就不再匹配，WorkBuddy 从此不再拉起这个 MCP——连续三轮迭代我手上
+    一个 `hub_*` 工具都没有，全靠 `cli.py` 兜底，而账本上 `log_work`/`memory_append`
+    一行不少，跟「MCP 好用」长得**一模一样**。没有任何检查项能看出来。
+
+    R845 起流水带 `via`（stdio/cli/hook/ops），这一项才有判据：
+      · stdio>0            → MCP 工具通道在
+      · stdio==0 且钩子在   → 工具通道断：AI 只能被动等简报，主动检索/写库全靠人推
+      · stdio==0 且只有兜底 → 同上，且连钩子都没送达，更该点名
+
+    口径边界：via 生效前的老行是空串，**不倒推成 cli**（倒推会把真 MCP 使用判成兜底）。
+    只统计 via<>'' 的行，首行声明覆盖起点；没有一条带口径的行时明说「暂不判定」。
+    """
+    if err := _need_root(root):
+        return err
+    core = _import_core()
+    import brain as _brain  # noqa: PLC0415
+    detail: list = []
+    d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+    try:
+        with _brain.db_conn(root) as conn:
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(journal)")}
+            if "via" not in cols:
+                return {"ok": True,
+                        "summary": "通道账：库还没有 via 列（迁移没跑到），本轮不判定",
+                        "detail": ["跑任意一条 hub_* 调用或 python cli.py doctor 会补列，"
+                                   "之后这项开始出结论"]}
+            since_row = conn.execute(
+                "SELECT MIN(ts) t FROM journal WHERE COALESCE(via,'')<>''").fetchone()
+            since = (since_row["t"] if since_row else "") or ""
+            start = max(d7, since) if since else d7
+            rows = list(conn.execute(
+                "SELECT agent, via, COUNT(*) n FROM journal "
+                "WHERE ts>=? AND COALESCE(via,'')<>'' GROUP BY agent, via", (start,)).fetchall())
+    except Exception:  # noqa: BLE001  库不可用/表缺失都算「无从判定」，与 brief_hook_health 同口径
+        # 库还没建（空目录/根指错）：这一项无从判定，别跟着报第二条「需要有效根目录」——
+        # 那是 db_integrity 的活，重复摊开会把最该看的那条压下去（R716 的老教训）。
+        return {"ok": True,
+                "summary": "通道账：大脑库不可用，本轮不判定（先建库或指对根目录）",
+                "detail": []}
+    stat: dict = {}
+    for r in rows:
+        key = core.agent_key(r["agent"] or "")
+        if not key:
+            continue
+        s = stat.setdefault(key, {"hook": 0, "stdio": 0, "cli": 0, "ops": 0})
+        v = (r["via"] or "").strip().lower()
+        s[v if v in s else "cli"] += int(r["n"] or 0)
+    # 只判注册过的 agent：探针（probe/via/smoke）、内部写入（ops/system/cli/auto-hook）、
+    # 以及服务名（agenthub=cli 自调的署名）都不该进「某家 agent 通道断」的名单——
+    # 上一版就是这么把 2 条测试流水报成「工具通道断了」的。
+    known = {core.agent_key(a.get("name") or "") for a in _brain.list_agents(root)}
+    unknown = sorted(k for k in stat if k not in known)
+    stat = {k: v for k, v in stat.items() if k in known}
+    if not stat:
+        return {"ok": True,
+                "summary": "通道账：窗口内只有未登记署名的流水（探针/内部写入），无 agent 可判",
+                "detail": ([f"未登记署名：{'、'.join(unknown)}"] if unknown else [])
+                          + [f"统计窗口：{start} 起"]}
+    if not stat:
+        return {"ok": True,
+                "summary": "通道账：窗口内没有带口径的流水（刚上线或这几家都没动）",
+                "detail": [f"统计窗口：{start} 起"]}
+    live = sorted(k for k, s in stat.items() if s["stdio"] > 0)
+    broken = sorted(k for k, s in stat.items() if s["stdio"] == 0 and (s["hook"] or s["cli"]))
+    silent = sorted(k for k, s in stat.items() if not any(s.values()))
+    for k in sorted(stat, key=lambda x: -(stat[x]["hook"] + stat[x]["stdio"] + stat[x]["cli"])):
+        s = stat[k]
+        verdict = ("MCP 工具在" if s["stdio"] > 0
+                   else "工具通道断" if (s["hook"] or s["cli"]) else "静默")
+        detail.append(f"{k}：MCP {s['stdio']} · 钩子 {s['hook']} · 兜底 {s['cli']}"
+                      f" · 巡检 {s['ops']} —— {verdict}")
+    if since and since > d7:
+        detail.append(f"口径起点 {since}：比这更早的流水没有 via，未参与判定"
+                      f"（历史行不猜，倒推会把真 MCP 使用误判成兜底）")
+    if silent:
+        detail.append("窗口内零流水（不算故障，只说明这几家没动）：" + "、".join(silent))
+    if broken:
+        return {"ok": False,
+                "summary": f"通道账：{len(broken)} 家只有钩子/兜底，MCP 工具通道断了"
+                           f"（{len(live)} 家在用）—— {'、'.join(broken)}",
+                "fix": CHECK_FIXES["link_health"], "detail": detail}
+    return {"ok": True,
+            "summary": f"通道账：{len(live)} 家 MCP 工具在用"
+                       + (f"；{len(silent)} 家窗口内没动" if silent else ""),
             "detail": detail}
 
 
@@ -3761,7 +3868,8 @@ def _journal(root: str, name: str, summary: str, target_name: str = "", ok=None)
     try:
         brain = _import_brain()
         tag = "" if ok is None else ("[ok] " if ok else "[gap] ")
-        brain.journal_add(root, "ops", f"检查 {name}", target=target_name, note=(tag + summary)[:200])
+        brain.journal_add(root, "ops", f"检查 {name}", target=target_name,
+                          note=(tag + summary)[:200], via="ops")
     except Exception:  # noqa: BLE001
         pass
 

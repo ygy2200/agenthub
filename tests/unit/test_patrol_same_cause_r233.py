@@ -23,7 +23,7 @@ def test_empty_root_collapses_to_single_db_issue(hub_root):
 
     # 计数守卫（改 PATROL_CHECKS / DB_BACKED_CHECKS 必须同步这里并说明）：
     # 21→22、13→14 = R834 +error_debt（报错欠账账本，依赖大脑库 → 同因折叠也少跑一次 LIKE 扫描）
-    assert rep["total"] == len(ops.PATROL_CHECKS) == 22
+    assert rep["total"] == len(ops.PATROL_CHECKS) == 23
     assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 14
 
     db_issues = [i["name"] for i in rep["issues"] if i["name"] in ops.DB_BACKED_CHECKS]
@@ -94,8 +94,10 @@ def test_healthy_root_keeps_all_db_checks(hub_root):
 
 def test_db_backed_registry_covers_patrol_db_checks():
     non_db = set(ops.PATROL_CHECKS) - ops.DB_BACKED_CHECKS
-    assert non_db == {"env", "runtime_health", "backup_health",
-                      "rules_health", "mcp_drift", "inbox", "brief_hook_health"}, non_db
+    # link_health 读 journal，但它对「库不可用」自带早退（与 brief_hook_health 同口径），
+    # 所以不算 DB_BACKED——空库时不会多摊一条「需要有效根目录」。
+    assert non_db == {"env", "runtime_health", "backup_health", "rules_health",
+                      "mcp_drift", "inbox", "brief_hook_health", "link_health"}, non_db
     assert ops.DB_BACKED_CHECKS <= set(ops.CHECKS)
 
 

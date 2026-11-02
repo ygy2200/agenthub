@@ -344,7 +344,8 @@ CREATE INDEX IF NOT EXISTS idx_attrs_node ON attrs(node_kind, node_ref);
 CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, action TEXT, target TEXT, backup TEXT, note TEXT,
-    prev_hash TEXT DEFAULT '', hash TEXT DEFAULT ''
+    prev_hash TEXT DEFAULT '', hash TEXT DEFAULT '',
+    via TEXT DEFAULT ''
 );
 -- R91 治理查询索引：安全态势/日结按 action+ts 过滤，审计导出按 ts 切片。
 -- 只加索引不改数据；init_db 每次幂等补建，存量库同样生效。
@@ -707,6 +708,28 @@ def _now() -> str:
 
 # user=GUI 本机操作、unknown/migrated=历史数据来源，不算 agent 身份
 _NON_AGENT = {"", "user", "unknown", "migrated"}
+
+
+# R845（2026-11-02）传输口径：同一件事（写记录/存记忆/检索）可能从四条路进来——
+# stdio（MCP 长驻进程）、cli（命令行兜底）、hook（会话钩子）、ops（后台巡检）。
+# 此前 journal 只记「谁做的」，不记「从哪进来的」，代价是两件事同时看不见：
+#   ①某家 agent 的 MCP 悄悄掉了（它照样有 log_work 行，只是全走 cli 兜底），
+#     在账本上与「MCP 好用」长得一模一样——本次实测：workbuddy 的 MCP 从
+#     11-01 19:33 改配置后一直没被拉起，整轮 1500 轮迭代全靠 cli 兜，无一处报警；
+#   ②cli 自调被算进「简报送达」，读报表的人以为多一家 agent 在收简报（B050）。
+# 这一列就是分流依据。via **不进审计链哈希**（_journal_hash 的字段没有它）：
+# 审计只锚「谁在何时做了什么」，传输方式是诊断信息，改它不该判成断链。
+_VIA = ""
+
+
+def set_via(v: str) -> None:
+    """设置本进程的传输口径（各入口 main 里调一次，全进程生效）。"""
+    global _VIA
+    _VIA = (v or "").strip().lower()
+
+
+def get_via() -> str:
+    return _VIA
 
 
 def _norm_agent(agent: str) -> str:
@@ -1386,6 +1409,11 @@ def _migrate_columns(root: str) -> None:
             conn.execute("ALTER TABLE tasks ADD COLUMN progress_at TEXT DEFAULT ''")
             conn.execute("UPDATE tasks SET progress_at=updated "
                          "WHERE progress_at IS NULL OR progress_at=''")
+        # R845（2026-11-02）流水补 via 传输口径（stdio/cli/hook/ops）。历史行留空，
+        # 一律按「来源不可知」处理——不能倒推成 cli，否则会把真正的 MCP 使用判成兜底。
+        jcols = {r["name"] for r in conn.execute("PRAGMA table_info(journal)")}
+        if jcols and "via" not in jcols:
+            conn.execute("ALTER TABLE journal ADD COLUMN via TEXT DEFAULT ''")
         # R6（2026-10-21）接入验证快照补指纹列：旧快照默认空，读取时回落 mtime 判定
         # R23（2026-10-22）再补 base 列：记录指纹来自哪个代码树，跨树比对不判过期
         acols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_onboarding)")}
@@ -10378,25 +10406,41 @@ def _journal_last_hash(conn) -> str:
     return (row["hash"] if row else "") or ""
 
 
-def _journal_insert_plain(conn, ts, agent, action, target, backup, note) -> None:
-    conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note) VALUES(?,?,?,?,?,?)",
-                 (ts, agent, action, target, backup, note))
+def _journal_insert_plain(conn, ts, agent, action, target, backup, note, via="") -> None:
+    """不接链的普通写入。旧库没有 via 列时退回六列写法（迁移前也不会丢流水）。"""
+    try:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,via) "
+                     "VALUES(?,?,?,?,?,?,?)",
+                     (ts, agent, action, target, backup, note, via or _VIA))
+    except sqlite3.Error:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note) "
+                     "VALUES(?,?,?,?,?,?)",
+                     (ts, agent, action, target, backup, note))
 
 
 def _journal_append(conn, ts: str, agent: str, action: str, target: str = "",
-                    backup: str = "", note: str = "") -> str:
-    """同事务追加一条接链流水。抢不到写锁或旧库缺列时降级为普通写入（旁路 fail-open）。"""
+                    backup: str = "", note: str = "", via: str = "") -> str:
+    """同事务追加一条接链流水。抢不到写锁或旧库缺列时降级为普通写入（旁路 fail-open）。
+
+    via 是 R845 加的传输口径（stdio/cli/hook/ops），**不进哈希**：审计链只锚
+    「谁在什么时候做了什么」，从哪条路进来的属诊断信息，改它不该被判成断链。
+    """
     try:
         if not conn.in_transaction and _begin_write(conn):
-            _journal_insert_plain(conn, ts, agent, action, target, backup, note)
+            _journal_insert_plain(conn, ts, agent, action, target, backup, note, via)
             return ""
         prev = _journal_last_hash(conn)
         h = _journal_hash(prev, ts, agent, action, target, backup, note)
     except sqlite3.Error:
-        _journal_insert_plain(conn, ts, agent, action, target, backup, note)
+        _journal_insert_plain(conn, ts, agent, action, target, backup, note, via)
         return ""
-    conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,prev_hash,hash) "
-                 "VALUES(?,?,?,?,?,?,?,?)", (ts, agent, action, target, backup, note, prev, h))
+    try:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,"
+                     "prev_hash,hash,via) VALUES(?,?,?,?,?,?,?,?,?)",
+                     (ts, agent, action, target, backup, note, prev, h, via or _VIA))
+    except sqlite3.Error:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,prev_hash,hash) "
+                     "VALUES(?,?,?,?,?,?,?,?)", (ts, agent, action, target, backup, note, prev, h))
     try:
         _meta_set_conn(conn, "journal_head", h)
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('journal_chain_at',?)", (ts,))
@@ -10437,11 +10481,11 @@ def _journal_row(conn, agent: str, action: str, target: str = "", note: str = ""
 
 
 def journal_add(root: str, agent: str, action: str, target: str = "",
-                backup: str = "", note: str = "") -> None:
+                backup: str = "", note: str = "", via: str = "") -> None:
     try:
         with db_conn(root) as conn:
             _journal_append(conn, _now(), _norm_agent(agent) or "", action, target,
-                            backup, note)
+                            backup, note, via)
     except Exception:  # noqa: BLE001 流水是旁路
         pass
 
