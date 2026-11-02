@@ -8215,6 +8215,16 @@ _RECALL_OPEN_STATUS = ("pending", "blocked", "in_progress", "claimed", "awaiting
 # 不明相关性。实测标定：df=2→2.80，df=5→2.01，df=9→1.46，df=20→0.69。
 _RECALL_RARE_IDF = 2.0
 
+# R842 注入配额不是目标：绝对阈值（上面的稀有词线）回答「是不是同一件事」，但答不了
+# 「够不够格一起上」。真实库实测 284 次逐句回忆里 258 次顶满 3 条（91%）——选择器干的
+# 不是「挑最相关」，是「凑满配额」。整块注入长得像固定模板，模型学会无视它（R830 免疫
+# 断路器治的是「推了没人用」，这里治的是「一开始就不该推」）。
+# 相对阈值只做一件事：后位候选必须达到首位得分的这个比例才跟上来。设为 0.62 是让
+# 「同一件事的不同侧面」留下、把「只是都碰到了同一个泛词」的挤掉；<=0 即关闭（回放对照用）。
+RECALL_REL_MARGIN = 0.62
+RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
+RECALL_RECORD_CAP = 2        # 记录通道（过程证据）每次最多几条
+
 # R827：fingeprint 抽取。思路照 Grimoire 的实测结论——「让 agent 写引用标签没用
 # （qwen 即使被要求也只有 14% 会写）」，所以判「这条记忆有没有被用」只能靠**内容里
 # 那些独一无二的 token** 有没有在后续动作里冒出来。token 只取「一眼能认出来源」的
@@ -8518,6 +8528,25 @@ def _is_coaching_prompt(prompt: str) -> bool:
     return q.startswith(_COACHING_PREFIXES)
 
 
+def _recall_pick_margin(scored: list, cap: int, margin: float = RECALL_REL_MARGIN) -> list:
+    """按相对强度截断候选（R842）：首位无条件保留，后位要够得上首位的 margin 才跟上。
+
+    入参 `scored` 是已降序的 [(score, row)]。返回 [row]（≤cap）。
+
+    为什么不能只靠绝对阈值：稀有词线判的是「这条是不是在讲同一件事」，它答不了
+    「三条是不是一样硬」。实测 91% 的注入顶满配额＝后位几乎不受约束，整块变成模型
+    眼里的固定模板（R830 免疫账本的另一面）。相对线补上这一维。
+    margin<=0 视为关闭（纯 top-cap，回放对照用）；margin=1.0 只留与首位并列的。
+    """
+    if not scored:
+        return []
+    top = float(scored[0][0])
+    if margin <= 0 or not top > 0:
+        return [r for _, r in scored[:cap]]
+    keep = [r for s, r in scored if float(s) >= top * margin][:cap]
+    return keep or [scored[0][1]]
+
+
 def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                   project: str = "", max_chars: int = RECALL_MAX_CHARS,
                   session: str = "", state_path: str = "",
@@ -8642,7 +8671,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
     strong = [(s, r) for s, r in scored
               if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
-    picked = [r for _, r in strong[:3]]
+    picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     out["muted"] = muted      # 本轮被免疫挡掉的条数（报表/单测据此看断路器有没有在动）
     try:
         recs = search_records(root, query, limit=30)
@@ -8673,8 +8702,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             (rec_idf_raw.get(t, 0.0) for t, _ in terms if t in body.lower()), default=0.0)
         rec_scored.append((spec, r))
     rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
-    rec_rows = [r for _, r in rec_scored
-                if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF][:2]
+    rec_strong = [(s, r) for s, r in rec_scored
+                  if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
+    rec_rows = _recall_pick_margin(rec_strong, RECALL_RECORD_CAP)
     # R836：叮嘱型提示不当检索词——相关历史不给口语切片噪声
     if _is_coaching_prompt(prompt):
         rec_rows = []
@@ -9578,6 +9608,17 @@ def _state_card_lines(card: dict) -> list:
     if len(lines) <= 2:
         # 只有路径、没有任何可用字段——宁可不出这一段，也别占着版面说废话
         return []
+    # R843：续跑点已经写进上下文了，但「知道」和「说出口」是两件事——不要求报到，
+    # 模型照样可以开口就问「你想做什么」，用户就得再提醒一次「接着上次的干」。
+    # 一行指令把状态变成可核对的开场白：说了就证明读过，没读就说不出来。
+    seed = (card.get("next") or [""])[0]
+    # 候选串通常长这样「B049 签名沉淀回填（P1，实测 512 条…）」——括号里是理由，
+    # 报到只要「编号 + 事项」，砍在括号中间会让开场白变成一串省略号。
+    seed = str(seed).split("（")[0].split("(")[0].strip()
+    tag = ("R" + str(card["round"])) if card.get("round") else ""
+    head_bits = " · ".join(x for x in (tag, _brief_oneline(seed, 26)) if x)
+    if head_bits:
+        lines.append(f"  开口先说：接上 {head_bits}（一句话，别复述本简报）")
     return lines
 
 
