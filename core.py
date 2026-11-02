@@ -1238,10 +1238,16 @@ HOOK_RECALL_DESC = "AgentHub 即时回忆：按每句话检索相关记忆（R82
 # 可能触发几十次，每次都比对指纹纯属浪费）。
 HOOK_ADHERENCE_NAME = "brain_adherence.mjs"
 HOOK_ADHERENCE_DESC = "AgentHub 采纳回填：一轮结束标记哪些注入被用到（R828）"
+# 报错即时回忆（R833）：模型真正需要历史结论的时刻是它自己撞墙那一刻，不是用户
+# 发言那一刻。PostToolUseFailure 是各家（Claude/Qoder 契约）给的确定出口；脚本同时
+# 兼容 PostToolUse 带错误标记的形态，拿不到错误正文就静默。
+HOOK_ERROR_RECALL_NAME = "brain_error_recall.mjs"
+HOOK_ERROR_RECALL_DESC = "AgentHub 报错即时回忆：工具失败时自动送同签名的旧坑（R833）"
 HOOK_JSON_EVENTS = {
     "session": ("SessionStart", HOOK_BRIEF_NAME, HOOK_BRIEF_DESC),
     "prompt": ("UserPromptSubmit", HOOK_RECALL_NAME, HOOK_RECALL_DESC),
     "answer": ("Stop", HOOK_ADHERENCE_NAME, HOOK_ADHERENCE_DESC),
+    "error": ("PostToolUseFailure", HOOK_ERROR_RECALL_NAME, HOOK_ERROR_RECALL_DESC),
 }
 
 
@@ -1251,6 +1257,33 @@ def hook_brief_script_path() -> Path:
 
 def hook_script_path(name: str) -> Path:
     return Path.home() / ".agenthub" / "hooks" / name
+
+
+def refresh_installed_hooks(src_dir: str = "", dst_dir: str = "") -> tuple:
+    """把运行时目录里最新的钩子脚本刷进 ~/.agenthub/hooks/ 里**已经存在**的副本。
+
+    钩子跑的是这份副本，而它只有 hook-install 会写——install 要动各家配置，日常
+    发布不可能每次都跑，于是「源码改了 + deploy 完」仍不等于线上生效（R833 实测：
+    .mjs 里修好命令换行，deploy 15/15 全绿，线上钩子还是旧的那份）。这里只覆盖
+    已经挂着的脚本，没装的不新建，所以不会把用户没启用的钩子偷偷激活。
+    src_dir/dst_dir 仅供回归注入，生产不传。返回 (刷新了的文件名, 跳过无变化的)。
+    """
+    src = Path(src_dir) if src_dir else _runtime_dir()
+    dst = Path(dst_dir) if dst_dir else Path.home() / ".agenthub" / "hooks"
+    refreshed, unchanged = [], []
+    for name in HOOK_SCRIPT_FILES:
+        s, d = src / name, dst / name
+        if not s.is_file() or not d.is_file():
+            continue                      # 没挂载 / 源文件缺失：不新建，也不报错
+        try:
+            if s.read_bytes() != d.read_bytes():
+                d.write_bytes(s.read_bytes())
+                refreshed.append(name)
+            else:
+                unchanged.append(name)
+        except OSError:                   # 刷不动（只读/占用）不影响已完成的 server 部署
+            continue
+    return refreshed, unchanged
 
 
 def _hook_node() -> str:
@@ -1383,9 +1416,20 @@ def install_adherence_hook(agent: str, apply: bool = False, path: str = "",
                               install_script=install_script)
 
 
+def install_error_recall_hook(agent: str, apply: bool = False, path: str = "",
+                              node: str = "", install_script: bool = True) -> dict:
+    """把 brain_error_recall.mjs 挂到 agent 的 PostToolUseFailure（R833）。
+
+    工具失败是「大脑该开口」的确定信号：这时候给一句同签名的旧坑，比事后由用户
+    提醒「你先查一下记忆」有效得多，成本也低——只在失败时跑一次检索。
+    """
+    return _install_json_hook(agent, "error", apply=apply, path=path, node=node,
+                              install_script=install_script)
+
+
 def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
                          node: str = "", install_script: bool = True) -> dict:
-    """一次装齐开机简报 + 按句回忆；返回 {"session": …, "prompt": …}，互不阻塞。
+    """一次装齐开机简报 + 按句回忆 + 报错回忆 + 采纳回填，互不阻塞。
 
     hermes 的 pre_llm_call 是唯一出口，同一脚本先发简报、之后每轮回忆：
     prompt 行复用 session 结果并标 covered，不写第二份配置。
@@ -1398,17 +1442,23 @@ def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
         prompt.update({"event": "pre_llm_call", "covered": True})
         # hermes 的 pre_llm_call 是唯一被登记过的出口；post_llm_call 挂回填脚本
         # 还没在真机验证过，这里如实标 unsupported 而不是假装装上了（R828）。
+        # 报错回忆同理：没有验证过的「工具失败」出口，不假装装上（R833）。
         answer = {"agent": key, "event": "Stop", "status": "unsupported",
                   "path": str(Path(os.path.expanduser(
                       "D:/hermes/Hermes Agent CN Desktop/data/hermes-home/config.yaml"))),
                   "command": "", "backup": "", "copied": False}
-        return {"session": session, "prompt": prompt, "answer": answer}
+        error = dict(answer)
+        error.update({"event": "PostToolUseFailure", "command": "", "backup": "",
+                      "copied": False})
+        return {"session": session, "prompt": prompt, "answer": answer, "error": error}
     return {"session": install_brief_hook(agent, apply=apply, path=path, node=node,
                                           install_script=install_script),
             "prompt": install_recall_hook(agent, apply=apply, path=path, node=node,
                                           install_script=install_script),
             "answer": install_adherence_hook(agent, apply=apply, path=path, node=node,
-                                             install_script=install_script)}
+                                             install_script=install_script),
+            "error": install_error_recall_hook(agent, apply=apply, path=path, node=node,
+                                               install_script=install_script)}
 
 
 # hermes 没有 SessionStart 出口，只有 pre_llm_call（每次模型调用都触发）——
@@ -1568,11 +1618,11 @@ def _hook_state(probe: dict) -> str:
 
 
 def memory_hook_status(agent: str, path: str = "") -> dict:
-    """只读：某家「开机简报 + 按句回忆 + 采纳回填」三条钩子的合并状态（R821/R828）。
+    """只读：某家「开机简报 + 按句回忆 + 报错回忆 + 采纳回填」四条钩子的合并状态。
 
-    JSON 系三家钩子各挂一个事件；hermes 只有 pre_llm_call 一个出口，同一份
-    脚本先发简报、后续每轮按 prompt 回忆，故 prompt 记为 covered，Stop 回填
-    尚未在真机验证过，如实记 unsupported。
+    JSON 系各家钩子各挂一个事件；hermes 只有 pre_llm_call 一个出口，同一份
+    脚本先发简报、后续每轮按 prompt 回忆，故 prompt 记为 covered，Stop 回填与
+    工具失败回忆都没有验证过的出口，如实记 unsupported（R821/R828/R833）。
     """
     key = agent_key(agent) or (agent or "").strip().lower()
     hermes = key.startswith("hermes")
@@ -1592,6 +1642,8 @@ def memory_hook_status(agent: str, path: str = "") -> dict:
                   "path": session["path"], "script": script.is_file()}
         answer = {"agent": key, "state": "unsupported", "path": session["path"],
                   "script": hook_script_path(HOOK_ADHERENCE_NAME).is_file()}
+        error = {"agent": key, "state": "unsupported", "path": session["path"],
+                 "script": hook_script_path(HOOK_ERROR_RECALL_NAME).is_file()}
     else:
         probe = install_recall_hook(key, apply=False, path=path, install_script=False)
         prompt = {"agent": key, "state": _hook_state(probe), "path": probe.get("path", ""),
@@ -1599,7 +1651,11 @@ def memory_hook_status(agent: str, path: str = "") -> dict:
         aprobe = install_adherence_hook(key, apply=False, path=path, install_script=False)
         answer = {"agent": key, "state": _hook_state(aprobe), "path": aprobe.get("path", ""),
                   "script": hook_script_path(HOOK_ADHERENCE_NAME).is_file()}
-    return {"agent": key, "session": session, "prompt": prompt, "answer": answer}
+        eprobe = install_error_recall_hook(key, apply=False, path=path, install_script=False)
+        error = {"agent": key, "state": _hook_state(eprobe), "path": eprobe.get("path", ""),
+                 "script": hook_script_path(HOOK_ERROR_RECALL_NAME).is_file()}
+    return {"agent": key, "session": session, "prompt": prompt,
+            "answer": answer, "error": error}
 
 
 def hook_managed_keys() -> set:
@@ -1669,12 +1725,13 @@ MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # 2026-10-13 release playbook 实跑时 deploy_diff 抓到 api.py 不一致，根因即此。
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
                 "api.py", "brain_brief.py", "brain_recall.py", "brain_adherence.py",
+                "brain_error_recall.py",
                 "my/__init__.py", "my/work/__init__.py")
 
 # 钩子脚本随 exe 一起打包：安装器要能从运行目录复制到 ~/.agenthub/hooks/，
 # 只有 .py 进了 PYZ 而脚本没进 datas，打包版的「安装钩子」会复制 0 个文件。
 HOOK_SCRIPT_FILES = ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs",
-                    "brain_adherence.mjs")
+                    "brain_adherence.mjs", "brain_error_recall.mjs")
 
 
 def bundle_files() -> tuple:

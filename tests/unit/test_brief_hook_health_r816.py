@@ -20,13 +20,14 @@ def _patch(monkeypatch, targets, hermes, tmp_path, with_scripts=True):
     d.mkdir(exist_ok=True)
     if with_scripts:
         for n in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT,
-                  core.HOOK_ADHERENCE_NAME):
+                  core.HOOK_ADHERENCE_NAME, core.HOOK_ERROR_RECALL_NAME):
             (d / n).write_text("// stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "hook_script_path", lambda name: d / name)
     mcp = tmp_path / "mcp"
     mcp.mkdir(exist_ok=True)
     if with_scripts:
-        for n in ("brain_brief.py", "brain_recall.py", "brain_adherence.py"):
+        for n in ("brain_brief.py", "brain_recall.py", "brain_adherence.py",
+                  "brain_error_recall.py"):
             (mcp / n).write_text("# stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "MCP_SERVER_DIR", mcp)
 
@@ -38,11 +39,12 @@ def _cfg(tmp_path, name, text):
 
 
 def _both(script_brief=core.HOOK_BRIEF_NAME, script_recall=core.HOOK_RECALL_NAME):
-    # R828：三条钩子（简报/回忆/回填）都齐才算「全在位」，否则体检会点名回填缺失。
+    # R833：四条钩子（简报/回忆/回填/报错）都齐才算「全在位」，否则体检会点名缺失。
     return {"hooks": {
         "SessionStart": [{"hooks": [{"type": "command", "command": script_brief}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": script_recall}]}],
         "Stop": [{"hooks": [{"type": "command", "command": core.HOOK_ADHERENCE_NAME}]}],
+        "PostToolUseFailure": [{"hooks": [{"type": "command", "command": core.HOOK_ERROR_RECALL_NAME}]}],
     }}
 
 
@@ -83,13 +85,32 @@ def test_all_in_place_is_ok_and_counts_deliveries(hub_root, tmp_path, monkeypatc
     with brain.db_conn(hub_root) as conn:
         brain._journal_append(conn, ts, "qoder", "brain_brief", "session", "", "x")
         brain._journal_append(conn, ts, "qoder", "brain_recall", "prompt", "", "x")
+        brain._journal_append(conn, ts, "qoder", "brain_error_recall", "error", "", "x")
     r = ops.run_check("brief_hook_health", "", hub_root)
     assert r["ok"] is True, r
-    assert "简报 2 家、回忆 2 家在位" in r["summary"], r["summary"]
+    assert "简报 2 家、回忆 2 家、报错回忆 1 家在位" in r["summary"], r["summary"]
     text = " ".join(r["detail"])
     assert "近 7 天简报送达：qoder 1" in text, text
     assert "近 7 天回忆送达：qoder 1" in text, text
+    assert "近 7 天报错回忆送达：qoder 1" in text, text
     assert "零送达" in text and "hermes" in text, "钩子在位但没送达应作为信息行点名"
+
+
+def test_missing_error_hook_is_named_but_not_red(hub_root, tmp_path, monkeypatch):
+    """R833：机器还没升第 4 条钩子时，明细要点名 + 给修复命令，但不把体检刷成红。
+
+    红是给「装坏了」的，不是给「还没装新的」的——否则每台未升级机器天天红，
+    用户很快就不看体检了（同 R828 回填的口径）。
+    """
+    brain.init_db(hub_root)
+    cfg = _both()
+    del cfg["hooks"]["PostToolUseFailure"]
+    q = _cfg(tmp_path, "q.json", json.dumps(cfg))
+    _patch(monkeypatch, {"qoder": str(q)}, (("hermes-cn", str(tmp_path / "none")),), tmp_path)
+    r = ops.run_check("brief_hook_health", "", hub_root)
+    assert r["ok"] is True, r
+    assert any("报错回忆钩子丢失" in d and "qoder" in d for d in r["detail"]), r["detail"]
+    assert any("--events error --apply" in d for d in r["detail"]), r["detail"]
 
 
 def test_missing_recall_hook_is_named(hub_root, tmp_path, monkeypatch):

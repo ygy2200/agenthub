@@ -2832,6 +2832,7 @@ def _brief_hook_health(root: str) -> dict:
     targets["hermes-cn"] = core.HOOK_BRIEF_HERMES_TARGETS[0][1]
     inplace, unwired, recall_inplace, recall_unwired, absent = [], [], [], [], []
     answer_inplace, answer_unwired = [], []   # R828：Stop 采纳回填
+    error_inplace, error_unwired = [], []     # R833：工具失败即时回忆
     for agent, cfg_s in targets.items():
         p = Path(os.path.expanduser(cfg_s))
         if not p.is_file():
@@ -2853,37 +2854,48 @@ def _brief_hook_health(root: str) -> dict:
         if not hermes:
             (answer_inplace if core.HOOK_ADHERENCE_NAME in text
              else answer_unwired).append(agent)
+            (error_inplace if core.HOOK_ERROR_RECALL_NAME in text
+             else error_unwired).append(agent)
     d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
     delivered: dict = {}
     recalled: dict = {}
+    errored: dict = {}
     try:
         with _brain.db_conn(root) as conn:
             for r in conn.execute(
                     "SELECT action, agent, COUNT(*) n FROM journal "
-                    "WHERE action IN ('brain_brief','brain_recall','brain_adherence') "
+                    "WHERE action IN ('brain_brief','brain_recall','brain_adherence',"
+                    "'brain_error_recall') "
                     "AND ts>=? "
                     "GROUP BY action, agent", (d7,)):
                 if not r["agent"]:
                     continue
-                bucket = delivered if r["action"] == "brain_brief" else recalled
-                bucket[core.agent_key(r["agent"])] = int(r["n"])
+                act = r["action"]
+                bucket = (delivered if act == "brain_brief"
+                          else errored if act == "brain_error_recall" else recalled)
+                key = core.agent_key(r["agent"])
+                bucket[key] = bucket.get(key, 0) + int(r["n"])
     except Exception:  # noqa: BLE001 送达统计失败不影响配置核对
-        delivered, recalled = {}, {}
+        delivered, recalled, errored = {}, {}, {}
     detail = []
     # 配置里写着脚本名 ≠ 脚本还在盘上：删了脚本钩子会静默失败，比配置丢失更隐蔽。
     scripts_missing = []
     for want in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT,
-                 core.HOOK_ADHERENCE_NAME):
+                 core.HOOK_ADHERENCE_NAME, core.HOOK_ERROR_RECALL_NAME):
         sp = core.hook_script_path(want)
         if not sp.is_file():
             scripts_missing.append(want)
     entries_missing = [name for name in ("brain_brief.py", "brain_recall.py",
-                                        "brain_adherence.py")
+                                        "brain_adherence.py", "brain_error_recall.py")
                        if not (core.MCP_SERVER_DIR / name).is_file()]
     if answer_unwired:
         detail.append("采纳回填钩子丢失：" + "、".join(answer_unwired)
                       + "（注入账本 recall_adherence 会一直是空的——python cli.py "
                         "hook-install --events answer --apply 补上）")
+    if error_unwired:
+        detail.append("报错回忆钩子丢失：" + "、".join(error_unwired)
+                      + "（AI 撞墙时不会自动想起同签名的旧坑，仍要人提醒才查大脑——"
+                        "python cli.py hook-install --events error --apply 补上）")
     if unwired or recall_unwired:
         lost = sorted(set(unwired) | set(recall_unwired))
         detail.append("钩子丢失：" + "、".join(lost)
@@ -2920,6 +2932,11 @@ def _brief_hook_health(root: str) -> dict:
                           + "（可能这些天没说话，或每句都没命中记忆；看 ~/.workbuddy/logs/brain-recall.log）")
     else:
         detail.append("近 7 天无回忆送达记录（新装、还没说过需要回忆的话，或都没命中）")
+    if errored:
+        detail.append("近 7 天报错回忆送达：" + " / ".join(
+            f"{a} {n}" for a, n in sorted(errored.items())))
+    else:
+        detail.append("近 7 天无报错回忆送达（新装、这几家没遇到过工具失败，或都没命中）")
     if unwired or recall_unwired or scripts_missing or entries_missing:
         bits = []
         if scripts_missing or entries_missing:
@@ -2933,7 +2950,8 @@ def _brief_hook_health(root: str) -> dict:
                            f"（简报 {len(inplace)} 家 / 回忆 {len(recall_inplace)} 家在位）",
                 "fix": CHECK_FIXES["brief_hook_health"], "detail": detail}
     return {"ok": True,
-            "summary": f"记忆钩子：简报 {len(inplace)} 家、回忆 {len(recall_inplace)} 家在位"
+            "summary": f"记忆钩子：简报 {len(inplace)} 家、回忆 {len(recall_inplace)} 家"
+                       f"、报错回忆 {len(error_inplace)} 家在位"
                        + (f"；{len(absent)} 家本机无配置" if absent else "")
                        + (f"；{len(unmanaged)} 家无钩子出口" if unmanaged else ""),
             "detail": detail}

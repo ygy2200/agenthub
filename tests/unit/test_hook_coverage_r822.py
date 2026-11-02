@@ -19,12 +19,13 @@ def _patch(monkeypatch, targets, hermes, tmp_path):
     d = tmp_path / "hooks"
     d.mkdir(exist_ok=True)
     for n in (core.HOOK_BRIEF_NAME, core.HOOK_RECALL_NAME, core.HOOK_BRIEF_HERMES_SCRIPT,
-              core.HOOK_ADHERENCE_NAME):
+              core.HOOK_ADHERENCE_NAME, core.HOOK_ERROR_RECALL_NAME):
         (d / n).write_text("// stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "hook_script_path", lambda name: d / name)
     mcp = tmp_path / "mcp"
     mcp.mkdir(exist_ok=True)
-    for n in ("brain_brief.py", "brain_recall.py", "brain_adherence.py"):
+    for n in ("brain_brief.py", "brain_recall.py", "brain_adherence.py",
+              "brain_error_recall.py"):
         (mcp / n).write_text("# stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "MCP_SERVER_DIR", mcp)
     return d
@@ -35,6 +36,7 @@ def _both():
         "SessionStart": [{"hooks": [{"type": "command", "command": core.HOOK_BRIEF_NAME}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": core.HOOK_RECALL_NAME}]}],
         "Stop": [{"hooks": [{"type": "command", "command": core.HOOK_ADHERENCE_NAME}]}],
+        "PostToolUseFailure": [{"hooks": [{"type": "command", "command": core.HOOK_ERROR_RECALL_NAME}]}],
     }}
 
 

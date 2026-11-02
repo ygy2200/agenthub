@@ -18,18 +18,22 @@ def _rows(*names):
 
 
 def _states(mapping, answer=""):
-    """R828：状态里多了 answer（Stop 采纳回填）。hermes 没有 Stop 出口，固定 unsupported。"""
+    """R833：状态里四条钩子（简报/回忆/回填/报错）。hermes 没有 Stop / 工具失败出口，
+    后两项固定 unsupported，标记要如实写成「回填+报错无出口」而不是硬说全在位。"""
     def _fake(agent, path=""):
         s = mapping.get(agent, "inplace")
-        ans = answer or ("unsupported" if str(agent).startswith("hermes") else "inplace")
+        hop = "unsupported" if str(agent).startswith("hermes") else "inplace"
+        ans = answer or hop
         if s == "covered":
             return {"agent": agent, "session": {"state": "inplace"},
-                    "prompt": {"state": "covered"}, "answer": {"state": ans}}
+                    "prompt": {"state": "covered"}, "answer": {"state": ans},
+                    "error": {"state": hop}}
         if s == "unsupported":
             return {"agent": agent, "session": {"state": "unsupported"},
-                    "prompt": {"state": "unsupported"}, "answer": {"state": ans}}
+                    "prompt": {"state": "unsupported"}, "answer": {"state": ans},
+                    "error": {"state": hop}}
         return {"agent": agent, "session": {"state": s}, "prompt": {"state": s},
-                "answer": {"state": ans}}
+                "answer": {"state": ans}, "error": {"state": hop}}
     return _fake
 
 
@@ -40,10 +44,10 @@ def test_status_prints_hook_column_per_agent(monkeypatch, capsys, tmp_path):
     rc = cli.cmd_status(str(tmp_path))
     out = capsys.readouterr().out
     assert rc == 0, out
-    assert "钩子:✓简报+回忆+回填" in out, out
+    assert "钩子:✓简报+回忆+回填+报错" in out, out
     assert "钩子:—无出口" in out, "ZCode 没有钩子出口，要写清楚而不是留空"
-    # hermes 的回忆由同一 pre_llm_call 覆盖、Stop 回填没有出口——两项都要如实体现
-    assert "钩子:✓简报+回忆（回填无出口）" in out, out
+    # hermes 的回忆由同一 pre_llm_call 覆盖、Stop 回填和工具失败回忆都没有出口——都要如实体现
+    assert "钩子:✓简报+回忆（回填+报错无出口）" in out, out
 
 
 def test_unwired_hook_turns_status_red(monkeypatch, capsys, tmp_path):
@@ -72,16 +76,31 @@ def test_status_json_carries_hook_state(monkeypatch, capsys, tmp_path):
     cli.cmd_status(str(tmp_path), as_json=True)
     data = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert data["agents"][0]["hook"] == {"session": "inplace", "prompt": "inplace",
-                                         "answer": "inplace"}, data
+                                         "answer": "inplace", "error": "inplace"}, data
     assert data["healthy"] is True, data
 
 
 def test_hook_mark_partial_names_the_missing_side():
     """只挂了简报没挂回忆时，标记要说缺哪条，别只说「异常」。"""
-    # R828：三条钩子各自独立，缺哪条就点名哪条——回填在位时不该被算进「缺」。
+    # R828：四条钩子各自独立，缺哪条就点名哪条——回填在位时不该被算进「缺」。
     st = {"session": {"state": "inplace"}, "prompt": {"state": "unwired"},
           "answer": {"state": "inplace"}}
     assert cli._hook_mark(st) == "✗缺回忆"
     st2 = {"session": {"state": "inplace"}, "prompt": {"state": "inplace"},
            "answer": {"state": "unwired"}}
     assert cli._hook_mark(st2) == "✗缺回填"
+    # R833：报错回忆单独缺失也要点名，且不能牵连其它三条
+    st3 = {"session": {"state": "inplace"}, "prompt": {"state": "inplace"},
+           "answer": {"state": "inplace"}, "error": {"state": "unwired"}}
+    assert cli._hook_mark(st3) == "✗缺报错"
+
+
+def test_hook_mark_ignores_a_dimension_the_impl_does_not_report():
+    """R833：老实现的状态字典里没有 error 键——「没报的那一维」不算缺口。
+
+    把看不见的东西当问题报，会让每台没升级的机器天天红（同 runtime_health 的诚实口径），
+    用户很快就不信这个标记了。
+    """
+    st = {"session": {"state": "inplace"}, "prompt": {"state": "inplace"},
+          "answer": {"state": "inplace"}}
+    assert cli._hook_mark(st) == "✓简报+回忆+回填"

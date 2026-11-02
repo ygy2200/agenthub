@@ -26,6 +26,11 @@ def _hooked(tmp_path, name="hooked.json"):
         # R831：三条钩子都要在，否则「全部在位」这句不成立（回填缺口会被点名）
         "Stop": [
             {"hooks": [{"type": "command", "command": "node brain_adherence.mjs --agent x"}]}],
+        # R833：第四条（报错即时回忆）同理——少它这家就会被当成缺口点名，
+        # 「已在位的不该被点名」这条断言会假红
+        "PostToolUseFailure": [
+            {"hooks": [{"type": "command",
+                        "command": "node brain_error_recall.mjs --agent x"}]}],
     }})
 
 
@@ -47,7 +52,8 @@ def _build(qapp, hub_root, monkeypatch, targets, hermes, tmp_path=None):
     if tmp_path is not None:
         hooks = tmp_path / "hooks"
         hooks.mkdir(exist_ok=True)
-        for n in ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs"):
+        for n in ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs",
+                  "brain_error_recall.mjs"):
             (hooks / n).write_text("// brain_recall.py\n", encoding="utf-8")
         monkeypatch.setattr(core, "hook_script_path", lambda name: hooks / name)
     win = QWidget()

@@ -11,7 +11,9 @@
   · 采纳率对照区间 **40%–70%**（sheratonhq 的实测口径）。低于 40% 是排序/门槛有问题，
     高于 70% 要怀疑上下文冗余（全都用上了，说明给得太少或太泛）。
   · 平均记忆年龄对照 **7–30 天**：太短=只靠近期记忆，太长=旧结论权重过高。
-  · 分 strong / weak 两档看——如果两档采纳率差不多，说明 R826 的「分流」判断不成立。
+  · 分档看（strong / weak / R833 起的 error＝工具失败那一刻的注入）——如果各档采纳率
+    差不多，说明 R826 的「分流」判断不成立；error 档单独看，它面对的是「模型正卡在
+    错误上」的时刻，理论上比按句回忆更容易被用上，没差距就要查签名词是不是抽得太泛。
 
 标记采纳（agent 侧调用）：
     --mark <session> --text "<本轮回答或执行的命令>"   → 命中指纹即记 used
@@ -77,13 +79,20 @@ def main() -> int:
             "偏旧（旧结论权重可能过高）" if age > AGE_HI else "在区间内")
         print(f"平均记忆年龄 {age} 天（参考 {AGE_LO:.0f}–{AGE_HI:.0f}）→ {note}")
     if st["by_strength"]:
-        print("\n分档（R826 的分流判断是否成立，看这两行差距）：")
-        for s in ("strong", "weak"):
-            b = st["by_strength"].get(s)
-            if not b:
-                continue
-            print(f"  {s:<6} 注入 {b['injected']:>4}  可指纹 {b['fingerprintable']:>4}  "
-                  f"被用 {b['used']:>3}  采纳率 {b['rate']}%")
+        # 档位从账本里动态取（R833 起多了 error 一档：工具失败那一刻的注入）。
+        # 硬编码 strong/weak 会让新档悄悄掉出报表——看了半天以为没人用它，其实只是没印。
+        print("\n分档（R826 的分流判断是否成立，看各档采纳率差距）：")
+        label = {"strong": "strong 强命中", "weak": "weak 弱命中",
+                 "error": "error 报错即时"}
+        for s, b in sorted(st["by_strength"].items(),
+                           key=lambda kv: -kv[1]["injected"]):
+            print(f"  {label.get(s, s):<14} 注入 {b['injected']:>4}  "
+                  f"可指纹 {b['fingerprintable']:>4}  被用 {b['used']:>3}  "
+                  f"采纳率 {b['rate']}%")
+        if "error" in st["by_strength"]:
+            e = st["by_strength"]["error"]
+            if e["injected"] and not e["fingerprintable"]:
+                print("  （error 档还抽不出指纹——先别按采纳率判它好坏，先看送达数：cli.py doctor --only brief_hook_health）")
 
     # R829：曝光与采纳是两本账。只看采纳率回答不了「该动谁」——这两张榜才是动作清单。
     ev = brain.exposure_vs_adoption(root)

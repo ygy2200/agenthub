@@ -25,10 +25,14 @@ def _cfg(tmp_path, name, events):
 
 
 def _all_three(tmp_path, name="full.json"):
+    # R833 起「全部在位」是四条：少报错回忆，接入页会照样点名这家是缺口，
+    # 这条用例守的「齐全时按钮不可点」就会假红
     return _cfg(tmp_path, name, {
         "SessionStart": [{"hooks": [{"type": "command", "command": "node brain_inject.mjs"}]}],
         "UserPromptSubmit": [{"hooks": [{"type": "command", "command": "node brain_recall.mjs"}]}],
         "Stop": [{"hooks": [{"type": "command", "command": "node brain_adherence.mjs"}]}],
+        "PostToolUseFailure": [{"hooks": [{"type": "command",
+                                           "command": "node brain_error_recall.mjs"}]}],
     })
 
 
@@ -53,7 +57,8 @@ def _build(qapp, hub_root, monkeypatch, targets, tmp_path):
                         (("hermes-cn", str(tmp_path / "none.yaml")),))
     hooks = tmp_path / "hooks"
     hooks.mkdir(exist_ok=True)
-    for n in ("brain_inject.mjs", "brain_recall.mjs", "brain_adherence.mjs"):
+    for n in ("brain_inject.mjs", "brain_recall.mjs", "brain_adherence.mjs",
+              "brain_error_recall.mjs"):
         (hooks / n).write_text("// stub\n", encoding="utf-8")
     monkeypatch.setattr(core, "hook_script_path", lambda name: hooks / name)
     win = QWidget()

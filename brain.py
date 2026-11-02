@@ -8579,7 +8579,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             except sqlite3.Error:
                 pass
     try:
-        log_search(root, "prompt_recall", query[:200], len(out["memory_ids"]), agent=who)
+        log_search(root, "prompt_recall", query[:200],
+                   len(out["memory_ids"]) + len(out.get("record_ids") or []), agent=who)
     except sqlite3.Error:
         pass
     if skey and update_state and out["memory_ids"]:
@@ -8589,6 +8590,396 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         entry["ts"] = _now()
         state["sessions"][skey] = entry
         _save_recall_state(state_file, state)
+    out["elapsed_ms"] = int((time.time() - t0) * 1000)
+    return out
+
+
+ERROR_RECALL_MAX_CHARS = 700
+
+# 报错签名里「一眼认得出来源」的形态。与自然语言检索词（extract_prompt_terms）不同：
+# 报错的区分度全在标识符上——异常类名、错误码、被点名的列/文件/包。拿「报错」「失败」
+# 这种词去查等于没查，所以高价值词（w=3）必须至少命中一个才允许注入。
+_ERR_EXC_RE = re.compile(r"\b[A-Z][A-Za-z0-9_]{2,}(?:Error|Exception|Warning|Failure|"
+                         r"Timeout|Abort|Refused|Denied|Violation|Overflow|Underflow)\b")
+_ERR_CODE_RE = re.compile(r"\b(?:0x[0-9A-Fa-f]{6,16}|E(?:ACCES|AGAIN|NOENT|PERM|LOOP|"
+                          r"ADDRINUSE|ADDRNOTAVAIL|CONNREFUSED|CONNRESET|INTR|INVAL|IO|"
+                          r"NOSPC|TIMEDOUT|CHILD|DEADLK|EXIST|2MM)\b)\b", re.I)
+# 带编号的错误必须连号一起当招牌：WinError 5（拒绝访问）与 WinError 32（文件被占用）
+# 根因完全不同，只抽「WinError」会把上次的修法安在错的坑上（R833 冒烟实测误配）。
+_ERR_NUMCODE_RE = re.compile(r"(?i)\b(winerror|oserror|errno|error|status|code)"
+                             r"[\s:=]+(\d{1,5})\b")
+# code/status/exit 这类泛名配小数字就是 shell 退出码：每次失败都是 1，零区分度，
+# 却因「含数字」被 _err_distinctive 判成独占锚点（2026-11-02 真会话 journal 的 sig
+# 里就出现过 "code: 1"）。只放行大值（HTTP 404/500 那种才有意义）。
+_ERR_EXITY_NAMES = frozenset(("exit", "code", "status", "rc"))
+_ERR_IPPORT_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b")
+_ERR_NAMED_RE = re.compile(r"(?i)\b(?:no such (?:column|table|function|view|index)"
+                           r"|no module named|cannot find (?:name|module)"
+                           r"|unrecognized (?:option|argument)|unknown (?:option|command)"
+                           r"|permission denied|access is denied|address already in use"
+                           r"|command not found|file not found|not found|missing"
+                           r"|invalid (?:value|argument|state|path)"
+                           r"|exceeds|corrupt|denied|refused)\b[^\n\"']{0,44}")
+_ERR_QUOTED_RE = re.compile(r"[\"'`\u2018\u201c]([^\"'`\u2019\u201d\n]{3,48})[\"'`\u2019\u201d]")
+_ERR_FILE_RE = re.compile(r"\b[\w.-]+\.(?:py|mjs|js|json|exe|dll|so|db|sqlite|md|bat|cmd"
+                          r"|spec|txt|log|yaml|yml|toml|cpp|cc|c|h|hpp|ps1|sh)\b")
+_ERR_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]{2,}(?:[_-][a-z0-9]+)+\b")
+# 反复出现在每条报错里的词：命中它们不证明任何相关性（照 R826 的「泛词不注入」口径）。
+_ERR_STOP = frozenset({"error", "errors", "exception", "traceback", "failed", "failure",
+                       "warning", "unknown", "invalid", "cannot", "unable", "not",
+                       "found", "true", "false", "none", "null", "exit", "code",
+                       "status", "message", "stderr", "stdout", "line", "file",
+                       "the", "and", "for", "with", "is", "of", "in", "at", "to"})
+# traceback 脚手架对检索是纯噪声（每份栈都一样），路径只留 basename。
+_ERR_NOISE_RE = re.compile(r'File "[^"]+", line \d+, in \w+|\s*File "[^"]+", line \d+')
+# 挽具（agent 运行时）自己加的套话：每一次失败调用都带退出码，所以「exit code 1」
+# 没有任何区分度，反而会被当成招牌把无关旧坑捞上来（2026-11-02 qoder 真会话实测）。
+_ERR_BOILER_RE = re.compile(
+    r"(?im)^\s*(?:exit(?:ed)?\s+with\s+(?:code|status)[\s:=]+\d+|exit\s+code[\s:=]+\d+"
+    r"|command\s+failed(?:\s+with\s+(?:exit\s+)?code[\s:=]+\d+)?"
+    r"|returned\s+non-?zero\s+exit\s+status[\s:=]+\d+|process\s+exited"
+    r"(?:\s+(?:with\s+)?(?:code|status))?[\s:=]+\d+"
+    r"|exit[\s:=]+\d+)\s*$")
+# 「失败调用：<我敲的命令>」是 brain_error_recall.mjs:116 拼进 payload 首行的，大脑自己
+# 上次注入的那几行也会被回声进来。这两样都不能参与签名抽取：命令里的 echo "=== x ==="、
+# 提示里的 keyword="…" 会被引号规则抽成 w=3 招牌——2026-11-02 线上实测一条失败的 8 个签名词
+# 有 5 个来自命令行，去重键随命令变，「同会话同签名只说一次」当场失效。原先判「命令是上下文
+# 所以不剥」，实测代价大于收益，改成抽签名前摘掉（摘要里也不再出现「这次失败：这次失败：」）。
+_ERR_VOICE_RE = re.compile(r"(?im)^\s*(?:失败调用|这次失败|先自查再动手)\s*[:：][^\n]*$")
+_ERR_OWN_ECHO_RE = re.compile(r"(?ms)^\s*【AgentHub[^\n]*报错即时回忆[^\n]*\n.*?(?=【AgentHub|\Z)")
+
+
+def _error_voice(text: str) -> str:
+    """只留「这条报错本身」：摘掉挽具拼进来的命令首行和大脑自己注入过的整块。"""
+    return _ERR_VOICE_RE.sub(" ", _ERR_OWN_ECHO_RE.sub(" ", text or ""))
+
+
+def _err_distinctive(term: str) -> bool:
+    """这个词单独出现就足以认出是哪条报错。
+
+    纯异常类名（OperationalError/TypeError）不算——全库每条 SQLite 坑都含它，
+    单凭它上墙就是把「像答案的废话」递给模型（R826 定过的那条线）。
+    """
+    t = (term or "").lower()
+    if not t:
+        return False
+    if any(ch.isdigit() for ch in t):
+        return True
+    if any(ch in t for ch in "_.-/"):
+        return True
+    return " " in t
+
+
+def _error_clean(text: str) -> str:
+    """报错正文压成可检索的形状：去栈脚手架、去路径前缀、去挽具套话、去时间戳。"""
+    t = _ERR_BOILER_RE.sub(" ", text or "")
+    t = _ERR_NOISE_RE.sub(" ", t)
+    t = re.sub(r"[A-Za-z]:\\\\?[^\s\"'<>|]*[\\/]", " ", t)      # D:\a\b\ → 空格
+    t = re.sub(r"/(?:[\w.-]+/){2,}", " ", t)                     # /a/b/c/ → 空格
+    t = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?\b", " ", t)
+    return t
+
+
+def error_signature_terms(text: str, cap: int = 24) -> list:
+    """从一条报错里抽出签名词，返回 [(term, weight)]，高价值词在前。
+
+    权重含义：3=异常类名/错误码/被点名的标识符/报错成语（认出这条报错就靠它）；
+    2=文件名/snake_case 标识符/IP；1=报错短语里的普通词（只补召回，不做判据）。
+    """
+    t = _error_clean(text or "")
+    if not t.strip():
+        return []
+    out, seen, num_names = [], set(), set()
+
+    def add(term: str, weight: int) -> None:
+        term = re.sub(r"\s+", " ", (term or "").strip().strip(":.,;!?«»“”")).lower()
+        if len(term) < 3 or term in seen or term in _ERR_STOP or term.isdigit():
+            return
+        seen.add(term)
+        out.append((term, weight))
+
+    for m in _ERR_EXC_RE.finditer(t):
+        add(m.group(0), 3)
+    for m in _ERR_CODE_RE.finditer(t):
+        add(m.group(0), 3)
+    for m in _ERR_NUMCODE_RE.finditer(t):
+        name = m.group(1).lower()
+        num_names.add(name)
+        if name in _ERR_EXITY_NAMES and int(m.group(2)) <= 255:
+            continue          # shell 退出码不是招牌，别让「每次都有」的词钉住注入
+        add(m.group(0), 3)
+    for m in _ERR_QUOTED_RE.finditer(t):
+        add(m.group(1), 3)
+    for m in _ERR_NAMED_RE.finditer(t):
+        seg = m.group(0)
+        add(seg, 3)
+        for w in re.findall(r"[a-z]{4,}", seg.lower()):        # 短语同时给单词补召回
+            add(w, 1)
+    for m in _ERR_FILE_RE.finditer(t):
+        add(Path(m.group(0)).name, 2)
+    for m in _ERR_SNAKE_RE.finditer(t):
+        add(m.group(0), 2)
+    # 报错正文里剩下的驼峰/短横线标识符（torch_cpu、game/csgo 之类）
+    for m in re.finditer(r"\b[A-Za-z][A-Za-z0-9]{4,}\b", t):
+        w = m.group(0)
+        if w.lower() in _ERR_STOP:
+            continue
+        if re.search(r"[A-Z]", w[1:]) or "_" in w:
+            add(w, 2)
+    for m in _ERR_IPPORT_RE.finditer(t):
+        add(m.group(0), 2)
+    # 编号已经跟名字绑成招牌（winerror 5），再留裸名（winerror）等于给 WinError 32 那条
+    # 旧坑开后门——同一条编号规则的另一面（R833 冒烟实测：5 是拒绝访问，32 是文件被占用）。
+    out = [(x, w) for x, w in out if x not in num_names]
+    out.sort(key=lambda x: (-x[1], x[0]))
+    return out[:cap]
+
+
+def _error_sig_key(terms: list) -> str:
+    """同一会话里判定「这条报错是不是已经说过」的稳定键。"""
+    top = sorted(t for t, w in terms[:6] if w >= 2)
+    return "|".join(top[:4])
+
+
+def _error_headline(text: str, high: list, limit: int = 96) -> str:
+    """摘要挑「说清这是哪条报错」的那一行，而不是整段拼接的头 90 字。
+
+    实测首行停在「失败调用：… Exit code 1 Traceback (most r…」——真正该看见的异常被截没，
+    模型看不出是哪件事就只能猜，而猜是这条路最贵的错。
+    """
+    best = ""
+    for ln in _error_clean(text or "").splitlines():
+        s = re.sub(r"\s+", " ", ln).strip()
+        if len(s) < 4:
+            continue
+        low = s.lower()
+        if any(h in low for h in high):
+            return _brief_oneline(s, limit)
+        if not best and "失败调用" not in low:
+            best = s
+    return _brief_oneline(best or (text or ""), limit)
+
+
+def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
+                 cwd: str = "", project: str = "", max_chars: int = ERROR_RECALL_MAX_CHARS,
+                 session: str = "", state_path: str = "", update_state: bool = True,
+                 count: bool = True) -> dict:
+    """工具失败那一刻的自动回忆（PostToolUseFailure 钩子入口，R833）。
+
+    为什么需要它：简报解决开局、按句回忆解决「用户说到某件事」，但模型真正需要
+    历史结论的时刻是**它自己撞上错误**那一刻——上次这条报错怎么定位、怎么修的，
+    这时候给一句比事后提醒有用得多，也正是「不用人提醒就会用大脑」的落点。
+
+    与 prompt_recall 的三条硬差异：
+      · 检索词从报错签名抽（异常类名/错误码/被点名标识符），不走停用词那套；命令回显和
+        大脑自己注入过的行先摘掉，不参与签名；
+      · 精度闸门换成「至少命中一个 w≥3 的签名词」，泛词命中一律不注入；
+      · 同会话同签名只说一次（重试循环每次失败都注一遍纯属刷屏，照 mem9 的
+        「nudge once」口径）。
+    命中 errors 表时优先给「上次登记的同类故障 + 它的回滚方式」，那是现成的修法。
+    `count=False` 只看不记账（冒烟探针用）：曝光账本（inject_count）一旦把试跑的
+    查询算成送达，R830 的免疫断路器就会拿假数据冷却真记忆。返回的 `counted` 回显
+    这个开关（含各 skip 分支），意思是「本次允不允许记账」，不是「账本动了没」。
+    """
+    t0 = time.time()
+    out = {"text": "", "memory_ids": [], "record_ids": [], "error_ids": [],
+           "terms": [], "sig": "", "project": "", "chars": 0, "elapsed_ms": 0,
+           "skipped": "", "counted": bool(count)}
+    if not root or not os.path.isdir(root):
+        return out
+    terms = error_signature_terms(_error_voice(error_text))
+    if not terms or not any(w >= 3 for _, w in terms):
+        # 抽不出高价值签名词 = 这条报错没有可比对的招牌（「命令失败」这种），闭嘴
+        out["skipped"] = "no_signature"
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
+    sig = _error_sig_key(terms)
+    out["sig"] = sig
+    out["terms"] = [t for t, _ in terms]
+    who = _norm_agent(agent) or (agent or "").strip()
+    pname = (project or "").strip() or infer_project_from_cwd(root, cwd)
+    low_tool = (tool or "").lower()
+    # 大脑自己的工具失败，再让大脑回忆自己 = 自我反馈循环，只会加重故障。
+    # 只看 tool 会被分发器绕过：qoder 侧 MCP 调用走 mcp_call/hub_call_tool 转发，钩子拿到的
+    # 是分发器名字——2026-11-02 线上 journal 实锤投递过 tool=mcp_call · sig=hub_get_record。
+    # 所以名字是泛分发器时，改看正文里有没有点到 hub_*/mcp__agenthub__ 的名字。
+    _self_named = "hub_" in low_tool or "agenthub" in low_tool
+    _dispatched = (("mcp_call" in low_tool or "call_tool" in low_tool or "mcp__" in low_tool)
+                   and ("hub_" in (error_text or "").lower()
+                        or "mcp__agenthub__" in (error_text or "").lower()))
+    if _self_named or _dispatched:
+        out["skipped"] = "self_tool"
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
+    # 同会话同签名去重（重试循环刷屏）
+    skey = f"{who or '?'}|{session}" if session else ""
+    state_file = _recall_state_file(state_path) if state_path else \
+        Path.home() / ".workbuddy" / "state" / "brain-error-recall.json"
+    if skey:
+        state = _load_recall_state(state_file)
+        entry = (state.get("sessions") or {}).get(skey) or {}
+        if sig in {str(x) for x in (entry.get("sigs") or [])}:
+            out["skipped"] = "seen_this_session"
+            out["elapsed_ms"] = int((time.time() - t0) * 1000)
+            return out
+    query = " ".join(t for t, w in terms if w >= 2)[:180] or " ".join(t for t, _ in terms)
+    high = [t for t, w in terms if w >= 3]
+
+    def _accept(low: str) -> bool:
+        """上墙判定：必须被「独一份的招牌」钉住，泛词命中一律不上墙。
+
+        三条实测教训拧成的口径：
+          · 成语短语拆出来的普通词（"no such column" 里的 count）到处都在，拿它凑第二条
+            信号等于没有第二条（R833 冒烟：#3607 就这样被 operationalerror + count 蒙过）；
+          · 泛类型名互相凑数也不行——TypeError + NoneType 是 Python 报错的常态，两条都不
+            能证明是同一件事，照上次的修法改就是自信地跑偏（R826「弱命中不注入」）；
+          · 能单独钉住这条报错的词（带编号/带点划线/被点名的标识符/报错成语）才算招牌。
+        """
+        if not any(h in low for h in high):
+            return False
+        if any(_err_distinctive(h) and h in low for h in high):
+            return True                      # 招牌词独一份，一条就够定身份
+        return sum(1 for t, w in terms if w >= 2 and _err_distinctive(t) and t in low) >= 2
+
+    try:
+        mems = search_memories(root, query, limit=25, count_hits=False,
+                               semantic=False, gate=False)
+    except sqlite3.Error:
+        mems = []
+    mem_texts = [str(r.get("content") or "") + " " + str(r.get("tags") or "")
+                 for r in mems]
+    scored = []
+    for body, r in zip(mem_texts, mems):
+        low = body.lower()
+        if not _accept(low):
+            continue                      # 精度闸门：一个招牌词都没命中就不要上墙
+        hit = sum(1 for t, w in terms if t in low)
+        spec = hit + sum(w for t, w in terms if t in low)
+        kind = r.get("kind") or "note"
+        spec += 0.8 if kind == "lesson" else 0.0
+        if pname and (r.get("project") or "") == pname:
+            spec += 0.8
+        try:
+            spec += {"fresh": 0.5, "expired": -0.8}.get(memory_freshness(r).get("state"), 0.0)
+        except Exception:  # noqa: BLE001 新鲜度只是注脚
+            pass
+        scored.append((spec, r))
+    scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
+    picked = [r for _, r in scored[:2]]
+
+    try:
+        recs = search_records(root, query, limit=20)
+    except sqlite3.Error:
+        recs = []
+    rec_scored = []
+    now_dt = datetime.datetime.now()
+    for r in recs:
+        body = (str(r.get("title") or "") + " " + str(r.get("content") or "")).lower()
+        if not _accept(body):
+            continue
+        spec = sum(1 for t, w in terms if t in body) + sum(w for t, w in terms if t in body)
+        if pname and (r.get("project") or "") == pname:
+            spec += 1.0
+        try:
+            age = (now_dt - datetime.datetime.strptime(str(r.get("date"))[:10],
+                                                       "%Y-%m-%d")).total_seconds() / 86400
+            spec += 1.0 if age <= 14 else 0.0
+        except (ValueError, TypeError):
+            pass
+        rec_scored.append((spec, r))
+    rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
+    rec_rows = [r for _, r in rec_scored[:2]]
+
+    err_rows = []
+    # 种子词只用「独一份」的招牌词（带编号/带点/成语短语）；全泛词时不查 errors 表——
+    # 否则 errors 里每一条「MCP 工具 xx 执行异常」都会被 OperationalError/TypeError 捞出来，
+    # 给出一句毫不相干的「上次登记过同类故障」（R833 冒烟实测连中两条这种）。
+    seeds = [t for t in high if _err_distinctive(t)][:3]
+    if seeds:
+        cond = " OR ".join(["(title LIKE ? ESCAPE '\\' OR detail LIKE ? ESCAPE '\\')"]
+                           * len(seeds))
+        args: list = []
+        for s in seeds:
+            like = f"%{_like_escape(s)}%"
+            args.extend([like, like])
+        try:
+            with db_conn(root) as conn:
+                raw = [dict(r) for r in conn.execute(
+                    "SELECT id, title, detail, status, undo, last_ts FROM errors"
+                    f" WHERE {cond} ORDER BY last_ts DESC, id DESC LIMIT 6", args)]
+        except sqlite3.Error:
+            raw = []
+        for r in raw:
+            body = (str(r.get("title") or "") + " "
+                    + str(r.get("detail") or "")).lower()
+            if _accept(body):
+                err_rows.append(r)
+        err_rows = err_rows[:2]
+
+    if not picked and not rec_rows and not err_rows:
+        out["skipped"] = "no_match"
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
+
+    shown = _error_headline(_error_voice(error_text), high)
+    lines = ["【AgentHub 报错即时回忆 · 自动匹配，没人提醒你查大脑】",
+             f"这次失败：{shown}"]
+    ids = []
+    for r in err_rows:
+        out["error_ids"].append(r.get("id"))
+        undo = _brief_oneline(str(r.get("undo") or ""), 80)
+        lines.append(f"· 大脑登记过同类故障 #{r.get('id')}[{r.get('status') or '?'}] "
+                     f"{_brief_oneline(str(r.get('title') or ''), 70)}"
+                     + (f"｜回滚：{undo}" if undo else ""))
+    for r in picked:
+        ids.append(r.get("id"))
+        lines.append(f"· 记忆 #{r.get('id')} [{r.get('kind') or 'note'}] "
+                     f"{_brief_oneline(str(r.get('content') or ''), 140)}")
+    for r in rec_rows:
+        out["record_ids"].append(r.get("id"))
+        head = _brief_title(str(r.get("title") or "")) or _brief_oneline(
+            str(r.get("content") or ""), 40)
+        lines.append(f"· 历史 {r.get('id')} [{_brief_oneline(str(r.get('project') or ''), 20)}] "
+                     f"{_brief_oneline(head, 46)}（{r.get('agent') or '其他'} · "
+                     f"{r.get('date') or '—'}）")
+    lines.append(f"先自查再动手：hub_search(keyword=\"{_brief_oneline(' '.join(high[:3]), 60)}\")"
+                 "｜同签名≠同根因，别照抄上次的修法，对不上就当没看见。")
+    text = "\n".join(lines)
+    if len(text) > max_chars:
+        text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
+    out.update(text=text, memory_ids=[i for i in ids if i is not None],
+               project=pname, chars=len(text))
+    if count and out["memory_ids"]:
+        try:
+            _bump_inject(root, out["memory_ids"])
+        except sqlite3.Error:
+            pass
+        if session:
+            try:
+                _record_adherence(root, session, who, picked, pname, "error",
+                                  error_text, mem_texts)
+            except sqlite3.Error:
+                pass
+    if count:
+        try:
+            # hits 要含记录/错误：只命中记录=大脑**答上了**，却在这里被算成 0 命中，
+            # 下游 ops 的「查时知识未入脑的欠账」提醒就会催着给已有知识再写一条记忆
+            log_search(root, "error_recall", query[:200],
+                       len(out["memory_ids"]) + len(out["record_ids"])
+                       + len(out["error_ids"]), agent=who)
+        except sqlite3.Error:
+            pass
+    if count and skey and update_state and (out["memory_ids"] or out["record_ids"]
+                                            or out["error_ids"]):
+        try:
+            st = _load_recall_state(state_file)
+            ent = (st["sessions"].get(skey) or {"ids": []})
+            ent["sigs"] = list(dict.fromkeys(list(ent.get("sigs") or []) + [sig]))[-60:]
+            ent["ts"] = _now()
+            st["sessions"][skey] = ent
+            _save_recall_state(state_file, st)
+        except Exception:  # noqa: BLE001 去重状态写失败不影响本次召回
+            pass
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
     return out
 
