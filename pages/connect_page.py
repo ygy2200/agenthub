@@ -291,13 +291,20 @@ class ConnectPage(QWidget):
             st = core.deploy_status()
         # agent 名写进启动参数（B1）：server 据此锁定身份，忽略工具调用里的自报值
         # profile（P3-1）：来自 adapter 配置（config.agents.json），重装时保持工具面切片
+        # B051：记写入前的指纹，只有内容真变了才提醒「去点信任」——同一份配置重装不该天天吵。
+        before_digest = core.file_digest(path)
         err = core.install_mcp_entry(path, layout, st["python"], st["server"], self.win.root,
                                      agent=agent, profile=profile)
         if err:
             InfoBar.error("接入失败", err, duration=5000, parent=self.win)
         else:
             core.journal(self.win.root, "user", "mcp_connect", path)
-            InfoBar.success("已接入", f"{path}（原文件已备份）", duration=3000, parent=self.win)
+            if core.file_digest(path) != before_digest:
+                # 客户端的授权绑配置指纹，改完不点信任就会静默不加载（2026-11-01 的坑）。
+                InfoBar.warning("配置已改写：需要去客户端点一次「信任」",
+                                core.mcp_trust_hint(agent), duration=12000, parent=self.win)
+            else:
+                InfoBar.success("已接入", f"{path}（原文件已备份）", duration=3000, parent=self.win)
         self.refresh_status()
 
     def do_remove(self, path, layout):

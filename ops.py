@@ -3029,42 +3029,73 @@ def _link_health(root: str = "") -> dict:
         s = stat.setdefault(key, {"hook": 0, "stdio": 0, "cli": 0, "ops": 0})
         v = (r["via"] or "").strip().lower()
         s[v if v in s else "cli"] += int(r["n"] or 0)
+    # R848：有活进程 ≠ 通道断。via 是 R845 才有的口径，跑着旧代码的 MCP 进程写不出 via 行，
+    # 只看流水就会把「进程好好活着、只是代码旧」误报成「工具通道断了」。误报一次，这个检查项
+    # 就没人信了——而它存在的全部意义就是被人信。判据不用版本号（版本只能粗略代表时间），
+    # 用**进程指纹**：运行标记里记着该进程加载的 brain.py md5，与当前部署的那份比。
+    def _md5(p) -> str:
+        try:
+            import hashlib  # noqa: PLC0415
+            return hashlib.md5(Path(p).read_bytes()).hexdigest()
+        except OSError:
+            return ""
+
+    cur_brain = _md5(Path(core.MCP_SERVER_DIR) / "brain.py")
+    running: dict = {}
+    try:
+        for m in core.runtime_markers():
+            k = core.agent_key(m.get("agent") or "")
+            if k and k not in running:
+                running[k] = m
+    except Exception:  # noqa: BLE001  标记是旁路观测，读不到就当没有
+        running = {}
+    old_proc = []
+    for k, s in stat.items():
+        if s["stdio"] > 0 or k not in running:
+            continue
+        fp = str((running[k].get("fingerprint") or {}).get("brain.py") or "")
+        if cur_brain and fp and fp != cur_brain:
+            old_proc.append(k)
     # 只判注册过的 agent：探针（probe/via/smoke）、内部写入（ops/system/cli/auto-hook）、
     # 以及服务名（agenthub=cli 自调的署名）都不该进「某家 agent 通道断」的名单——
     # 上一版就是这么把 2 条测试流水报成「工具通道断了」的。
     known = {core.agent_key(a.get("name") or "") for a in _brain.list_agents(root)}
     unknown = sorted(k for k in stat if k not in known)
     stat = {k: v for k, v in stat.items() if k in known}
+    old_proc = [k for k in old_proc if k in stat]
     if not stat:
         return {"ok": True,
                 "summary": "通道账：窗口内只有未登记署名的流水（探针/内部写入），无 agent 可判",
                 "detail": ([f"未登记署名：{'、'.join(unknown)}"] if unknown else [])
                           + [f"统计窗口：{start} 起"]}
-    if not stat:
-        return {"ok": True,
-                "summary": "通道账：窗口内没有带口径的流水（刚上线或这几家都没动）",
-                "detail": [f"统计窗口：{start} 起"]}
     live = sorted(k for k, s in stat.items() if s["stdio"] > 0)
-    broken = sorted(k for k, s in stat.items() if s["stdio"] == 0 and (s["hook"] or s["cli"]))
+    broken = sorted(k for k, s in stat.items()
+                    if s["stdio"] == 0 and (s["hook"] or s["cli"]) and k not in old_proc)
     silent = sorted(k for k, s in stat.items() if not any(s.values()))
     for k in sorted(stat, key=lambda x: -(stat[x]["hook"] + stat[x]["stdio"] + stat[x]["cli"])):
         s = stat[k]
         verdict = ("MCP 工具在" if s["stdio"] > 0
+                   else "旧进程在跑（重启后才有口径）" if k in old_proc
                    else "工具通道断" if (s["hook"] or s["cli"]) else "静默")
         detail.append(f"{k}：MCP {s['stdio']} · 钩子 {s['hook']} · 兜底 {s['cli']}"
                       f" · 巡检 {s['ops']} —— {verdict}")
     if since and since > d7:
         detail.append(f"口径起点 {since}：比这更早的流水没有 via，未参与判定"
                       f"（历史行不猜，倒推会把真 MCP 使用误判成兜底）")
+    if old_proc:
+        detail.append("进程活着但加载的是旧代码（无 via 口径，不能算断也不能算通）："
+                      + "、".join(old_proc) + "——重启该会话后重跑本项")
     if silent:
         detail.append("窗口内零流水（不算故障，只说明这几家没动）：" + "、".join(silent))
     if broken:
+        note = f"（另有 {'、'.join(old_proc)} 进程旧了待重启）" if old_proc else ""
         return {"ok": False,
                 "summary": f"通道账：{len(broken)} 家只有钩子/兜底，MCP 工具通道断了"
-                           f"（{len(live)} 家在用）—— {'、'.join(broken)}",
+                           f"—— {'、'.join(broken)}{note}",
                 "fix": CHECK_FIXES["link_health"], "detail": detail}
     return {"ok": True,
             "summary": f"通道账：{len(live)} 家 MCP 工具在用"
+                       + (f"；{len(old_proc)} 家进程旧了待重启" if old_proc else "")
                        + (f"；{len(silent)} 家窗口内没动" if silent else ""),
             "detail": detail}
 

@@ -2160,6 +2160,34 @@ def is_mcp_unsupported(err: str) -> bool:
     return bool(err) and err.startswith(MCP_BUNDLE_PREFIX)
 
 
+def file_digest(path: str) -> str:
+    """文件内容指纹（sha1 前 16 位）；不存在返回 "". 用来判断「这次写到底改了没有」。"""
+    p = Path(os.path.expandvars(os.path.expanduser(path)))
+    try:
+        return hashlib.sha1(p.read_bytes()).hexdigest()[:16]
+    except OSError:
+        return ""
+
+
+def mcp_trust_hint(agent: str = "") -> str:
+    """改写 MCP 配置后必须说的话（B051）。
+
+    同一个坑踩了两次：2026-10-10（记录#3118）与 2026-11-01 各栽一次。机制完全一样——
+    客户端把「已信任」绑在配置指纹上（command/args/env 任一变化都算新配置），改完它
+    判成未信任就**静默不加载**，日志里连报错都没有。更贵的是：这段空窗里 agent 仍然能
+    干活（走 `cli.py` 兜底写记录），所以账本上 `log_work` 一行不少，谁都看不出异常——
+    2026-11-01 那次连跑了三轮迭代才发现。
+
+    授权在客户端手里，代码拦不住，能做的只有「改完当场把话说出去」并给一个可自查的判据。
+    """
+    who = f"{agent} 的" if agent else "该客户端的"
+    return ("  ⚠ 配置已改写：客户端的「已信任」绑定配置指纹，改过 command/args/env 之后它会把"
+            "新配置判成未信任并**静默不加载**（没有报错；期间 agent 仍能用命令行兜底，"
+            "`log_work` 之类照样进账，看不出异常）。\n"
+            f"     去{who}「连接器 / 自定义 MCP」页点一次「信任」，再重启那个会话。\n"
+            "     验证：python cli.py check link_health —— 该家出现 via=stdio 才算真连上")
+
+
 def install_mcp_entry(path: str, layout: str, python_exe: str, server_py: str, root: str,
                       agent: str = "", profile: str = "") -> str:
     """把 agenthub server 写入 agent 的 MCP 配置（**外科式**，格式无关；先备份，失败还原）。

@@ -275,6 +275,7 @@ def cmd_onboard(root: str, agent: str) -> int:
     done = []
     failed = []
     skipped = []
+    mcp_changed: list = []
     spec = core._mcp_spec_of(a)
     if spec:
         st = core.deploy_status()
@@ -290,6 +291,8 @@ def cmd_onboard(root: str, agent: str) -> int:
             print(f"  ✓ MCP server 已部署{fix} -> {deployed}")
             done.append(f"MCP server -> {deployed}")
         path, fmt, _kp = spec
+        # B051：记写入前的指纹，只有内容真变了才提醒「去点信任」——幂等重跑不该天天吵。
+        before_digest = core.file_digest(path)
         err = core.install_mcp_entry(path, (a.get("mcp") or {}).get("layout", ""), py, server, root,
                                      agent=a.get("agent", ""),
                                      profile=(a.get("mcp") or {}).get("profile", ""))
@@ -303,6 +306,8 @@ def cmd_onboard(root: str, agent: str) -> int:
                 failed.append(f"MCP 配置（{path}）：{err}")
         else:
             done.append(f"MCP 配置（{fmt}）-> {path}")
+            if core.file_digest(path) != before_digest:
+                mcp_changed.append(path)
     else:
         print("  · 该 agent 未登记 MCP 配置（只注入引导）")
     bp = _boot_of(a)
@@ -315,6 +320,8 @@ def cmd_onboard(root: str, agent: str) -> int:
             done.append(f"引导规则 -> {bp}")
     for d in done:
         print(f"  ✓ {d}")
+    if mcp_changed:
+        print(core.mcp_trust_hint(a.get("agent", "")))
     if failed:
         print(f"\n接入未完成：{len(failed)} 处写入失败（已成功的部分保留）。")
         print("  排查：python cli.py doctor；修复后重跑 onboard（幂等）。")
