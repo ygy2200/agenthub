@@ -8391,6 +8391,29 @@ def _recall_project_block(root: str, pname: str, limit: int = 3) -> list:
     return lines
 
 
+_COACHING_PREFIXES = (
+    "记得", "别忘", "记住", "注意", "以后", "尽量", "帮我", "麻烦",
+    "顺手", "顺便", "继续", "接着", "下一步", "不用", "先", "记录一下",
+    "收工", "开工",
+)
+
+
+def _is_coaching_prompt(prompt: str) -> bool:
+    """叮嘱型提示判别（R836）：短、不含 ASCII、以叮嘱动词开头的纯中文串是**给
+    agent 的指令**，不是对库的检索。它的内容词全是滑窗切片（「记得边做边记录」→
+    得边/边做/做边/边记），而这些碎片在全库近乎零命中、唯一撞上的「边找边记」
+    是纯语义噪声（线上标本 rec#21，2026-11-02 实测：全库 1712 条记录里「边记」
+    仅 1 条——全局 IDF 都判它是精确信号，内容侧无解，只能识别意图）。
+    前缀表来自 prompt_recall 真实日志采样（继续迭代/接着弄/下一步/先恢复原版/
+    不用试过都是实际发生过的叮嘱型查询）；主题型查询几乎全带 ASCII 或名词开头，
+    不受影响。只降 records 通道——记忆通道门槛更严，且「注意 N卡 的坑」这类
+    点名式叮嘱仍该召回（含 ASCII / 超长 / 名词开头都从这里漏出去）。"""
+    q = (prompt or "").strip()
+    if not q or len(q) > 14 or re.search(r"[A-Za-z0-9]", q):
+        return False
+    return q.startswith(_COACHING_PREFIXES)
+
+
 def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                   project: str = "", max_chars: int = RECALL_MAX_CHARS,
                   session: str = "", state_path: str = "",
@@ -8543,10 +8566,26 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
     rec_rows = [r for _, r in rec_scored
                 if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF][:2]
+    # R836：叮嘱型提示不当检索词——相关历史不给口语切片噪声
+    if _is_coaching_prompt(prompt):
+        rec_rows = []
     proj_lines = _recall_project_block(root, pname)
     top_terms = [t for t, _ in sorted(terms, key=lambda x: -float(mem_idf.get(x[0]) or 0))[:3]]
     search_cmd = f"hub_search(keyword=\"{_brief_oneline(' '.join(top_terms), 60)}\")"
     if not picked and not rec_rows:
+        # R836：叮嘱不包装成「没查到」，更不建议拿切片碎片去 hub_search——明说这句
+        # 是对 agent 的指令，库不翻；有项目近况就顺手带上。
+        if _is_coaching_prompt(prompt):
+            lines = ["【AgentHub 即时回忆 · 这句是对我的叮嘱，不是检索，不翻库】",
+                     "要查什么直接点名：项目名 / 组件名 / 报错编号。"]
+            if proj_lines:
+                lines.extend(proj_lines)
+            text = "\n".join(lines)
+            if len(text) > max_chars:
+                text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
+            out.update(text=text, project=pname, chars=len(text),
+                       elapsed_ms=int((time.time() - t0) * 1000))
+            return out
         # R826：有候选、但每一条都只命中泛词 —— 这是最该克制的场景。摘要看着像答案、
         # 实际不相关（实测「这个版本显示有问题怎么办」会端出「接入层通用化」「审批队列」
         # 三条），模型照着答就是自信地跑偏。此时只给检索词，让模型自己去查。
