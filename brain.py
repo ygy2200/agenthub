@@ -7944,6 +7944,110 @@ def _save_recall_state(path: Path, state: dict, now: "datetime.datetime | None" 
         pass
 
 
+# ── R837 单会话注入预算（nudge budget）──────────────────────────────────────
+# 为什么需要：精度再高的注入，量大了也会被当成背景噪声——这是「模型对注入免疫」
+# 的主因，不是相关性不够。线上实测（recall_adherence，2026-11-02 口径）两个会话
+# 分别被塞了 16 条 / 15 条记忆，而一个会话真正能记住的「几件事」远小于这个数。
+# 这里给「主动塞」设硬上限，超了只写 journal 不进上下文——**不删知识**，主动检索
+# （hub_search / hub_memory_read）完全不受限，跟 R830 的曝光免疫断路器同一条纪律。
+NUDGE_BUDGET_DEFAULTS = {"prompt": 8, "error": 6}
+NUDGE_BUDGET_ENV = "AGENTHUB_NUDGE_BUDGET"
+NUDGE_STATE_TTL_H = 24
+
+
+def _nudge_limits() -> dict:
+    """读各通道上限。`AGENTHUB_NUDGE_BUDGET=prompt=6,error=4`；`0`/`off` 表示不限。
+
+    0 的语义是「关掉预算」而不是「一条都不许」：闸门是保险丝，出问题时得能一根线
+    掐掉，而不是把整个注入通道一起关死（关死等于回到「要人提醒才会查」）。
+    """
+    lim = dict(NUDGE_BUDGET_DEFAULTS)
+    raw = (os.environ.get(NUDGE_BUDGET_ENV) or "").strip().lower()
+    if raw in ("0", "off", "false", "no", "none"):
+        return {k: 0 for k in lim}
+    if not raw:
+        return lim
+    for part in raw.split(","):
+        k, _, v = part.partition("=")
+        k = k.strip()
+        if k not in lim:
+            continue
+        try:
+            lim[k] = max(0, int(v.strip()))
+        except ValueError:
+            pass
+    return lim
+
+
+def _nudge_state_file(path: str = "") -> Path:
+    return Path(path) if path else Path.home() / ".agenthub" / "state" / "nudge-budget.json"
+
+
+def _nudge_load(path: Path) -> dict:
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if isinstance(data, dict) and isinstance(data.get("sessions"), dict):
+            return data
+    except (OSError, ValueError):
+        pass
+    return {"v": 1, "sessions": {}}
+
+
+def nudge_peek(root: str, session: str, channel: str, agent: str = "",
+               path: str = "") -> dict:
+    """看本会话这个通道还剩多少额度——**只看不扣**。
+
+    为什么分成 peek/commit 两步：注入是否真的发生要等检索跑完才知道。先扣后查的话，
+    一句没命中任何东西的提问也会吃掉额度，预算会比实际更早用光——那是把闸门装反了，
+    用户看到的是「脑子越来越沉默」，正好与目标相反。
+    """
+    lim = _nudge_limits().get(channel, 0)
+    out = {"allowed": True, "used": 0, "limit": lim, "channel": channel,
+           "session": session, "path": "", "at": "", "skipped": ""}
+    if lim <= 0 or not session:
+        # 没有 session（CLI 单次调用、探针）就不设闸：预算的单位是「一次对话」，
+        # 拿不到对话边界时硬扣额度只会误伤。
+        return out
+    p = _nudge_state_file(path)
+    key = f"{(agent or '?')}|{session}"
+    used = int((((_nudge_load(p).get("sessions") or {}).get(key) or {})
+                .get(channel) or {}).get("n", 0))
+    out.update(used=used, allowed=used < lim, path=str(p), at=key)
+    return out
+
+
+def nudge_commit(peek: dict) -> None:
+    """真注入了才记一笔（尽力而为，写失败不影响本次注入）。"""
+    if not peek or not peek.get("allowed") or not peek.get("path"):
+        return
+    p = Path(peek["path"])
+    state = _nudge_load(p)
+    sessions = state["sessions"]
+    entry = sessions.get(peek["at"]) or {}
+    cell = entry.get(peek["channel"]) or {"n": 0}
+    cell["n"] = int(cell.get("n") or 0) + 1
+    cell["ts"] = _now()
+    entry[peek["channel"]] = cell
+    entry["ts"] = cell["ts"]
+    sessions[peek["at"]] = entry
+    cutoff = datetime.datetime.now() - datetime.timedelta(hours=NUDGE_STATE_TTL_H)
+    kept = {}
+    for k, v in sessions.items():
+        try:
+            if datetime.datetime.fromisoformat(str((v or {}).get("ts") or "")) >= cutoff:
+                kept[k] = v
+        except (ValueError, TypeError):
+            continue
+    state["sessions"] = kept
+    try:
+        p.parent.mkdir(parents=True, exist_ok=True)
+        tmp = p.with_name(p.name + ".tmp")
+        tmp.write_text(json.dumps(state, ensure_ascii=False, indent=1), encoding="utf-8")
+        os.replace(tmp, p)
+    except OSError:
+        pass
+
+
 def extract_prompt_terms(prompt: str, max_terms: int = RECALL_TERM_CAP) -> list:
     """把一句自然语言压成检索词：短中文串保留整词，长中文串切 bigram，英文保留标识符。
 
@@ -8417,16 +8521,21 @@ def _is_coaching_prompt(prompt: str) -> bool:
 def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                   project: str = "", max_chars: int = RECALL_MAX_CHARS,
                   session: str = "", state_path: str = "",
-                  update_state: bool = True) -> dict:
+                  update_state: bool = True, budget_path: str = "") -> dict:
     """按用户这一句话自动回忆（UserPromptSubmit 钩子入口）。
 
     与 session_brief 分工：简报解决「开局知道团队在干什么」，本函数解决「说到某件事时
     自动想起相关记忆」。只在真命中时返回文本——每句话都塞一段「无相关记忆」纯属噪声。
     记忆与历史记录分开取：记忆给结论，记录给过程；都受字符预算约束。
+
+    R837：本会话的「真记忆注入」有次数上限（默认 8 次），超了只写 journal 不进上下文。
+    只算推记忆/历史的那条路径——「项目近况」「没查到」这类短提示不占额度，它们是
+    最小的上下文兜底，掐掉它等于让模型重新变聋。
     """
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
-           "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False, "muted": 0}
+           "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False,
+           "muted": 0, "skipped": "", "budget": {}}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -8615,6 +8724,27 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             out["terms"] = [t for t, _ in terms]
             out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
+    # R837：额度用完就不再往下注——但别装成「没查到」：调用方与账本要能看见这是
+    # 「被预算挡了」，否则一次静默会被误读成召回失败，报表上又是一笔假账。
+    # 预算文件默认跟着 state_path 走：调用方既然指定了会话状态的落点（用例、探针），
+    # 就没道理再往真实用户的 nudge-state 里记账——第一版没这条，R833 的去重用例
+    # 跑第二次就红（真实文件里 qoder|s1 的 error 额度被上一次跑吃光了）。
+    budget = nudge_peek(root, session, "prompt", agent=who,
+                        path=budget_path or (
+                            str(Path(state_path).with_name("nudge-budget.json"))
+                            if state_path else ""))
+    if not budget["allowed"]:
+        out["terms"] = [t for t, _ in terms]
+        out["skipped"] = "budget"
+        out["budget"] = {k: budget[k] for k in ("used", "limit", "channel")}
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        try:
+            journal_add(root, who, "brain_nudge_skip", "prompt",
+                        f"used={budget['used']}/{budget['limit']} "
+                        f"session={(session or '')[:8]}")
+        except sqlite3.Error:
+            pass
+        return out
     lines = ["【AgentHub 即时回忆 · 自动检索，无需提醒】",
              "这是索引不是全文：要动具体命令/路径/参数前先 hub_search 取原文，"
              "别照着摘要复述；与现状冲突时以现状为准，收工时顺手更正。"]
@@ -8676,6 +8806,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         entry["ts"] = _now()
         state["sessions"][skey] = entry
         _save_recall_state(state_file, state)
+    if out["text"] and update_state:
+        nudge_commit(budget)
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
     return out
 
@@ -9067,7 +9199,7 @@ def _error_headline(text: str, high: list, limit: int = 96) -> str:
 def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
                  cwd: str = "", project: str = "", max_chars: int = ERROR_RECALL_MAX_CHARS,
                  session: str = "", state_path: str = "", update_state: bool = True,
-                 count: bool = True) -> dict:
+                 count: bool = True, budget_path: str = "") -> dict:
     """工具失败那一刻的自动回忆（PostToolUseFailure 钩子入口，R833）。
 
     为什么需要它：简报解决开局、按句回忆解决「用户说到某件事」，但模型真正需要
@@ -9088,7 +9220,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "error_ids": [],
            "terms": [], "sig": "", "project": "", "chars": 0, "elapsed_ms": 0,
-           "skipped": "", "counted": bool(count)}
+           "skipped": "", "counted": bool(count), "budget": {}}
     if not root or not os.path.isdir(root):
         return out
     terms = error_signature_terms(_error_voice(error_text))
@@ -9274,6 +9406,22 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
 
+    # R837：报错通道也有额度。这个通道最容易被「重试循环」打穿——R833 自己当小白鼠
+    # 两小时被注了约 15 次，每条签名都不同，同签名去重根本挡不住。超了只写 journal。
+    budget = nudge_peek(root, session, "error", agent=who,
+                        path=budget_path or (
+                            str(Path(state_path).with_name("nudge-budget.json"))
+                            if state_path else ""))
+    if not budget["allowed"]:
+        out["skipped"] = "budget"
+        out["budget"] = {k: budget[k] for k in ("used", "limit", "channel")}
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        try:
+            journal_add(root, who, "brain_nudge_skip", "error",
+                        f"used={budget['used']}/{budget['limit']} sig={sig[:40]}")
+        except sqlite3.Error:
+            pass
+        return out
     shown = _error_headline(_error_voice(error_text), high)
     lines = ["【AgentHub 报错即时回忆 · 自动匹配，没人提醒你查大脑】",
              f"这次失败：{shown}"]
@@ -9325,6 +9473,8 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     if count and skey and update_state and (out["memory_ids"] or out["record_ids"]
                                             or out["error_ids"]):
         _remember_error_sig(state_file, skey, sig)
+    if count and out["text"]:
+        nudge_commit(budget)
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
     return out
 
