@@ -218,6 +218,10 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
         if issues:
             problems.append({"agent": r["agent"], "issues": issues})
     if as_json:
+        try:
+            drift = core.hook_copy_drift()
+        except Exception:  # noqa: BLE001 只读检查失败不该让 status 崩
+            drift = []
         print(json.dumps({
             "bootstrap_version": core.BOOTSTRAP_VERSION,
             "root": root,
@@ -225,6 +229,7 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
             "root_mismatch": mismatch,
             "healthy": not problems,
             "problems": problems,
+            "hook_copy_drift": drift,
             "agents": rows,
         }, ensure_ascii=False))
         return 1 if problems else 0
@@ -245,6 +250,16 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
               f"钩子:{mark}  {r['instr_path']}")
     if problems:
         print(f"\n{len(problems)} 个 agent 需要处理——修好后重跑：python cli.py onboard <agent>")
+    # R840（B044）：钩子副本漂移要点名。它不属于「接入缺口」（退出码不变），但它是
+    # 最会骗人的那种故障——源码改完、单测全绿、脚本还是旧的那一份。
+    try:
+        drift = core.hook_copy_drift()
+    except Exception:  # noqa: BLE001
+        drift = []
+    if drift:
+        print(f"\n⚠ 钩子副本落后：{('、'.join(drift))}")
+        print("  线上跑的是 ~/.agenthub/hooks 里的副本，源码改了不等于生效——"
+              "修：python cli.py deploy（会顺手刷新副本）")
     return 1 if problems else 0
 
 

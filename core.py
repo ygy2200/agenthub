@@ -1259,6 +1259,33 @@ def hook_script_path(name: str) -> Path:
     return Path.home() / ".agenthub" / "hooks" / name
 
 
+def hook_copy_drift(src_dir: str = "", dst_dir: str = "") -> list:
+    """已挂载的钩子副本里，哪些跟源码不一致（R840 · B044）。
+
+    为什么要有它：钩子真正执行的是 `~/.agenthub/hooks/*.mjs` 这份副本，而它只有
+    `hook-install --apply` 或 `deploy` 会写。于是「源码改了 + 单测全绿」很容易骗过自己，
+    线上跑的仍是旧脚本（R833 实锤过一次：命令换行修好了，部署 15/15 全绿，线上还是旧的）。
+    `deploy` 会顺手刷副本，但**没人保证部署真的跑过**——这里给一个只读检查，让
+    `cli.py status` 能直接点名。
+
+    只报「副本存在但内容不同」：副本不存在说明这家压根没挂（refresh 故意不新建，
+    免得把用户没启用的钩子偷偷激活），那是接入问题，由 memory_hook_status 负责。
+    """
+    src = Path(src_dir) if src_dir else _runtime_dir()
+    dst = Path(dst_dir) if dst_dir else Path.home() / ".agenthub" / "hooks"
+    stale = []
+    for name in HOOK_SCRIPT_FILES:
+        s, d = src / name, dst / name
+        if not s.is_file() or not d.is_file():
+            continue
+        try:
+            if s.read_bytes() != d.read_bytes():
+                stale.append(name)
+        except OSError:
+            continue
+    return stale
+
+
 def refresh_installed_hooks(src_dir: str = "", dst_dir: str = "") -> tuple:
     """把运行时目录里最新的钩子脚本刷进 ~/.agenthub/hooks/ 里**已经存在**的副本。
 
