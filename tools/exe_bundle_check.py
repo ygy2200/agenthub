@@ -54,9 +54,16 @@ def check(exe: Path) -> int:
         print("  查 build.bat 的 [1.5/4] 步序（bundle 必须在 PyInstaller 之前）与 "
               "AgentHub.spec 的 datas 是否含 ('build/bundle', '.')")
         return 1
-    print("✓ 16 个运行时文件全部在归档根目录——打包版能把它们铺到 _MEIPASS，"
-          "部署服务端/安装钩子不会空转")
+    print(ok_line(len(want)))
     return 0
+
+
+def ok_line(n: int) -> str:
+    """通过语必须带真实条数（R841）：写死「16 个」时，随包文件已经涨到 20 个，
+    输出就变成「随包文件：20/20」紧跟「✓ 16 个……」，自相矛盾——结论对、文案错，
+    而这种自相矛盾的体检最容易被当成「工具坏了」直接无视。"""
+    return (f"✓ {n} 个运行时文件全部在归档根目录——打包版能把它们铺到 _MEIPASS，"
+            "部署服务端/安装钩子不会空转")
 
 
 def main() -> int:
