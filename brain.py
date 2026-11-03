@@ -489,7 +489,8 @@ CREATE TABLE IF NOT EXISTS recall_adherence (
     fp TEXT DEFAULT "",               -- JSON 数组；空数组 = 这条抽不出指纹（不进分母）
     cited INTEGER DEFAULT 0,
     used INTEGER DEFAULT 0,
-    decided_at TEXT DEFAULT ""
+    decided_at TEXT DEFAULT "",
+    origin TEXT DEFAULT "live"        -- R853：live=生产钩子，eval/probe=装置；账只认 live
 );
 CREATE INDEX IF NOT EXISTS idx_adherence_session ON recall_adherence(session, ts);
 CREATE INDEX IF NOT EXISTS idx_adherence_ts ON recall_adherence(ts);
@@ -1487,6 +1488,41 @@ def _migrate_columns(root: str) -> None:
             _journal_seal_backlog(conn)
         elif "prev_hash" not in jcols:
             conn.execute("ALTER TABLE journal ADD COLUMN prev_hash TEXT DEFAULT ''")
+        # R853 装置隔离：`recall_adherence.origin`（live / eval / probe）。真库实测 181 行里
+        # 116 行（64.1%）是 tools/ 下的评测与探针写的（eval-1…12、probe-*、smoke-r837、
+        # test-r828、e2e-adh-*）。这些会话永远不会再交证据，全部落在「未观测」，于是公共账本
+        # 的采纳率把采集缺口读成了「记忆没人用」（记忆 #524）。默认 live：生产钩子不必声明，
+        # 装置入口必须显式带 origin——**来历要由写入口自己说，不靠会话名猜**（会话形状判别
+        # 只用于下面那次历史回填，长期判据是 origin）。
+        # `decided_at` 在这里一并兜底：它只在 R82x 的建表语句里出现过、没有 ALTER 分支，
+        # 早于它建过表的老库根本没这一列，R852 起它是三态判据，缺列会让判定静默失败。
+        dcols = {r["name"] for r in conn.execute("PRAGMA table_info(recall_adherence)")}
+        if "decided_at" not in dcols:
+            conn.execute('ALTER TABLE recall_adherence ADD COLUMN decided_at TEXT DEFAULT ""')
+        if "origin" not in dcols:
+            conn.execute('ALTER TABLE recall_adherence ADD COLUMN origin TEXT DEFAULT "live"')
+            # 回填只跑一次（新库为空操作）：按会话形状把存量装置行标成 probe。
+            # 形状清单是**真库逐条点出来的**（R853 取证）：eval-*/probe*/smoke-*/test-r*/
+            # e2e-* 这五种有命中，其余（adh-%、s-%、tmp%、unit-%、agent=probe…）实测 0 行，
+            # 属于凭空猜的形状——留着只会误伤真实会话，删掉。对不上的一律留 live：
+            # 宁可少剔几行装置，也不能把生产数据误标成装置（后者会静默吃掉真账）。
+            # `agent|session` 前缀是写入口的老 bug（该存原始 session 却存了去重键，R827
+            # 注释里记过）：不归一化就有 3 行 `workbuddy|e2e-adh-2` 顶着 agent 名躲过匹配，
+            # 继续留在生产分母里。
+            conn.execute(
+                "UPDATE recall_adherence SET origin='probe' WHERE origin='live' AND id IN ("
+                " SELECT id FROM (SELECT id,"
+                "  CASE WHEN instr(session, agent || '|')=1"
+                "       THEN substr(session, length(agent)+2) ELSE session END AS s"
+                "  FROM recall_adherence)"
+                " WHERE s LIKE 'eval-%' OR s LIKE 'probe%' OR s LIKE 'smoke-%'"
+                "   OR s LIKE 'test-r%' OR s LIKE 'e2e-%')")
+        # R852/R853 两次改了采纳账的分子分母（判定即盖章、只认 live），历史行不改写：
+        # 没有锚点，跨变更点的比率会把「修前没盖章」读成「修后没判过」（同 §R834 锚点教训）。
+        conn.execute("INSERT OR IGNORE INTO meta(key,value)"
+                     " VALUES('caliber:adherence_three_state',?)", (_now(),))
+        conn.execute("INSERT OR IGNORE INTO meta(key,value)"
+                     " VALUES('caliber:adherence_origin',?)", (_now(),))
         # R834 口径锚点：`searches.hits` 自 R833 起包含记录/错误命中，历史行不改写。
         # 没有这个锚点，任何跨变更点的比率都会把「修前只命中记录被记成 0」的历史行
         # 当成空转——本轮开工就先被 55.6% 那个假数字带偏了一次（台账 §一①）。
@@ -8332,25 +8368,33 @@ def recall_fingerprints(text: str, pool_texts: list = None, prompt: str = "",
 
 def _record_adherence(root: str, session: str, agent: str, picked: list,
                       project: str, strength: str, prompt: str,
-                      pool_texts: list = None) -> int:
+                      pool_texts: list = None, origin: str = "live") -> int:
     """把「这次注入了哪些记忆、各自的指纹是什么」记一笔。返回写入行数。
 
     抽不出指纹的记忆也照记（fp="[]"）——它们是**分母的诚实部分**：采纳率要拿
     「可指纹的」当分母，不能把无法判定的悄悄算成「被忽略」。
+
+    R853 `origin`：生产钩子留默认 live，评测/探针必须显式传 eval/probe——采纳率的分母
+    只认 live。装置跑的注入不会再交证据，混进公共账本就等于凭空多出一堆「未观测」。
     """
     if not picked:
         return 0
     now = _now()
+    origin = (origin or "live").strip().lower()
+    if origin not in ("live", "eval", "probe"):
+        # 认不出的来历按装置处理：生产路径一律走默认值不传参，会传乱码的只有评测/探针；
+        # 反过来把乱码当 live，就等于让装置继续混进分母（R853 要治的就是这个）。
+        origin = "probe"
     rows = []
     for r in picked:
         fp = recall_fingerprints(str(r.get("content") or "") + " " + str(r.get("tags") or ""),
                                  pool_texts=pool_texts, prompt=prompt)
         rows.append((now, session, agent or "", int(r.get("id") or 0), project or "",
-                     strength, json.dumps(fp, ensure_ascii=False)))
+                     strength, json.dumps(fp, ensure_ascii=False), origin))
     with db_conn(root) as conn:
         conn.executemany(
-            "INSERT INTO recall_adherence(ts, session, agent, memory_id, project, strength, fp)"
-            " VALUES(?,?,?,?,?,?,?)", rows)
+            "INSERT INTO recall_adherence(ts, session, agent, memory_id, project, strength,"
+            " fp, origin) VALUES(?,?,?,?,?,?,?,?)", rows)
         # 有界：只留最近 ADHERENCE_KEEP_DAYS 天，行数超上限时删最旧的
         conn.execute("DELETE FROM recall_adherence WHERE ts < ?",
                      (_days_ago(ADHERENCE_KEEP_DAYS),))
@@ -8369,8 +8413,13 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
     「判官看过但没认出来」和「判定压根没跑到这一行」在账上长得一模一样（都是
     used=0）——而这两者的修法相反（收注入精度 vs 补采集通道）。`used` 的语义不动，
     仍是 R829 那条唯一的 adopt_count 依据。
+
+    R853（装置隔离）：`origin<>'live'` 的行照样判定、照样写 used/decided_at——装置靠这条
+    自证闭环真的跑得通（R849 的探针就是读自己那几行的 used 来判 PASS 的，一刀不判等于把
+    尺子也锁在门外）。不放过的是**外溢**：命中的记忆只有生产行才 +adopt_count，
+    否则 eval 造的那段文本会替真实记忆刷有用性，而那正是 R829 立这条唯一写入口要防的。
     """
-    out = {"checked": 0, "matched": 0, "memory_ids": []}
+    out = {"checked": 0, "matched": 0, "memory_ids": [], "device_matched": 0}
     if not session or not (text or "").strip():
         return out
     low = text.lower()
@@ -8379,7 +8428,7 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
     hit_ids, rows, judged_ids = [], [], []
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, memory_id, fp FROM recall_adherence"
+            "SELECT id, memory_id, fp, COALESCE(origin,'live') AS origin FROM recall_adherence"
             " WHERE session=? AND used=0 AND ts>=?", (session, since))]
         for r in rows:
             try:
@@ -8391,7 +8440,10 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
             judged_ids.append(r["id"])
             if any(tok and tok in low for tok in fp):
                 hit_ids.append(r["id"])
-                out["memory_ids"].append(r["memory_id"])
+                if (r.get("origin") or "live") == "live":
+                    out["memory_ids"].append(r["memory_id"])
+                else:
+                    out["device_matched"] += 1
         if judged_ids:
             now = _now()
             conn.executemany("UPDATE recall_adherence SET decided_at=? WHERE id=?",
@@ -8401,6 +8453,8 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
                              [(i,) for i in hit_ids])
             # R829：指纹证实「这一条真的被用上了」。adopt_count 只有这一个写入口，
             # 因此它是全库唯一不被曝光污染的有用性信号（被动注入只进 inject_count）。
+            # R853：只有生产行能给它——装置喂进来的文本是造出来的，让它替真实记忆
+            # 记一次「被用上」，等于用假证据把唯一可信的那个计数器重新污染掉。
             for mid in sorted({int(m) for m in out["memory_ids"] if m}):
                 conn.execute("UPDATE memories SET adopt_count=adopt_count+1 WHERE id=?",
                              (mid,))
@@ -8423,17 +8477,27 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
         `judged_unused` 判过且没认出来（判无用）· `judged_used` 判过且认出来（判用上）。
         `observed_rate` = used / 判过的笔数，只有这个分母没有「没判过」掺水，可用于定罪；
       · 平均记忆年龄 = 被注入记忆的创建时间均值，对照 7–30 天（太短=只靠近期记忆，
-        太长=旧结论权重过高）。
+        太长=旧结论权重过高）；
+      · 只算 `origin='live'`（R853）。真库实测近 30 天 181 行里 116 行是 eval/probe
+        装置写的：它们永远不会被判定（没有对应的产出文本），全落在「未观测」——
+        于是「账面 7.8%」和「采集侧饿着」被装置放大成同一种症状，`device_rows`
+        单独报出来，让「排除多少」这件事本身可核查。
     """
     since = _days_ago(max(1, int(days)))
     out = {"window_days": days, "injected": 0, "fingerprintable": 0, "used": 0,
            "rate": 0.0, "by_strength": {}, "avg_memory_age_days": None,
            "unjudgeable": 0, "unobserved": 0, "judged_unused": 0, "judged_used": 0,
-           "judged": 0, "observed_rate": 0.0}
+           "judged": 0, "observed_rate": 0.0, "device_rows": 0}
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT strength, fp, used, decided_at, memory_id FROM recall_adherence WHERE ts>=?",
+            "SELECT strength, fp, used, decided_at, memory_id,"
+            " COALESCE(origin,'live') AS origin FROM recall_adherence WHERE ts>=?",
             (since,))]
+    if not rows:
+        return out
+    device_rows = sum(1 for r in rows if (r.get("origin") or "live") != "live")
+    rows = [r for r in rows if (r.get("origin") or "live") == "live"]
+    out["device_rows"] = device_rows
     if not rows:
         return out
     out["injected"] = len(rows)
@@ -8605,7 +8669,8 @@ def _recall_pick_margin(scored: list, cap: int, margin: float = RECALL_REL_MARGI
 def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                   project: str = "", max_chars: int = RECALL_MAX_CHARS,
                   session: str = "", state_path: str = "",
-                  update_state: bool = True, budget_path: str = "") -> dict:
+                  update_state: bool = True, budget_path: str = "",
+                  origin: str = "live") -> dict:
     """按用户这一句话自动回忆（UserPromptSubmit 钩子入口）。
 
     与 session_brief 分工：简报解决「开局知道团队在干什么」，本函数解决「说到某件事时
@@ -8876,7 +8941,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         # 钩子）手里只有 session，让它去拼 agent 前缀迟早对不上（实测踩过）。
         if session:
             try:
-                _record_adherence(root, session, who, picked, pname, "strong", prompt, mem_texts)
+                _record_adherence(root, session, who, picked, pname, "strong", prompt,
+                                  mem_texts, origin=origin)
             except sqlite3.Error:
                 pass
     try:
@@ -9290,7 +9356,7 @@ def _error_headline(text: str, high: list, limit: int = 96) -> str:
 def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
                  cwd: str = "", project: str = "", max_chars: int = ERROR_RECALL_MAX_CHARS,
                  session: str = "", state_path: str = "", update_state: bool = True,
-                 count: bool = True, budget_path: str = "") -> dict:
+                 count: bool = True, budget_path: str = "", origin: str = "live") -> dict:
     """工具失败那一刻的自动回忆（PostToolUseFailure 钩子入口，R833）。
 
     为什么需要它：简报解决开局、按句回忆解决「用户说到某件事」，但模型真正需要
@@ -9555,7 +9621,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         if session:
             try:
                 _record_adherence(root, session, who, picked, pname, "error",
-                                  error_text, mem_texts)
+                                  error_text, mem_texts, origin=origin)
             except sqlite3.Error:
                 pass
     if count:

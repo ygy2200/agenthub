@@ -3146,7 +3146,10 @@ def _adherence_health(root: str = "") -> dict:
       · 三态数（R852）：判不了（抽不出招牌）· 未观测（判定从没跑到）· 判无用（判过没认出来）·
         判用上——低采纳率混着前两种成因时，定罪的是「观测口径」而不是账面数字；
       · 口径数：带 src 的采集次数、其中 transcript 占比、单轮证据字数中位数；
-      · 送达数：有注入账的 agent 里，窗口内一次采集都没有的（hermes 无出口除外）。
+      · 送达数：有注入账的 agent 里，窗口内一次采集都没有的（hermes 无出口除外）；
+      · 装置隔离（R853）：`origin<>'live'` 的注入行一笔都不进上面三组数，闭环点名也
+        只点生产会话——真库里 181 行有 116 行是 tools/ 的评测与探针写的，它们永远不会
+        再交证据，掺进来就是把「我自己的脚手架」读成「63h 没人闭环的生产欠账」。
     判红顺序刻意是「先尺子后结论」：尺子不可信时不出「记忆没人用」这种判决。
     """
     if err := _need_root(root):
@@ -3164,7 +3167,8 @@ def _adherence_health(root: str = "") -> dict:
                 " ORDER BY ts DESC", (d7,))]
             sess_rows = [dict(r) for r in conn.execute(
                 "SELECT agent, session, MAX(ts) AS last_ts, COUNT(*) AS n FROM recall_adherence"
-                " WHERE ts>=? AND agent<>'' AND session<>'' GROUP BY agent, session"
+                " WHERE ts>=? AND agent<>'' AND session<>''"
+                " AND COALESCE(origin,'live')='live' GROUP BY agent, session"
                 " ORDER BY last_ts DESC", (d7,))]
     except Exception as e:  # noqa: BLE001 库不可用时不硬判（同 link_health：不和 db_integrity 抢根因）
         return {"ok": True, "summary": f"采纳账：读不到数据（{str(e)[:60]}），本轮不判定",
@@ -3201,6 +3205,7 @@ def _adherence_health(root: str = "") -> dict:
     median = int(statistics.median(chars)) if chars else 0
     rate = float(st.get("rate") or 0.0)
     injected_n = int(st.get("injected") or 0)
+    device_n = int(st.get("device_rows") or 0)
     fingerprintable = int(st.get("fingerprintable") or 0)
     used_n = int(st.get("used") or 0)
     # 三态（R852）：判不了 / 未观测 / 判无用 / 判用上。只有「判过」的两态能进定罪分母——
@@ -3245,8 +3250,9 @@ def _adherence_health(root: str = "") -> dict:
         if not sess_caliber:
             return [f"闭环账：窗口内 {len(sess_rows)} 个会话有注入，但流水里还没有带 sess= 的"
                     f"采集——判过没有无从核对（装上补扫跑过一轮才看得见）"]
-        note = (f"闭环账：窗口内 {len(sess_rows)} 个会话有注入 · {len(captured_sess)} 个判定过"
-                f"（采集通道：回填 {len(scoped) - len(swept)} · 补扫 {len(swept)}）")
+        note = (f"闭环账：窗口内 {len(sess_rows)} 个生产会话有注入 · {len(captured_sess)} 个判定过"
+                f"（采集通道：回填 {len(scoped) - len(swept)} · 补扫 {len(swept)}；"
+                f"装置会话不参与点名）")
         if idle:
             worst = max(idle, key=lambda x: x[2])
             note += (f" · {len(idle)} 个会话注入后隔了 {ADHERENCE_IDLE_H}h 以上仍没被判定"
@@ -3282,6 +3288,9 @@ def _adherence_health(root: str = "") -> dict:
     # 二、送达：有注入账的家里，谁一次采集都没交（hermes 这类无 Stop 出口的不算）
     ran = {core.agent_key(r.get("agent") or "") for r in runs}
     never = [a for a in injected if a not in ran and not _answer_unsupported(core, a)]
+    if device_n:
+        detail.append(f"装置隔离：窗口内另有 {device_n} 笔注入是 eval/probe 写的，一笔没进下面的账"
+                      f"（装置没有对应产出，永远不会被判定；算进来会把采集缺陷读成「记忆没人用」）")
     detail.append(f"结果账：注入 {injected_n} 笔 · 可指纹 {fingerprintable} 笔 · 被用上 "
                   f"{used_n} 条 = 账面采纳率 {rate:.1f}%")
     detail.append(f"三态账：判不了 {unjudgeable_n} · 未观测 {unobserved_n} · "

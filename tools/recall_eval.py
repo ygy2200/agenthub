@@ -62,7 +62,8 @@ def run(verbose: bool = False, root: str = "", cases=None) -> int:
         try:
             out = brain.prompt_recall(root, prompt, agent="workbuddy",
                                       cwd=str(ROOT_DIR), session=f"eval-{i}",
-                                      state_path=str(state), update_state=False)
+                                      state_path=str(state), update_state=False,
+                                      origin="eval")
         except Exception as e:  # noqa: BLE001 量具不能因为单条炸掉而中断
             print(f"[{i:02d}] ERROR {prompt!r}: {e}")
             continue

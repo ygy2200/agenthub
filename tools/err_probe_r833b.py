@@ -28,7 +28,8 @@ def main() -> int:
         # 签名词按召回路径的真实口径算：先摘掉「失败调用：…」命令回显和大脑自己注入过的块
         terms = brain.error_signature_terms(brain._error_voice(text))
         res = brain.error_recall(root, text, tool="Bash", agent="qoder",
-                                 session="probe-r834", update_state=False, count=False)
+                                 session="probe-r834", update_state=False, count=False,
+                                 origin="probe")
         print("=" * 66)
         print(f"{name} · {text[:64]}")
         print(f"  签名词 {terms}")

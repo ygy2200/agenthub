@@ -53,7 +53,8 @@ def _build(hub: str, session: str) -> None:
         brain.add_memory(hub, text, kind="lesson", tags="misc", agent="workbuddy")
     brain.add_memory(hub, f"adoption_hunger 这类坑记在 {SIG}：只看收尾一句话会漏判采纳率。",
                      kind="lesson", tags="r849 采纳", agent="qoder")
-    brain.prompt_recall(hub, QUERY, agent="qoder", session=session, update_state=False)
+    brain.prompt_recall(hub, QUERY, agent="qoder", session=session, update_state=False,
+                        origin="probe")
 
 
 def _cases(tmp: Path) -> list:

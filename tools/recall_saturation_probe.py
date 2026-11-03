@@ -52,7 +52,7 @@ def replay(root: str, queries: list, margin: float, cwd: str) -> list:
     try:
         for q in queries:
             res = brain.prompt_recall(root, q, agent="probe", cwd=cwd,
-                                      update_state=False, session="")
+                                      update_state=False, session="", origin="probe")
             hits.append({"q": q, "n": len(res["memory_ids"]) + len(res["record_ids"]),
                          "mem": res["memory_ids"], "rec": res["record_ids"],
                          "chars": res["chars"], "skipped": res.get("skipped", "")})

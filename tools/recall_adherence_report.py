@@ -76,12 +76,16 @@ def main() -> int:
             print("× --mark 需要同时给 --text（这一轮的回答或命令）")
             return 2
         r = brain.mark_recall_used(root, a.mark, a.text)
-        print(f"检查 {r['checked']} 条注入记录，命中 {r['matched']} 条：{r['memory_ids']}")
+        dev = f" · 装置行 {r['device_matched']} 条（只判定，不进 adopt_count）" \
+            if r.get("device_matched") else ""
+        print(f"检查 {r['checked']} 条注入记录，命中 {r['matched']} 条：{r['memory_ids']}{dev}")
         return 0
 
     st = brain.recall_adherence_stats(root, a.days)
     print(f"窗口：近 {st['window_days']} 天（大脑根：{root}）")
-    print(f"注入记录  {st['injected']} 条")
+    print(f"注入记录  {st['injected']} 条（生产 origin=live）"
+          + (f" · 另有 {st['device_rows']} 条是 eval/probe 装置写的，已从下面所有账里排除"
+             if st.get("device_rows") else ""))
     print(f"可指纹    {st['fingerprintable']} 条"
           + (f"（占 {st['fingerprintable'] / st['injected'] * 100:.0f}%）" if st["injected"] else ""))
     print(f"被用      {st['used']} 条")

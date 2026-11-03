@@ -90,7 +90,7 @@ def main() -> int:
         hit = hinted = missed = nosig = mute = 0
         for tool, text in CASES:
             res = brain.error_recall(hub, text, tool=tool, agent="qoder",
-                                     session="probe", state_path=state)
+                                     session="probe", state_path=state, origin="probe")
             sk = res["skipped"]
             if sk == "":
                 hit += 1
@@ -144,7 +144,7 @@ def main() -> int:
 
             # ④ 同一条报错再来：必须真命中，且不再出欠账提示
             re_hit = brain.error_recall(hub, text, tool="Bash", agent="qoder",
-                                         session="probe2", state_path=state)
+                                        session="probe2", state_path=state, origin="probe")
             print(f"④ 再撞 skipped={re_hit['skipped']!r} · error_ids={re_hit['error_ids']}"
                   f" · {len(re_hit['text'])} chars")
             ok4 = (re_hit["skipped"] == "" and info["id"] in re_hit["error_ids"]

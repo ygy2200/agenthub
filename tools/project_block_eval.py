@@ -44,7 +44,7 @@ def run(verbose: bool = False, root: str = "") -> int:
         cwd = str(Path(root) / project)
         out = brain.prompt_recall(root, prompt, agent="workbuddy", cwd=cwd,
                                   session=f"pe-{i}", state_path=str(state),
-                                  update_state=False)
+                                  update_state=False, origin="eval")
         text = out.get("text") or ""
         has_head = "本项目近况" in text
         has_kw = kw in text
