@@ -28,9 +28,9 @@ import core  # noqa: E402
 
 core.JOURNAL_SINK = brain.journal_add
 
-# 一轮回答可能很长（几万字），但指纹匹配只需要「产出里出现过什么」——截中间没有意义，
-# 头尾各留一段就够（工具调用通常在中间，但命令里重复出现的路径也会在结尾总结里出现）。
-MAX_TEXT = 40000
+# 一轮证据现在包含本轮全部工具调用参数（R849），动辄几万字符；指纹匹配只看「出现过没有」，
+# 头尾各留一段就够，中间的重复正文对判定没有额外信息。
+MAX_TEXT = 120000
 
 
 def main(argv=None) -> int:
@@ -40,6 +40,7 @@ def main(argv=None) -> int:
     ap.add_argument("--session", default="", help="会话 id（必须与注入时一致）")
     ap.add_argument("--text", default="", help="这一轮的产出文本；留空则从 stdin 读")
     ap.add_argument("--window-h", type=int, default=24, help="回看多少小时内的注入")
+    ap.add_argument("--src", default="", help="证据来源口径（transcript/direct/both），只进流水不改判定")
     ap.add_argument("--json", action="store_true", help="输出 JSON（测试/脚本用）")
     ap.add_argument("--no-journal", action="store_true", help="不写流水（测试用）")
     args = ap.parse_args(argv)
@@ -69,7 +70,8 @@ def main(argv=None) -> int:
             try:
                 core.journal(root, agent or "unknown", "brain_adherence", "answer",
                              note=(f"checked={out['checked']} matched={out['matched']} "
-                                   f"mem={out['memory_ids']} chars={len(text)}"))
+                                   f"mem={out['memory_ids']} chars={len(text)} "
+                                   f"src={args.src or '-'}"))
             except Exception:  # noqa: BLE001 流水失败不影响记账
                 pass
     except Exception as e:  # noqa: BLE001 钩子侧必须 fail-open
