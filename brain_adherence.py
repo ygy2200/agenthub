@@ -39,6 +39,7 @@ def main(argv=None) -> int:
     ap.add_argument("--agent", default="", help="会话 agent 名")
     ap.add_argument("--session", default="", help="会话 id（必须与注入时一致）")
     ap.add_argument("--text", default="", help="这一轮的产出文本；留空则从 stdin 读")
+    ap.add_argument("--text-file", default="", help="从文件读证据（补扫钩子后台跑时用，R851）")
     ap.add_argument("--window-h", type=int, default=24, help="回看多少小时内的注入")
     ap.add_argument("--src", default="", help="证据来源口径（transcript/direct/both），只进流水不改判定")
     ap.add_argument("--json", action="store_true", help="输出 JSON（测试/脚本用）")
@@ -50,6 +51,13 @@ def main(argv=None) -> int:
         agent = (args.agent or os.environ.get("AGENTHUB_AGENT", "") or "").strip()
         session = (args.session or "").strip()
         text = args.text
+        if not text and args.text_file:
+            # 补扫钩子（R851）把证据写成临时文件后 detached 拉起本脚本：子进程没有 stdin，
+            # 命令行又装不下一轮几万字节的证据，文件是这两条约束下唯一的传送带。
+            try:
+                text = Path(args.text_file).read_text(encoding="utf-8", errors="replace")
+            except OSError:
+                text = ""
         if not text:
             try:
                 if not sys.stdin.isatty():
@@ -68,10 +76,12 @@ def main(argv=None) -> int:
         out = brain.mark_recall_used(root, session, text, window_h=args.window_h)
         if root and not args.no_journal:
             try:
+                # sess= 是 R851 加的：采纳闭环要能落到「哪一次会话没闭环」，光有 agent
+                # 维度看不出一个会话里判了没有——巡检项就是按这个数算闭环率的。
                 core.journal(root, agent or "unknown", "brain_adherence", "answer",
                              note=(f"checked={out['checked']} matched={out['matched']} "
                                    f"mem={out['memory_ids']} chars={len(text)} "
-                                   f"src={args.src or '-'}"))
+                                   f"src={args.src or '-'} sess={session[:16]}"))
             except Exception:  # noqa: BLE001 流水失败不影响记账
                 pass
     except Exception as e:  # noqa: BLE001 钩子侧必须 fail-open

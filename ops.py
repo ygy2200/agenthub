@@ -96,7 +96,7 @@ PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_ch
                  "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
                  "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
-    "adherence": "分三种红各修各的：① 口径未覆盖又装不了新副本 → 先 `python cli.py deploy`（顺带刷新 ~/.agenthub/hooks 副本），让流水带上 src=；② 判官饿着（transcript 占比低 / 单轮证据中位数只有几十字）→ 采集侧问题，查 brain_adherence.mjs 是否仍优先用事件自带文本，修法见 R849（本轮工具调用才是证据）；③ 口径正常、采集在跑而采纳率低 → 才是注入精度问题：跑 tools/recall_adherence_report.py 看 by_strength，压掉「只曝光不采纳」的那批（R830 断路器），不是加大注入量。某家有注入账却窗口内零次 Stop 采集：`python cli.py status` 核对回填钩子，再看 ~/.agenthub/logs/brain-adherence.log 的 skip 原因（hermes 无 Stop 出口不算故障）",
+    "adherence": "分三种红各修各的：① 口径未覆盖又装不了新副本 → 先 `python cli.py deploy`（顺带刷新 ~/.agenthub/hooks 副本），让流水带上 src=；② 判官饿着（transcript 占比低 / 单轮证据字数中位数只有几十字）→ 采集侧问题，查 brain_adherence.mjs 是否仍优先用事件自带文本，修法见 R849（本轮工具调用才是证据）；③ 口径正常、采集在跑而采纳率低 → 才是注入精度问题：跑 tools/recall_adherence_report.py 看 by_strength，压掉「只曝光不采纳」的那批（R830 断路器），不是加大注入量。某家有注入账却窗口内零次采集：`python cli.py status` 核对回填钩子，再看 ~/.agenthub/logs/brain-adherence.log 的 skip 原因（hermes 无 Stop 出口不算故障）。④ 会话没闭环（有注入的会话隔了几小时从没被判定，R851）→ 先分清是「宿主压根不发 Stop」还是「钩子没跑」：Qoder Desktop 实测 3 次发言 0 次 Stop，这种家要给补扫通道 `python cli.py hook-install <agent> --events sweep --apply`（挂在 UserPromptSubmit，判的是上一轮），装完再跑一轮本项就会换成真实闭环数",
     "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
     "env": "按 detail 点名项修环境（Python/代理/磁盘/库路径）；装依赖用 pip install -e .",
     "runtime_health": "重启各 agent 的 agenthub MCP 进程（旧进程仍跑旧代码）；部署先 cli.py deploy",
@@ -3111,6 +3111,9 @@ ADHERENCE_BAD_RATE = 20.0
 ADHERENCE_OK_RATE = 40.0
 ADHERENCE_TRANSCRIPT_SHARE = 0.5    # 口径内的采集次数里，证据来自 transcript 的最低占比
 ADHERENCE_MIN_MEDIAN_CHARS = 120    # 单轮证据字数中位数低于此 = 判官只捞到收尾一句话
+# 会话注入后隔多久还没被判定就算「没闭环」（R851）。6 小时是刻意留的宽量：一个会话
+# 可能连着跑几小时，补扫在下一句发言时才判上一轮，短暂无判不算故障。
+ADHERENCE_IDLE_H = 6
 
 
 def _adherence_capture_marker_present() -> tuple:
@@ -3154,16 +3157,19 @@ def _adherence_health(root: str = "") -> dict:
             runs = [dict(r) for r in conn.execute(
                 "SELECT agent, ts, note FROM journal WHERE action='brain_adherence' AND ts>=?"
                 " ORDER BY ts DESC", (d7,))]
-            injected_agents = [dict(r) for r in conn.execute(
-                "SELECT DISTINCT agent FROM recall_adherence WHERE ts>=? AND agent<>''", (d7,))]
+            sess_rows = [dict(r) for r in conn.execute(
+                "SELECT agent, session, MAX(ts) AS last_ts, COUNT(*) AS n FROM recall_adherence"
+                " WHERE ts>=? AND agent<>'' AND session<>'' GROUP BY agent, session"
+                " ORDER BY last_ts DESC", (d7,))]
     except Exception as e:  # noqa: BLE001 库不可用时不硬判（同 link_health：不和 db_integrity 抢根因）
         return {"ok": True, "summary": f"采纳账：读不到数据（{str(e)[:60]}），本轮不判定",
                 "detail": []}
+    injected_agents = [r.get("agent") for r in sess_rows]
 
     known = {core.agent_key(a.get("name") or "") for a in _brain.list_agents(root)}
     runs = [r for r in runs if core.agent_key(r.get("agent") or "") in known]
-    injected = sorted({core.agent_key(r.get("agent") or "") for r in injected_agents
-                       if core.agent_key(r.get("agent") or "") in known})
+    injected = sorted({core.agent_key(a or "") for a in injected_agents
+                       if core.agent_key(a or "") in known})
 
     def _src_of(note: str) -> str:
         m = re.search(r"src=([^\s]+)", note or "")
@@ -3173,13 +3179,45 @@ def _adherence_health(root: str = "") -> dict:
         m = re.search(r"chars=(\d+)", note or "")
         return int(m.group(1)) if m else 0
 
+    def _sess_of(note: str) -> str:
+        m = re.search(r"sess=([^\s]+)", note or "")
+        return m.group(1) if m else ""
+
     scoped = [r for r in runs if _src_of(r.get("note") or "")]
-    trans = [r for r in scoped if "transcript" in _src_of(r.get("note") or "")]
+    # transcript 级证据：Stop 取的是本轮，补扫取的是上一轮那段增量——两者都来自
+    # transcript 的 assistant 正文+工具参数，同一档口径，不能把补扫算成「饿着」。
+    def _grade(note: str) -> bool:
+        src = _src_of(note)
+        return "transcript" in src or src == "sweep"
+
+    trans = [r for r in scoped if _grade(r.get("note") or "")]
+    swept = [r for r in runs if _src_of(r.get("note") or "") == "sweep"]
     chars = sorted(_chars_of(r.get("note") or "") for r in scoped)
     median = int(statistics.median(chars)) if chars else 0
     rate = float(st.get("rate") or 0.0)
     injected_n = int(st.get("injected") or 0)
     fingerprintable = int(st.get("fingerprintable") or 0)
+
+    # 闭环账（R851）：采纳判定的粒度是「会话」，不是「家」。一个会话里注入了 5 条记忆、
+    # 跑了 40 轮，若回填与补扫都没判过它，这几十条就永远不会进 adopt_count——按家汇总
+    # 看不出这个洞（同一家在别处判过就算「有采集」），必须按会话点名。
+    # 只认带 sess= 的采集为「判过」：更早的流水没这个字段，判没判过无从知晓，
+    # 于是这一层在口径覆盖前只报「无从核对」，不报红（报不出来的东西不能当问题报）。
+    captured_sess = {_sess_of(r.get("note") or "") for r in runs} - {""}
+    sess_caliber = bool(captured_sess)
+    now = datetime.datetime.now()
+    idle = []
+    for r in sess_rows:
+        s = (r.get("session") or "")[:16]
+        if not s or s in captured_sess:
+            continue
+        try:
+            then = datetime.datetime.fromisoformat(str(r.get("last_ts"))[:19])
+            age_h = (now - then).total_seconds() / 3600.0
+        except ValueError:
+            continue
+        if age_h >= ADHERENCE_IDLE_H:
+            idle.append((core.agent_key(r.get("agent") or "") or "?", s, int(age_h)))
 
     if not injected_n and not runs:
         return {"ok": True,
@@ -3188,6 +3226,19 @@ def _adherence_health(root: str = "") -> dict:
                            "工具通道是否活着见 link_health——这两项红了这里就是空的"]}
 
     # 一、尺子本身：口径覆盖不足时先说尺子，不给「记忆没人用」定罪
+    def _closure_note() -> list:
+        """闭环账一行话：会话粒度的「判过 / 没判过」，加上通道拆分。"""
+        if not sess_caliber:
+            return [f"闭环账：窗口内 {len(sess_rows)} 个会话有注入，但流水里还没有带 sess= 的"
+                    f"采集——判过没有无从核对（装上补扫跑过一轮才看得见）"]
+        note = (f"闭环账：窗口内 {len(sess_rows)} 个会话有注入 · {len(captured_sess)} 个判定过"
+                f"（采集通道：回填 {len(scoped) - len(swept)} · 补扫 {len(swept)}）")
+        if idle:
+            worst = max(idle, key=lambda x: x[2])
+            note += (f" · {len(idle)} 个会话注入后隔了 {ADHERENCE_IDLE_H}h 以上仍没被判定"
+                     f"（最久 {worst[2]}h，如 {worst[0]}/{worst[1]}）")
+        return [note]
+
     if not scoped:
         present, where = _adherence_capture_marker_present()
         if present:
@@ -3195,7 +3246,7 @@ def _adherence_health(root: str = "") -> dict:
                     "summary": f"采纳账：口径已部署（{where} 带 src）但窗口内还没有一次带口径的采集"
                                f"——采纳率 {rate:.1f}% 先别当真",
                     "detail": detail + [f"近 7 天采集 {len(runs)} 次，全部没有 src（旧流水或旧进程）",
-                                        "新会话跑一轮后重读本项即可出结论"]}
+                                        "新会话跑一轮后重读本项即可出结论"] + _closure_note()}
         return {"ok": True,
                 "summary": f"采纳账：采集脚本还是 R849 之前的口径，判官吃进去什么无从知晓"
                            f"（账面采纳率 {rate:.1f}% 不可用于下结论）",
@@ -3229,22 +3280,37 @@ def _adherence_health(root: str = "") -> dict:
     detail.append(f"口径内采集 {len(scoped)} 次 · transcript 证据 {len(trans)} 次 · "
                   f"单轮证据中位 {median} 字 · 起点 {min(r['ts'] for r in scoped)}")
     if never:
-        detail.append("有注入账但窗口内零次 Stop 采集：" + "、".join(never)
-                      + "（回填钩子没跑或被禁用）")
+        detail.append("有注入账但窗口内零次采集：" + "、".join(never)
+                      + "（回填/补扫都没交账）")
         return {"ok": False,
                 "summary": f"采纳账：{'、'.join(never)} 家有注入但没有采集记录——"
                            f"采纳率只覆盖了交账的那几家",
-                "fix": CHECK_FIXES["adherence"], "detail": detail}
+                "fix": CHECK_FIXES["adherence"], "detail": detail + _closure_note()}
+    # 二·五、闭环：会话粒度补一刀（R851）。上面那条只看「这家有没有交过账」，看不出一家
+    # 里某个会话整段没被判——宿主不发 Stop 时正是这种形状：别的会话判过，这一局永远没判。
+    if sess_caliber and idle:
+        for ag in sorted({a for a, _s, _h in idle})[:4]:
+            try:
+                hs = core.memory_hook_status(ag) or {}
+                detail.append(f"  {ag}：回填={(hs.get('answer') or {}).get('state', '')}"
+                              f" 补扫={(hs.get('sweep') or {}).get('state', '')}")
+            except Exception:  # noqa: BLE001 读不动配置就只报账，不拖垮整项
+                pass
+        worst = max(idle, key=lambda x: x[2])
+        return {"ok": False,
+                "summary": f"采纳账：{len(idle)} 个会话有注入却从没被判定（最久 {worst[2]}h，"
+                           f"{worst[0]}）——这些注入进不了 adopt_count，排序拿不到反馈",
+                "fix": CHECK_FIXES["adherence"], "detail": detail + _closure_note()}
     if rate < ADHERENCE_BAD_RATE:
         return {"ok": False,
                 "summary": f"采纳账：口径正常而采纳率 {rate:.1f}% 低于 {ADHERENCE_BAD_RATE:.0f}%"
                            f"——这才是「注入的记忆真没被用上」，收注入精度而不是加量",
-                "fix": CHECK_FIXES["adherence"], "detail": detail}
+                "fix": CHECK_FIXES["adherence"], "detail": detail + _closure_note()}
     tail = "偏低（介于观察线与正常之间）" if rate < ADHERENCE_OK_RATE else "在正常区间"
     return {"ok": True,
             "summary": f"采纳账：采纳率 {rate:.1f}%（{tail}），采集口径覆盖 {len(scoped)} 次"
                        f" · transcript 证据 {share * 100:.0f}%",
-            "detail": detail}
+            "detail": detail + _closure_note()}
 
 
 def _answer_unsupported(core, agent_key: str) -> bool:

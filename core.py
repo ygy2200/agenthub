@@ -1238,6 +1238,13 @@ HOOK_RECALL_DESC = "AgentHub 即时回忆：按每句话检索相关记忆（R82
 # 可能触发几十次，每次都比对指纹纯属浪费）。
 HOOK_ADHERENCE_NAME = "brain_adherence.mjs"
 HOOK_ADHERENCE_DESC = "AgentHub 采纳回填：一轮结束标记哪些注入被用到（R828）"
+# 采纳补扫（R851）：Stop 不是所有宿主都发——本机实测 Qoder Desktop 一次会话里 3 次
+# UserPromptSubmit、0 次 Stop（同版本 qodercli 却发 Stop），于是这一家在 Desktop 里
+# 永远不交采纳账，adopt_count 这条唯一的有用性信号长期饿着。补扫把判定时点挪到
+# 「下一次发言开头」：按水位线只读上次扫过之后的那段 transcript，判的是刚结束的那一轮。
+# 每句话一次（与回忆同频），不碰 PostToolUse——一轮几十次工具调用每次都比对才是纯浪费。
+HOOK_SWEEP_NAME = "brain_adherence_sweep.mjs"
+HOOK_SWEEP_DESC = "AgentHub 采纳补扫：下次发言时补判上一轮用没用到（R851，无 Stop 出口的宿主用这条）"
 # 报错即时回忆（R833）：模型真正需要历史结论的时刻是它自己撞墙那一刻，不是用户
 # 发言那一刻。PostToolUseFailure 是各家（Claude/Qoder 契约）给的确定出口；脚本同时
 # 兼容 PostToolUse 带错误标记的形态，拿不到错误正文就静默。
@@ -1248,6 +1255,7 @@ HOOK_JSON_EVENTS = {
     "prompt": ("UserPromptSubmit", HOOK_RECALL_NAME, HOOK_RECALL_DESC),
     "answer": ("Stop", HOOK_ADHERENCE_NAME, HOOK_ADHERENCE_DESC),
     "error": ("PostToolUseFailure", HOOK_ERROR_RECALL_NAME, HOOK_ERROR_RECALL_DESC),
+    "sweep": ("UserPromptSubmit", HOOK_SWEEP_NAME, HOOK_SWEEP_DESC),
 }
 
 
@@ -1325,8 +1333,8 @@ def _install_json_hook(agent: str, event_key: str, apply: bool = False, path: st
     """把某个钩子脚本挂到 agent 的某个事件（幂等；写前备份；默认只预演）。"""
     event, script_name, desc = HOOK_JSON_EVENTS[event_key]
     key = agent_key(agent) or (agent or "").strip().lower()
-    out = {"agent": key, "event": event, "path": "", "status": "", "command": "",
-           "backup": "", "copied": False}
+    out = {"agent": key, "event": event, "channel": event_key, "path": "", "status": "",
+           "command": "", "backup": "", "copied": False}
     dest = Path.home() / ".agenthub" / "hooks" / script_name
     if install_script:
         src = _runtime_dir() / script_name
@@ -1454,9 +1462,21 @@ def install_error_recall_hook(agent: str, apply: bool = False, path: str = "",
                               install_script=install_script)
 
 
+def install_sweep_hook(agent: str, apply: bool = False, path: str = "",
+                       node: str = "", install_script: bool = True) -> dict:
+    """把 brain_adherence_sweep.mjs 挂到 agent 的 UserPromptSubmit（R851）。
+
+    采纳判定不该只指望 Stop：宿主不发 Stop 时（Qoder Desktop 实测），注入有没有被用
+    就永远没有下文。挂在这条**必然触发**的通道上，判定的是上一轮已经写进 transcript
+    的那段——同一家装了 Stop 回填也不冲突：水位线保证每段证据只判一次。
+    """
+    return _install_json_hook(agent, "sweep", apply=apply, path=path, node=node,
+                              install_script=install_script)
+
+
 def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
                          node: str = "", install_script: bool = True) -> dict:
-    """一次装齐开机简报 + 按句回忆 + 报错回忆 + 采纳回填，互不阻塞。
+    """一次装齐开机简报 + 按句回忆 + 报错回忆 + 采纳回填 + 采纳补扫，互不阻塞。
 
     hermes 的 pre_llm_call 是唯一出口，同一脚本先发简报、之后每轮回忆：
     prompt 行复用 session 结果并标 covered，不写第二份配置。
@@ -1477,7 +1497,11 @@ def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
         error = dict(answer)
         error.update({"event": "PostToolUseFailure", "command": "", "backup": "",
                       "copied": False})
-        return {"session": session, "prompt": prompt, "answer": answer, "error": error}
+        sweep = dict(answer)
+        sweep.update({"event": "UserPromptSubmit", "channel": "sweep", "command": "",
+                      "backup": "", "copied": False})
+        return {"session": session, "prompt": prompt, "answer": answer, "error": error,
+                "sweep": sweep}
     return {"session": install_brief_hook(agent, apply=apply, path=path, node=node,
                                           install_script=install_script),
             "prompt": install_recall_hook(agent, apply=apply, path=path, node=node,
@@ -1485,7 +1509,9 @@ def install_memory_hooks(agent: str, apply: bool = False, path: str = "",
             "answer": install_adherence_hook(agent, apply=apply, path=path, node=node,
                                              install_script=install_script),
             "error": install_error_recall_hook(agent, apply=apply, path=path, node=node,
-                                               install_script=install_script)}
+                                               install_script=install_script),
+            "sweep": install_sweep_hook(agent, apply=apply, path=path, node=node,
+                                        install_script=install_script)}
 
 
 # hermes 没有 SessionStart 出口，只有 pre_llm_call（每次模型调用都触发）——
@@ -1645,11 +1671,13 @@ def _hook_state(probe: dict) -> str:
 
 
 def memory_hook_status(agent: str, path: str = "") -> dict:
-    """只读：某家「开机简报 + 按句回忆 + 报错回忆 + 采纳回填」四条钩子的合并状态。
+    """只读：某家「开机简报 + 按句回忆 + 报错回忆 + 采纳回填 + 采纳补扫」的合并状态。
 
     JSON 系各家钩子各挂一个事件；hermes 只有 pre_llm_call 一个出口，同一份
     脚本先发简报、后续每轮按 prompt 回忆，故 prompt 记为 covered，Stop 回填与
     工具失败回忆都没有验证过的出口，如实记 unsupported（R821/R828/R833）。
+    补扫（R851）与回忆共用 UserPromptSubmit：装了没装都要单独看得见——某家只有
+    补扫在交账、没有 Stop，是「通道差异」而不是「钩子坏了」，混在回填一格里就分不清。
     """
     key = agent_key(agent) or (agent or "").strip().lower()
     hermes = key.startswith("hermes")
@@ -1671,6 +1699,8 @@ def memory_hook_status(agent: str, path: str = "") -> dict:
                   "script": hook_script_path(HOOK_ADHERENCE_NAME).is_file()}
         error = {"agent": key, "state": "unsupported", "path": session["path"],
                  "script": hook_script_path(HOOK_ERROR_RECALL_NAME).is_file()}
+        sweep = {"agent": key, "state": "unsupported", "path": session["path"],
+                 "script": hook_script_path(HOOK_SWEEP_NAME).is_file()}
     else:
         probe = install_recall_hook(key, apply=False, path=path, install_script=False)
         prompt = {"agent": key, "state": _hook_state(probe), "path": probe.get("path", ""),
@@ -1681,8 +1711,11 @@ def memory_hook_status(agent: str, path: str = "") -> dict:
         eprobe = install_error_recall_hook(key, apply=False, path=path, install_script=False)
         error = {"agent": key, "state": _hook_state(eprobe), "path": eprobe.get("path", ""),
                  "script": hook_script_path(HOOK_ERROR_RECALL_NAME).is_file()}
+        wprobe = install_sweep_hook(key, apply=False, path=path, install_script=False)
+        sweep = {"agent": key, "state": _hook_state(wprobe), "path": wprobe.get("path", ""),
+                 "script": hook_script_path(HOOK_SWEEP_NAME).is_file()}
     return {"agent": key, "session": session, "prompt": prompt,
-            "answer": answer, "error": error}
+            "answer": answer, "error": error, "sweep": sweep}
 
 
 def hook_managed_keys() -> set:
@@ -1758,7 +1791,8 @@ SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "repo
 # 钩子脚本随 exe 一起打包：安装器要能从运行目录复制到 ~/.agenthub/hooks/，
 # 只有 .py 进了 PYZ 而脚本没进 datas，打包版的「安装钩子」会复制 0 个文件。
 HOOK_SCRIPT_FILES = ("brain_inject.mjs", "brain_recall.mjs", "brain_inject_hermes.mjs",
-                    "brain_adherence.mjs", "brain_error_recall.mjs")
+                    "brain_adherence.mjs", "brain_error_recall.mjs",
+                    HOOK_SWEEP_NAME)
 
 
 def bundle_files() -> tuple:

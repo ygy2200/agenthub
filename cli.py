@@ -1460,13 +1460,14 @@ def cmd_hook_install(agents=None, apply: bool = False, node: str = "",
     """大脑记忆钩子安装（R814/R820/R828）：简报 + 即时回忆 + 采纳回填。
 
     幂等：已在位只报 already；默认预演，--apply 才改（改前自动备份）。
-    events=all/session/prompt/answer/error 可只装一类；hermes 走 pre_llm_call，
+    events=all/session/prompt/answer/error/sweep 可只装一类；hermes 走 pre_llm_call，
     同一脚本先发简报、之后每轮回忆，故回忆行报 covered 而不是 unsupported；
-    它的 Stop 回填与工具失败回忆都尚未在真机验证过，如实报 unsupported。
+    它的 Stop 回填、工具失败回忆与采纳补扫都尚未在真机验证过，如实报 unsupported。
     """
     import core  # noqa: PLC0415
     names = list(agents or (list(core.HOOK_BRIEF_TARGETS) + ["hermes-cn"]))
-    specs = (["session", "prompt", "answer", "error"] if events == "all" else [events])
+    specs = (["session", "prompt", "answer", "error", "sweep"] if events == "all"
+             else [events])
     rows = []
     for a in names:
         k = core.agent_key(a) or (a or "").strip().lower()
@@ -1491,11 +1492,18 @@ def cmd_hook_install(agents=None, apply: bool = False, node: str = "",
                                            if core.agent_key(n) == k), ""),
                              "status": "unsupported",
                              "command": "", "backup": "", "copied": False})
+            if "sweep" in specs:
+                rows.append({"agent": k, "event": "UserPromptSubmit", "channel": "sweep",
+                             "path": next((p for n, p in core.HOOK_BRIEF_HERMES_TARGETS
+                                           if core.agent_key(n) == k), ""),
+                             "status": "unsupported",
+                             "command": "", "backup": "", "copied": False})
             continue
         fn_map = {"session": core.install_brief_hook,
                   "prompt": core.install_recall_hook,
                   "answer": core.install_adherence_hook,
-                  "error": core.install_error_recall_hook}
+                  "error": core.install_error_recall_hook,
+                  "sweep": core.install_sweep_hook}
         for ev in specs:
             rows.append(fn_map[ev](a, apply=apply, node=node))
     if as_json:
@@ -1507,9 +1515,12 @@ def cmd_hook_install(agents=None, apply: bool = False, node: str = "",
                 "covered": "由 pre_llm_call 同一脚本覆盖（无需第二条配置）",
                 "bad_schema": "失败：hooks 结构不符合预期", "write_failed": "失败：写入出错"}
         for r in rows:
-            ev = {"SessionStart": "简报", "UserPromptSubmit": "回忆",
-                  "Stop": "回填", "PostToolUseFailure": "报错"}.get(
-                      r.get("event"), r.get("event") or "")
+            # 通道名优先于事件名：回忆与补扫共用 UserPromptSubmit（R851），只按事件
+            # 打标会把两条都印成「回忆」，看的人分不清到底装了哪条。
+            ev = {"session": "简报", "prompt": "回忆", "answer": "回填",
+                  "error": "报错", "sweep": "补扫"}.get(r.get("channel") or "") or {
+                  "SessionStart": "简报", "UserPromptSubmit": "回忆", "Stop": "回填",
+                  "PostToolUseFailure": "报错"}.get(r.get("event"), r.get("event") or "")
             line = f"{r['agent']:<10} {ev:<2} {word.get(r['status'], r['status'])}"
             if r.get("path"):
                 line += f" · {r['path']}"
@@ -2087,10 +2098,10 @@ def main(argv=None) -> int:
     p_hook.add_argument("--apply", action="store_true", help="真正写入（默认只预演；写前自动备份）")
     p_hook.add_argument("--node", default="", help="node 可执行文件路径（默认自动找 D:/node 或 PATH）")
     p_hook.add_argument("--events",
-                        choices=["all", "session", "prompt", "answer", "error"],
+                        choices=["all", "session", "prompt", "answer", "error", "sweep"],
                         default="all",
                         help="装哪类钩子：session=开工简报 / prompt=按句回忆 / "
-                             "answer=采纳回填 / error=报错即时回忆 / all=四条（默认）")
+                             "answer=采纳回填 / error=报错即时回忆 / sweep=采纳补扫 / all=五条（默认）")
     p_hook.add_argument("--json", action="store_true", dest="as_json", help="机器可读输出")
     p_claim = _cmd("claim", help="认领任务（原子；前置未完成会拒绝）")
     p_claim.add_argument("task_id", type=int)
