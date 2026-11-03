@@ -69,6 +69,7 @@ def test_network_failure_hints_proxy(monkeypatch):
     """直连 api.github.com 在本机会 SSL 断——提示必须给出实测可用的代理写法。
 
     R752：网络层失败会重试 NET_RETRIES 次，所以这里按次数喂同样的异常。
+    R852 的自动换代理只认 `_opener()` 造出来的连接，这里传的是 None，序列不受影响。
     """
     monkeypatch.setattr(pub, "NET_BACKOFF", 0)
     _seq(monkeypatch, [pub.NetworkError("SSL: UNEXPECTED_EOF_WHILE_READING")] * pub.NET_RETRIES)

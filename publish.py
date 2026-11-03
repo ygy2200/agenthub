@@ -81,12 +81,97 @@ def _upload_timeout() -> float:
     return v if v > 0 else 1800.0
 
 
-def _opener(token: str):
-    opener = urllib.request.build_opener()
+def _opener(token: str, proxy: str = ""):
+    """建一个带鉴权头的 opener；`proxy` 非空时只走这条代理（不吃环境变量）。"""
+    handlers = [urllib.request.ProxyHandler({"http": proxy, "https": proxy})] if proxy else []
+    opener = urllib.request.build_opener(*handlers)
     opener.addheaders = [("User-Agent", "agenthub-release"),
                          ("Authorization", f"Bearer {token}"),
                          ("Accept", "application/vnd.github+json")]
+    # 连接层标记，回归装置据此分辨「这条 opener 走的是哪条代理」。build_opener 默认就带
+    # 一个 ProxyHandler（读环境变量），所以不能拿「有没有 ProxyHandler」当判据。
+    opener._agenthub_proxy = proxy
+    opener._agenthub_token = token
     return opener
+
+
+# R852：本机直连 api.github.com 经常是 TLS 握手就失败（实测 curl 000，走 127.0.0.1:7890
+# 是 200）。release.bat 是双击起的，不继承 shell 里的代理变量，于是每次发版都要人工
+# 「带 HTTPS_PROXY 重跑一次」——这一步昨天是我手工补的，明天就会是别人踩的坑。
+# 这里只做连接层的事：直连抛 NetworkError 时把**同一个请求**换候选代理再发一次，
+# 通了就记住这条通道给后续请求用；**闸门、token、预检、确认一条都不放宽**。
+# 第一版写的是「开跑前先 GET /meta 探路」，实测那样会给每次发版凭空加一次请求，
+# 还把 R761/R765 那批「按调用序列取证」的用例整体错位——探路是替真实请求做决定，
+# 而失败本身已经带了全部信息，不需要预先问一次。
+DEFAULT_PROXY_CANDIDATES = ("http://127.0.0.1:7890",)
+
+# 换成功一次就记在这里，后续请求不再回直连；`tried` 防止每次网络抖动都把候选列表跑一遍。
+_PROXY_CHANNEL: dict = {"opener": None, "name": "", "tried": False}
+
+
+def _env_proxy_set() -> bool:
+    return bool(os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+                or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy"))
+
+
+def _proxy_candidates() -> list:
+    """候选代理：`AGENTHUB_RELEASE_PROXIES` 逗号分隔可覆盖，写 `none` 关掉这条自动降级。"""
+    raw = os.environ.get("AGENTHUB_RELEASE_PROXIES")
+    if raw is None:
+        return list(DEFAULT_PROXY_CANDIDATES)
+    items = [p.strip() for p in raw.split(",") if p.strip()]
+    return [] if items in ([], ["none"], ["off"]) else items
+
+
+def _reset_channel() -> None:
+    """把记住的代理通道清空（进程内一次发布只该有一条路；回归装置也用它复位）。"""
+    _PROXY_CHANNEL.update({"opener": None, "name": "", "tried": False})
+
+
+def _route(opener):
+    """当前该用哪条 opener：已经换过代理就一直用那条，否则照传入的走。"""
+    return _PROXY_CHANNEL["opener"] or opener
+
+
+def _channel_label(opener) -> str:
+    if _PROXY_CHANNEL["name"]:
+        return _PROXY_CHANNEL["name"]
+    return "环境变量代理（按现状）" if _env_proxy_set() else "直连"
+
+
+def _via_proxy(opener, url, method, data, timeout):
+    """直连抛了网络错才走到这里：逐候选代理把同一个请求再发一次。
+
+    返回 (status, body, headers) 表示换路成功并已记住通道；返回 None 表示不该换
+    （已在代理上 / 用户自己配了代理 / 候选试完都不通），调用方按原路继续重试。
+    """
+    if getattr(opener, "_agenthub_proxy", None) is None:
+        # 不是本模块 _opener() 造出来的连接（装置传的假 opener、预检传的 None）：
+        # 没有 token 也没有代理字段，替它换路只会拿错误的构造参数去撞真网络。
+        return None
+    if _PROXY_CHANNEL["tried"] or opener._agenthub_proxy:
+        return None
+    if _env_proxy_set():
+        # 用户已经显式配了代理，build_opener 自己会读环境变量；再猜一遍只会掩盖真因
+        _PROXY_CHANNEL["tried"] = True
+        print("网络：环境变量里的代理连不上 api.github.com，发布脚本不猜第二条路——"
+              "按现状继续重试，预检会如实报错")
+        return None
+    _PROXY_CHANNEL["tried"] = True
+    token = getattr(opener, "_agenthub_token", "")
+    for p in _proxy_candidates():
+        cand = _opener(token, proxy=p)
+        try:
+            st, body, hdr = _call(cand, url, method=method, data=data, timeout=timeout)
+        except NetworkError:
+            continue
+        _PROXY_CHANNEL["opener"] = cand
+        _PROXY_CHANNEL["name"] = f"代理 {p}"
+        print(f"网络：直连 api.github.com 不通，这个请求改走本机代理 {p}（后续请求沿用）")
+        return st, body, hdr
+    print(f"网络：直连与候选代理（{'、'.join(_proxy_candidates()) or '无'}）都不通——"
+          f"照直连继续重试，预检会如实报错")
+    return None
 
 
 def _call(opener, url, method=None, data=None, timeout=120):
@@ -116,9 +201,17 @@ NET_BACKOFF = 0.5
 
 def _call_retry(opener, url, method=None, data=None, timeout=120):
     for attempt in range(NET_RETRIES):
+        target = _route(opener)
         try:
-            return _call(opener, url, method=method, data=data, timeout=timeout)
+            return _call(target, url, method=method, data=data, timeout=timeout)
         except NetworkError:
+            # R852：这条请求本身已经带了「直连不通」的全部证据，顺手换代理把它发出去，
+            # 不预先探路（探一次要多一个请求，还会把按序列取证的回归用例整体错位）。
+            # `_via_proxy` 内部的 tried 标记保证一个进程最多只扫一遍候选列表。
+            if target is opener:
+                got = _via_proxy(opener, url, method, data, timeout)
+                if got is not None:
+                    return got
             if attempt == NET_RETRIES - 1:
                 raise
         time.sleep(NET_BACKOFF * (attempt + 1))
@@ -135,11 +228,12 @@ def _create_release(opener, base: str, tag: str, payload: dict):
     last = None
     for attempt in range(NET_RETRIES):
         try:
-            st, body, _ = _call(opener, f"{base}/releases", method="POST", data=payload)
+            st, body, _ = _call(_route(opener), f"{base}/releases", method="POST",
+                             data=payload)
         except NetworkError as e:
             last = e
             try:
-                st2, rel2, _ = _call(opener, f"{base}/releases/tags/{tag}")
+                st2, rel2, _ = _call(_route(opener), f"{base}/releases/tags/{tag}")
             except NetworkError:
                 st2 = 0
             if st2 == 200 and isinstance(rel2, dict) and rel2.get("id"):
@@ -188,8 +282,10 @@ def preflight(opener, repo: str) -> dict:
     except NetworkError as e:
         out["problems"].append(
             f"连不上 api.github.com（{e}）。本机实测：直连会 SSL 断，需走代理 "
-            f"HTTPS_PROXY=http://127.0.0.1:7890；代理节点失效时换节点（mihomo API "
-            f"PUT /proxies/<分组>）")
+            f"HTTPS_PROXY=http://127.0.0.1:7890；R852 起发布脚本自己会换候选代理，"
+            f"还能走到这里说明代理也没通——确认加速器在听，或换节点"
+            f"（mihomo API PUT /proxies/<分组>），也可 "
+            f"AGENTHUB_RELEASE_PROXIES=http://127.0.0.1:<端口> 指定一次")
     out["ok"] = not out["problems"]
     return out
 
@@ -347,7 +443,7 @@ def _upload_asset(opener, upload_url: str, base: str, rel_id, asset_name: str,
                      "_reconciled": True, "_attempts": attempt,
                      "_elapsed": time.time() - t0}, progress)
         if found and found.get("id"):
-            _call(opener, f"{base}/releases/assets/{found['id']}", method="DELETE")
+            _call(_route(opener), f"{base}/releases/assets/{found['id']}", method="DELETE")
             print(f"  同名附件大小 {found.get('size')} ≠ {total}，已删除后重传：{asset_name}")
         if attempt < attempts:
             wait = NET_BACKOFF * attempt
@@ -412,9 +508,11 @@ def _run(args) -> int:
         print(f"  代码推送：{pushed}；token / 闸门 / 发布说明均已通过，不用重做。")
         print("  直接重跑同一条命令即可：已建出来的 Release 会自动沿用，不会重复创建、"
               "不会撞 tag。")
-        print("  本机实测直连 api.github.com 会 SSL 断，需走代理："
-              "export HTTPS_PROXY=http://127.0.0.1:7890；"
-              "代理节点抖动时换个节点，或先 python publish.py --check 验网络。")
+        print("  本机直连 api.github.com 会 SSL 断：发布脚本已自动换过候选代理（R852），"
+              "还能到这里说明代理也没通。手工写法仍有效："
+              "export HTTPS_PROXY=http://127.0.0.1:7890；换节点或 "
+              "AGENTHUB_RELEASE_PROXIES=http://127.0.0.1:<端口> 后，"
+              "先 python publish.py --check 验网络。")
         if getattr(args, "log_file", None):
             print(f"  完整日志：{args.log_file}")
         return 1
@@ -463,6 +561,7 @@ def _run_inner(args) -> int:
         if not token:
             print("\ntoken：不可用，预检无法进行（--yes 同样会被拒绝）")
             return 1
+        _reset_channel()
         opener = _opener(token)
         pf = preflight(opener, args.repo)
         print(f"\n预检：身份 {pf['login'] or '未知'}，scope {pf['scopes']}")
@@ -495,6 +594,7 @@ def _run_inner(args) -> int:
     if not notes and not args.upload_only:
         sys.exit(f"没有发布说明：CHANGELOG.md 里找不到 | v{version} | 行，或改用 --notes-file")
 
+    _reset_channel()
     opener = _opener(token)
     pf = preflight(opener, args.repo)
     if not pf["ok"]:
@@ -502,7 +602,8 @@ def _run_inner(args) -> int:
         for p in pf["problems"]:
             print("  - " + p)
         sys.exit("预检未通过，拒绝发布（还没有在 GitHub 上留下任何东西）")
-    print(f"预检：身份 {pf['login']}，scope {pf['scopes']}")
+    print(f"预检：身份 {pf['login']}，scope {pf['scopes']}"
+          f"（连接通道：{_channel_label(opener)}）")
 
     # R759：先推代码再建 Release。GitHub 在 tag 不存在时会把 tag 钉在**当时的 main**
     # 上；「publish 完再 push」让 tag 永远落后一个提交（实测 v2.41.159 指向 R740、
@@ -542,7 +643,7 @@ def _run_inner(args) -> int:
     if status == 200:
         for a in assets:
             if a.get("name") == asset_name:
-                _call(opener, f"https://api.github.com/repos/{args.repo}/releases/assets/{a['id']}",
+                _call(_route(opener), f"https://api.github.com/repos/{args.repo}/releases/assets/{a['id']}",
                       method="DELETE")
                 print(f"已删除同名旧附件：{asset_name}")
 

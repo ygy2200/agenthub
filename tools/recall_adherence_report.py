@@ -8,8 +8,13 @@
 口径（为什么这么算，别照着改）：
   · **分母只算可指纹行**。「抽不出指纹」不等于「没被用」，那是「测不了」；把它算进
     分母会系统性压低采纳率，从而让人得出「注入没用」的错误结论。
-  · 采纳率对照区间 **40%–70%**（sheratonhq 的实测口径）。低于 40% 是排序/门槛有问题，
-    高于 70% 要怀疑上下文冗余（全都用上了，说明给得太少或太泛）。
+  · 判定分三态（R852）：**未观测**（这行从没被判定过，used 恒为 0，不能算被拒绝）、
+    **判无用**（判官带着证据看过、没认出来）、**判用上**（指纹命中）。定罪看观测口径
+    used/判过，账面 used/可指纹 里掺着未观测。
+  · 40%–70% 那句原先写作「sheratonhq 的实测口径」，R851 收尾取证查无出处（记忆 #523），
+    现在**线只有巡检项那一条**（`ops.ADHERENCE_BAD_RATE` 观察线 20% / `ADHERENCE_OK_RATE`
+    正常线 40%，均为本库自设）：低于观察线先看排序与门槛，观察区内算「能用但不算宽裕」，
+    判过的全命中反而要怀疑注入给得太少或太泛。两处各发一套判词，读的人只能挑一句信。
   · 平均记忆年龄对照 **7–30 天**：太短=只靠近期记忆，太长=旧结论权重过高。
   · 分档看（strong / weak / R833 起的 error＝工具失败那一刻的注入）——如果各档采纳率
     差不多，说明 R826 的「分流」判断不成立；error 档单独看，它面对的是「模型正卡在
@@ -28,19 +33,27 @@ sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _console  # noqa: E402,F401  控制台 UTF-8 守卫
 import brain  # noqa: E402
+import ops  # noqa: E402
 
-RATE_LO, RATE_HI = 40.0, 70.0
-AGE_LO, AGE_HI = 7.0, 30.0
+# 线只有一套：巡检项说什么，报表就说什么。原来这里是 40/70 而 ops 是 20/40，
+# 同一个库对同一个数发两套判词，读的人只能挑一句信（R852 收掉）。
+RATE_WATCH = ops.ADHERENCE_BAD_RATE     # 观察线：观测口径低于此，注入精度该收
+RATE_OK = ops.ADHERENCE_OK_RATE         # 正常线：以上算正常
+AGE_LO, AGE_HI = 7.0, 30.0              # 记忆年龄的经验区间（同样为本库自设）
 
 
-def _verdict(rate: float, fingerprintable: int) -> str:
-    if fingerprintable == 0:
-        return "样本不足（还没有可指纹的注入记录）"
-    if rate < RATE_LO:
+def _verdict(rate: float, judged: int) -> str:
+    """判词按「判过的笔数」给：分母掺了未观测就会把采集缺陷读成「记忆没人用」（R852）。"""
+    if judged == 0:
+        return "无从判定（还没有判过的可指纹注入记录——先确认回填/补扫有没有在跑）"
+    if rate < RATE_WATCH:
         return "偏低——先看排序（Recall@3）与门槛（_RECALL_RARE_IDF），再看注入文本是否太长被忽略"
-    if rate > RATE_HI:
-        return "偏高——留意上下文冗余：全都用上往往说明给得太少或太泛"
-    return "在区间内"
+    if rate < RATE_OK:
+        return f"观察区（{RATE_WATCH:.0f}%–{RATE_OK:.0f}%，两线本库自设）——能用但不算宽裕"
+    if judged >= 5 and rate >= 100.0:
+        # 判过的全都命中，更可能是给得太少/太泛（每条都在上下文里），而不是记忆真的条条有用
+        return "全命中——留意注入是否过少或过泛（全是必要条件时，采纳率失去区分力）"
+    return "在本库正常线以上"
 
 
 def main() -> int:
@@ -72,7 +85,11 @@ def main() -> int:
     print(f"可指纹    {st['fingerprintable']} 条"
           + (f"（占 {st['fingerprintable'] / st['injected'] * 100:.0f}%）" if st["injected"] else ""))
     print(f"被用      {st['used']} 条")
-    print(f"采纳率    {st['rate']}%（健康区间 {RATE_LO:.0f}%–{RATE_HI:.0f}%）→ {_verdict(st['rate'], st['fingerprintable'])}")
+    print(f"三态      判不了 {st.get('unjudgeable', 0)} · 未观测 {st.get('unobserved', 0)} · "
+          f"判无用 {st.get('judged_unused', 0)} · 判用上 {st.get('judged_used', 0)}")
+    obs = float(st.get("observed_rate") or 0.0)
+    print(f"采纳率    观测口径 {obs}%（判过 {st.get('judged', 0)} 笔）· 账面 {st['rate']}%"
+          f"（可指纹 {st['fingerprintable']} 笔）→ {_verdict(obs, int(st.get('judged') or 0))}")
     if st["avg_memory_age_days"] is not None:
         age = st["avg_memory_age_days"]
         note = "偏新（只靠近期记忆）" if age < AGE_LO else (

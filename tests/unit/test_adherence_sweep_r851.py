@@ -303,13 +303,20 @@ def test_closure_line_survives_on_red_paths(hub_root):
     """判红也要带闭环账：红的时候正是最需要知道「哪些会话从没判过」的时候。"""
     import ops
     mid = _hub(hub_root, agents=("qoder", "workbuddy", "zcode"))
-    _inject(hub_root, "qoder", 10, 0, mid, session="sw2")     # 采纳率 0% → 定罪红
-    _inject(hub_root, "zcode", 4, 0, mid, session="zc1")      # zcode 零采集 → 送达红
+    _inject(hub_root, "qoder", 10, 0, mid, session="sw2", judged=True)
+    _inject(hub_root, "zcode", 4, 0, mid, session="zc1")      # zcode 零采集 → 先命中送达红
     for _ in range(3):
         _run(hub_root, "qoder", "sweep", 4200, sess="sw2")
     r = ops._adherence_health(hub_root)
     assert r["ok"] is False, r
+    assert "没有采集记录" in r["summary"], r["summary"]
     assert any("闭环账" in d for d in r["detail"]), r["detail"]
+    # 给 zcode 交上账，送达红消失、定罪红接手（qoder 判过 10 笔零采纳）——两条红路都得带闭环账
+    _run(hub_root, "zcode", "sweep", 4200, sess="zc1")
+    r2 = ops._adherence_health(hub_root)
+    assert r2["ok"] is False, r2
+    assert "真没被用上" in r2["summary"], r2["summary"]
+    assert any("闭环账" in d for d in r2["detail"]), r2["detail"]
 
 
 # —— 以下三个 helper 与 R850 检查项用例同源，复制到本文件是为了各轮自带装置 ——
@@ -329,17 +336,19 @@ def _today() -> str:
 
 
 def _inject(hub_root: str, agent: str, n: int, used: int, mid: int, session: str = "s1",
-             hours: int = 0) -> None:
+            hours: int = 0, judged: bool = False) -> None:
+    """`judged=True` 给没命中的行补 decided_at（R852 的「判过没用上」与「没判过」分开记）。"""
     import datetime
     import brain
     ts = (datetime.datetime.now() - datetime.timedelta(hours=hours)).strftime("%Y-%m-%dT%H:%M:%S")
     with brain.db_conn(hub_root) as conn:
         for i in range(n):
+            hit = i < used
             conn.execute(
-                "INSERT INTO recall_adherence(ts,session,agent,memory_id,project,strength,fp,used)"
-                " VALUES(?,?,?,?,?,?,?,?)",
+                "INSERT INTO recall_adherence(ts,session,agent,memory_id,project,strength,fp,"
+                "used,decided_at) VALUES(?,?,?,?,?,?,?,?,?)",
                 (ts, session, agent, mid, "补扫账-测试-对象问题", "strong",
-                 '["zebra_r851_check.py"]', 1 if i < used else 0))
+                 '["zebra_r851_check.py"]', 1 if hit else 0, ts if (hit or judged) else ""))
 
 
 def _run(hub_root: str, agent: str, src: str, chars: int, sess: str = "") -> None:

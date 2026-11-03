@@ -8361,8 +8361,14 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
     """给一段 agent 产出（回答正文、执行的命令、改的文件路径），标记被用到的注入。
 
     调用时机（由 agent 侧或钩子决定）：一轮结束后拿这一轮的产出文本喂进来即可。
-    只匹配**同一会话**、window_h 小时内、尚未判定的记录——跨会话比对会把「碰巧
-    提到同一个文件名」算成采纳，那是假信号。
+    只匹配**同一会话**、window_h 小时内、还没用上的记录——跨会话比对会把「碰巧
+    提到同一个文件名」算成采纳，那是假信号。判过但没命中的行下一轮仍会被再判一次
+    （筛的是 used=0，不是 decided_at），所以「判无用」只是当下状态，不会挡住后来的命中。
+
+    R852：判过的行一律写 `decided_at`，不管有没有命中。以前只有命中的写，于是
+    「判官看过但没认出来」和「判定压根没跑到这一行」在账上长得一模一样（都是
+    used=0）——而这两者的修法相反（收注入精度 vs 补采集通道）。`used` 的语义不动，
+    仍是 R829 那条唯一的 adopt_count 依据。
     """
     out = {"checked": 0, "matched": 0, "memory_ids": []}
     if not session or not (text or "").strip():
@@ -8370,7 +8376,7 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
     low = text.lower()
     since = (datetime.datetime.now() - datetime.timedelta(hours=max(1, int(window_h)))
              ).strftime("%Y-%m-%dT%H:%M:%S")
-    hit_ids, rows = [], []
+    hit_ids, rows, judged_ids = [], [], []
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, memory_id, fp FROM recall_adherence"
@@ -8381,15 +8387,18 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
             except ValueError:
                 fp = []
             if not fp:
-                continue
+                continue        # 抽不出招牌 = 判不了，不算「判过」（记了会假装有证据）
+            judged_ids.append(r["id"])
             if any(tok and tok in low for tok in fp):
                 hit_ids.append(r["id"])
                 out["memory_ids"].append(r["memory_id"])
-        if hit_ids:
+        if judged_ids:
             now = _now()
-            conn.executemany(
-                "UPDATE recall_adherence SET used=1, decided_at=? WHERE id=?",
-                [(now, i) for i in hit_ids])
+            conn.executemany("UPDATE recall_adherence SET decided_at=? WHERE id=?",
+                             [(now, i) for i in judged_ids])
+        if hit_ids:
+            conn.executemany("UPDATE recall_adherence SET used=1 WHERE id=?",
+                             [(i,) for i in hit_ids])
             # R829：指纹证实「这一条真的被用上了」。adopt_count 只有这一个写入口，
             # 因此它是全库唯一不被曝光污染的有用性信号（被动注入只进 inject_count）。
             for mid in sorted({int(m) for m in out["memory_ids"] if m}):
@@ -8401,21 +8410,29 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
 
 
 def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
-    """注入采纳率的账：分强/弱两档给「可指纹数 / 被用数 / 采纳率」，附平均记忆年龄。
+    """注入采纳的账：分强/弱两档给「可指纹数 / 被用数 / 采纳率」，附三态与平均记忆年龄。
 
-    口径（为什么这么算）：
+    口径（为什么这么算，别照着改）：
       · 分母只算**可指纹**的行（fp 非空数组）——抽不出指纹的记忆无法判定，算进分母
         就是把「测不了」当成「没被用」；
-      · 采纳率 = used / 可指纹数，对照行业区间 40%–70%（sheratonhq 的实测口径）；
+      · 采纳率 = used / 可指纹数。20%–40% 是**本库自设**的观察线/正常线（ops 那边），
+        R851 收尾做外部取证时查不到任何「记忆采纳率 40%–70%」的出处（搜到的 40%~70%
+        是提示工程对任务表现的提升，不是采纳率），所以这里不再引用外部区间当判据；
+      · 三态（R852）把可指纹但没算成「用上」的行拆开，因为同一个低采纳率有两种相反成因：
+        `unjudgeable` 抽不出招牌（判不了）· `unobserved` 判定从没跑到这一行（未观测）·
+        `judged_unused` 判过且没认出来（判无用）· `judged_used` 判过且认出来（判用上）。
+        `observed_rate` = used / 判过的笔数，只有这个分母没有「没判过」掺水，可用于定罪；
       · 平均记忆年龄 = 被注入记忆的创建时间均值，对照 7–30 天（太短=只靠近期记忆，
         太长=旧结论权重过高）。
     """
     since = _days_ago(max(1, int(days)))
     out = {"window_days": days, "injected": 0, "fingerprintable": 0, "used": 0,
-           "rate": 0.0, "by_strength": {}, "avg_memory_age_days": None}
+           "rate": 0.0, "by_strength": {}, "avg_memory_age_days": None,
+           "unjudgeable": 0, "unobserved": 0, "judged_unused": 0, "judged_used": 0,
+           "judged": 0, "observed_rate": 0.0}
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT strength, fp, used, memory_id FROM recall_adherence WHERE ts>=?",
+            "SELECT strength, fp, used, decided_at, memory_id FROM recall_adherence WHERE ts>=?",
             (since,))]
     if not rows:
         return out
@@ -8431,18 +8448,28 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
         b = buckets.setdefault(s, {"injected": 0, "fingerprintable": 0, "used": 0})
         b["injected"] += 1
         if not fp:
+            out["unjudgeable"] += 1
             continue
         b["fingerprintable"] += 1
+        out["fingerprintable"] += 1
+        # used=1 必然是判过的（唯一写入口 mark_recall_used 同时写 decided_at）；
+        # R852 之前的老行没有判过标记，按 used 归位比按空 decided_at 归成「未观测」诚实。
         if r.get("used"):
+            out["judged_used"] += 1
             b["used"] += 1
+        elif (r.get("decided_at") or "").strip():
+            out["judged_unused"] += 1
+        else:
+            out["unobserved"] += 1
         ids.append(r.get("memory_id"))
-    for s, b in buckets.items():
+    for b in buckets.values():
         b["rate"] = round(b["used"] / b["fingerprintable"] * 100, 1) if b["fingerprintable"] else 0.0
-        out["fingerprintable"] += b["fingerprintable"]
-        out["used"] += b["used"]
+    out["used"] = out["judged_used"]
+    out["judged"] = out["judged_used"] + out["judged_unused"]
+    out["rate"] = round(out["used"] / out["fingerprintable"] * 100, 1) if out["fingerprintable"] else 0.0
+    out["observed_rate"] = (round(out["used"] / out["judged"] * 100, 1)
+                            if out["judged"] else 0.0)
     out["by_strength"] = buckets
-    if out["fingerprintable"]:
-        out["rate"] = round(out["used"] / out["fingerprintable"] * 100, 1)
     if ids:
         marks = ",".join("?" * len(ids))
         try:

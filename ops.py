@@ -62,7 +62,7 @@ CHECKS = {
     "usage_health": ("用量异常巡检（R105）：多 agent 共用大脑的行为异常检测——单 agent 近 1h 调用量失控嫌疑（速率限制硬拦前的软信号）、单工具 10 分钟循环调用嫌疑、MCP 已配置但近 7 天零调用的接入闲置、空归属调用计数（归因缺口）。只读不动手", False),
     "brief_hook_health": ("记忆钩子体检（R816 简报 / R821 回忆）：逐家核对 SessionStart 简报与 UserPromptSubmit 回忆钩子是否仍在配置里（被改配置/重装客户端会静默丢失），脚本与 Python 入口是否还在盘上，并给出近 7 天各 agent 的简报/回忆送达次数——「该送到却没送」要比等用户报「又不读记忆」更早发现", False),
     "link_health": ("通道账（R846）：逐家按流水里的 via（stdio/cli/hook/ops）分清三条路哪条真在走——MCP 工具 / 会话钩子 / 命令行兜底。改过 MCP 配置后客户端不再拉起服务时，账本上照样有 log_work 行（全走兜底），只有这一项能把「工具通道断了」点出来", False),
-    "adherence": ("采纳账（R850）：注入的记忆到底有没有被用上——按 recall_adherence 出采纳率，并把采集口径一起摆出来（证据来源 src 覆盖率、单轮证据字数中位数）。低采纳率有两种完全不同的成因：记忆真的没人理会修排序，判官饿着（只看收尾一句话）修采集；分不清这两种就等于没有这项", False),
+    "adherence": ("采纳账（R850 定，R852 收口径）：注入的记忆到底有没有被用上——出三态账（判不了/未观测/判无用/判用上）、观测口径与账面采纳率、采集口径（src 覆盖率、单轮证据字数中位数）与送达闭环。低采纳率有三种相反成因：记忆真没人用（收排序精度）、判官饿着（改取证）、判定没跑到（补采集通道）；分不清就定罪等于没有这项。阈值是本库自设观察线，不引外部区间", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计 / 零触发按 agent 活性分级）——检测规则有没有被真正执行，而非只写在纸面", False),
     "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
     "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
@@ -3105,10 +3105,13 @@ def _link_health(root: str = "") -> dict:
             "detail": detail}
 
 
-# 采纳账的三条阈值（R850）。行业区间 40%–70%（sheratonhq 口径）取 40 当「正常」，
-# 20 以下才判红——中间那段是「注入精度还可以但值得收」，报成红会把人引去加大注入量。
+# 采纳账的阈值（R850 定线，R852 改口径来源）。原先注释写「行业区间 40%–70%（sheratonhq
+# 口径）」，R851 收尾做外部取证时查不到这句话的出处——搜到的 40%~70% 是「提示工程能把任务
+# 表现提升多少」，不是记忆采纳率（记忆 #523）。数字留着（20 判红线 / 40 正常线仍是本库
+# 自己定的观察线），但话术不许再冒充外部标准：判红是硬动作，判据必须说得出来源。
 ADHERENCE_BAD_RATE = 20.0
 ADHERENCE_OK_RATE = 40.0
+ADHERENCE_MIN_JUDGED = 5      # 判过的笔数不足此数就不定罪：分母太薄的百分比没有意义
 ADHERENCE_TRANSCRIPT_SHARE = 0.5    # 口径内的采集次数里，证据来自 transcript 的最低占比
 ADHERENCE_MIN_MEDIAN_CHARS = 120    # 单轮证据字数中位数低于此 = 判官只捞到收尾一句话
 # 会话注入后隔多久还没被判定就算「没闭环」（R851）。6 小时是刻意留的宽量：一个会话
@@ -3140,8 +3143,10 @@ def _adherence_health(root: str = "") -> dict:
     收尾话（chars=19），从没看到本轮的工具调用。**同一个 5.5%，可能是「记忆没人用」，
     也可能是「采集侧饿着」**，两者的修法完全相反（收注入 vs 改取证）。所以这项同时出：
       · 结果数：注入笔数 / 可指纹笔数 / 采纳率（按 strong 与 error 分档）；
+      · 三态数（R852）：判不了（抽不出招牌）· 未观测（判定从没跑到）· 判无用（判过没认出来）·
+        判用上——低采纳率混着前两种成因时，定罪的是「观测口径」而不是账面数字；
       · 口径数：带 src 的采集次数、其中 transcript 占比、单轮证据字数中位数；
-      · 送达数：有注入账的 agent 里，窗口内一次 Stop 采集都没有的（hermes 无出口除外）。
+      · 送达数：有注入账的 agent 里，窗口内一次采集都没有的（hermes 无出口除外）。
     判红顺序刻意是「先尺子后结论」：尺子不可信时不出「记忆没人用」这种判决。
     """
     if err := _need_root(root):
@@ -3197,6 +3202,15 @@ def _adherence_health(root: str = "") -> dict:
     rate = float(st.get("rate") or 0.0)
     injected_n = int(st.get("injected") or 0)
     fingerprintable = int(st.get("fingerprintable") or 0)
+    used_n = int(st.get("used") or 0)
+    # 三态（R852）：判不了 / 未观测 / 判无用 / 判用上。只有「判过」的两态能进定罪分母——
+    # 未观测的行 used 恒为 0，把它算进分母就是拿采集缺陷给记忆质量定罪（R849 那个坑的账面版）。
+    unjudgeable_n = int(st.get("unjudgeable") or 0)
+    unobserved_n = int(st.get("unobserved") or 0)
+    judged_unused = int(st.get("judged_unused") or 0)
+    judged_used = int(st.get("judged_used") or 0)
+    judged_n = int(st.get("judged") or 0)
+    observed_rate = float(st.get("observed_rate") or 0.0)
 
     # 闭环账（R851）：采纳判定的粒度是「会话」，不是「家」。一个会话里注入了 5 条记忆、
     # 跑了 40 轮，若回填与补扫都没判过它，这几十条就永远不会进 adopt_count——按家汇总
@@ -3269,14 +3283,20 @@ def _adherence_health(root: str = "") -> dict:
     ran = {core.agent_key(r.get("agent") or "") for r in runs}
     never = [a for a in injected if a not in ran and not _answer_unsupported(core, a)]
     detail.append(f"结果账：注入 {injected_n} 笔 · 可指纹 {fingerprintable} 笔 · 被用上 "
-                  f"{int(st.get('used') or 0)} 条 = 采纳率 {rate:.1f}%"
-                  f"（对照行业区间 {int(ADHERENCE_OK_RATE):.0f}%–70%）")
+                  f"{used_n} 条 = 账面采纳率 {rate:.1f}%")
+    detail.append(f"三态账：判不了 {unjudgeable_n} · 未观测 {unobserved_n} · "
+                  f"判无用 {judged_unused} · 判用上 {judged_used}"
+                  f"（互斥，相加=注入 {injected_n}）· 观测口径 "
+                  f"{judged_used}/{judged_n} = {observed_rate:.1f}%"
+                  f"（定罪只看这个：账面分母里掺着没判过的）")
+    detail.append(f"判据线：观察线 {ADHERENCE_BAD_RATE:.0f}% / 正常线 {ADHERENCE_OK_RATE:.0f}% 是本库自设"
+                  f"——外部「记忆采纳率 40%–70%」查无出处（记忆 #523），不引用")
     for s, b in (st.get("by_strength") or {}).items():
         detail.append(f"  {s}：注入 {b.get('injected')} · 可指纹 {b.get('fingerprintable')} "
                       f"· 用上 {b.get('used')} · {b.get('rate')}%")
     if st.get("avg_memory_age_days") is not None:
         detail.append(f"被用上/被注入的记忆平均年龄 {st['avg_memory_age_days']:.1f} 天"
-                      f"（区间 7–30 天，太短=只靠近期，太长=旧结论权重过高）")
+                      f"（本库自设经验区间 7–30 天，太短=只靠近期，太长=旧结论权重过高）")
     detail.append(f"口径内采集 {len(scoped)} 次 · transcript 证据 {len(trans)} 次 · "
                   f"单轮证据中位 {median} 字 · 起点 {min(r['ts'] for r in scoped)}")
     if never:
@@ -3301,15 +3321,28 @@ def _adherence_health(root: str = "") -> dict:
                 "summary": f"采纳账：{len(idle)} 个会话有注入却从没被判定（最久 {worst[2]}h，"
                            f"{worst[0]}）——这些注入进不了 adopt_count，排序拿不到反馈",
                 "fix": CHECK_FIXES["adherence"], "detail": detail + _closure_note()}
-    if rate < ADHERENCE_BAD_RATE:
+    # 三、定罪只看观测口径（R852）。R850 那版拿账面 rate 定罪，分母是可指纹的全部行——
+    # 里面混着「判定从没跑到」的行，而那些行 used 恒为 0，等于用采集缺陷给记忆质量定罪。
+    # 判过的笔数不足 ADHERENCE_MIN_JUDGED 时既不判红也不报好：样本太薄的百分比没有意义。
+    if judged_n < ADHERENCE_MIN_JUDGED:
+        return {"ok": True,
+                "summary": f"采纳账：只判过 {judged_n} 笔（少于 {ADHERENCE_MIN_JUDGED} 笔），"
+                           f"另有 {unobserved_n} 笔注入从没被判定——样本太薄，"
+                           f"账面 {rate:.1f}% 不用于下结论",
+                "detail": detail + _closure_note()}
+    if observed_rate < ADHERENCE_BAD_RATE:
         return {"ok": False,
-                "summary": f"采纳账：口径正常而采纳率 {rate:.1f}% 低于 {ADHERENCE_BAD_RATE:.0f}%"
-                           f"——这才是「注入的记忆真没被用上」，收注入精度而不是加量",
+                "summary": f"采纳账：判过的 {judged_n} 笔里只有 {judged_used} 笔用上"
+                           f"（观测口径 {observed_rate:.1f}%，低于本库观察线 "
+                           f"{ADHERENCE_BAD_RATE:.0f}%）——这才是「注入的记忆真没被用上」，"
+                           f"收注入精度而不是加量",
                 "fix": CHECK_FIXES["adherence"], "detail": detail + _closure_note()}
-    tail = "偏低（介于观察线与正常之间）" if rate < ADHERENCE_OK_RATE else "在正常区间"
+    tail = (f"偏低（观察线 {ADHERENCE_BAD_RATE:.0f}% 与正常线 {ADHERENCE_OK_RATE:.0f}% 之间，"
+            f"两线本库自设）" if observed_rate < ADHERENCE_OK_RATE
+            else "在正常区间（本库自设正常线以上）")
     return {"ok": True,
-            "summary": f"采纳账：采纳率 {rate:.1f}%（{tail}），采集口径覆盖 {len(scoped)} 次"
-                       f" · transcript 证据 {share * 100:.0f}%",
+            "summary": f"采纳账：观测口径 {observed_rate:.1f}%（{tail}）· 账面 {rate:.1f}%，"
+                       f"采集口径覆盖 {len(scoped)} 次 · transcript 证据 {share * 100:.0f}%",
             "detail": detail + _closure_note()}
 
 

@@ -12,8 +12,10 @@ R849 把「判官只看到收尾一句话」这个采集缺陷修掉了，但修
   · 盘上副本还没带 src → 「不可用于下结论」，不判红（冤枉没部署的场景要单独点名）；
   · 已部署但窗口内还没有带口径的采集 → 只说「先别当真」；
   · 有 src 但 transcript 占比低 / 中位字数薄 → 判红「判官饿着」；
-  · 口径正常、采集在跑、而采纳率 < 20% → 才判红「记忆真没被用上」；
-  · 20%–40% 之间是观察区（报绿但写「偏低」），因为区间下限按行业口径 40% 定。
+  · 口径正常、采集在跑，而**观测口径**（判过的行里用上多少）< 20% → 才判红「记忆真没被用上」；
+  · 20%–40% 之间是观察区（报绿但写「偏低」）。两条线是**本库自设**：R852 起删掉了原先
+    「对照行业区间 40%–70%」的说法——那句话查无出处（记忆 #523），判红的话术不能建在
+    编不出来源的数字上（同轮次新增 test_adherence_caliber_r852.py 钉住文案与三态）。
 
 未登记的署名（探针/smoke）不进判定，同 link_health 的教训：上一版就是把 2 条测试
 流水报成「工具通道断了」。
@@ -40,15 +42,23 @@ def _hub(hub_root: str, agents=("qoder", "workbuddy")) -> int:
                             kind="lesson", tags="r850", agent="qoder")
 
 
-def _inject(hub_root: str, agent: str, n: int, used: int, mid: int, session: str = "s1") -> None:
-    """直写 recall_adherence（检查项只读这张表，不必走完整检索链）。"""
+def _inject(hub_root: str, agent: str, n: int, used: int, mid: int, session: str = "s1",
+            judged: bool = False) -> None:
+    """直写 recall_adherence（检查项只读这张表，不必走完整检索链）。
+
+    `judged=True` 给没命中的行补 `decided_at`——R852 起「判过没用上」与「判定没跑到」
+    是两种不同的账，不写这个标记的行落在「未观测」里，不该被定罪分母吃进去。
+    """
+    now = _now()
     with brain.db_conn(hub_root) as conn:
         for i in range(n):
+            hit = i < used
             conn.execute(
-                "INSERT INTO recall_adherence(ts,session,agent,memory_id,project,strength,fp,used)"
-                " VALUES(?,?,?,?,?,?,?,?)",
-                (_now(), session, agent, mid, PROJECT, "strong",
-                 '["zebra_r850.py"]', 1 if i < used else 0))
+                "INSERT INTO recall_adherence(ts,session,agent,memory_id,project,strength,fp,"
+                "used,decided_at) VALUES(?,?,?,?,?,?,?,?,?)",
+                (now, session, agent, mid, PROJECT, "strong",
+                 '["zebra_r850.py"]', 1 if hit else 0,
+                 now if (hit or judged) else ""))
 
 
 def _run(hub_root: str, agent: str, src: str, chars: int) -> None:
@@ -117,9 +127,9 @@ def test_healthy_rate_passes_with_numbers(hub_root):
 
 
 def test_low_rate_with_good_capture_is_real_rejection(hub_root):
-    """口径正常、采集在跑而采纳率 0%：这才是「注入的记忆真没被用上」。"""
+    """口径正常、采集在跑、判过的行零采纳：这才是「注入的记忆真没被用上」。"""
     mid = _hub(hub_root)
-    _inject(hub_root, "qoder", 10, 0, mid)
+    _inject(hub_root, "qoder", 10, 0, mid, judged=True)
     for _ in range(3):
         _run(hub_root, "qoder", "transcript", 5200)
     r = ops._adherence_health(hub_root)
