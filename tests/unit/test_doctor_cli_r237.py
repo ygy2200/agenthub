@@ -180,7 +180,8 @@ def test_check_list_covers_every_registered_check(capsys):
     out = capsys.readouterr().out
     # 巡检项数量守卫：动了 PATROL_CHECKS 必须显式改这里并说明（防「自检悄悄多/少一项」）
     # 21→22 = R834 +error_debt（报错欠账账本：撞过却没答案的签名要在收尾自检里看得见）
-    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 23
+    # 23→24 = R850 +adoption 采纳账（注入到底有没有被用上，且先分清「记忆没人用」与「采集饿着」）
+    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 24
     assert all(n in out for n in ops.CHECKS)
     assert "需要 --target" in out and "免 target" in out
 

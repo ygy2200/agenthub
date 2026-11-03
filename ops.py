@@ -62,6 +62,7 @@ CHECKS = {
     "usage_health": ("用量异常巡检（R105）：多 agent 共用大脑的行为异常检测——单 agent 近 1h 调用量失控嫌疑（速率限制硬拦前的软信号）、单工具 10 分钟循环调用嫌疑、MCP 已配置但近 7 天零调用的接入闲置、空归属调用计数（归因缺口）。只读不动手", False),
     "brief_hook_health": ("记忆钩子体检（R816 简报 / R821 回忆）：逐家核对 SessionStart 简报与 UserPromptSubmit 回忆钩子是否仍在配置里（被改配置/重装客户端会静默丢失），脚本与 Python 入口是否还在盘上，并给出近 7 天各 agent 的简报/回忆送达次数——「该送到却没送」要比等用户报「又不读记忆」更早发现", False),
     "link_health": ("通道账（R846）：逐家按流水里的 via（stdio/cli/hook/ops）分清三条路哪条真在走——MCP 工具 / 会话钩子 / 命令行兜底。改过 MCP 配置后客户端不再拉起服务时，账本上照样有 log_work 行（全走兜底），只有这一项能把「工具通道断了」点出来", False),
+    "adherence": ("采纳账（R850）：注入的记忆到底有没有被用上——按 recall_adherence 出采纳率，并把采集口径一起摆出来（证据来源 src 覆盖率、单轮证据字数中位数）。低采纳率有两种完全不同的成因：记忆真的没人理会修排序，判官饿着（只看收尾一句话）修采集；分不清这两种就等于没有这项", False),
     "rules_health": ("规则执行体检：逐家核对「干完活记大脑」闸门（配置在否 / 守卫脚本在否 / 近期是否真触发 / 拦截统计 / 零触发按 agent 活性分级）——检测规则有没有被真正执行，而非只写在纸面", False),
     "agent_onboard": ("接入清单逐项体检（R6）：注册表/引导注入/MCP/规则闸门/技能索引/工作记录/运行版本/验证快照——新 agent 接入、重启后、或怀疑「装了但没生效」时核对还差哪步；target=agent 名（缺省=全部注册 agent）", False),
     "runtime_health": ("运行版本（R7）：进程加载的代码是否落后于磁盘——部署后没重启会静默跑旧代码，这里当场点名需重启的文件，并核对验证快照是否已过期", False),
@@ -90,10 +91,12 @@ CHECKS = {
 # R8 一键自检：巡哪些项 + 每项失败时「下一步怎么做」（修复建议必须可执行，
 # 不是「请检查」这类把活推回人的废话）。巡检项刻意不含需要 target 的（回归/部署比对）。
 PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_chain", "security_health",
-                 "backup_health", "rules_health", "brief_hook_health", "link_health", "mcp_drift", "usage_health",
+                 "backup_health", "rules_health", "brief_hook_health", "link_health", "adherence",
+                 "mcp_drift", "usage_health",
                  "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
                  "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
+    "adherence": "分三种红各修各的：① 口径未覆盖又装不了新副本 → 先 `python cli.py deploy`（顺带刷新 ~/.agenthub/hooks 副本），让流水带上 src=；② 判官饿着（transcript 占比低 / 单轮证据中位数只有几十字）→ 采集侧问题，查 brain_adherence.mjs 是否仍优先用事件自带文本，修法见 R849（本轮工具调用才是证据）；③ 口径正常、采集在跑而采纳率低 → 才是注入精度问题：跑 tools/recall_adherence_report.py 看 by_strength，压掉「只曝光不采纳」的那批（R830 断路器），不是加大注入量。某家有注入账却窗口内零次 Stop 采集：`python cli.py status` 核对回填钩子，再看 ~/.agenthub/logs/brain-adherence.log 的 skip 原因（hermes 无 Stop 出口不算故障）",
     "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
     "env": "按 detail 点名项修环境（Python/代理/磁盘/库路径）；装依赖用 pip install -e .",
     "runtime_health": "重启各 agent 的 agenthub MCP 进程（旧进程仍跑旧代码）；部署先 cli.py deploy",
@@ -147,7 +150,7 @@ DB_BACKED_CHECKS = frozenset({
     "db_integrity", "db_health", "audit_chain", "security_health",
     "usage_health", "stale_health", "ghost_memory", "dup_mem", "record_quality",
     "date_health", "tasks_health", "governance_health", "lease_health", "stalled",
-    "error_debt",
+    "error_debt", "adherence",
 })
 _CAUSE_DB_SKIP_WHY = "大脑库不存在（同因跳过，建库/指对根目录后重跑）"
 
@@ -375,6 +378,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _brief_hook_health(root)
     elif name == "link_health":
         r = _link_health(root)
+    elif name == "adherence":
+        r = _adherence_health(root)
     elif name == "rules_health":
         r = _rules_health(root)
     elif name == "agent_onboard":
@@ -3098,6 +3103,157 @@ def _link_health(root: str = "") -> dict:
                        + (f"；{len(old_proc)} 家进程旧了待重启" if old_proc else "")
                        + (f"；{len(silent)} 家窗口内没动" if silent else ""),
             "detail": detail}
+
+
+# 采纳账的三条阈值（R850）。行业区间 40%–70%（sheratonhq 口径）取 40 当「正常」，
+# 20 以下才判红——中间那段是「注入精度还可以但值得收」，报成红会把人引去加大注入量。
+ADHERENCE_BAD_RATE = 20.0
+ADHERENCE_OK_RATE = 40.0
+ADHERENCE_TRANSCRIPT_SHARE = 0.5    # 口径内的采集次数里，证据来自 transcript 的最低占比
+ADHERENCE_MIN_MEDIAN_CHARS = 120    # 单轮证据字数中位数低于此 = 判官只捞到收尾一句话
+
+
+def _adherence_capture_marker_present() -> tuple:
+    """盘上的采集脚本是否已带 R849 的 `--src` 口径（只读，用于区分「旧副本」与「新副本没跑」）。
+
+    为什么要问盘而不看流水：改完代码没 `deploy` 时，流水里的 src 自然全是空，这时把
+    「口径未覆盖」报成红是冤枉——真正该点的是「部署没跟上」。两个来源任一命中即算已装。
+    """
+    home = Path.home() / ".agenthub"
+    for p in (home / "hooks" / "brain_adherence.mjs", home / "mcp_server" / "brain_adherence.py"):
+        try:
+            if p.is_file() and "--src" in p.read_text(encoding="utf-8", errors="replace"):
+                return True, p.name
+        except OSError:
+            continue
+    return False, ""
+
+
+def _adherence_health(root: str = "") -> dict:
+    """采纳账（R850）：注入的记忆有没有被用上 + 这把尺子本身有没有被喂到东西。
+
+    为什么必须合成一项（R849 实锤）：主人那句「不提醒就不读记忆」要的是证据，而账本上
+    179 笔注入只标出 9 条 used（5.5%）——看着像结论，其实是判官只看到 Stop 事件里那句
+    收尾话（chars=19），从没看到本轮的工具调用。**同一个 5.5%，可能是「记忆没人用」，
+    也可能是「采集侧饿着」**，两者的修法完全相反（收注入 vs 改取证）。所以这项同时出：
+      · 结果数：注入笔数 / 可指纹笔数 / 采纳率（按 strong 与 error 分档）；
+      · 口径数：带 src 的采集次数、其中 transcript 占比、单轮证据字数中位数；
+      · 送达数：有注入账的 agent 里，窗口内一次 Stop 采集都没有的（hermes 无出口除外）。
+    判红顺序刻意是「先尺子后结论」：尺子不可信时不出「记忆没人用」这种判决。
+    """
+    if err := _need_root(root):
+        return err
+    core = _import_core()
+    import brain as _brain  # noqa: PLC0415
+    import statistics
+    d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
+    detail: list = []
+    try:
+        st = _brain.recall_adherence_stats(root, days=7)
+        with _brain.db_conn(root) as conn:
+            runs = [dict(r) for r in conn.execute(
+                "SELECT agent, ts, note FROM journal WHERE action='brain_adherence' AND ts>=?"
+                " ORDER BY ts DESC", (d7,))]
+            injected_agents = [dict(r) for r in conn.execute(
+                "SELECT DISTINCT agent FROM recall_adherence WHERE ts>=? AND agent<>''", (d7,))]
+    except Exception as e:  # noqa: BLE001 库不可用时不硬判（同 link_health：不和 db_integrity 抢根因）
+        return {"ok": True, "summary": f"采纳账：读不到数据（{str(e)[:60]}），本轮不判定",
+                "detail": []}
+
+    known = {core.agent_key(a.get("name") or "") for a in _brain.list_agents(root)}
+    runs = [r for r in runs if core.agent_key(r.get("agent") or "") in known]
+    injected = sorted({core.agent_key(r.get("agent") or "") for r in injected_agents
+                       if core.agent_key(r.get("agent") or "") in known})
+
+    def _src_of(note: str) -> str:
+        m = re.search(r"src=([^\s]+)", note or "")
+        return "" if not m or m.group(1) == "-" else m.group(1)
+
+    def _chars_of(note: str) -> int:
+        m = re.search(r"chars=(\d+)", note or "")
+        return int(m.group(1)) if m else 0
+
+    scoped = [r for r in runs if _src_of(r.get("note") or "")]
+    trans = [r for r in scoped if "transcript" in _src_of(r.get("note") or "")]
+    chars = sorted(_chars_of(r.get("note") or "") for r in scoped)
+    median = int(statistics.median(chars)) if chars else 0
+    rate = float(st.get("rate") or 0.0)
+    injected_n = int(st.get("injected") or 0)
+    fingerprintable = int(st.get("fingerprintable") or 0)
+
+    if not injected_n and not runs:
+        return {"ok": True,
+                "summary": "采纳账：近 7 天没有注入账也没有采集记录，无数据不判定",
+                "detail": ["各家的 UserPromptSubmit 回忆钩子是否送达见 brief_hook_health，"
+                           "工具通道是否活着见 link_health——这两项红了这里就是空的"]}
+
+    # 一、尺子本身：口径覆盖不足时先说尺子，不给「记忆没人用」定罪
+    if not scoped:
+        present, where = _adherence_capture_marker_present()
+        if present:
+            return {"ok": True,
+                    "summary": f"采纳账：口径已部署（{where} 带 src）但窗口内还没有一次带口径的采集"
+                               f"——采纳率 {rate:.1f}% 先别当真",
+                    "detail": detail + [f"近 7 天采集 {len(runs)} 次，全部没有 src（旧流水或旧进程）",
+                                        "新会话跑一轮后重读本项即可出结论"]}
+        return {"ok": True,
+                "summary": f"采纳账：采集脚本还是 R849 之前的口径，判官吃进去什么无从知晓"
+                           f"（账面采纳率 {rate:.1f}% 不可用于下结论）",
+                "fix": CHECK_FIXES["adherence"],
+                "detail": detail + ["修法：python cli.py deploy（顺带刷新 ~/.agenthub/hooks 副本），"
+                                    "之后流水 note 里会出现 src=transcript/... "]}
+    share = len(trans) / len(scoped)
+    if share < ADHERENCE_TRANSCRIPT_SHARE or median < ADHERENCE_MIN_MEDIAN_CHARS:
+        detail.append(f"口径内采集 {len(scoped)} 次：transcript 证据 {len(trans)} 次"
+                      f"（占 {share * 100:.0f}%），单轮证据字数中位数 {median}")
+        detail.append(f"起点 {min(r['ts'] for r in scoped)}：比这更早的流水没有 src，未参与判定")
+        why = ("证据大多只来自事件自带文本（各家 Stop 只给一句收尾话）" if share < ADHERENCE_TRANSCRIPT_SHARE
+               else "单轮证据太薄（中位字数低于 " + str(ADHERENCE_MIN_MEDIAN_CHARS) + "）")
+        return {"ok": False,
+                "summary": f"采纳账：判官饿着——{why}，采纳率 {rate:.1f}% 是采集侧算出来的，"
+                           f"不能当「记忆没人用」",
+                "fix": CHECK_FIXES["adherence"], "detail": detail}
+
+    # 二、送达：有注入账的家里，谁一次采集都没交（hermes 这类无 Stop 出口的不算）
+    ran = {core.agent_key(r.get("agent") or "") for r in runs}
+    never = [a for a in injected if a not in ran and not _answer_unsupported(core, a)]
+    detail.append(f"结果账：注入 {injected_n} 笔 · 可指纹 {fingerprintable} 笔 · 被用上 "
+                  f"{int(st.get('used') or 0)} 条 = 采纳率 {rate:.1f}%"
+                  f"（对照行业区间 {int(ADHERENCE_OK_RATE):.0f}%–70%）")
+    for s, b in (st.get("by_strength") or {}).items():
+        detail.append(f"  {s}：注入 {b.get('injected')} · 可指纹 {b.get('fingerprintable')} "
+                      f"· 用上 {b.get('used')} · {b.get('rate')}%")
+    if st.get("avg_memory_age_days") is not None:
+        detail.append(f"被用上/被注入的记忆平均年龄 {st['avg_memory_age_days']:.1f} 天"
+                      f"（区间 7–30 天，太短=只靠近期，太长=旧结论权重过高）")
+    detail.append(f"口径内采集 {len(scoped)} 次 · transcript 证据 {len(trans)} 次 · "
+                  f"单轮证据中位 {median} 字 · 起点 {min(r['ts'] for r in scoped)}")
+    if never:
+        detail.append("有注入账但窗口内零次 Stop 采集：" + "、".join(never)
+                      + "（回填钩子没跑或被禁用）")
+        return {"ok": False,
+                "summary": f"采纳账：{'、'.join(never)} 家有注入但没有采集记录——"
+                           f"采纳率只覆盖了交账的那几家",
+                "fix": CHECK_FIXES["adherence"], "detail": detail}
+    if rate < ADHERENCE_BAD_RATE:
+        return {"ok": False,
+                "summary": f"采纳账：口径正常而采纳率 {rate:.1f}% 低于 {ADHERENCE_BAD_RATE:.0f}%"
+                           f"——这才是「注入的记忆真没被用上」，收注入精度而不是加量",
+                "fix": CHECK_FIXES["adherence"], "detail": detail}
+    tail = "偏低（介于观察线与正常之间）" if rate < ADHERENCE_OK_RATE else "在正常区间"
+    return {"ok": True,
+            "summary": f"采纳账：采纳率 {rate:.1f}%（{tail}），采集口径覆盖 {len(scoped)} 次"
+                       f" · transcript 证据 {share * 100:.0f}%",
+            "detail": detail}
+
+
+def _answer_unsupported(core, agent_key: str) -> bool:
+    """这家客户端是不是压根没有 Stop 出口（hermes 只有 pre_llm_call）——没有的不算欠账。"""
+    try:
+        st = core.memory_hook_status(agent_key)
+        return (st.get("answer") or {}).get("state") == "unsupported"
+    except Exception:  # noqa: BLE001 读配置失败不该拖垮整项
+        return False
 
 
 def _runtime_health(root: str = "") -> dict:

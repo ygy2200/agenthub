@@ -109,22 +109,29 @@ def test_hook_script_is_silent_without_text(tmp_path):
     ev = {"hook_event_name": "Stop", "session_id": "s-empty"}
     r = subprocess.run([node, str(script)], input=json.dumps(ev),
                        capture_output=True, text=True, timeout=30,
-                       env={**os.environ, "AGENTHUB_ADHERENCE_SCRIPT": str(tmp_path / "nope.py")})
+                       env={**os.environ, "AGENTHUB_ADHERENCE_SCRIPT": str(tmp_path / "nope.py"),
+                            # 钩子日志写 homedir() 下，不伪造 HOME 就会把 skip 行灌进
+                            # ~/.agenthub/logs/brain-adherence.log——而那份日志正是采集口径的
+                            # 取证来源（R849 用它数出「38 次里 chars=19」），污染源必须隔离。
+                            **({"USERPROFILE": str(tmp_path / "fake-home")} if os.name == "nt"
+                               else {"HOME": str(tmp_path / "fake-home")})})
     assert r.returncode == 0, (r.returncode, r.stderr)
     assert r.stdout.strip() == "", r.stdout
 
 
-def test_hook_script_ignores_non_stop_events():
+def test_hook_script_ignores_non_stop_events(tmp_path):
     node = _node()
     if not node:
         import pytest
         pytest.skip("没有 node")
     script = REPO / "brain_adherence.mjs"
+    fake = {"USERPROFILE": str(tmp_path / "fake-home")} if os.name == "nt" else {"HOME": str(tmp_path / "fake-home")}
     for ev in ({"hook_event_name": "UserPromptSubmit", "session_id": "s1",
                 "prompt": "hi"},
                {"hook_event_name": "PreToolUse", "session_id": "s1"}):
         r = subprocess.run([node, str(script)], input=json.dumps(ev),
-                           capture_output=True, text=True, timeout=30)
+                           capture_output=True, text=True, timeout=30,
+                           env={**os.environ, **fake})
         assert r.returncode == 0 and r.stdout.strip() == "", (ev, r.stdout, r.stderr)
 
 

@@ -23,8 +23,9 @@ def test_empty_root_collapses_to_single_db_issue(hub_root):
 
     # 计数守卫（改 PATROL_CHECKS / DB_BACKED_CHECKS 必须同步这里并说明）：
     # 21→22、13→14 = R834 +error_debt（报错欠账账本，依赖大脑库 → 同因折叠也少跑一次 LIKE 扫描）
-    assert rep["total"] == len(ops.PATROL_CHECKS) == 23
-    assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 14
+    # 23→24、14→15 = R850 +adherence（采纳账读 recall_adherence 与 journal，坏库上同样归因到 db_integrity）
+    assert rep["total"] == len(ops.PATROL_CHECKS) == 24
+    assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 15
 
     db_issues = [i["name"] for i in rep["issues"] if i["name"] in ops.DB_BACKED_CHECKS]
     assert db_issues == ["db_integrity"], f"同因库检查应只剩一条：{db_issues}"
@@ -35,7 +36,7 @@ def test_empty_root_collapses_to_single_db_issue(hub_root):
     assert "unable to open database file" not in blob, "裸 sqlite 错误文案不该出现在问题里"
 
     primary = next(i for i in rep["issues"] if i["name"] == "db_integrity")
-    assert primary["skipped_same_cause"] == 14
+    assert primary["skipped_same_cause"] == 15  # R850 +adherence（同因折叠多一项）
     assert primary.get("fix_brief"), "根因条目仍要带可执行修复口径"
 
     skipped = {s["name"]: s["why"] for s in rep["skipped"]}
