@@ -57,6 +57,10 @@ def main(argv=None) -> int:
     local = args.expect_size or (args.exe.stat().st_size if args.exe.is_file() else 0)
     print(f"期望尺寸：{local or '未知'} 字节"
           + ("" if args.expect_size else f"（来自 {args.exe}）"))
+    # R869：页面与附件是两条独立验收，必须**同一个通道都过**才算过。
+    # 旧版页面直连成功后直接 break，附件直连 HTTP 0 也再无机会走代理——假红。
+    page_ok = asset_ok = False
+    last_asset_err = ""
     for proxy in [None] + PROXIES:
         opener = _opener(proxy)
         st, _, body = _get(opener, page)
@@ -67,16 +71,20 @@ def main(argv=None) -> int:
         hit = args.tag in text
         print(f"页面：HTTP 200，页面含 {args.tag}：{'是' if hit else '否'}（通道 {proxy or '直连'}）")
         if not hit:
-            problems.append("页面 200 但正文里没有该 tag")
+            continue
+        page_ok = True
         st2, h2, _ = _get(opener, dl, method="GET", read_bytes=1)
         length = int(h2.get("Content-Length") or 0)
         print(f"附件：HTTP {st2}  Content-Length={length or '未知'}  "
-              f"{'一致' if length == local else '不一致/未知'}")
-        if st2 != 200 or length != local:
-            problems.append(f"附件直链校验失败（HTTP {st2}，长度 {length} vs 本地 {local}）")
-        break
-    else:
-        problems.append("页面在所有通道都取不到 200")
+              f"{'一致' if length == local else '不一致/未知'}（通道 {proxy or '直连'}）")
+        if st2 == 200 and length == local:
+            asset_ok = True
+            break
+        last_asset_err = f"HTTP {st2}，长度 {length} vs 本地 {local}"
+    if not page_ok:
+        problems.append("页面在所有通道都取不到 200 或正文里没有该 tag")
+    if not asset_ok:
+        problems.append(f"附件直链校验失败（{last_asset_err or '所有通道均不可达'}）")
     for p in problems:
         print("  - " + p)
     print("验收：通过" if not problems else "验收：未通过")
