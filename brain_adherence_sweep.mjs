@@ -121,6 +121,11 @@ function readRange(file, start, end, maxBytes) {
   }
 }
 
+/** 一条消息里能当证据的片段（R873：含 workbuddy 的 input_text/output_text）。
+ *
+ * 只认 `text` 的那版在 workbuddy 上一次都抽不到：它的正文 part 叫 output_text，
+ * 工具调用是独立 `function_call` 事件。证据饿着时「未观测」会冒充「记忆没人用」。
+ */
 function evidenceFromContent(content) {
   const out = [];
   if (typeof content === 'string') { out.push(content); return out; }
@@ -129,7 +134,8 @@ function evidenceFromContent(content) {
     if (typeof part === 'string') { out.push(part); continue; }
     if (!part || typeof part !== 'object') continue;
     const type = part.type || '';
-    if (type === 'text' && typeof part.text === 'string') out.push(part.text);
+    if ((type === 'text' || type === 'input_text' || type === 'output_text')
+      && typeof part.text === 'string') out.push(part.text);
     else if (type === 'tool_use') {
       let blob = '';
       try { blob = JSON.stringify(part.input || {}).slice(0, MAX_TOOL_INPUT); } catch { blob = ''; }
@@ -137,6 +143,104 @@ function evidenceFromContent(content) {
     }
   }
   return out;
+}
+
+/** 一条事件折算成证据。function_call（workbuddy）没有 role，靠事件类型认。 */
+function evidenceFromEvent(ev) {
+  const out = [];
+  const msg = (ev && ev.message && typeof ev.message === 'object') ? ev.message : ev;
+  const role = (msg && msg.role) || (ev && ev.role) || '';
+  const etype = String((ev && ev.type) || '');
+  if (role === 'assistant') out.push(...evidenceFromContent(msg.content));
+  if (etype === 'function_call') {
+    let blob = '';
+    const args = ev.arguments;
+    if (typeof args === 'string') blob = args.slice(0, MAX_TOOL_INPUT);
+    else {
+      try { blob = JSON.stringify(args || {}).slice(0, MAX_TOOL_INPUT); } catch { blob = ''; }
+    }
+    out.push(`${ev.name || ''} ${blob}`);
+  }
+  return out;
+}
+
+/** 真人开口判定（轮边界）。R873：workbuddy 的提问 part 是 input_text。 */
+function isRealPrompt(content) {
+  if (typeof content === 'string') return !!content.trim();
+  if (!Array.isArray(content)) return false;
+  return content.some((p) => p && typeof p === 'object'
+    && (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text')
+    && typeof p.text === 'string' && p.text.trim());
+}
+
+/** 事件时间戳 → 本地 ISO（DB 的 ts 是本地时间，比较必须同口径）。
+ *
+ * Qoder 给 `2026-11-04T08:40:00.783Z`，workbuddy 给 epoch 毫秒；无时区的字符串按本地算。
+ */
+function isoLocal(v) {
+  if (v === undefined || v === null || v === '') return '';
+  let d;
+  if (typeof v === 'number') d = new Date(v < 1e12 ? v * 1000 : v);
+  else {
+    const s = String(v);
+    d = new Date(s);
+    if (Number.isNaN(d.getTime())) {
+      const m = s.match(/^(\d{4}-\d{2}-\d{2})[T ](\d{2}:\d{2}:\d{2})/);
+      return m ? `${m[1]}T${m[2]}` : '';
+    }
+  }
+  if (Number.isNaN(d.getTime())) return '';
+  const p = (n) => String(n).padStart(2, '0');
+  return `${d.getFullYear()}-${p(d.getMonth() + 1)}-${p(d.getDate())}`
+    + `T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+}
+
+/**
+ * 首见会话时取「最后一轮」的证据与开口时间（R873）。
+ *
+ * 为什么需要：第一句话的注入发生在 transcript 落盘之前——SessionStart/首句的
+ * UserPromptSubmit 拿不到文件，补扫第一次真正看见会话时水位线直接跳到文件尾，
+ * 于是**第一轮的注入永远没人判**（本机实测 a3aa5b2a：16:39 注入 3 条，16:59 首见
+ * 跳尾，之后整局都停在未观测）。这里在首见时把尾部的最后一轮判掉，并用开口时间做
+ * 下界：只认「这一轮开始之后」的注入，历史会话的旧账不许借尸还魂（R851 那条纪律）。
+ * 尾部窗口没兜住轮首（>1.2MB 的巨轮）时不判——宁少一笔，不拿半段冒充整轮。
+ */
+function firstSightWindow(raw) {
+  const lines = raw.split('\n');
+  if (lines.length && lines[0].trim() && lines[0].trim()[0] !== '{') lines.shift();
+  const current = [];
+  let promptTs = '';
+  let seenPrompt = false;
+  let events = 0;
+  let lastTurn = null;
+  for (const line of lines) {
+    const t = line.trim();
+    if (!t || t[0] !== '{') continue;
+    let ev;
+    try { ev = JSON.parse(t); } catch { continue; }
+    const msg = (ev && ev.message) || ev;
+    const role = (msg && msg.role) || (ev && ev.role) || '';
+    if (role === 'user') {
+      if (isRealPrompt(msg.content)) {
+        // 有些宿主先把这一句写进 transcript 再触发钩子：此时最后一轮还没有产出，
+        // 退回上一轮（它才是「这句话之前的完整一轮」），开口时间跟着退。
+        if (current.length) lastTurn = { text: current.join('\n'), ts: promptTs };
+        current.length = 0;
+        seenPrompt = true;
+        promptTs = isoLocal((ev && ev.timestamp) || (msg && msg.timestamp));
+      }
+      continue;
+    }
+    const pieces = evidenceFromEvent(ev);
+    if (!pieces.length) continue;
+    for (const piece of pieces) {
+      if (piece && piece.trim()) current.push(piece);
+    }
+    events += 1;
+  }
+  const chosen = current.length ? { text: current.join('\n'), ts: promptTs } : lastTurn;
+  if (!chosen) return { text: '', promptTs: '', seenPrompt, events };
+  return { text: chosen.text, promptTs: chosen.ts, seenPrompt, events };
 }
 
 /**
@@ -158,8 +262,11 @@ function sweepWindow(raw, readFrom) {
     try { ev = JSON.parse(t); } catch { continue; }
     const msg = (ev && ev.message) || ev;
     const role = (msg && msg.role) || (ev && ev.role) || '';
-    if (role !== 'assistant') continue;      // user（含注入上下文）不算产出
-    for (const piece of evidenceFromContent(msg.content)) {
+    if (role === 'user') continue;           // user（含注入上下文）不算产出
+    // R873：function_call（workbuddy）没有 role，靠事件类型认；reasoning/*_result 返回空。
+    const evPieces = evidenceFromEvent(ev);
+    if (!evPieces.length) continue;
+    for (const piece of evPieces) {
       if (piece && piece.trim()) pieces.push(piece);
     }
     events += 1;
@@ -191,28 +298,58 @@ try {
   const wm = wmFile(agent, session);
   const size = statSync(tp).size;
   const prev = readWm(wm);
-  if (!prev) {
-    // 本会话第一次被补扫看见：没有「上一轮」可判，从文件尾开始记水位线。
-    writeWm(wm, size, size);
-    process.exit(0);
-  }
-  if (size <= prev.offset) {
-    // 文件被换/截断（新 session 复用同名？）：重置到尾，不拿旧内容冒充新产出。
-    if (size < prev.offset) writeWm(wm, size, size);
-    process.exit(0);
-  }
+  let text = '';
+  let nextOffset = size;
+  let src = 'sweep';
+  let since = '';
+  let bytesTaken = 0;
+  let events = 0;
 
-  const chunk = readRange(tp, prev.offset, size, MAX_BYTES);
-  const win = sweepWindow(chunk.text, chunk.from);
-  const text = (win.text || '').trim();
-  if (!text) {
-    writeWm(wm, Math.max(prev.offset, win.nextOffset), size);
-    logLine(`skip sweep: 增量无产出 session=${session.slice(0, 24)} bytes=${chunk.taken}`);
-    process.exit(0);
+  if (!prev) {
+    // R873 首见：第一轮的注入发生在 transcript 落盘之前，第一次真正看见会话时
+    // 水位线直接跳到尾，会把这一轮永久留在「未观测」（实测 a3aa5b2a：16:39 注入
+    // 3 条，16:59 首见跳尾，整局没人判）。改成把尾部最后一轮判掉；`--since` 用
+    // 那一轮开口时间做下界，历史会话的旧账不许借尸还魂（R851 那条纪律）。
+    const tail = readRange(tp, Math.max(0, size - MAX_BYTES), size, MAX_BYTES);
+    const win = firstSightWindow(tail.text);
+    // 水位线只吃到最后一个完整行：文件可能正在写，半截行留给下一次。
+    const lastNl = tail.text.lastIndexOf('\n');
+    nextOffset = lastNl >= 0
+      ? tail.from + Buffer.byteLength(tail.text.slice(0, lastNl + 1), 'utf8')
+      : size;
+    text = (win.text || '').trim();
+    bytesTaken = tail.taken;
+    events = win.events;
+    if (!win.seenPrompt || !text || !win.promptTs) {
+      writeWm(wm, nextOffset, size);
+      logLine(`skip sweep: 首见无可判轮 session=${session.slice(0, 24)}`
+        + ` prompt=${win.seenPrompt ? 'y' : 'n'} ev=${win.events}`);
+      process.exit(0);
+    }
+    src = 'firstsight';
+    since = win.promptTs;
+  } else {
+    if (size <= prev.offset) {
+      // 文件被换/截断（新 session 复用同名？）：重置到尾，不拿旧内容冒充新产出。
+      if (size < prev.offset) writeWm(wm, size, size);
+      process.exit(0);
+    }
+    const chunk = readRange(tp, prev.offset, size, MAX_BYTES);
+    const win = sweepWindow(chunk.text, chunk.from);
+    text = (win.text || '').trim();
+    bytesTaken = chunk.taken;
+    events = win.events;
+    nextOffset = Math.max(prev.offset, win.nextOffset);
+    if (!text) {
+      writeWm(wm, nextOffset, size);
+      logLine(`skip sweep: 增量无产出 session=${session.slice(0, 24)} bytes=${chunk.taken}`);
+      process.exit(0);
+    }
   }
   const body = text.length > MAX_TEXT ? text.slice(-MAX_TEXT) : text;
 
-  const args = [SCRIPT, '--agent', agent, '--session', session, '--src', 'sweep'];
+  const args = [SCRIPT, '--agent', agent, '--session', session, '--src', src];
+  if (since) args.push('--since', since);
   let rootArg = process.env.AGENTHUB_ROOT || '';
   if (!rootArg && existsSync(CONFIG)) {
     try { rootArg = String(JSON.parse(readFileSync(CONFIG, 'utf8')).root || ''); } catch { /* ignore */ }
@@ -260,9 +397,10 @@ try {
     logLine(`sweep spawn 异常 ${String((e && e.message) || e).slice(0, 120)}`);
     process.exit(0);
   }
-  writeWm(wm, Math.max(prev.offset, win.nextOffset), size, body.length);
-  logLine(`ok sweep session=${session.slice(0, 24)} src=sweep chars=${body.length}`
-    + ` ev=${win.events} bytes=${chunk.taken}${sync ? ' sync' : ' detached'}`);
+  writeWm(wm, nextOffset, size, body.length);
+  logLine(`ok sweep session=${session.slice(0, 24)} src=${src} chars=${body.length}`
+    + ` ev=${events} bytes=${bytesTaken}${since ? ` since=${since}` : ''}`
+    + `${sync ? ' sync' : ' detached'}`);
 } catch (e) {
   logLine(`sweep error ${String((e && e.message) || e).slice(0, 160)}`);
   process.exit(0);

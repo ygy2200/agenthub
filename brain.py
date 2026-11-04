@@ -8644,7 +8644,8 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
     return len(rows)
 
 
-def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> dict:
+def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
+                     not_before: str = "") -> dict:
     """给一段 agent 产出（回答正文、执行的命令、改的文件路径），标记被用到的注入。
 
     调用时机（由 agent 侧或钩子决定）：一轮结束后拿这一轮的产出文本喂进来即可。
@@ -8661,6 +8662,10 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
     自证闭环真的跑得通（R849 的探针就是读自己那几行的 used 来判 PASS 的，一刀不判等于把
     尺子也锁在门外）。不放过的是**外溢**：命中的记忆只有生产行才 +adopt_count，
     否则 eval 造的那段文本会替真实记忆刷有用性，而那正是 R829 立这条唯一写入口要防的。
+
+    R873 `not_before`（本地 ISO 时间）：首见会话时补扫只判「这一轮开口之后」的注入。
+    没有这条下界，把 transcript 尾部一整轮当证据会替几小时前的旧注入领功（R851 的
+    假信号）；时间戳由钩子从 transcript 的 user 行读出来，缺省时行为与旧版一致。
     """
     out = {"checked": 0, "matched": 0, "memory_ids": [], "device_matched": 0}
     if not session or not (text or "").strip():
@@ -8668,6 +8673,9 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24) -> 
     low = text.lower()
     since = (datetime.datetime.now() - datetime.timedelta(hours=max(1, int(window_h)))
              ).strftime("%Y-%m-%dT%H:%M:%S")
+    if (not_before or "").strip() > since:
+        # R873：首见补扫只用 transcript 里最后一轮的开口时间当更紧的下界。
+        since = (not_before or "").strip()
     hit_ids, rows, judged_ids = [], [], []
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
@@ -8725,15 +8733,19 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
         装置写的：它们永远不会被判定（没有对应的产出文本），全落在「未观测」——
         于是「账面 7.8%」和「采集侧饿着」被装置放大成同一种症状，`device_rows`
         单独报出来，让「排除多少」这件事本身可核查。
+      · `unobserved` 再拆两半（R873）：`unobserved_tail` 是同一会话最后一笔注入（证据
+        要等下一句，单轮会话等不到——结构性上限）；`unobserved_gap` 是同一会话后面
+        还有发言却没判到（采集通道漏了，才是要修的东西）。不拆会把上限读成缺陷。
     """
     since = _days_ago(max(1, int(days)))
     out = {"window_days": days, "injected": 0, "fingerprintable": 0, "used": 0,
            "rate": 0.0, "by_strength": {}, "avg_memory_age_days": None,
-           "unjudgeable": 0, "unobserved": 0, "judged_unused": 0, "judged_used": 0,
+           "unjudgeable": 0, "unobserved": 0, "unobserved_tail": 0, "unobserved_gap": 0,
+           "judged_unused": 0, "judged_used": 0,
            "judged": 0, "observed_rate": 0.0, "device_rows": 0}
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT strength, fp, used, decided_at, memory_id,"
+            "SELECT strength, fp, used, decided_at, memory_id, ts, agent, session,"
             " COALESCE(origin,'live') AS origin FROM recall_adherence WHERE ts>=?",
             (since,))]
     if not rows:
@@ -8744,19 +8756,29 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
     if not rows:
         return out
     out["injected"] = len(rows)
-    buckets = {}
-    ids = []
+    # R873：未观测拆「尾巴 / 断档」。同一会话里最后一笔注入是结构性尾巴——证据要等
+    # 下一句发言，单轮会话甚至永远等不到（这台宿主不发 Stop 时尤其明显）；同一会话
+    # 后面还发过言（有更晚的注入）却仍没判到，才是采集通道漏了。两种成因修法相反，
+    # 混成一个数会把结构性上限读成产品质量差。
+    last_ts = {}
+    fped = []
     for r in rows:
         try:
             fp = json.loads(r.get("fp") or "[]")
         except ValueError:
             fp = []
+        if not fp:
+            continue
+        fped.append(r)
+        key = (r.get("agent") or "", r.get("session") or "")
+        if (r.get("ts") or "") > last_ts.get(key, ""):
+            last_ts[key] = r.get("ts") or ""
+    buckets = {}
+    ids = []
+    for r in fped:
         s = r.get("strength") or "strong"
         b = buckets.setdefault(s, {"injected": 0, "fingerprintable": 0, "used": 0})
         b["injected"] += 1
-        if not fp:
-            out["unjudgeable"] += 1
-            continue
         b["fingerprintable"] += 1
         out["fingerprintable"] += 1
         # used=1 必然是判过的（唯一写入口 mark_recall_used 同时写 decided_at）；
@@ -8768,7 +8790,24 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
             out["judged_unused"] += 1
         else:
             out["unobserved"] += 1
+            key = (r.get("agent") or "", r.get("session") or "")
+            if (r.get("ts") or "") == last_ts.get(key):
+                out["unobserved_tail"] += 1
+            else:
+                out["unobserved_gap"] += 1
         ids.append(r.get("memory_id"))
+    # 抽不出指纹的行也要进各档 injected（它们是分母的诚实部分，只是不进判定）
+    for r in rows:
+        try:
+            fp = json.loads(r.get("fp") or "[]")
+        except ValueError:
+            fp = []
+        if fp:
+            continue
+        out["unjudgeable"] += 1
+        s = r.get("strength") or "strong"
+        b = buckets.setdefault(s, {"injected": 0, "fingerprintable": 0, "used": 0})
+        b["injected"] += 1
     for b in buckets.values():
         b["rate"] = round(b["used"] / b["fingerprintable"] * 100, 1) if b["fingerprintable"] else 0.0
     out["used"] = out["judged_used"]

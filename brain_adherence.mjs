@@ -82,7 +82,13 @@ function readTail(file, maxBytes) {
   }
 }
 
-/** 一条消息里能当证据的片段：正文文本 + 工具调用（名称与参数）。 */
+/** 一条消息里能当证据的片段：正文文本 + 工具调用（名称与参数）。
+ *
+ * R873：宿主不只一种 transcript 形状。Qoder/Claude 用 `text` / `tool_use`；workbuddy
+ * 用 `input_text` / `output_text`，工具调用是独立的 `function_call` 事件（见下）。
+ * 只认 `text` 的那版在 workbuddy 上一段证据都抽不到——实测 18e1b66f 会话 66 个
+ * assistant 事件全部空手，判官只剩收尾 600 字（log: src=direct chars=600）。
+ */
 function evidenceFromContent(content) {
   const out = [];
   if (typeof content === 'string') { out.push(content); return out; }
@@ -91,13 +97,38 @@ function evidenceFromContent(content) {
     if (typeof part === 'string') { out.push(part); continue; }
     if (!part || typeof part !== 'object') continue;
     const type = part.type || '';
-    if (type === 'text' && typeof part.text === 'string') out.push(part.text);
+    if ((type === 'text' || type === 'input_text' || type === 'output_text')
+      && typeof part.text === 'string') out.push(part.text);
     else if (type === 'tool_use') {
       let blob = '';
       try { blob = JSON.stringify(part.input || {}).slice(0, MAX_TOOL_INPUT); } catch { blob = ''; }
       out.push(`${part.name || ''} ${blob}`);
     }
-    // thinking / tool_result 不算证据：前者会复述注入原文，后者是读进来的文件内容。
+    // thinking / reasoning / tool_result / function_call_result 不算证据：
+    // 前者会复述注入原文，后两者是读进来的工具输出。
+  }
+  return out;
+}
+
+/**
+ * 一条事件能当证据的片段。除 `{message:{role,content}}` 这一种外，还认 workbuddy 的
+ * 顶层 `{type:'function_call', name, arguments}`（56 次调用/会话，招牌全在这儿）。
+ * 只有 assistant 消息与 function_call 算产出；user、reasoning、*_result 一律不算。
+ */
+function evidenceFromEvent(ev) {
+  const out = [];
+  const msg = (ev && ev.message && typeof ev.message === 'object') ? ev.message : ev;
+  const role = (msg && msg.role) || (ev && ev.role) || '';
+  const etype = String((ev && ev.type) || '');
+  if (role === 'assistant') out.push(...evidenceFromContent(msg.content));
+  if (etype === 'function_call') {
+    let blob = '';
+    const args = ev.arguments;
+    if (typeof args === 'string') blob = args.slice(0, MAX_TOOL_INPUT);
+    else {
+      try { blob = JSON.stringify(args || {}).slice(0, MAX_TOOL_INPUT); } catch { blob = ''; }
+    }
+    out.push(`${ev.name || ''} ${blob}`);
   }
   return out;
 }
@@ -106,7 +137,8 @@ function evidenceFromContent(content) {
 function isRealPrompt(content) {
   if (typeof content === 'string') return !!content.trim();
   if (!Array.isArray(content)) return false;
-  return content.some((p) => p && typeof p === 'object' && p.type === 'text'
+  return content.some((p) => p && typeof p === 'object'
+    && (p.type === 'text' || p.type === 'input_text' || p.type === 'output_text')
     && typeof p.text === 'string' && p.text.trim());
 }
 
@@ -134,8 +166,11 @@ function turnFromTranscript(file) {
       if (isRealPrompt(msg.content)) { current.length = 0; reset = true; }
       continue;
     }
-    if (role !== 'assistant') continue;
-    for (const piece of evidenceFromContent(msg.content)) {
+    // R873：不再只认 role=assistant——workbuddy 的工具调用是独立 function_call 事件，
+    // 没有 role；evidenceFromEvent 负责把它折算成「工具名 + 参数」。
+    const pieces = evidenceFromEvent(ev);
+    if (!pieces.length) continue;
+    for (const piece of pieces) {
       if (piece && piece.trim()) { current.push(piece); fallback.push(piece); }
     }
     events += 1;

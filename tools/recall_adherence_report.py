@@ -91,6 +91,13 @@ def main() -> int:
     print(f"被用      {st['used']} 条")
     print(f"三态      判不了 {st.get('unjudgeable', 0)} · 未观测 {st.get('unobserved', 0)} · "
           f"判无用 {st.get('judged_unused', 0)} · 判用上 {st.get('judged_used', 0)}")
+    if st.get("unobserved"):
+        tail = int(st.get("unobserved_tail") or 0)
+        gap = int(st.get("unobserved_gap") or 0)
+        hint = "尾巴是结构性上限（证据要等下一句），断档才是采集漏了"
+        if gap:
+            hint += "——先看对应宿主有没有 Stop/补扫（log: ~/.agenthub/logs/brain-adherence.log）"
+        print(f"  未观测拆解  尾巴 {tail}（会话最后一笔，等不到下一句）· 断档 {gap} · {hint}")
     obs = float(st.get("observed_rate") or 0.0)
     print(f"采纳率    观测口径 {obs}%（判过 {st.get('judged', 0)} 笔）· 账面 {st['rate']}%"
           f"（可指纹 {st['fingerprintable']} 笔）→ {_verdict(obs, int(st.get('judged') or 0))}")
