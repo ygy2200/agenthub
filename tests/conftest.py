@@ -14,6 +14,10 @@ if str(ROOT) not in sys.path:
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 # 测试进程不触网：语义模型走本地缓存；"不带离线变量的生产路径"由 adv_brain.t_emb_local_first 覆盖
 os.environ.setdefault("HF_HUB_OFFLINE", "1")
+# R861：单测不加载 23MB ONNX 权重（真实读路/部署由 tools/rebuild_emb_onnx.py 与 live 探针覆盖）。
+# 必须在 test 模块 import brain 之前设置——_ONNX_TAG 在模块导入时定值；
+# 需要验证 ONNX 行为的用例自己重置 emb_onnx._STATE 并 monkeypatch 环境变量。
+os.environ.setdefault("AGENTHUB_ONNX", "0")
 
 
 @pytest.fixture

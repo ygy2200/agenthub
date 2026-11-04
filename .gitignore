@@ -13,6 +13,10 @@ _pytest_tmp/
 # 它不含任何凭据——token 由 release_token.py 的查找链在运行时取。
 drag_probe.py
 *.bak-*
+# ONNX 语义编码器权重（24MB 二进制，R861）：由 tools/export_onnx_r861.py 生成、
+# cli.py deploy 粘性带进 ~/.agenthub/mcp_server/models/；不入库也不进 exe 包。
+# 不入库的原因和 *.exe 一样：二进制体积不该进版本历史。
+models/
 output/
 ..output*
 # 并行 agent 在本仓库里的私有记忆/自动化目录：不是 AgentHub 源码，

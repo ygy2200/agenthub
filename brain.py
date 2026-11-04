@@ -26,6 +26,11 @@ from pathlib import Path
 
 import core
 
+try:  # R861：ONNX 读路是可选能力，模块缺失/装坏都不得影响主链路
+    import emb_onnx
+except Exception:  # noqa: BLE001
+    emb_onnx = None
+
 DB_NAME = "brain.db"
 BACKUP_DIR = "brain-backups"
 # 在线库快照（backup_brain → _hub/brain-backups/）的轮转上限。
@@ -2701,8 +2706,8 @@ def flush_index(root: str, force: bool = False, batch: int = 64) -> dict:
     """语义索引维护（P3-1 hub_flush_index）：把缺失（force=True 时全部）向量补进 embeddings。
     文本口径与写入钩子 _ensure_emb_for、tools/build_embeddings.py 三处一致。
     fail-open：语义依赖缺失/模型装载失败 → 返回 {"error": ...}，不影响其余功能。"""
-    out = {"records": 0, "memories": 0, "scanned": 0, "dim": None, "model": _EMB_MODEL_NAME}
-    if _st_cls() is None:
+    out = {"records": 0, "memories": 0, "scanned": 0, "dim": None, "model": _emb_tag()}
+    if not _ONNX_TAG and _st_cls() is None:
         return {"error": "未安装 sentence-transformers（语义路未启用，其余功能不受影响）"}
     if not _ensure_emb():
         return {"error": "语义模型加载失败（stderr 有留痕；本地缓存缺失时需联网首装）"}
@@ -7038,6 +7043,15 @@ def _phrase_boost(r: dict, kw: str) -> float:
 # （BAAI/bge-small-zh-v1.5，数据不出本机）。零硬依赖：未安装 / 模型缺失 / 编码异常时全部降级——
 # 融合只跑 LIKE+BM25 两路，MCP server 照常零依赖启动（铁律：外部能力用 fail-open 包裹）。
 _EMB_MODEL_NAME = "BAAI/bge-small-zh-v1.5"
+# R861：ONNX 读路可用时，向量改由它产生——同一权重、不同运行时，向量不可混比，
+# 所以 model 列写「编码器标签」而不是家族名；_semantic_rank 只比同标签的向量。
+# 换编码器（或从 torch 切到 ONNX）必须整表重嵌入：tools/rebuild_emb_onnx.py。
+_ONNX_TAG = emb_onnx.tag() if (emb_onnx and emb_onnx.active()) else ""
+
+
+def _emb_tag() -> str:
+    """当前生效的编码器标签（embeddings.model 的口径）。"""
+    return _ONNX_TAG or _EMB_MODEL_NAME
 _EMB = None          # 懒加载的 SentenceTransformer 实例（进程级缓存）
 _EMB_DIM = None
 _EMB_READY = None    # None=未尝试 / True / False
@@ -7120,6 +7134,12 @@ def _ensure_emb() -> bool:
     global _EMB, _EMB_DIM, _EMB_READY
     if not _SEM_ENABLED:
         return False   # R832 开关关闭：连 write 路径也不加载模型（fail-open 静默降级，向量不落库）
+    if _ONNX_TAG:
+        # R861：ONNX 读路可用时不必进 torch——写路径同样用它（4–9ms vs 首次 9.2s），
+        # 顺带把 R832 的「每进程 2GB 常驻」整条消掉。
+        _EMB_READY = True
+        _EMB_DIM = 512
+        return True
     if _EMB_READY is not None:
         return _EMB_READY
     with _EMB_LOCK:
@@ -7175,6 +7195,8 @@ def _emb_ready_now() -> bool:
     global _EMB_BG_THREAD
     if not _SEM_ENABLED:
         return False   # R832 开关关闭：连后台预热线程都不许起，否则照样把 torch 拖进常驻内存
+    if _ONNX_TAG:
+        return True    # R861：ONNX 冷启动 0.16s，没有「等 9 秒」问题，读路径直接用
     if _EMB_READY is not None:
         return _EMB_READY
     with _EMB_BG_LOCK:
@@ -7222,7 +7244,11 @@ def _encode(texts: list) -> object | None:
     try:
         if len(texts) == 1 and texts[0] in _QUERY_VEC_CACHE:
             return _QUERY_VEC_CACHE[texts[0]]
-        out = _EMB.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
+        out = None
+        if _ONNX_TAG and emb_onnx is not None:
+            out = emb_onnx.encode(texts)      # R861：4–9ms，钩子路径唯一的可行语义路
+        if out is None:
+            out = _EMB.encode(texts, normalize_embeddings=True, convert_to_numpy=True)
         if len(texts) == 1:
             if len(_QUERY_VEC_CACHE) >= 64:
                 _QUERY_VEC_CACHE.clear()   # 简单封顶：清空重来（查询空间小，命中率损失可忽略）
@@ -7241,7 +7267,7 @@ def _store_emb(root: str, entity: str, eid: int, vec, conn=None) -> None:
         blob = vec.astype("float32").tobytes()
         sql = ("INSERT OR REPLACE INTO embeddings(entity, eid, vec, model, dim, updated) "
                "VALUES(?,?,?,?,?,?)")
-        args = (entity, eid, blob, _EMB_MODEL_NAME, int(vec.shape[0]), _dt.datetime.now().isoformat())
+        args = (entity, eid, blob, _emb_tag(), int(vec.shape[0]), _dt.datetime.now().isoformat())
         if conn is not None:
             conn.execute(sql, args)
         else:
@@ -7253,8 +7279,9 @@ def _store_emb(root: str, entity: str, eid: int, vec, conn=None) -> None:
 
 def _ensure_emb_for(root: str, entity: str, eid: int, *texts, conn=None) -> None:
     """写入钩子：内容变更后同步语义索引。fail-open（编码失败忽略，该条降级无语义分）。
-    conn 传入时复用外层已开连接（add_record/add_memory 写事务内写入，消除并发锁竞争）。"""
-    if _st_cls() is None:
+    conn 传入时复用外层已开连接（add_record/add_memory 写事务内写入，消除并发锁竞争）。
+    R861：ONNX 可用时不再要求 sentence-transformers——否则新写入的数据永远拿不到向量。"""
+    if _st_cls() is None and not _ONNX_TAG:
         return
     blob = " ".join((t or "") for t in texts).strip()
     if not blob:
@@ -7283,7 +7310,8 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     except Exception:
         return []
     key = (root, entity)
-    fp = _db_file_fp(root)
+    tag = _emb_tag()                      # R861：只比同编码器的向量，跨运行时余弦不可信
+    fp = (tag,) + _db_file_fp(root)
     cached = _SEM_MAT_CACHE.get(key)
     if cached is not None and cached[0] != fp:
         _SEM_MAT_CACHE.pop(key, None)     # 库变了：旧矩阵立刻作废，不参与本轮
@@ -7291,8 +7319,9 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
     if cached is None:                    # 有缓存说明表非空，省掉每次 1.1ms 的 COUNT(*)
         try:
             with db_conn(root) as c:
-                if c.execute("SELECT COUNT(*) FROM embeddings WHERE entity=?", (entity,)).fetchone()[0] == 0:
-                    return []   # 空表短路：无索引时不加载模型（避免无谓开销）
+                if c.execute("SELECT COUNT(*) FROM embeddings WHERE entity=? AND model=?",
+                             (entity, tag)).fetchone()[0] == 0:
+                    return []   # 空表/未迁移到当前编码器：不加载模型（避免无谓开销）
         except Exception:
             return []
     if not _emb_ready_now():              # R257：读路径不等 9.2s 的模型加载
@@ -7312,7 +7341,7 @@ def _semantic_rank(root: str, query: str, entity: str, limit: int = 100) -> list
             with db_conn(root) as c:
                 rows = c.execute(
                     f"SELECT e.eid, e.vec FROM embeddings e JOIN {tbl} r ON e.eid=r.id "
-                    f"WHERE e.entity=? AND {live}", (entity,)).fetchall()
+                    f"WHERE e.entity=? AND e.model=? AND {live}", (entity, tag)).fetchall()
             if not rows:
                 return []
             # 批量矩阵点积：把所有 vec 堆成 (N,D) 矩阵，一次 (M@q) 替代逐行 np.dot + 逐行 norm
@@ -8666,6 +8695,61 @@ def _is_coaching_prompt(prompt: str) -> bool:
     return q.startswith(_COACHING_PREFIXES)
 
 
+# R861：语义救援准入（B035）。词法两路**一条候选都没有**时，才允许语义候选进上下文——
+# 它不替代现有排序，只补「问法不同、库里连那些字都没有」的洞。
+# 阈值 0.62 是标定值，不是行业数字：真库 33 查询实测，真相关 0.59–0.73，废话查询
+# （「帮我看看这个文件」）0.52–0.58——0.62 把废话整条挡在门外，代价是语义弱相关
+# （#463 类）仍救不回。它比 _SEM_MIN_SIM（0.58，融合用的宽进）更严，因为这里是
+# **绕过词法闸门直接进上下文**，错了就是一条无依据的注入。
+_RECALL_SEM_MIN = float(os.environ.get("AGENTHUB_RECALL_SEM_MIN") or 0.62)
+# 上限 3 与 RECALL_PICK_CAP 对齐：只在词法一条强命中都没有时才启用，全部候选
+# 都已过 0.62 的「绕过闸门」线；给三条是让「问法不同」的几个角度都能露头，
+# 而不是只押一条。2026-11-04 真库标定：#457 这类答案排在语义第 3（0.6255），
+# 只取 2 条恰好把它挡在外面——上限对齐后它才进得了上下文。
+_RECALL_SEM_CAP = 3
+_RECALL_SEM_ENABLED = str(os.environ.get("AGENTHUB_RECALL_SEM", "1")).strip().lower() not in (
+    "0", "false", "no", "off")
+
+
+def _semantic_rescue(root: str, prompt: str, excluded: set, limit: int = 12) -> list:
+    """词法零候选时的语义救援（R861）：返回至多 _RECALL_SEM_CAP 条带 _semantic_bridge 的行。
+
+    只在 `not picked and not scored`（词法一条候选都没有）时由 prompt_recall 调用——
+    有候选时一分钱不花，也不会绕过 R825/R826 的 nudge 护栏。
+    免疫/会话内已注入的过滤与主路径同口径（免疫判定要三本账，统一回查）。
+    """
+    if not _RECALL_SEM_ENABLED:
+        return []
+    rows = _semantic_rank(root, prompt, "memories", limit=limit)
+    if not rows:
+        return []
+    ids = [int(r.get("id") or eid) for eid, _s, r in rows]
+    try:
+        acct = _memory_counters(root, ids)
+    except sqlite3.Error:
+        acct = {}
+    out = []
+    for eid, _s, r in rows:
+        sim = float(r.get("_semantic_sim") or 0.0)
+        if sim < _RECALL_SEM_MIN:
+            continue
+        if int(r.get("id") or eid) in excluded:
+            continue
+        cnt = acct.get(int(r.get("id") or eid)) or {}
+        if cnt:
+            r.update(inject_count=cnt["inject_count"], adopt_count=cnt["adopt_count"],
+                     last_inject=cnt["last_inject"])
+        if is_exposure_immune(r):
+            continue
+        r["_semantic_bridge"] = round(sim, 3)
+        r["_recall_hit"] = 0
+        r["_recall_best"] = 0.0
+        out.append(r)
+        if len(out) >= _RECALL_SEM_CAP:
+            break
+    return out
+
+
 def _recall_pick_margin(scored: list, cap: int, margin: float = RECALL_REL_MARGIN) -> list:
     """按相对强度截断候选（R842）：首位无条件保留，后位要够得上首位的 margin 才跟上。
 
@@ -8703,7 +8787,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
            "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False,
-           "muted": 0, "skipped": "", "budget": {}}
+           "muted": 0, "skipped": "", "budget": {}, "semantic_bridge": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -8811,6 +8895,22 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     strong = [(s, r) for s, r in scored
               if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
     picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
+    rescue = 0
+    # R861：救援的边界是「词法**一条候选都没有**」，不是「词法没挑出强的」。
+    # 后者（scored 非空、strong 空）是 R825/R826 的领域：泛词命中的摘要会误导，
+    # 该给「去查」提示而不是语义近邻。2026-11-04 门禁实测：第一版 `not picked`
+    # 直接把这两条旧结论顶红（语义桥 0.77–0.80 的近义记忆被当结论注入）。
+    # 语义救援只处理词法结构性失明的极端：库里连一个含查询词的候选都没有。
+    if not picked and not scored:
+        # R861（B035）：词法零候选 → 语义救援。只在读路径能立刻拿到向量时跑：
+        # 钩子里靠 ONNX（0.16s 冷启动），长驻进程里靠已预热的 torch；都没有就维持原样。
+        try:
+            rescue_rows = _semantic_rescue(root, prompt, excluded)
+        except Exception:  # noqa: BLE001 可选能力，任何异常都不得影响即时回忆
+            rescue_rows = []
+        if rescue_rows:
+            rescue = len(rescue_rows)
+            picked = rescue_rows   # 与 _recall_pick_margin 同形态：下游只吃行，不吃 (分, 行)
     out["muted"] = muted      # 本轮被免疫挡掉的条数（报表/单测据此看断路器有没有在动）
     try:
         recs = search_records(root, query, limit=30)
@@ -8862,6 +8962,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             if len(text) > max_chars:
                 text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
             out.update(text=text, project=pname, chars=len(text),
+                       terms=[t for t, _ in terms],
                        elapsed_ms=int((time.time() - t0) * 1000))
             return out
         # R826：有候选、但每一条都只命中泛词 —— 这是最该克制的场景。摘要看着像答案、
@@ -8878,6 +8979,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             if len(text) > max_chars:
                 text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
             out.update(text=text, project=pname, chars=len(text),
+                       terms=[t for t, _ in terms],
                        elapsed_ms=int((time.time() - t0) * 1000))
             return out
         # R825：连候选都没有 ≠ 没有上下文。「继续迭代」抽到「迭代」却在库里查不到，
@@ -8888,6 +8990,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             if len(text) > max_chars:
                 text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
             out.update(text=text, project=pname, chars=len(text),
+                       terms=[t for t, _ in terms],
                        elapsed_ms=int((time.time() - t0) * 1000))
         else:
             out["terms"] = [t for t, _ in terms]
@@ -8932,9 +9035,11 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         adopt, used = int(pc.get("adopt_count") or 0), int(pc.get("use_count") or 0)
         tag = (f"采纳 {adopt} 次" if adopt
                else (f"检索命中 {used} 次" if used else "首次想起"))
+        why = (f"语义桥 {float(r['_semantic_bridge']):.2f}" if r.get("_semantic_bridge")
+               else f"命中 {r.get('_recall_hit') or 0}")
         lines.append(f"· #{r.get('id')} [{r.get('kind') or 'note'}] "
                      f"{_brief_oneline(str(r.get('content') or ''), 150)}"
-                     f"（命中 {r.get('_recall_hit') or 0}；{tag}）")
+                     f"（{why}；{tag}）")
     if rec_rows:
         lines.append("相关历史：")
         for r in rec_rows:
@@ -8949,12 +9054,22 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
     out.update(text=text, memory_ids=[i for i in ids if i is not None],
                record_ids=[r.get("id") for r in rec_rows], terms=[t for t, _ in terms],
-               project=pname, chars=len(text))
-    if out["memory_ids"]:
+               project=pname, chars=len(text), semantic_bridge=rescue)
+    if rescue:
         try:
-            _bump_inject(root, out["memory_ids"])
+            journal_add(root, who, "brain_recall_semantic_bridge", "prompt",
+                        f"n={rescue} ids={','.join(str(i) for i in out['memory_ids'])} "
+                        f"min={_RECALL_SEM_MIN}")
         except sqlite3.Error:
             pass
+    if out["memory_ids"]:
+        # R861：只有真实会话的注入才算曝光。eval/probe 是量具，不是「推给 agent」——
+        # 反复跑评测会把好记忆推成「推了 5 次零采纳」的免疫行，第二轮起测的就不是产品了。
+        if origin == "live":
+            try:
+                _bump_inject(root, out["memory_ids"])
+            except sqlite3.Error:
+                pass
         # R827：记一笔「这次注入了什么、指纹是什么」，后续 mark_recall_used 才能判采纳。
         # 存**原始 session**而不是去重键 skey（`agent|session`）：判定方（agent 自己或
         # 钩子）手里只有 session，让它去拼 agent 前缀迟早对不上（实测踩过）。
@@ -9970,10 +10085,11 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     out.update(text=text, memory_ids=[i for i in ids if i is not None],
                project=pname, chars=len(text))
     if count and out["memory_ids"]:
-        try:
-            _bump_inject(root, out["memory_ids"])
-        except sqlite3.Error:
-            pass
+        if origin == "live":   # R861：eval/probe 不计曝光，见 prompt_recall 同款注释
+            try:
+                _bump_inject(root, out["memory_ids"])
+            except sqlite3.Error:
+                pass
         if session:
             try:
                 _record_adherence(root, session, who, picked, pname, "error",

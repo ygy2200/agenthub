@@ -1795,8 +1795,15 @@ MCP_SERVER_DIR = CONFIG_DIR / "mcp_server"
 # 2026-10-13 release playbook 实跑时 deploy_diff 抓到 api.py 不一致，根因即此。
 SERVER_FILES = ("agenthub_mcp.py", "core.py", "agentscore.py", "brain.py", "report.py", "ops.py", "cli.py", "codec.py",
                 "api.py", "brain_brief.py", "brain_recall.py", "brain_adherence.py",
-                "brain_error_recall.py",
+                "brain_error_recall.py", "emb_onnx.py",
                 "my/__init__.py", "my/work/__init__.py")
+
+# R861：ONNX 编码器的权重不进 exe（build.bat 本来就排除 torch/numpy，打包版走纯词法），
+# 但部署目录必须带上——钩子每次都是新进程，只有落盘的模型才能让「即时回忆」用上语义。
+# 与 SERVER_FILES 分开的原因：bundle_files() 决定 exe 体积（当前 102MB，上传要 26 分钟），
+# 权重 22.8MB 不该为打包版付这个代价；而从源码部署时必须有它。
+MODEL_DIR_REL = "models/bge-small-zh-v1.5"
+MODEL_FILES = ("model.int8.onnx", "tokenizer.json")
 
 # 钩子脚本随 exe 一起打包：安装器要能从运行目录复制到 ~/.agenthub/hooks/，
 # 只有 .py 进了 PYZ 而脚本没进 datas，打包版的「安装钩子」会复制 0 个文件。
@@ -1848,6 +1855,17 @@ def deploy_server(src_dir: str = "", dst_dir: str = "") -> tuple:
             target = stage / rel
             target.parent.mkdir(parents=True, exist_ok=True)
             _copy_verified(src / rel, target)
+        # R861：模型权重「源码有就用源码、源码没有就沿用上次部署」——打包版不含权重
+        # （见 MODEL_FILES 注释），从 exe 部署时不能把已落盘的模型连带删掉，否则
+        # 「即时回忆」的语义救援会静默消失，而且没有任何一处会报错。
+        for f in MODEL_FILES:
+            rel = Path(MODEL_DIR_REL) / f
+            target = stage / rel
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if (src / rel).is_file():
+                _copy_verified(src / rel, target)
+            elif (dst / rel).is_file():
+                _copy_verified(dst / rel, target)
         old = None
         if dst.exists():
             old = dst.parent / f".{dst.name}.old-{os.getpid()}-{int(time.time() * 1000)}"
