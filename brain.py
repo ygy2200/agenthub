@@ -8508,6 +8508,20 @@ _RECALL_OPEN_STATUS = ("pending", "blocked", "in_progress", "claimed", "awaiting
 # 不明相关性。实测标定：df=2→2.80，df=5→2.01，df=9→1.46，df=20→0.69。
 _RECALL_RARE_IDF = 2.0
 
+
+def _recall_rare_threshold(n: int) -> float:
+    """稀有词门槛随候选池大小缩放（R871）。
+
+    固定 2.0 是按 40 条候选标定的；候选池很小时这条线在数学上够不着——
+    n=1 时「只在这一条里出现」的词 raw idf 也只有 log(2/1.5)=0.29，整批候选
+    被判弱相关。2026-11-04 实测：问「工作台每组只显示二十条没有出口」时
+    rec#3636 明明在记录候选第 1，prompt_recall 的 record_ids 却是空。
+    口径改成与旧标定同一出现率：df ≤ max(1, 14%·n) 视为稀有。池子大时
+    与 2.0 基本重合（n=40 → 1.90），池子小时退到「命中即可」。
+    """
+    n = max(1, int(n or 0))
+    return math.log((n + 1.0) / (max(1.0, n * 0.14) + 0.5))
+
 # R842 注入配额不是目标：绝对阈值（上面的稀有词线）回答「是不是同一件事」，但答不了
 # 「够不够格一起上」。真实库实测 284 次逐句回忆里 258 次顶满 3 条（91%）——选择器干的
 # 不是「挑最相关」，是「凑满配额」。整块注入长得像固定模板，模型学会无视它（R830 免疫
@@ -9092,7 +9106,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     # 整批判会误伤：提问里既有泛词也有精确词时（「qfluentwidgets 中文被截断」），
     # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
     strong = [(s, r) for s, r in scored
-              if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
+              if float(r.get("_recall_best") or 0.0) >= _recall_rare_threshold(len(mems))]
     picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     rescue = 0
     # R861：救援的边界是「词法**一条候选都没有**」，不是「词法没挑出强的」。
@@ -9141,7 +9155,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         rec_scored.append((spec, r))
     rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
     rec_strong = [(s, r) for s, r in rec_scored
-                  if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
+                  if float(r.get("_recall_best") or 0.0) >= _recall_rare_threshold(len(recs))]
     rec_rows = _recall_pick_margin(rec_strong, RECALL_RECORD_CAP)
     # R836：叮嘱型提示不当检索词——相关历史不给口语切片噪声。
     # R863：这句虽是「继续」，但检索词来自上一轮话题（context_used），历史照常给。

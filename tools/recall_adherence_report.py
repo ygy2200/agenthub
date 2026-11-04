@@ -47,7 +47,7 @@ def _verdict(rate: float, judged: int) -> str:
     if judged == 0:
         return "无从判定（还没有判过的可指纹注入记录——先确认回填/补扫有没有在跑）"
     if rate < RATE_WATCH:
-        return "偏低——先看排序（Recall@3）与门槛（_RECALL_RARE_IDF），再看注入文本是否太长被忽略"
+        return "偏低——先看排序（Recall@3）与门槛（_recall_rare_threshold），再看注入文本是否太长被忽略"
     if rate < RATE_OK:
         return f"观察区（{RATE_WATCH:.0f}%–{RATE_OK:.0f}%，两线本库自设）——能用但不算宽裕"
     if judged >= 5 and rate >= 100.0:
