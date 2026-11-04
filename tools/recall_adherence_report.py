@@ -94,10 +94,18 @@ def main() -> int:
     if st.get("unobserved"):
         tail = int(st.get("unobserved_tail") or 0)
         gap = int(st.get("unobserved_gap") or 0)
+        old = int(st.get("unobserved_gap_old") or 0)
+        cur = max(0, gap - old)
+        start = str(st.get("capture_start") or "")
         hint = "尾巴是结构性上限（证据要等下一句），断档才是采集漏了"
-        if gap:
+        if cur:
             hint += "——先看对应宿主有没有 Stop/补扫（log: ~/.agenthub/logs/brain-adherence.log）"
-        print(f"  未观测拆解  尾巴 {tail}（会话最后一笔，等不到下一句）· 断档 {gap} · {hint}")
+        print(f"  未观测拆解  尾巴 {tail}（会话最后一笔，等不到下一句）· "
+              f"断档 {gap}（历史 {old} · 现行 {cur}）· {hint}")
+        if old:
+            where = f"（采集口径起点 {start}）" if start else ""
+            print(f"    历史断档早于首条带 src 的采集{where}，证据已不可回溯；"
+                  f"现行断档 {cur} 才是要查的采集缺陷")
     obs = float(st.get("observed_rate") or 0.0)
     print(f"采纳率    观测口径 {obs}%（判过 {st.get('judged', 0)} 笔）· 账面 {st['rate']}%"
           f"（可指纹 {st['fingerprintable']} 笔）→ {_verdict(obs, int(st.get('judged') or 0))}")

@@ -155,6 +155,11 @@ def test_closure_naming_skips_device_sessions(hub_root):
     _row(hub_root, mid, "prod-idle", ts=old)                 # 真欠账，要被点名
     _row(hub_root, mid, "prod-run")                          # 判过的生产会话
     _capture(hub_root, ["prod-run"])
+    # R875：捕获起点必须早于 prod-idle（两天前），否则会被当成「历史断档」豁免——
+    # 本用例要验的是装置会话跳过，不是历史分流。
+    with brain.db_conn(hub_root) as conn:
+        conn.execute("UPDATE journal SET ts=? WHERE action='brain_adherence'",
+                     (_now(offset_min=60 * 24 * 3),))
     r = ops._adherence_health(hub_root)
     line = _find(r["detail"], "闭环账")
     assert "窗口内 2 个生产会话有注入" in line, line

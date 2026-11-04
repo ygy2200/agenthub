@@ -8736,11 +8736,15 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
       · `unobserved` 再拆两半（R873）：`unobserved_tail` 是同一会话最后一笔注入（证据
         要等下一句，单轮会话等不到——结构性上限）；`unobserved_gap` 是同一会话后面
         还有发言却没判到（采集通道漏了，才是要修的东西）。不拆会把上限读成缺陷。
+      · 断档再按采集口径起点分历史/现行（R875）：`capture_start` 取流水里第一条带
+        `src=` 的采集时间；早于它的断档是口径上线前的历史注入，证据不可回溯，不该
+        被当成现行缺陷（`unobserved_gap_old` 是子集，`unobserved_gap` 仍是总数）。
     """
     since = _days_ago(max(1, int(days)))
     out = {"window_days": days, "injected": 0, "fingerprintable": 0, "used": 0,
            "rate": 0.0, "by_strength": {}, "avg_memory_age_days": None,
            "unjudgeable": 0, "unobserved": 0, "unobserved_tail": 0, "unobserved_gap": 0,
+           "unobserved_gap_old": 0, "capture_start": "",
            "judged_unused": 0, "judged_used": 0,
            "judged": 0, "observed_rate": 0.0, "device_rows": 0}
     with db_conn(root) as conn:
@@ -8748,6 +8752,13 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
             "SELECT strength, fp, used, decided_at, memory_id, ts, agent, session,"
             " COALESCE(origin,'live') AS origin FROM recall_adherence WHERE ts>=?",
             (since,))]
+        try:
+            cap = conn.execute(
+                "SELECT MIN(ts) FROM journal WHERE action='brain_adherence'"
+                " AND note LIKE '%src=%'").fetchone()
+            out["capture_start"] = (cap[0] if cap else "") or ""
+        except sqlite3.Error:
+            pass
     if not rows:
         return out
     device_rows = sum(1 for r in rows if (r.get("origin") or "live") != "live")
@@ -8795,6 +8806,8 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
                 out["unobserved_tail"] += 1
             else:
                 out["unobserved_gap"] += 1
+                if out["capture_start"] and (r.get("ts") or "") < out["capture_start"]:
+                    out["unobserved_gap_old"] += 1
         ids.append(r.get("memory_id"))
     # 抽不出指纹的行也要进各档 injected（它们是分母的诚实部分，只是不进判定）
     for r in rows:

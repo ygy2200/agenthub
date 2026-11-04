@@ -274,13 +274,24 @@ def test_sweep_counts_as_transcript_grade_evidence(hub_root):
 
 
 def test_idle_session_without_capture_is_named(hub_root):
-    """会话粒度的洞：别处判过不算这一局判过——有注入却隔了几小时没闭环的要点名。"""
+    """会话粒度的洞：别处判过不算这一局判过——有注入却隔了几小时没闭环的要点名。
+
+    R875 口径：整段早于「首条带 src 的采集」的会话属历史，不判红。本用例要测的是
+    **采集已上线之后**仍没闭环的会话，所以把采集流水拨到 48h 前，让 idle1（30h 前）
+    落在起点之后。
+    """
+    import datetime
     import ops
+    import brain
     mid = _hub(hub_root)
     _inject(hub_root, "qoder", 6, 5, mid, session="closed1")
     _inject(hub_root, "qoder", 4, 0, mid, session="idle1", hours=30)
     for _ in range(3):
         _run(hub_root, "qoder", "sweep", 4200, sess="closed1")
+    ts = (datetime.datetime.now() - datetime.timedelta(hours=48)).strftime(
+        "%Y-%m-%dT%H:%M:%S")
+    with brain.db_conn(hub_root) as conn:
+        conn.execute("UPDATE journal SET ts=? WHERE action='brain_adherence'", (ts,))
     r = ops._adherence_health(hub_root)
     assert r["ok"] is False, r
     assert "从没被判定" in r["summary"], r

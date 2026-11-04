@@ -3235,14 +3235,22 @@ def _adherence_health(root: str = "") -> dict:
     # 于是这一层在口径覆盖前只报「无从核对」，不报红（报不出来的东西不能当问题报）。
     captured_sess = {_sess_of(r.get("note") or "") for r in runs} - {""}
     sess_caliber = bool(captured_sess)
+    capture_start = str(st.get("capture_start") or "")
     now = datetime.datetime.now()
     idle = []
+    old_sess = []
     for r in sess_rows:
         s = (r.get("session") or "")[:16]
         if not s or s in captured_sess:
             continue
+        last_ts = str(r.get("last_ts") or "")
+        if capture_start and last_ts < capture_start:
+            # R875：整段都早于首条带 src 的采集——历史注入，证据不可回溯。
+            # 把它算成「漏采集」会让旧账永远红着，真正的新缺陷反而被淹没。
+            old_sess.append((core.agent_key(r.get("agent") or "") or "?", s))
+            continue
         try:
-            then = datetime.datetime.fromisoformat(str(r.get("last_ts"))[:19])
+            then = datetime.datetime.fromisoformat(last_ts[:19])
             age_h = (now - then).total_seconds() / 3600.0
         except ValueError:
             continue
@@ -3268,6 +3276,8 @@ def _adherence_health(root: str = "") -> dict:
             worst = max(idle, key=lambda x: x[2])
             note += (f" · {len(idle)} 个会话注入后隔了 {ADHERENCE_IDLE_H}h 以上仍没被判定"
                      f"（最久 {worst[2]}h，如 {worst[0]}/{worst[1]}）")
+        if old_sess:
+            note += f" · {len(old_sess)} 个会话整段早于采集口径起点（历史，不计漏判）"
         return [note]
 
     if not scoped:
@@ -3298,7 +3308,16 @@ def _adherence_health(root: str = "") -> dict:
 
     # 二、送达：有注入账的家里，谁一次采集都没交（hermes 这类无 Stop 出口的不算）
     ran = {core.agent_key(r.get("agent") or "") for r in runs}
-    never = [a for a in injected if a not in ran and not _answer_unsupported(core, a)]
+    # R875：只对「采集口径起点之后还有注入」的家判送达——整段都在起点前的家
+    # 属于历史欠账，证据已不可回溯；把它算进「零采集」会让体检永远红着。
+    injected_active = sorted({core.agent_key(r.get("agent") or "") for r in sess_rows
+                              if not capture_start
+                              or str(r.get("last_ts") or "") >= capture_start})
+    never = [a for a in injected_active if a not in ran and not _answer_unsupported(core, a)]
+    old_hosts = sorted({a for a in injected if a not in injected_active})
+    if old_hosts:
+        detail.append(f"历史未闭环：{'、'.join(old_hosts)} 的注入都早于采集口径起点"
+                      f"（{capture_start or '未知'}），证据不可回溯，不判红")
     if device_n:
         detail.append(f"装置隔离：窗口内另有 {device_n} 笔注入是 eval/probe 写的，一笔没进下面的账"
                       f"（装置没有对应产出，永远不会被判定；算进来会把采集缺陷读成「记忆没人用」）")
