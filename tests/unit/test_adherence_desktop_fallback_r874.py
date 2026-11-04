@@ -78,7 +78,8 @@ def _seed(hub_root: str, session: str) -> int:
     return mid
 
 
-def _run_sweep(tmp_path: Path, hub_root: str, payload: dict) -> subprocess.CompletedProcess:
+def _run_sweep(tmp_path: Path, hub_root: str, payload: dict,
+               agent: str = "qoder") -> subprocess.CompletedProcess:
     node = _node()
     if not node:
         pytest.skip("没有 node")
@@ -90,7 +91,7 @@ def _run_sweep(tmp_path: Path, hub_root: str, payload: dict) -> subprocess.Compl
            "AGENTHUB_SWEEP_SYNC": "1",
            "PYTHONIOENCODING": "utf-8",
            "USERPROFILE": str(fake_home), "HOME": str(fake_home)}
-    return subprocess.run([node, str(MJS), "--agent", "qoder"], input=json.dumps(payload),
+    return subprocess.run([node, str(MJS), "--agent", agent], input=json.dumps(payload),
                           capture_output=True, text=True, timeout=60, env=env)
 
 
@@ -161,6 +162,39 @@ def test_desktop_next_prompt_judges_delta(hub_root, tmp_path):
         adopt = int(conn.execute("SELECT adopt_count FROM memories WHERE id=?",
                                  (mid,)).fetchone()[0])
     assert adopt == 1, f"同一笔注入被重复计采纳（adopt_count={adopt}）"
+
+
+def _workbuddy_transcript(tmp_path: Path, session: str, lines: list) -> Path:
+    d = tmp_path / "fake-home" / ".workbuddy" / "projects" / "d-workbuddy产出-2026-11-04"
+    d.mkdir(parents=True, exist_ok=True)
+    p = d / f"{session}.jsonl"
+    p.write_text("\n".join(lines) + "\n", encoding="utf-8", newline="\n")
+    return p
+
+
+def _wb_event(kind: str, payload: dict, minutes_ago: int = 10) -> str:
+    ts = (datetime.utcnow() - timedelta(minutes=minutes_ago)).strftime(
+        "%Y-%m-%dT%H:%M:%S.000Z")
+    return json.dumps({"type": kind, "timestamp": ts, **payload}, ensure_ascii=False)
+
+
+def test_workbuddy_projects_fallback_r876(hub_root, tmp_path):
+    """R876：workbuddy 的会话也按 <slug>/<session>.jsonl 落盘，兜底必须覆盖它。"""
+    session = "r876-wb-desktop"
+    _seed(hub_root, session)
+    _workbuddy_transcript(tmp_path, session, [
+        _wb_event("message", {"role": "user", "content": [
+            {"type": "input_text", "text": QUERY}]}, minutes_ago=10),
+        _wb_event("function_call", {"name": "Bash", "arguments": json.dumps(
+            {"command": f"python {SIG}"}, ensure_ascii=False)}, minutes_ago=9),
+    ])
+    r = _run_sweep(tmp_path, hub_root, _payload(session), agent="workbuddy")
+    assert r.returncode == 0, r.stderr
+    st = _state(hub_root, session)
+    assert any(row["used"] for row in st["rows"]), \
+        f"workbuddy 兜底没把证据交上来：{r.stderr}"
+    assert any("src=firstsight" in n for n in st["notes"]), st["notes"]
+    assert "transcript=projects" in _log(tmp_path), _log(tmp_path)[-300:]
 
 
 def test_desktop_without_session_file_is_silent(hub_root, tmp_path):

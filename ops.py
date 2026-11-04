@@ -3208,7 +3208,8 @@ def _adherence_health(root: str = "") -> dict:
     # transcript 的 assistant 正文+工具参数，同一档口径，不能把补扫算成「饿着」。
     def _grade(note: str) -> bool:
         src = _src_of(note)
-        return "transcript" in src or src == "sweep"
+        # R876：离线逐轮回填读的也是 transcript，同一档证据——不能把回填算成「饿着」。
+        return "transcript" in src or src in ("sweep", "backfill")
 
     trans = [r for r in scoped if _grade(r.get("note") or "")]
     swept = [r for r in runs if _src_of(r.get("note") or "") == "sweep"]

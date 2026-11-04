@@ -111,8 +111,11 @@ function findSessionTranscript(session) {
   if (!/^[A-Za-z0-9._-]{1,128}$/.test(session)) return '';
   let best = '';
   let bestMtime = -1;
+  // R876：workbuddy 的会话也按 <slug>/<session>.jsonl 落盘；只搜前两家会让它的
+  // 桌面事件（不带 transcript_path 时）继续失明——它的形状解析 R873 已经修好了。
   for (const root of [path.join(HOME, '.qoder-cn', 'projects'),
-                      path.join(HOME, '.claude', 'projects')]) {
+                      path.join(HOME, '.claude', 'projects'),
+                      path.join(HOME, '.workbuddy', 'projects')]) {
     let dirs = [];
     try { dirs = readdirSync(root, { withFileTypes: true }); } catch { continue; }
     for (const d of dirs) {

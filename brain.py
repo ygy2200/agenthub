@@ -8645,7 +8645,7 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
 
 
 def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
-                     not_before: str = "") -> dict:
+                     not_before: str = "", not_after: str = "") -> dict:
     """给一段 agent 产出（回答正文、执行的命令、改的文件路径），标记被用到的注入。
 
     调用时机（由 agent 侧或钩子决定）：一轮结束后拿这一轮的产出文本喂进来即可。
@@ -8666,6 +8666,12 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
     R873 `not_before`（本地 ISO 时间）：首见会话时补扫只判「这一轮开口之后」的注入。
     没有这条下界，把 transcript 尾部一整轮当证据会替几小时前的旧注入领功（R851 的
     假信号）；时间戳由钩子从 transcript 的 user 行读出来，缺省时行为与旧版一致。
+
+    R876 `not_after`（本地 ISO 时间，开区间）：离线逐轮回填用。会话关闭后再也没有
+    UserPromptSubmit 触发补扫，未观测的账只能靠回填；而回填一轮必须只判「这一轮开口
+    到下一轮开口之间」的注入——只用下界会把后面几轮的产出文本拿来判前面的注入
+    （R851 假信号的反向形态：先发生的注入被后发生的话领功）。缺省空=不设上界，
+    在线 Stop/补扫的行为不变。
     """
     out = {"checked": 0, "matched": 0, "memory_ids": [], "device_matched": 0}
     if not session or not (text or "").strip():
@@ -8676,11 +8682,12 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
     if (not_before or "").strip() > since:
         # R873：首见补扫只用 transcript 里最后一轮的开口时间当更紧的下界。
         since = (not_before or "").strip()
+    until = (not_after or "").strip() or "9999-12-31T23:59:59"
     hit_ids, rows, judged_ids = [], [], []
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT id, memory_id, fp, COALESCE(origin,'live') AS origin FROM recall_adherence"
-            " WHERE session=? AND used=0 AND ts>=?", (session, since))]
+            " WHERE session=? AND used=0 AND ts>=? AND ts<?", (session, since, until))]
         for r in rows:
             try:
                 fp = json.loads(r.get("fp") or "[]")
