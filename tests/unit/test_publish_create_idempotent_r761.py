@@ -72,6 +72,8 @@ class Opener:
             return _Resp(200, {"login": "me"}, {"X-OAuth-Scopes": "repo"})
         if re.search(r"/repos/o/r$", url):
             return _Resp(200, {"permissions": {"push": True}})
+        if "/releases?per_page=" in url:
+            return _Resp(200, [])
         if "/releases/tags/" in url:
             step = self.tags_plan.pop(0) if self.tags_plan else (404, {"message": "Not Found"})
             if step == NET:

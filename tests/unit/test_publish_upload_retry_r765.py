@@ -72,6 +72,8 @@ class Opener:
             return _Resp(200, {"login": "me"}, {"X-OAuth-Scopes": "repo"})
         if re.search(r"/repos/o/r$", url):
             return _Resp(200, {"permissions": {"push": True}})
+        if "/releases?per_page=" in url:
+            return _Resp(200, [])
         if "/releases/tags/" in url:
             return _Resp(404, {"message": "Not Found"})
         if method == "POST" and url.endswith("/releases"):

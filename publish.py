@@ -705,7 +705,10 @@ def _run_inner(args) -> int:
             return rc
 
     base = f"https://api.github.com/repos/{args.repo}"
-    status, rel, _ = _call_retry(opener, f"{base}/releases/tags/{tag}")
+    # R861（B075）：草稿必须从列表里找。by-tag 端点对草稿一律 404，而 --upload-only
+    # 天然只服务草稿——用 tags 端点查等于「永远说版本不存在」，R860 只在
+    # --publish-only 里修过这一处，补传入口漏了。
+    status, rel = _find_release(opener, base, tag)
     if status == 200:
         if not args.upload_only:
             sys.exit(f"Release {tag} 已存在（{rel.get('html_url', '?')}），拒绝重复创建；"

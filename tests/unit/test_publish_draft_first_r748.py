@@ -58,8 +58,13 @@ class FakeOpener:
             return _Resp(200, {"login": "me"}, {"X-OAuth-Scopes": "repo"})
         if re.search(r"/repos/o/r$", url):
             return _Resp(200, {"permissions": {"push": True}})
+        if "/releases?per_page=" in url:
+            return _Resp(200, [self.existing] if self.existing else [])
         if "/releases/tags/" in url:
-            return _Resp(200, self.existing) if self.existing else _Resp(404, {"message": "Not Found"})
+            # 真 GitHub：by-tag 端点看不见草稿（R861/B075）
+            if self.existing and not self.existing.get("draft"):
+                return _Resp(200, self.existing)
+            return _Resp(404, {"message": "Not Found"})
         if method == "POST" and url.endswith("/releases"):
             return _Resp(201, {"id": 42, "draft": True, "html_url": "https://x/untagged",
                                "upload_url": "https://uploads.github.com/u{?name,label}"})
@@ -115,7 +120,7 @@ def test_failed_upload_leaves_it_draft(exe, monkeypatch, capsys):
 
 
 def test_upload_only_publishes_a_draft(exe, monkeypatch, capsys):
-    fake = FakeOpener(existing={"id": 7, "draft": True,
+    fake = FakeOpener(existing={"id": 7, "tag_name": "v9.9.9", "draft": True,
                                 "upload_url": "https://uploads.github.com/v{?name,label}"})
     assert _run(monkeypatch, fake, exe, ("--upload-only",)) == 0
     assert [p for m, u, p in fake.calls if m == "PATCH"] == [{"draft": False}]
@@ -124,7 +129,7 @@ def test_upload_only_publishes_a_draft(exe, monkeypatch, capsys):
 
 def test_upload_only_leaves_published_release_alone(exe, monkeypatch, capsys):
     """已公开的老版本补传附件时不该再 PATCH——避免多余的写操作与时间戳变动。"""
-    fake = FakeOpener(existing={"id": 9, "draft": False,
+    fake = FakeOpener(existing={"id": 9, "tag_name": "v9.9.9", "draft": False,
                                 "upload_url": "https://uploads.github.com/w{?name,label}"})
     assert _run(monkeypatch, fake, exe, ("--upload-only",)) == 0
     assert not [1 for m, u, p in fake.calls if m == "PATCH"]
