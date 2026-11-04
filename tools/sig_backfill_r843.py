@@ -54,8 +54,14 @@ def _tag_worthy(term: str) -> bool:
 
 
 def _sig_terms_for(content: str) -> list:
-    """这条正文该沉淀哪些签名词：w>=3 的招牌、ASCII 单词形、且够格进标签库。"""
-    terms = brain.error_signature_terms(brain._error_voice(content or ""))  # noqa: SLF001
+    """这条正文该沉淀哪些签名词：w>=3 的招牌、ASCII 单词形、且够格进标签库。
+
+    R856：与 `error_sig_of` 用同一把尺子——先 `_error_span` 剪掉说明文字。记忆正文普遍是
+    「报错原文 + 当时怎么查的」，不剪就会把 `brain.db`、`last_ts` 这类**说明里的标识符**
+    灌进标签库（批量写错一次污染一整批，正是 `_tag_worthy` 那段注释防的那类）。
+    """
+    terms = brain.error_signature_terms(                    # noqa: SLF001
+        brain._error_voice(brain._error_span(content or "")))  # noqa: SLF001
     out, seen = [], set()
     for t, w in terms:
         if w < 3 or not t or " " in t or not t.isascii() or t in seen:

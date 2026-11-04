@@ -9152,13 +9152,69 @@ def _error_sig_key(terms: list) -> str:
     return "|".join(top[:4])
 
 
+# 中文句读：人在写说明时才会用的标点。ASCII 报错正文（异常名、错误码、被点名的标识符）
+# 不带这些字符，所以「第一个全角标点之前」就是报错本身的那一段。
+# 刻意不含全角冒号「：」——`ValueError：参数必须是整数` 是中文报错，冒号后面才是招牌本身；
+# 也不含挽具拼的「失败调用：」，那类行由 _error_voice 整行摘除，不在这里剪。
+# 【】《》是批注/引用括号（真库 errors#8 就是 `… 【销账2026-10-02】`），报错正文不会带。
+_ERR_PROSE_PUNCT_RE = re.compile(r"[（）。；、，！？【】《》〔〕]")
+
+
+def _error_span(text: str) -> str:
+    """从一段可能掺着说明的文字里，只留下「报错本身」那几段。
+
+    为什么必须有这一步（R856 真库实锤）：登记（`errors.sig`、记忆的签名 tag）拿到的正文
+    通常是「报错原文 + 我后来怎么修的」，而召回拿到的是裸报错原文。两边喂的是同一个
+    `error_sig_of`，抽出来的键却不相等——说明文字里的 `brain.db`、`last_ts`、`table_info`
+    一样带下划线、一样算标识符，挤进 `_error_sig_key` 的前 4 位，把真招牌顶了出去。
+    R834 写的那句「同一条报错的键必然逐字相同——这是实现不是概率」只保证了函数同一，
+    没保证输入形状同一，于是「登记一次、下次同签名秒命中」在生产上是断的（欠账 #20）。
+
+    取舍：整段都抽不出错误形状时**原样返回**——收窄不能把「没有形状」变成「没有词」，
+    那是另一种误伤（中文报错正文照常参与签名，只要它不含全角句读）。
+    """
+    if not text:
+        return ""
+    keep = []
+    for ln in str(text).splitlines():
+        cut = _ERR_PROSE_PUNCT_RE.search(ln)
+        head = ln[:cut.start()] if cut else ln
+        if not head.strip():
+            head = ln
+        if any(rx.search(head) for rx in (_ERR_EXC_RE, _ERR_CODE_RE, _ERR_NUMCODE_RE,
+                                          _ERR_NAMED_RE)):
+            keep.append(head)
+    return "\n".join(keep) if keep else str(text)
+
+
 def error_sig_of(text: str) -> str:
     """任何含错误形状的正文 → 签名键。登记（errors.sig / memories.tags）与召回
-    （error_recall 的去重键）必须走同一个函数，否则「登记一次下次秒命中」就是空话。"""
-    terms = error_signature_terms(_error_voice(text or ""))
+    （error_recall 的去重键）必须走同一个函数，否则「登记一次下次秒命中」就是空话。
+
+    R856：先 `_error_span` 剪掉说明文字再抽词——同一个函数不够，两边**输入形状**也得对齐。
+    """
+    terms = error_signature_terms(_error_voice(_error_span(text or "")))
     if not terms or not any(w >= 3 for _, w in terms):
         return ""
     return _error_sig_key(terms)
+
+
+def _debt_sig_terms(sig: str) -> list:
+    """欠账账本读的是**去重键**（`a|b|c`），不是报错正文——不许重解析。
+
+    R856 第二个断点：`error_signature_terms("created_at|no such column: created_at")`
+    会抽出一个跨着分隔符的超长 w=3 词，LIKE 谁也匹配不上，于是「库里明明有答案」
+    永远判不成收编。键本身就是 term 列表拼出来的，按 `|` 拆开还原即可；拆不出东西时
+    （历史行存的是正文形状）才退回按正文抽词。
+
+    短的排前面：账本 detail 只给 70 字展示预算（ops._error_debt），键里的段是同一身份
+    的等价招牌词，长的几乎总是路径段，按字母序会让异常名被挤出可见区。判定不受顺序影响
+    （`_error_sig_key` 自己会排序），这里只管「读账本的人第一眼看见的是哪几个词」。
+    """
+    parts = [p.strip().lower() for p in str(sig or "").split("|") if p.strip()]
+    if "|" in str(sig or "") and parts:
+        return sorted([(p, 3) for p in parts if len(p) >= 3], key=lambda tw: (len(tw[0]), tw[0]))
+    return error_signature_terms(str(sig or ""))
 
 
 def _err_accept(terms: list, low: str) -> bool:
@@ -9307,6 +9363,12 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
     能查、解决了自动收编」。只读：不写库、不注入。
 
     收编判定用与召回同一把尺子（`_err_accept`）＋逐字 sig 相等的强通道，不需要谁手动销账。
+    三态（R856）：`resolved`（库里有答案）/ `open`（确实欠，登记就能销）/
+    `unjudgeable`（签名拆不出词——修口径之前写进去的正文形状键）。第三态既不算收编
+    （假装没问题）也不算欠账（催一条没法登记的账），单独计数让读数说得清差在哪。
+    另带 `distinct`（窗口内共有几类签名）与 `sampled`（本次判了几类）：收编判定按签名逐条
+    查库，只对重复次数最高的那批做，比率却是全窗口计数——不报这两个数，「没答案 1 条」
+    就把「只判了前 8 类」说成了「整个窗口只有 1 条欠」（台账 §四④ 同族的分母谎）。
     统计口径双重闸门：时间窗口 + 口径锚点（`caliber:searches_error_hits`），
     锚点之前的历史行只计入 `skipped_legacy`，不再有能力污染比率（台账 §一①）。
     **锚点还没落的时候不假装校准过**：窗口内 `hits=0` 的旧口径行既进不了分子也进不了分母，
@@ -9316,7 +9378,7 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
     """
     out = {"rows": [], "open": 0, "resolved": 0, "asked": 0, "answered": 0,
            "miss_rows": 0, "skipped_legacy": 0, "since": "", "window_days": days,
-           "calibrated": False}
+           "unjudgeable": 0, "distinct": 0, "sampled": 0, "calibrated": False}
     if not root or not os.path.isdir(root):
         return out
     since = caliber_ts(root, "searches_error_hits")
@@ -9340,6 +9402,11 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
             legacy = conn.execute(
                 "SELECT COUNT(*) AS n FROM searches WHERE tool IN ('error_recall',"
                 " 'error_recall_miss') AND ts<?", (since or "0",)).fetchone()["n"]
+            distinct = conn.execute(
+                "SELECT COUNT(DISTINCT query) AS n FROM searches"
+                " WHERE tool='error_recall_miss' AND query<>'(no_signature)'"
+                " AND ts>=? AND (?='' OR agent=?)",
+                (floor, who, who)).fetchone()["n"]
             # 没有锚点 = 这些零命中行到底是「知识缺失」还是「旧口径把只命中记录写成 0」，
             # 事后无法分辨；如实标成未锚定，让它们 counted 而不是蒸发。
             unanchored = 0 if since else conn.execute(
@@ -9351,21 +9418,25 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
     out["miss_rows"] = int(miss_rows or 0)
     out["asked"] = out["answered"] + out["miss_rows"]
     out["skipped_legacy"] = int(legacy or 0) + int(unanchored or 0)
+    out["distinct"] = int(distinct or 0)
     out["calibrated"] = bool(since)
     for sig, n in counts:
         if not sig or sig == "(no_signature)":
             continue          # 没签名可追的失败不进欠账（无从登记）
-        terms = error_signature_terms(sig)
-        if not terms:
-            terms = [(t, 3) for t in sig.split("|") if t]
-        covered = _error_covered(root, terms)
+        terms = _debt_sig_terms(sig)
+        covered = _error_covered(root, terms) if terms else False
+        # 三态：判不了≠没欠账——既不假装收编，也不催一条根本没法登记的账
+        state = "resolved" if covered else ("open" if terms else "unjudgeable")
         out["rows"].append({
-            "sig": sig, "count": n, "status": "resolved" if covered else "open",
+            "sig": sig, "count": n, "status": state,
             "terms": [t for t, _ in terms],
             "hint": ("库里已有答案，下次同签名会自动命中" if covered else
-                     "解决了就 hub_report_error(title, detail=报错原文, undo=修法)")})
-        out["resolved" if covered else "open"] += 1
+                     ("这条键是旧算法留下的，拆不出招牌词，等它出窗口即可"
+                      if state == "unjudgeable" else
+                      "解决了就 hub_report_error(title, detail=报错原文, undo=修法)"))})
+        out[state] += 1
     out["rows"].sort(key=lambda r: (-r["count"], r["sig"]))
+    out["sampled"] = len(out["rows"])
     out["since"] = since
     return out
 

@@ -55,7 +55,7 @@ CHECKS = {
     "inbox": ("Inbox 待分拣清单（00_Inbox 里的积压文件，分拣提醒）", False),
     "stalled": ("停滞项目清单（R20）：按最后工作记录/任务活动算真实闲置天数；显式标记属待决策不算故障，活跃项目超 90 天无活动=状态漏标才失败——归档清理供用户拍板", False),
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
-    "error_debt": ("报错欠账账本（R834）：近 7 天工具失败撞过、但大脑答不上来的签名清单——报错即时回忆的空转率与「解决了却没登记」的漏账都在这里显形；同一签名重复撞 ≥3 次仍没答案才报红，一次性失败只报数不催（长期噪音会把通道教成没人看的检查项）。库里已有答案的签名自动收编，不用谁手动销账", False),
+    "error_debt": ("报错欠账账本（R834）：近 7 天工具失败撞过、但大脑答不上来的签名清单——报错即时回忆的空转率与「解决了却没登记」的漏账都在这里显形；同一签名重复撞 ≥3 次仍没答案才报红，一次性失败只报数不催（长期噪音会把通道教成没人看的检查项）。库里已有答案的签名自动收编，不用谁手动销账；三态里的「判不了」是改签名口径前写进去的旧键，既不算欠也不算收编，出窗口自清（R856）", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
     "mcp_drift": ("接入参数漂移巡检（R103）：配了 agenthub 但配得不对的入口——--agent 被删（未锁身份，署名闸会持续拦写）/锁名与注册名不符（归属分裂）/server 脚本路径失效（MCP 起不来）/--root 指向别库。这些事后只在越权拦截流水露痕迹，这里事前点名", False),
@@ -4026,16 +4026,22 @@ def _error_debt(root: str) -> dict:
         return err
     try:
         brain = _import_brain()
-        debt = brain.error_debt(root, days=getattr(brain, "ERROR_DEBT_DAYS", 7), limit=8)
+        debt = brain.error_debt(root, days=getattr(brain, "ERROR_DEBT_DAYS", 7), limit=40)
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
     rows, asked, answered = debt["rows"], debt["asked"], debt["answered"]
     rate = f"· 命中率 {answered * 100 // asked}%" if asked else ""
     head = (f"近 {debt['window_days']} 天报错回忆被问 {asked} 次{rate}，"
             f"没答案 {debt['open']} 条 / 已收编 {debt['resolved']} 条")
+    if debt.get("unjudgeable"):
+        head += f" / 判不了 {debt['unjudgeable']} 条（改签名口径前写进去的旧键，出窗口自清）"
+    if debt["distinct"] > debt["sampled"]:
+        # 判定只做了重复次数最高的那批，别把「没判」说成「没欠」
+        head += f"（窗口共 {debt['distinct']} 类签名，本次判了 {debt['sampled']} 类）"
     if debt["skipped_legacy"]:
         head += f"（口径变更前 {debt['skipped_legacy']} 行不计入）"
-    detail = [f"×{r['count']} [{r['status']}] " + " ".join(r["terms"][:4])[:70]
+    detail = [f"×{r['count']} [{r['status']}] "
+              + (" ".join(r["terms"][:4]) or r["sig"])[:70]
               for r in rows[:8]]
     if not rows:
         return {"ok": True, "summary": head + "——没有欠账，撞过的报错库里都有答案", "detail": []}
