@@ -7957,6 +7957,92 @@ def infer_project_from_cwd(root: str, cwd: str) -> str:
         return ""
 
 
+# R864：会话不一定在项目目录里启动（Desktop 的 cwd 常在远程会话目录），但人往往
+# 一开口就点名项目。两种补法都必须**有证据**才认：项目名来自已登记表，最近活跃
+# 来自最近几天的记录；猜不出来就维持原样，绝不硬塞一个项目上下文。
+_PROJECT_ALIAS_MIN = 4
+
+
+def _project_aliases(name: str) -> list:
+    """项目的可识别写法：全名 + 首个「对象」段（命名约定「对象-问题」）。"""
+    full = (name or "").strip()
+    if not full:
+        return []
+    out = [full]
+    head = re.split(r"[-_—/]", full, maxsplit=1)[0].strip()
+    if len(head) >= _PROJECT_ALIAS_MIN and head != full:
+        out.append(head)
+    return out
+
+
+def project_mentioned(root: str, text: str) -> str:
+    """从一句话里认出已登记项目；全名优先，其次「对象」段，多个候选取最近有记录的。
+
+    只做字面包含，不做模糊/拼音匹配——认错项目比认不出更糟（会把别项目的近况
+    当成本项目上下文推到模型眼前）。返回 "" 表示没认出来。
+    """
+    low = (text or "").lower()
+    if not low:
+        return ""
+    try:
+        with db_conn(root) as conn:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT p.name AS name, COALESCE((SELECT MAX(r.date) FROM records r"
+                " WHERE r.project=p.name AND r.status='active'), '') AS last"
+                " FROM projects p")]
+    except sqlite3.Error:
+        return ""
+    best = []
+    for r in rows:
+        name = str(r.get("name") or "")
+        score = 0
+        if name and name.lower() in low:
+            score = 1000 + len(name)
+        else:
+            for alias in _project_aliases(name)[1:]:
+                if alias.lower() in low:
+                    score = max(score, len(alias))
+        if score:
+            best.append((score, str(r.get("last") or ""), name))
+    if not best:
+        return ""
+    # 先按名字排一次（保证同分同名顺序稳定），再按「最近有记录」倒序，最后压分数。
+    best.sort(key=lambda x: x[2])
+    best.sort(key=lambda x: x[1], reverse=True)
+    best.sort(key=lambda x: x[0], reverse=True)
+    return best[0][2]
+
+
+def recent_active_project(root: str, days: int = 3, agent: str = "") -> str:
+    """最近几天有活跃记录的项目（简报在 cwd 推断失败时的兜底）。
+
+    R864：先按**本 agent 自己**的记录找——重启后接着干的通常是「我上次那个项目」，
+    而不是别人五分钟前刚写的项目；自己没记录才退到全团队最近。
+    只认「记录日期在窗口内 + 项目仍登记」；没有就返回 ""，不拿陈旧项目充数。
+    """
+    if not root:
+        return ""
+    cutoff = (datetime.date.today() - datetime.timedelta(days=max(1, int(days)))).isoformat()
+    base = ("SELECT project, MAX(date) AS last, MAX(id) AS last_id FROM records"
+            " WHERE status='active' AND project<>'' AND date>=?")
+    tail = " GROUP BY project ORDER BY last DESC, last_id DESC LIMIT 1"
+    who = _norm_agent(agent) if agent else ""
+    try:
+        with db_conn(root) as conn:
+            row = None
+            if who:
+                row = conn.execute(base + " AND agent=?" + tail,
+                                   (cutoff, who)).fetchone()
+            if not row:
+                row = conn.execute(base + tail, (cutoff,)).fetchone()
+        name = str(row["project"]) if row else ""
+        if not name:
+            return ""
+        return name if project_exists(root, name) else ""
+    except sqlite3.Error:
+        return ""
+
+
 # ---------------------------------------------------------------- 即时回忆（R820）
 
 RECALL_MAX_CHARS = 900
@@ -8881,7 +8967,18 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         out["system_message"] = True
         return out
     who = _norm_agent(agent) or (agent or "").strip()
-    pname = (project or "").strip() or infer_project_from_cwd(root, cwd)
+    explicit_proj = (project or "").strip()
+    pname = explicit_proj or infer_project_from_cwd(root, cwd)
+    if not explicit_proj:
+        # R864：cwd 不在项目目录（Desktop 常见）时，从这句话/上一轮话题里认项目；
+        # 认出来时**压过 cwd**——人明确点名项目乙，就不该拿项目甲的近况回答。
+        # 认不出来就维持 cwd 推断/全局检索，绝不硬塞。
+        try:
+            mentioned = project_mentioned(root, (prompt or "") + "\n" + (context_text or ""))
+        except sqlite3.Error:
+            mentioned = ""
+        if mentioned:
+            pname = mentioned
     terms = extract_prompt_terms(prompt)
     # R863：这句抽不出词（「继续」「接着弄」）时，用 transcript 里的上一轮话题补语义。
     # 这是「用户没说清干啥，就是让 AI 自己接上」的场景——只回项目近况仍然接不上
@@ -10449,6 +10546,13 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
     try:
         who = _norm_agent(agent) or (agent or "").strip()
         pname = (project or "").strip() or infer_project_from_cwd(root, cwd)
+        inferred_recent = False
+        if not pname:
+            # R864：cwd 不在任何项目里（Desktop 会话常见）也别说「没有项目」——
+            # 最近三天有记录的项目就是最可能被「继续」的那个；明确标注是推断，
+            # 免得把别项目的近况冒充成当前目录。
+            pname = recent_active_project(root, agent=who)
+            inferred_recent = bool(pname)
         now = datetime.datetime.now()
         with db_conn(root) as conn:
             n_proj = conn.execute("SELECT COUNT(*) FROM projects").fetchone()[0]
@@ -10504,7 +10608,10 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                              f"（{r['agent'] or '其他'} · {r['date']}）")
         if pname and proj:
             lines.append("")
-            lines.append(f"▸ 当前项目：{pname}")
+            if inferred_recent:
+                lines.append(f"▸ 最近活跃项目（cwd 未落在项目目录，按最近记录推断）：{pname}")
+            else:
+                lines.append(f"▸ 当前项目：{pname}")
             lines.append(f"  {proj['n_records']} 条活跃记录，最近 {proj['last_active'] or '—'}；"
                          f"开工前先看最近记录再动手。")
             for r in proj_recs:
