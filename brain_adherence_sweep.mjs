@@ -29,7 +29,7 @@
 import { spawn, spawnSync } from 'node:child_process';
 import {
   appendFileSync, closeSync, existsSync, fstatSync, mkdirSync, openSync,
-  readFileSync, readSync, statSync, writeFileSync,
+  readFileSync, readdirSync, readSync, statSync, writeFileSync,
 } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
@@ -99,6 +99,35 @@ function writeWm(file, offset, seenUpTo, chars) {
       ts: new Date().toISOString(),
     }), 'utf8');
   } catch { /* 水位线写不了就下次重扫，宁重复不漏 */ }
+}
+
+/**
+ * Qoder Desktop / Claude Desktop 的 UserPromptSubmit 事件不带 transcript_path，
+ * 但会话文件按 session id 落在 `~/.qoder-cn/projects/<slug>/<session>.jsonl`
+ * （Claude 同构 `~/.claude/projects/...`）。找不到就返回空——补扫宁可静默，
+ * 也不去猜一个可能属于别的会话的文件（跨会话串证据比少判一笔更坏）。
+ */
+function findSessionTranscript(session) {
+  if (!/^[A-Za-z0-9._-]{1,128}$/.test(session)) return '';
+  let best = '';
+  let bestMtime = -1;
+  for (const root of [path.join(HOME, '.qoder-cn', 'projects'),
+                      path.join(HOME, '.claude', 'projects')]) {
+    let dirs = [];
+    try { dirs = readdirSync(root, { withFileTypes: true }); } catch { continue; }
+    for (const d of dirs) {
+      if (!d.isDirectory()) continue;
+      const f = path.join(root, d.name, `${session}.jsonl`);
+      try {
+        const st = statSync(f);
+        if (st.isFile() && st.size > 0 && st.mtimeMs > bestMtime) {
+          best = f;
+          bestMtime = st.mtimeMs;
+        }
+      } catch { /* 该 slug 下没有这个会话 */ }
+    }
+  }
+  return best;
 }
 
 /** 读 [start, end) 区间；超过 maxBytes 时只取尾部（新证据优先），返回真正的读取起点。 */
@@ -285,10 +314,19 @@ try {
 
   const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
   if (!session) { logLine('skip sweep: 无 session'); process.exit(0); }
-  const tp = String(ev.transcript_path || ev.transcriptPath || '');
+  // R874：桌面版事件不带 transcript_path，但会话文件按 session id 在 projects 下。
+  // 先认事件给的路径，缺了再按会话 id 找——只认文件名严格等于 session 的那份。
+  let tp = String(ev.transcript_path || ev.transcriptPath || '');
+  let tpSource = 'event';
   if (!tp || !existsSync(tp)) {
-    logLine(`skip sweep: 无 transcript session=${session.slice(0, 24)}`);
-    process.exit(0);
+    const found = findSessionTranscript(session);
+    if (!found) {
+      logLine(`skip sweep: 无 transcript session=${session.slice(0, 24)}`
+        + `（事件未带，projects 下也没找到）`);
+      process.exit(0);
+    }
+    tp = found;
+    tpSource = 'projects';
   }
   if (!existsSync(SCRIPT)) { logLine(`skip sweep: ${SCRIPT} 不存在`); process.exit(0); }
 
@@ -400,7 +438,8 @@ try {
   writeWm(wm, nextOffset, size, body.length);
   logLine(`ok sweep session=${session.slice(0, 24)} src=${src} chars=${body.length}`
     + ` ev=${events} bytes=${bytesTaken}${since ? ` since=${since}` : ''}`
-    + `${sync ? ' sync' : ' detached'}`);
+    + `${sync ? ' sync' : ' detached'}`
+    + `${tpSource === 'projects' ? ' transcript=projects' : ''}`);
 } catch (e) {
   logLine(`sweep error ${String((e && e.message) || e).slice(0, 160)}`);
   process.exit(0);
