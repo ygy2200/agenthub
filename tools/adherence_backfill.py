@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""离线逐轮回填采纳账（R876）。
+"""离线逐轮回填采纳账（R876，zcode 支持 R878）。
 
 为什么需要：补扫（brain_adherence_sweep.mjs）靠 UserPromptSubmit 触发。会话一旦关闭，
 再也没有事件把它叫起来——R874 之前那些「注入后没等来下一句」的账就永远悬在未观测里，
@@ -12,6 +12,11 @@
   · 证据取该轮 assistant 正文 + 工具参数；`reasoning`/`*_result` 不算（R873 同款）；
   · 找不到 transcript、没有真人开口、该轮没有证据的，一律诚实跳过并说明原因；
   · 默认 dry-run；`--apply` 才写账。流水 `src=backfill`，ops 把它归到「回填」通道。
+
+R878：zcode 的会话不落 `projects/<slug>/`，而是 `~/.zcode/cli/rollout/model-io-<session>.jsonl`。
+每条记录 = 一次模型调用（含全量历史），`turnId` 就是天然的轮边界，`startedAt` 是开口时刻；
+证据取 `response.text` + `response.toolCalls[].input`（`reasoningText` 不算——与别家同口径）。
+不认这一家时，zcode 的注入永远停在「判不了」，量具对它就等于失明。
 """
 from __future__ import annotations
 
@@ -36,7 +41,22 @@ def default_project_roots(home: Path | None = None) -> list[Path]:
             h / ".workbuddy" / "projects"]
 
 
-def find_transcript(session: str, roots: list[Path] | None = None) -> Path | None:
+def zcode_transcript(session: str, home: Path | None = None) -> Path | None:
+    """zcode 的会话文件：`~/.zcode/cli/rollout/model-io-<session>.jsonl`。
+
+    它是「一次模型调用一行」的 model-io 日志，不是 `<slug>/<session>.jsonl` 那种
+    事件流——文件名多了 `model-io-` 前缀，位置也不在 projects 下（R878 实锤）。
+    """
+    h = Path(home) if home else Path.home()
+    p = h / ".zcode" / "cli" / "rollout" / f"model-io-{session}.jsonl"
+    try:
+        return p if p.is_file() and p.stat().st_size > 0 else None
+    except OSError:
+        return None
+
+
+def find_transcript(session: str, roots: list[Path] | None = None,
+                    home: Path | None = None) -> Path | None:
     if not session or len(session) > 128 or any(c in session for c in '\\/:*?"<>|'):
         return None
     best, best_mtime = None, -1.0
@@ -58,6 +78,10 @@ def find_transcript(session: str, roots: list[Path] | None = None) -> Path | Non
                 continue
             if st.st_size > 0 and st.st_mtime > best_mtime:
                 best, best_mtime = f, st.st_mtime
+    if best is None:
+        # R878：同名前缀的文件仍最可信；projects 三家都没有时才看 zcode 的 rollout。
+        # 文件名严格等于 model-io-<session>，不猜、不串会话。
+        best = zcode_transcript(session, home)
     return best
 
 
@@ -119,16 +143,42 @@ def _is_human_open(text: str) -> bool:
 def turns_from_events(events) -> list:
     """把 transcript 事件切成轮：[{open: 本地ISO, evidence: [片段]}]。
 
-    兼容两种形状（R873 实锤）：
+    兼容三种形状（R873/R878 实锤）：
       · qoder/claude：`type:user|assistant` + `message.content[]`（text/tool_use）；
       · workbuddy：`type:message` + 顶层 `role` + `input_text/output_text`，
-        工具调用是独立 `function_call` 事件。
+        工具调用是独立 `function_call` 事件；
+      · zcode：`type:model_io` 一行一次模型调用，`turnId` 换值就是新的一轮，
+        `startedAt` 是开口时刻；证据在 `response.text` 与 `response.toolCalls[].input`。
     """
     turns, cur = [], None
     for ev in events:
         if not isinstance(ev, dict):
             continue
         t = ev.get("type")
+        if t == "model_io" and ev.get("turnId"):
+            tid = str(ev.get("turnId"))
+            open_ts = _iso_to_local(ev.get("startedAt") or ev.get("completedAt"))
+            if not open_ts:
+                continue
+            if cur is None or cur.get("turn") != tid:
+                cur = {"open": open_ts, "evidence": [], "turn": tid}
+                turns.append(cur)
+            resp = ev.get("response") if isinstance(ev.get("response"), dict) else {}
+            body = str(resp.get("text") or "")
+            if body.strip():
+                cur["evidence"].append(body)
+            for tc in (resp.get("toolCalls") or []):
+                if not isinstance(tc, dict):
+                    continue
+                args = tc.get("input")
+                try:
+                    blob = (json.dumps(args, ensure_ascii=False)
+                            if args is not None else "")
+                except ValueError:
+                    blob = ""
+                if blob.strip():
+                    cur["evidence"].append(f"{tc.get('name') or ''} {blob}")
+            continue
         msg = ev.get("message") if isinstance(ev.get("message"), dict) else {}
         role = str(msg.get("role") or ev.get("role") or "")
         if t in ("user", "assistant"):
@@ -206,7 +256,8 @@ def unobserved_sessions(root: str, days: int, only: list[str] | None = None) -> 
 
 
 def run(root: str, sessions: list[dict], project_roots: list[Path] | None,
-        apply: bool, days: int, min_idle_h: float = 2.0) -> dict:
+        apply: bool, days: int, min_idle_h: float = 2.0,
+        home: Path | None = None) -> dict:
     """逐会话回填。`min_idle_h` 是防抢跑闸门：会话最后注入还没过这么久，
     说明它可能仍活着——尾巴与最后一轮该交给在线补扫，回填提前判会误伤。"""
     out = {"applied": bool(apply), "sessions": []}
@@ -226,7 +277,7 @@ def run(root: str, sessions: list[dict], project_roots: list[Path] | None,
                 item["status"] = "active"
                 out["sessions"].append(item)
                 continue
-        tr = find_transcript(session, project_roots)
+        tr = find_transcript(session, project_roots, home=home)
         if not tr:
             item["status"] = "no-file"
             out["sessions"].append(item)

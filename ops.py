@@ -3177,7 +3177,9 @@ def _adherence_health(root: str = "") -> dict:
                 "SELECT agent, ts, note FROM journal WHERE action='brain_adherence' AND ts>=?"
                 " ORDER BY ts DESC", (d7,))]
             sess_rows = [dict(r) for r in conn.execute(
-                "SELECT agent, session, MAX(ts) AS last_ts, COUNT(*) AS n FROM recall_adherence"
+                "SELECT agent, session, MAX(ts) AS last_ts, COUNT(*) AS n,"
+                " SUM(CASE WHEN used=0 AND COALESCE(decided_at,'')='' THEN 1 ELSE 0 END)"
+                " AS pending FROM recall_adherence"
                 " WHERE ts>=? AND agent<>'' AND session<>''"
                 " AND COALESCE(origin,'live')='live' GROUP BY agent, session"
                 " ORDER BY last_ts DESC", (d7,))]
@@ -3248,7 +3250,10 @@ def _adherence_health(root: str = "") -> dict:
         if capture_start and last_ts < capture_start:
             # R875：整段都早于首条带 src 的采集——历史注入，证据不可回溯。
             # 把它算成「漏采集」会让旧账永远红着，真正的新缺陷反而被淹没。
-            old_sess.append((core.agent_key(r.get("agent") or "") or "?", s))
+            # R878：只对**还没判定**的旧行算历史；离线回填补判过（decided_at 已写）的
+            # 会话已经闭环，再点名「未闭环」就是把已还的账继续挂在墙上。
+            if int(r.get("pending") or 0) > 0:
+                old_sess.append((core.agent_key(r.get("agent") or "") or "?", s))
             continue
         try:
             then = datetime.datetime.fromisoformat(last_ts[:19])
@@ -3315,7 +3320,12 @@ def _adherence_health(root: str = "") -> dict:
                               if not capture_start
                               or str(r.get("last_ts") or "") >= capture_start})
     never = [a for a in injected_active if a not in ran and not _answer_unsupported(core, a)]
-    old_hosts = sorted({a for a in injected if a not in injected_active})
+    # R878：历史点名也要看「还欠不欠」——这些行被离线回填补判过后，家级豁免就没有对象了，
+    # 否则账明明闭环、detail 里还永远挂着一句「历史未闭环」。
+    hist_pending = {core.agent_key(r.get("agent") or "") for r in sess_rows
+                    if int(r.get("pending") or 0) > 0
+                    and (not capture_start or str(r.get("last_ts") or "") < capture_start)}
+    old_hosts = sorted(a for a in injected if a in hist_pending and a not in injected_active)
     if old_hosts:
         detail.append(f"历史未闭环：{'、'.join(old_hosts)} 的注入都早于采集口径起点"
                       f"（{capture_start or '未知'}），证据不可回溯，不判红")

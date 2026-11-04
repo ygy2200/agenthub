@@ -142,11 +142,52 @@ function isRealPrompt(content) {
     && typeof p.text === 'string' && p.text.trim());
 }
 
+/** zcode 的会话文件不在 projects 下，而是 rollout/model-io-<session>.jsonl（R878 实锤）。
+ *  Stop 载荷没有 transcript_path 时按 session id 找回；名字不匹配就不猜。 */
+function zcodeFileFor(session) {
+  if (!session) return '';
+  const p = path.join(HOME, '.zcode', 'cli', 'rollout', `model-io-${session}.jsonl`);
+  try { return existsSync(p) ? p : ''; } catch { return ''; }
+}
+
+/**
+ * zcode：一行 = 一次模型调用（含全量历史），`turnId` 换值就是新的一轮。
+ * 取尾部窗口里最后一个 turnId 组的 `response.text` + `response.toolCalls[].input`；
+ * `reasoningText` 不算证据（注入原文就在同一条消息里，复述≠照做，与别家同口径）。
+ */
+function zcodeTurn(file) {
+  const raw = readTail(file, MAX_BYTES);
+  if (!raw) return { text: '', events: 0, reset: false };
+  const groups = [];
+  let cur = null;
+  for (const line of raw.split('\n')) {
+    const t = line.trim();
+    if (!t || t[0] !== '{') continue;
+    let ev;
+    try { ev = JSON.parse(t); } catch { continue; }
+    if (String(ev.type || '') !== 'model_io') continue;
+    const tid = String(ev.turnId || '');
+    if (!tid) continue;
+    if (!cur || cur.tid !== tid) { cur = { tid, parts: [], records: 0 }; groups.push(cur); }
+    cur.records += 1;
+    const resp = (ev.response && typeof ev.response === 'object') ? ev.response : {};
+    if (typeof resp.text === 'string' && resp.text.trim()) cur.parts.push(resp.text);
+    for (const tc of (Array.isArray(resp.toolCalls) ? resp.toolCalls : [])) {
+      let blob = '';
+      try { blob = JSON.stringify((tc && tc.input) || {}).slice(0, MAX_TOOL_INPUT); } catch { blob = ''; }
+      if (blob) cur.parts.push(`${(tc && tc.name) || ''} ${blob}`);
+    }
+  }
+  const last = groups.length ? groups[groups.length - 1] : null;
+  return { text: last ? last.parts.join('\n') : '', events: last ? last.records : 0, reset: true };
+}
+
 /**
  * 取「本轮」的证据：从尾部按真人开口切轮，取最后一段里的 assistant 片段。
  * 尾部窗口没兜住轮开头时（超长轮）退化成「窗口内所有 assistant 片段」，宁多不漏本轮。
  */
 function turnFromTranscript(file) {
+  if (path.basename(String(file || '')).startsWith('model-io-')) return zcodeTurn(file);
   const raw = readTail(file, MAX_BYTES);
   if (!raw) return { text: '', events: 0, reset: false };
   const lines = raw.split('\n');
@@ -204,7 +245,9 @@ try {
   const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
   if (!session) { logLine('skip: 无 session'); process.exit(0); }
 
-  const turn = turnFromTranscript(String(ev.transcript_path || ev.transcriptPath || ''));
+  let tp = String(ev.transcript_path || ev.transcriptPath || '');
+  if (!tp) tp = zcodeFileFor(session);   // R878：zcode 的 Stop 载荷常不带 transcript_path
+  const turn = turnFromTranscript(tp);
   const direct = directText(ev);
   // 本轮正文通常已经包含收尾那句，重复喂只会让匹配多算一遍；真给了额外内容才并入。
   let parts = [];
