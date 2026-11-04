@@ -26,6 +26,7 @@ if errorlevel 1 (
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
+rem R861：ONNX 编码器不进 exe——numpy 已排除、权重也不打包，带上它只会白涨 14MB
 D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx --name AgentHub ^
   --icon assets\agenthub.ico --add-data "assets\agenthub.ico;." --add-data "build\bundle;." ^
   --exclude-module aiohttp --exclude-module aiohappyeyeballs --exclude-module aiosignal --exclude-module yarl --exclude-module multidict --exclude-module frozenlist --exclude-module propcache ^
@@ -38,6 +39,7 @@ D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx 
   --exclude-module pythonwin --exclude-module win32trace --exclude-module win32pdh --exclude-module win32evtlog ^
   --exclude-module torch --exclude-module tensorflow --exclude-module jupyter --exclude-module IPython --exclude-module notebook ^
   --exclude-module torchvision --exclude-module torchaudio --exclude-module cv2 --exclude-module hf_xet ^
+  --exclude-module onnxruntime --exclude-module tokenizers --exclude-module sentence_transformers ^
   main.py
 if errorlevel 1 (
   echo 打包失败
