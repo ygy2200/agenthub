@@ -66,3 +66,7 @@ if errorlevel 1 (
 )
 echo [4/4] 完成：桌面 AgentHub.exe
 if not defined AGENTHUB_NOPAUSE pause
+rem B057: explicit zero - without it the exit code is whatever the last real
+rem command left behind (release.bat gates `call build.bat` on errorlevel)
+exit /b 0
+

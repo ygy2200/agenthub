@@ -48,6 +48,18 @@ def test_release_ends_with_explicit_zero():
     assert lines[-1].lower() == "exit /b 0", lines[-3:]
 
 
+def test_build_ends_with_explicit_zero_too():
+    """B057：同一条规矩当时只落在一侧。`release.bat` 拿 `if errorlevel 1` 判 `call build.bat`，
+    而 build.bat 末尾是 `if not defined AGENTHUB_NOPAUSE pause`——自动化里 NOPAUSE 是设的，
+    这条 if 不执行，退出码就沿用**上一条真命令**留下的 errorlevel。打包链里那些
+    `if errorlevel 1 ( … exit /b 1 )` 走过的分支本身会把 1 留在环境里，于是「全成功」也可能
+    被上一行的残值报成失败（或反过来）。R740 在同一侧的 `copy /y` 上已经重演过一次同族问题。
+    """
+    lines = [ln.strip() for ln in (ROOT / "build.bat").read_text(
+        encoding="utf-8", errors="replace").splitlines() if ln.strip()]
+    assert lines[-1].lower() == "exit /b 0", lines[-3:]
+
+
 @pytest.mark.skipif(os.name != "nt", reason="cmd 批处理只在 Windows 上跑")
 def test_failed_build_aborts_release(tmp_path):
     """真跑一遍：把 build 换成必失败的桩，整条 release 必须中止且退非零。"""
