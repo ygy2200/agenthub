@@ -56,18 +56,27 @@ try {
 
   const prompt = String(ev.prompt || ev.user_prompt || ev.userPrompt
     || ev.prompt_text || ev.message || '').trim();
-  if (prompt.length < 6 || prompt.startsWith('/')) process.exit(0);
+  if (!prompt || prompt.startsWith('/')) process.exit(0);
 
   const argv = process.argv.slice(2);
   const ai = argv.indexOf('--agent');
   const agent = (ai >= 0 ? argv[ai + 1] : '') || ev.agent || process.env.AGENTHUB_AGENT || '';
   const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
   const cwd = ev.cwd || ev.workingDirectory || ev.cwdPath || process.cwd();
+  // R863：宿主给了 transcript 时，短句/推进句（继续/接着弄/重启了继续）也能交给
+  // Python 用「上一轮话题」补检索词；没给 transcript 就维持 R820 的短句静默。
+  // 注意：Qoder Desktop 的载荷实测不带 transcript_path，但 Python 侧能按 session_id
+  // 找到本地会话文件——所以 CONT_RE 命中的短句一律放行，由 Python 决定找不找得到。
+  const tp = String(ev.transcript_path || ev.transcriptPath || '');
+  const hasTranscript = !!tp && existsSync(tp);
+  const CONT_RE = /(继续|接着|然后|下一步|重启|往下|开始吧|接着干)/;
+  if (prompt.length < 6 && !CONT_RE.test(prompt)) process.exit(0);
   if (!existsSync(SCRIPT)) { logLine(`skip: ${SCRIPT} 不存在`); process.exit(0); }
 
   const args = [SCRIPT, '--agent', agent, '--cwd', cwd,
     '--prompt', prompt.slice(0, 8000), '--session', session,
     '--max-chars', String(MAX_CHARS)];
+  if (hasTranscript) args.push('--transcript', tp);
   let rootArg = process.env.AGENTHUB_ROOT || '';
   if (!rootArg && existsSync(CONFIG)) {
     try { rootArg = String(JSON.parse(readFileSync(CONFIG, 'utf8')).root || ''); } catch { /* ignore */ }
@@ -75,6 +84,9 @@ try {
   if (rootArg) args.push('--root', rootArg);
   if (process.env.AGENTHUB_RECALL_STATE) args.push('--state', process.env.AGENTHUB_RECALL_STATE);
   if (process.env.AGENTHUB_RECALL_NO_JOURNAL === '1') args.push('--no-journal');
+  // 装置/探针跑部署副本时不许把曝光账记脏（R861 的教训）：默认 live，显式才降级。
+  const origin = process.env.AGENTHUB_RECALL_ORIGIN || '';
+  if (origin === 'probe' || origin === 'eval') args.push('--origin', origin);
 
   const r = spawnSync(pickPython(), args, {
     encoding: 'utf8', timeout: 5000,

@@ -8281,6 +8281,91 @@ def _normalize_cn_numbers(text: str) -> str:
     return _CN_NUM_RE.sub(repl, text)
 
 
+# ── R863 短句补上下文：从 transcript 尾部取最近几条用户真说的话 ──────────────
+# 「继续」「接着弄」「重启了，继续」这类推进句整句都是停用词，抽不出检索词——
+# 而这恰恰是最需要接上「刚才在聊哪件事」的时候。宿主在 UserPromptSubmit 里
+# 已经给了 transcript_path（R851 的补扫钩子同源契约），读尾部就够：
+# 不解析整份会话、不跟宿主抢文件，坏行/半行一律跳过。
+RECALL_CTX_TAIL_BYTES = 262144
+RECALL_CTX_MSGS = 4
+RECALL_CTX_MSG_CHARS = 1200
+RECALL_CTX_CHARS = 4000
+# 这些「用户消息」其实是宿主塞进来的，不能当成人的意图：
+# 紧凑摘要（上下文压缩时生成的长文）、中断标记、后台任务通知、本钩子自己的注入块。
+_CTX_SKIP_PREFIXES = (
+    "This session is being continued from a previous conversation",
+    "[Request interrupted",
+    "<task-notification",
+    "task notification",
+)
+
+
+def recall_context_prompt(transcript_path: str, current_prompt: str = "",
+                          limit: int = RECALL_CTX_MSGS,
+                          max_chars: int = RECALL_CTX_CHARS) -> str:
+    """从会话 transcript 尾部取最近几条**用户真说的话**，给短句/推进句补语义（R863）。
+
+    只认 role=user 的 text part；工具结果、注入块、紧凑摘要、中断标记全部跳过。
+    返回按时间顺序拼接的文本（旧→新，最多 max_chars 从尾部保留）。
+    任何异常返回空串——补语义是可选能力，绝不能拖垮即时回忆主路径。
+    """
+    if not transcript_path:
+        return ""
+    try:
+        p = Path(transcript_path)
+        if not p.is_file():
+            return ""
+        size = p.stat().st_size
+        with p.open("rb") as fh:
+            if size > RECALL_CTX_TAIL_BYTES:
+                fh.seek(size - RECALL_CTX_TAIL_BYTES)
+            raw = fh.read().decode("utf-8", "replace")
+    except OSError:
+        return ""
+    lines = raw.splitlines()
+    if size > RECALL_CTX_TAIL_BYTES and lines:
+        lines = lines[1:]          # 从字节中间切进来的第一行多半是半截 JSON
+    cur = (current_prompt or "").strip()
+    texts = []
+    for line in lines:
+        line = line.strip()
+        if not line or line[0] != "{":
+            continue
+        try:
+            ev = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(ev, dict):
+            continue
+        msg = ev.get("message") if isinstance(ev.get("message"), dict) else ev
+        if str(msg.get("role") or ev.get("role") or "") != "user":
+            continue
+        content = msg.get("content")
+        parts = []
+        if isinstance(content, str):
+            parts.append(content)
+        elif isinstance(content, list):
+            for part in content:
+                if isinstance(part, str):
+                    parts.append(part)
+                elif isinstance(part, dict) and part.get("type") == "text":
+                    parts.append(str(part.get("text") or ""))
+        text = "\n".join(x for x in parts if x).strip()
+        if not text or text == cur:
+            continue
+        if text.startswith(_CTX_SKIP_PREFIXES) or "【AgentHub" in text[:80]:
+            continue
+        if _looks_like_system_message(text):
+            continue
+        if len(text) > RECALL_CTX_MSG_CHARS:
+            text = text[:RECALL_CTX_MSG_CHARS]
+        texts.append(text)
+    if not texts:
+        return ""
+    out = "\n".join(texts[-max(1, int(limit)):])
+    return out[-max_chars:] if len(out) > max_chars else out
+
+
 def _recall_idf(pool_texts: list, terms: list, weighted: bool = True) -> dict:
     """在候选池上估每个检索词的区分度，返回 {term: 加权分}。
 
@@ -8773,7 +8858,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                   project: str = "", max_chars: int = RECALL_MAX_CHARS,
                   session: str = "", state_path: str = "",
                   update_state: bool = True, budget_path: str = "",
-                  origin: str = "live") -> dict:
+                  origin: str = "live", context_text: str = "") -> dict:
     """按用户这一句话自动回忆（UserPromptSubmit 钩子入口）。
 
     与 session_brief 分工：简报解决「开局知道团队在干什么」，本函数解决「说到某件事时
@@ -8787,7 +8872,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
            "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False,
-           "muted": 0, "skipped": "", "budget": {}, "semantic_bridge": 0}
+           "muted": 0, "skipped": "", "budget": {}, "semantic_bridge": 0,
+           "context_used": False}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -8797,6 +8883,12 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     who = _norm_agent(agent) or (agent or "").strip()
     pname = (project or "").strip() or infer_project_from_cwd(root, cwd)
     terms = extract_prompt_terms(prompt)
+    # R863：这句抽不出词（「继续」「接着弄」）时，用 transcript 里的上一轮话题补语义。
+    # 这是「用户没说清干啥，就是让 AI 自己接上」的场景——只回项目近况仍然接不上
+    # 「刚才在聊哪件事」。补来的词与用户自己问的词走同一套召回，去重/预算/免疫照旧。
+    if not terms and context_text:
+        terms = extract_prompt_terms(context_text)
+        out["context_used"] = bool(terms)
     if not terms:
         # R825：「继续」「接着弄」「下一步」这类推进语整句都是停用词，抽不出检索词——
         # 而这恰恰是最需要上下文的时候（用户没说清干啥，就是让 AI 自己接上）。此前
@@ -8944,8 +9036,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     rec_strong = [(s, r) for s, r in rec_scored
                   if float(r.get("_recall_best") or 0.0) >= _RECALL_RARE_IDF]
     rec_rows = _recall_pick_margin(rec_strong, RECALL_RECORD_CAP)
-    # R836：叮嘱型提示不当检索词——相关历史不给口语切片噪声
-    if _is_coaching_prompt(prompt):
+    # R836：叮嘱型提示不当检索词——相关历史不给口语切片噪声。
+    # R863：这句虽是「继续」，但检索词来自上一轮话题（context_used），历史照常给。
+    if _is_coaching_prompt(prompt) and not out["context_used"]:
         rec_rows = []
     proj_lines = _recall_project_block(root, pname)
     top_terms = [t for t, _ in sorted(terms, key=lambda x: -float(mem_idf.get(x[0]) or 0))[:3]]
@@ -8953,7 +9046,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     if not picked and not rec_rows:
         # R836：叮嘱不包装成「没查到」，更不建议拿切片碎片去 hub_search——明说这句
         # 是对 agent 的指令，库不翻；有项目近况就顺手带上。
-        if _is_coaching_prompt(prompt):
+        # R863：由上一轮话题补出检索词时，这句「继续」确实是在翻库，不走叮嘱口径。
+        if _is_coaching_prompt(prompt) and not out["context_used"]:
             lines = ["【AgentHub 即时回忆 · 这句是对我的叮嘱，不是检索，不翻库】",
                      "要查什么直接点名：项目名 / 组件名 / 报错编号。"]
             if proj_lines:
@@ -9017,7 +9111,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         except sqlite3.Error:
             pass
         return out
-    lines = ["【AgentHub 即时回忆 · 自动检索，无需提醒】",
+    head = ("【AgentHub 即时回忆 · 这句没检索词，按上一轮话题接续】"
+            if out["context_used"] else "【AgentHub 即时回忆 · 自动检索，无需提醒】")
+    lines = [head,
              "这是索引不是全文：要动具体命令/路径/参数前先 hub_search 取原文，"
              "别照着摘要复述；与现状冲突时以现状为准，收工时顺手更正。"]
     if proj_lines:
@@ -10178,6 +10274,124 @@ def project_state_card(root: str, project: str) -> dict:
                "next": [str(x) for x in nxt if str(x).strip()][:3]}
         break
     return out
+
+
+STATE_ROUND_RE = re.compile(r"(?<![A-Za-z])R(\d{2,4})(?!\d)")
+STATE_VER_RE = re.compile(r"(?<![A-Za-z0-9])v(\d+)\.(\d+)\.(\d+)(?![\d.])")
+STATE_PURPOSE_RE = re.compile(r"目的\s*[:：]\s*(.+?)(?:\n|。|$)")
+STATE_NEXT_RE = re.compile(r"(?:下一步方向|下一步|下一轮|下一批)\s*[:：]\s*(.+?)(?:\n|。|$)")
+
+
+def _ver_tuple(text: str) -> tuple:
+    m = STATE_VER_RE.search(str(text or ""))
+    return tuple(int(x) for x in m.groups()) if m else ()
+
+
+def _state_card_theme(content: str) -> str:
+    m = STATE_PURPOSE_RE.search(content or "")
+    if m:
+        return m.group(1).strip()[:80]
+    for line in (content or "").splitlines():
+        line = line.strip()
+        if line:
+            # 去掉「2026-11-04（qoder）· R862——」这类前缀，只留事项本身
+            line = re.sub(r"^\d{4}-\d{2}-\d{2}（[^）]*）[·\s]*", "", line)
+            line = re.sub(r"^R\d{2,4}[a-zA-Z]?\s*[·:：—-]*\s*", "", line)
+            return line[:80]
+    return ""
+
+
+def _state_card_next(content: str) -> list:
+    m = STATE_NEXT_RE.search(content or "")
+    if not m:
+        return []
+    parts = re.split(r"[；;]|(?<=\))、", m.group(1))
+    return [p.strip(" -—·") for p in parts if len(p.strip(" -—·")) >= 2][:3]
+
+
+def sync_state_card(root: str, project: str, content: str, agent: str = "",
+                    record_id: int = 0, date: str = "") -> dict:
+    """把一条工作记录里的轮次/版本/主题回写到**已存在**的续跑点卡片（R862）。
+
+    为什么改：R838 让简报会读 `output/迭代状态.json`，但卡片本身仍靠人手动维护——
+    忘记更新，下一轮简报就会报旧轮次，模型接不上；这等于「要主人提醒才更新记忆」。
+    现在只要 agent 按铁律调 hub_log_work，卡片自动跟上。三条保守边界：
+    ① 只更新已存在的卡片，不给普通项目凭空造文件；② 轮次只进不退、单次跳幅 ≤20，
+    且忽略 ≥ target_rounds 的数字（正文里常有「目标 R1500」这类远期目标，不能当进度）；
+    ③ 坏 JSON / 无权限一律静默跳过，工作记录写入绝不因卡片失败而失败。
+    """
+    if not root or not project or not (content or "").strip():
+        return {}
+    target = None
+    for name in STATE_CARD_FILES:
+        p = Path(root) / project / "output" / name
+        if p.is_file():
+            target = p
+            break
+    if target is None:
+        return {}
+    try:
+        data = json.loads(target.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    cur_raw = data.get("current_round") or data.get("round")
+    try:
+        cur = int(cur_raw)
+    except (TypeError, ValueError):
+        cur = -1
+    try:
+        target_rounds = int(data.get("target_rounds"))
+    except (TypeError, ValueError):
+        target_rounds = 0
+    rounds = [int(m.group(1)) for m in STATE_ROUND_RE.finditer(content)]
+    # 远期目标/历史引用不算进度：上限 = 当前 +20，且低于 target_rounds
+    cap = (cur + 20) if cur >= 0 else 9999
+    if target_rounds > 0:
+        cap = min(cap, target_rounds - 1)
+    rounds = [r for r in rounds if r <= cap]
+    new_round = max(rounds) if rounds else -1
+    changed = {}
+    if new_round > cur:
+        if "current_round" in data or "round" not in data:
+            data["current_round"] = new_round
+        if "round" in data:
+            data["round"] = new_round
+        changed["round"] = new_round
+        last = data.get("last_round") if isinstance(data.get("last_round"), dict) else {}
+        theme = _state_card_theme(content)
+        if theme:
+            last["theme"] = theme
+            changed["theme"] = theme
+        if agent:
+            last["agent"] = agent
+        if record_id:
+            last["record_id"] = int(record_id)
+        last["date"] = date or datetime.date.today().isoformat()
+        nxt = _state_card_next(content)
+        if nxt:
+            last["next_candidates"] = nxt
+            changed["next_candidates"] = nxt
+        data["last_round"] = last
+    new_ver = _ver_tuple(content)
+    old_ver = _ver_tuple(data.get("version"))
+    if new_ver and (not old_ver or new_ver > old_ver):
+        data["version"] = "v" + ".".join(str(x) for x in new_ver)
+        changed["version"] = data["version"]
+    if not changed:
+        return {}
+    data["updated"] = date or datetime.date.today().isoformat()
+    try:
+        bak = target.with_name(target.name + ".bak-auto")
+        bak.write_bytes(target.read_bytes())
+        tmp = target.with_name(target.name + ".tmp")
+        tmp.write_text(json.dumps(data, ensure_ascii=False, indent=1) + "\n",
+                       encoding="utf-8")
+        os.replace(tmp, target)
+    except OSError:
+        return {}
+    return changed
 
 
 def _state_card_lines(card: dict) -> list:
