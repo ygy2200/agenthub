@@ -10518,8 +10518,14 @@ def _state_card_next(content: str) -> list:
 
 
 def sync_state_card(root: str, project: str, content: str, agent: str = "",
-                    record_id: int = 0, date: str = "") -> dict:
+                    record_id: int = 0, date: str = "", version: str = "") -> dict:
     """把一条工作记录里的轮次/版本/主题回写到**已存在**的续跑点卡片（R862）。
+
+    R866：版本不再只认正文。工作记录常只写「R866 …」不写 v 号，旧实现就让卡片
+    版本停在上一版（R864/R865 实锤 v2.41.215 落后于代码 2.41.216）。调用方
+    （hub_log_work）把服务端当前版本经 `version` 传进来；与正文里的版本取较大者，
+    仍然只进不退，避免旧记录/旧脚本把卡片版本改回去。
+
 
     为什么改：R838 让简报会读 `output/迭代状态.json`，但卡片本身仍靠人手动维护——
     忘记更新，下一轮简报就会报旧轮次，模型接不上；这等于「要主人提醒才更新记忆」。
@@ -10582,7 +10588,12 @@ def sync_state_card(root: str, project: str, content: str, agent: str = "",
             last["next_candidates"] = nxt
             changed["next_candidates"] = nxt
         data["last_round"] = last
-    new_ver = _ver_tuple(content)
+    ver_texts = [content or ""]
+    vparam = (version or "").strip()
+    if vparam:
+        # 允许调用方传 "2.41.216" 或 "v2.41.216"；_ver_tuple 只认带 v 的形态
+        ver_texts.append(vparam if vparam[:1].lower() == "v" else "v" + vparam)
+    new_ver = max((_ver_tuple(v) for v in ver_texts if _ver_tuple(v)), default=())
     old_ver = _ver_tuple(data.get("version"))
     if new_ver and (not old_ver or new_ver > old_ver):
         data["version"] = "v" + ".".join(str(x) for x in new_ver)
