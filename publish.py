@@ -461,6 +461,10 @@ def main(argv=None) -> int:
                     help="只做发布前预检（token 身份/仓库写权限/网络），不建 Release")
     ap.add_argument("--upload-only", action="store_true",
                     help="Release 已存在时只补传/替换 exe（同名附件先删再传）")
+    ap.add_argument("--publish-only", action="store_true",
+                    help="草稿已传完 exe 时只公开它（PATCH draft=false，不重传、不改说明）；"
+                         "默认针对当前版本，配 --tag 可点名旧版本")
+    ap.add_argument("--tag", help="--publish-only 的目标 tag（默认 v<当前版本>）")
     ap.add_argument("--repo", default=os.environ.get("AGENTHUB_REPO", DEFAULT_REPO),
                     help=f"owner/name，默认 {DEFAULT_REPO} 或 AGENTHUB_REPO")
     ap.add_argument("--notes-file", type=Path, help="发布说明文件（默认取 CHANGELOG.md 当前版本行）")
@@ -518,7 +522,92 @@ def _run(args) -> int:
         return 1
 
 
+def _find_release(opener, base: str, tag: str):
+    """按 tag 找 Release，**包含草稿**。
+
+    GitHub 的 `GET /releases/tags/<tag>` 对草稿一律 404（2026-11-04 实测：v2.41.209
+    的草稿带着 102MB 附件，tags 端点报「找不到」）。所以草稿要从列表里捞；列表分页
+    100，捞不到再退回 tags 端点（老版本可能已翻过 100 条）。这个差异是假 API 用例
+    咬不到的——第一版 `--publish-only` 就栽在这里。
+    """
+    st, rows, _ = _call_retry(opener, f"{base}/releases?per_page=100")
+    if st == 200 and isinstance(rows, list):
+        for r in rows:
+            if r.get("tag_name") == tag:
+                return 200, r
+    st, rel, _ = _call_retry(opener, f"{base}/releases/tags/{tag}")
+    return st, rel
+
+
+def _publish_only(args) -> int:
+    """R860（B069）：草稿已带完整附件时，只把可见性翻过来。
+
+    为什么单开一个入口：--upload-only 会先删旧附件再传 102MB，只为改一个 draft
+    布尔值；网络抖一次就留下「公开但没有附件」的半成品（B011 那类）。这里只做三
+    件事：确认草稿在、确认附件非空、PATCH draft=false。
+
+    发布闸门（prov）不参与：它按**当前工作树版本**算，补发旧版本必然对不上。对这次
+    操作真正重要的不变量是「附件非空」——空附件公开正是 v2.41.159 / v2.41.77 的形态。
+    """
+    if args.upload_only:
+        sys.exit("--publish-only 与 --upload-only 互斥：一个只改可见性，一个只补附件")
+    tag = args.tag or f"v{current_version()}"
+    cred = release_token.resolve_token(args.token_file)
+    token, token_src = cred["token"], cred["source"]
+    print(f"仓库：{args.repo}")
+    print(f"目标：{tag}（{'--tag 指定' if args.tag else '当前版本'}）")
+    if token:
+        print(f"token：已从 {token_src} 读取（{release_token.mask(token)}）")
+    else:
+        print("token：未找到，试过 " + "；".join(cred["tried"]) + "（--yes 会被拒绝）")
+    if not args.yes:
+        print("\n预演：--publish-only 会把该草稿公开（PATCH draft=false），"
+              "不重传附件、不改发布说明；附件为空的草稿会被拒绝。确认后加 --yes。")
+        return 0
+    if not token:
+        sys.exit("没有可用的 GitHub token，拒绝发布。已试过：" + "；".join(cred["tried"]))
+    _reset_channel()
+    opener = _opener(token)
+    pf = preflight(opener, args.repo)
+    if not pf["ok"]:
+        print(f"预检：身份 {pf['login'] or '未知'}")
+        for p in pf["problems"]:
+            print("  - " + p)
+        sys.exit("预检未通过，拒绝发布（还没有在 GitHub 上留下任何东西）")
+    print(f"预检：身份 {pf['login']}，scope {pf['scopes']}"
+          f"（连接通道：{_channel_label(opener)}）")
+    base = f"https://api.github.com/repos/{args.repo}"
+    status, rel = _find_release(opener, base, tag)
+    if status == 404:
+        sys.exit(f"{tag} 没有 Release（草稿也没有），--publish-only 无从公开；先正常发布")
+    if status != 200:
+        sys.exit(f"查询 Release 失败：HTTP {status} {rel.get('message', '')}")
+    if not rel.get("draft"):
+        sys.exit(f"{tag} 已经公开（{rel.get('html_url', '?')}），无需重复公开")
+    st, assets, _ = _call_retry(opener, f"{base}/releases/{rel['id']}/assets")
+    if st != 200:
+        sys.exit(f"读草稿附件失败：HTTP {st} {assets.get('message', '')}")
+    want = f"AgentHub-{tag}.exe"
+    have = [a for a in assets if a.get("name") == want]
+    if not have or not (have[0].get("size") or 0):
+        names = [a.get("name") for a in assets] or ["无"]
+        sys.exit(f"草稿里没有可用附件 {want}（现有：{'、'.join(names)}）；"
+                 f"公开会留下空附件版本，先 --upload-only 补传")
+    print(f"附件：{want}（{have[0]['size']} 字节，state={have[0].get('state')}）")
+    st, pub, _ = _call_retry(opener, f"{base}/releases/{rel['id']}", method="PATCH",
+                             data={"draft": False})
+    if st != 200 or pub.get("draft"):
+        print(f"公开失败：HTTP {st} {pub.get('message', '')}")
+        print("Release 仍是草稿；重跑同一条命令即可（幂等）。")
+        return 1
+    print(f"Release 已公开：{pub.get('html_url') or tag}")
+    print(f"验收：未登录打开 https://github.com/{args.repo}/releases/tag/{tag} 应能看到")
+    return 0
+
+
 def _run_inner(args) -> int:
+    if getattr(args, "publish_only", False):
+        return _publish_only(args)
     version = current_version()
     tag = f"v{version}"
     if args.notes_file:

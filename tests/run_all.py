@@ -1,7 +1,7 @@
 # -*- coding: utf-8 -*-
 """P2-3d：一条命令跑完三层测试。
 
-用法：python tests/run_all.py
+用法：python tests/run_all.py [--layer unit[,gui,e2e]]
 
 层：
   unit —— 纯 core（不启 Qt）：tokens 语义表 / actions 注册表 / records 分页切片
@@ -28,6 +28,7 @@ processEvents 里段错，junit 缺失 → 整层假红；系统空闲后同一�
 真实缺陷在重跑里会复现。所以只在「无 junit」且非超时时等 3 秒重跑一次，重跑通过
 标注「首次崩溃已重跑通过」并计入层汇总；超时不重跑（时间成本翻倍且超时通常是真卡死）。
 """
+import argparse
 import os
 import subprocess
 import sys
@@ -233,14 +234,38 @@ def _discard_run_dir(path: Path) -> None:
         pass
 
 
-def main() -> int:
+def _pick_layers(argv):
+    """R860（B070）：--layer 只跑指定层。改一条 unit 用例不必陪跑 20 分钟。
+
+    层名非法时**报错退出**而不是静默跑全部——静默跑全部在 CI 里等于「配错了也全绿」，
+    而这里恰恰是为了缩短反馈，配错的代价必须是看得见的一条错误。
+    """
+    names = [n for n, *_ in LAYERS]
+    ap = argparse.ArgumentParser(prog="run_all.py", description="AgentHub 三层测试")
+    ap.add_argument("--layer", action="append", metavar="L1,L2",
+                    help=f"只跑指定层（可重复或逗号分隔）：{'、'.join(names)}")
+    args = ap.parse_args(argv)
+    if not args.layer:
+        return LAYERS, False
+    want = [s.strip() for chunk in args.layer for s in chunk.split(",") if s.strip()]
+    bad = [w for w in want if w not in names]
+    if bad:
+        ap.error(f"未知层：{'、'.join(bad)}（可选：{'、'.join(names)}）")
+    return tuple(l for l in LAYERS if l[0] in want), True
+
+
+def main(argv=None) -> int:
+    layers, partial = _pick_layers(sys.argv[1:] if argv is None else argv)
     failed = []
     if ENV.get("AGENTHUB_RUNALL_SHIM_OFF"):
         print("· 测试子进程已关掉宿主 safe-delete（临时目录不进回收站，避免批量删被拦）",
               flush=True)
+    if partial:
+        print("· 只跑指定层：" + "、".join(n for n, *_ in layers)
+              + "（其余层本次未跑，结论不能当成全量门禁）", flush=True)
     tmp = _prepare_tmp_root()
     try:
-        for name, path, per_file, timeout_s in LAYERS:
+        for name, path, per_file, timeout_s in layers:
             targets = (sorted((ROOT / path).glob("test_*.py")) if per_file
                        else [ROOT / path])
             print(f"\n===== 层：{name}（{path}，{len(targets)} 个目标）=====", flush=True)
@@ -315,9 +340,11 @@ def main() -> int:
                 failed.append(name)
     finally:
         _discard_run_dir(tmp)
-    print("\n===== 三层汇总 =====")
-    for name, *_ in LAYERS:
+    print(f"\n===== {'层汇总' if partial else '三层汇总'} =====")
+    for name, *_ in layers:
         print(f"  {name:<5} {'FAIL' if name in failed else 'PASS'}")
+    if partial:
+        print("注：只跑了 " + "、".join(n for n, *_ in layers) + "，不是全量门禁。")
     print("结果：", "全绿" if not failed else f"存在失败层：{failed}")
     return 1 if failed else 0
 
