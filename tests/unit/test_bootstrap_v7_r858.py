@@ -26,8 +26,13 @@ OLD_BLOCK = (
 
 
 def test_bootstrap_version_bumped_to_v7():
-    """加了内容必须 +1 版本，否则 `boot_stale` 检测与 refresh 都看不见这次改动。"""
-    assert core.BOOTSTRAP_VERSION == "7"
+    """加了内容必须 +1 版本，否则 `boot_stale` 检测与 refresh 都看不见这次改动。
+
+    R880 起改为下界断言：v7 是历史里程碑，字面量 "7" 每次升版都要来拆一次，
+    按 R299 那条哨兵的教训会退化成机械动作；当轮版本号由自己的用例钉死
+    （v8 见 tests/unit/test_bootstrap_v8_r880.py）。
+    """
+    assert int(core.BOOTSTRAP_VERSION) >= 7
 
 
 def test_bootstrap_states_the_payoff_of_registering():

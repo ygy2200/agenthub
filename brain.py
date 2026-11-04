@@ -9023,6 +9023,55 @@ def _recall_pick_margin(scored: list, cap: int, margin: float = RECALL_REL_MARGI
     return keep or [scored[0][1]]
 
 
+# R879：注入的「策略层」——把「必须照做」的记忆从「可参考」里分出来。
+# 外部依据（2026-11-05 检索）：StratMem-Bench（GPT-5.2/Claude Sonnet 4.5/Gemini 3 Pro
+# 等 9 个前沿模型）在只有 required 记忆时合规 80–90%，一旦混入 supportive 记忆，
+# 最高的 Claude Sonnet 4.5 也只有 51.45%——模型把 supportive 当「建议」静默忽略；
+# Memento Protocol（github.com/myrakrusemark/memento-protocol）的写入纪律是
+# 「Instructions, not logs」并给 memory 分 type=instruction；Anthropic 每轮注入的
+# 「should not respond unless highly relevant」正是把 supportive 降级为可选的那句话。
+# 本仓 878 轮把「自动送到面前」做完了（四条钩子/六家接入），缺的是「送到之后算不算数」。
+# 判据只用写入口声明过的结构化字段，绝不猜正文措辞——记忆 #529 / B040 实锤：按正文
+# 词面判会把「讲机制本身」的记忆误标成答案，而且写入口没指引时没人写得出这种标记。
+# SELF_DOC_TAG / _tag_tokens 定义在下方报错召回段，函数运行时模块已加载完，引用成立。
+DIRECTIVE_TAGS = ("必做", "指令")
+
+
+def directive_tier(mem) -> str:
+    """required=本轮动手前必须落实；supportive=背景参考，别为它改动作。
+
+    只看结构化字段：kind=preference（用户偏好天生是硬约束）与 tags 里的
+    「必做/指令」（写入口显式声明）。正文写「必须先…」不算——那是叙述，不是声明。
+    带「机制说明」标记的永远降回 supportive：B040 实锤这类记忆讲的是机制怎么运作、
+    不是这次该怎么修，升成「必须照做」会把模型直接带偏。
+
+    R879 复盘点名：**pinned 不升档**。真库实测 528 条活跃记忆里 pinned=104
+    （19.7%，几乎全是历史 lesson 老坑），而 preference 只有 12 条。「人工置顶」的
+    含义是「重要、常看」，不是「本轮动作必须执行」——把 104 条旧结论全标成硬约束，
+    等于制造另一种噪声泛滥，与 StratMem-Bench 里 supportive 混入让合规崩塌是同源问题。
+    pinned 只在展示顺序里享受次级优先（见 prompt_recall 的 _show_key），不改变语义档位。
+    """
+    try:
+        get = mem.get
+    except AttributeError:
+        try:
+            def get(key, default=None):
+                return mem[key]          # sqlite3.Row：缺键抛 IndexError
+        except Exception:  # noqa: BLE001 拿不到取数口的怪行一律当参考
+            return "supportive"
+    try:
+        tags = _tag_tokens(get("tags", ""))
+        if SELF_DOC_TAG.lower() in tags:
+            return "supportive"
+        if tags.intersection(t.lower() for t in DIRECTIVE_TAGS):
+            return "required"
+        if str(get("kind", "") or "").strip().lower() == "preference":
+            return "required"
+    except (IndexError, KeyError, TypeError, ValueError):
+        return "supportive"
+    return "supportive"
+
+
 def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                   project: str = "", max_chars: int = RECALL_MAX_CHARS,
                   session: str = "", state_path: str = "",
@@ -9042,7 +9091,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
            "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False,
            "muted": 0, "skipped": "", "budget": {}, "semantic_bridge": 0,
-           "context_used": False}
+           "context_used": False, "directive_required": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9293,27 +9342,48 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         return out
     head = ("【AgentHub 即时回忆 · 这句没检索词，按上一轮话题接续】"
             if out["context_used"] else "【AgentHub 即时回忆 · 自动检索，无需提醒】")
-    lines = [head,
-             "这是索引不是全文：要动具体命令/路径/参数前先 hub_search 取原文，"
-             "别照着摘要复述；与现状冲突时以现状为准，收工时顺手更正。"]
+    # R879 策略层：原来第二行只说「这是索引不是全文」，等于把整块声明成参考资料——
+    # 而 supportive 记忆在 9 个前沿模型上的合规率最高只有 51.45%（StratMem-Bench）。
+    # 现在按结构化字段分档：required 排最前、前缀【必须照做】，并在第二行给一句
+    # 明确的执行口径。没有 required 时一个字都不加，免得每轮刷同一句变成新噪声。
+    tiers = [directive_tier(r) for r in picked]
+    has_required = any(t == "required" for t in tiers)
+    out["directive_required"] = sum(1 for t in tiers if t == "required")
+    # 只改展示顺序：ordered 专供渲染；ids 与 _record_adherence 仍吃原 picked，
+    # 免得一次文案调整顺带把采纳账的写入口径带偏（R878 刚把这本账对齐）。
+    def _show_key(pair):
+        r, t = pair
+        try:
+            pin = int(r.get("pinned", 0) or 0)
+        except (AttributeError, TypeError, ValueError):
+            pin = 0
+        return (0 if t == "required" else 1, 0 if pin else 1)
+
+    # sorted 稳定：同档内保持 _recall_pick_margin 给的原顺序，只把 required/pinned 前提。
+    ordered = [r for r, _ in sorted(zip(picked, tiers), key=_show_key)]
+    guard = ("这是索引不是全文：要动具体命令/路径/参数前先 hub_search 取原文，"
+             "别照着摘要复述；与现状冲突时以现状为准，收工时顺手更正。")
+    if has_required:
+        guard += " 标【必须照做】的先落实再动手，没标的只作背景，别为它改动作。"
+    lines = [head, guard]
     if proj_lines:
         lines.extend(proj_lines)
-    ids = []
+    ids = [r.get("id") for r in picked]
     # R829：上墙的计数必须是「被认可过」的证据，不是「被推过几次」。检索回来的行有
     # 一部分走 BM25/语义通道、列不全，所以这里按 id 回查一次三本账，不信行里带没带。
     try:
         proof = _memory_counters(root, [r.get("id") for r in picked])
     except sqlite3.Error:
         proof = {}   # 计数只是可信度注脚，查不到宁可少一句话也不闭嘴
-    for r in picked:
-        ids.append(r.get("id"))
+    for r in ordered:
         pc = proof.get(int(r.get("id") or 0), {})
         adopt, used = int(pc.get("adopt_count") or 0), int(pc.get("use_count") or 0)
         tag = (f"采纳 {adopt} 次" if adopt
                else (f"检索命中 {used} 次" if used else "首次想起"))
         why = (f"语义桥 {float(r['_semantic_bridge']):.2f}" if r.get("_semantic_bridge")
                else f"命中 {r.get('_recall_hit') or 0}")
-        lines.append(f"· #{r.get('id')} [{r.get('kind') or 'note'}] "
+        mark = "【必须照做】" if directive_tier(r) == "required" else ""
+        lines.append(f"· {mark}#{r.get('id')} [{r.get('kind') or 'note'}] "
                      f"{_brief_oneline(str(r.get('content') or ''), 150)}"
                      f"（{why}；{tag}）")
     if rec_rows:
