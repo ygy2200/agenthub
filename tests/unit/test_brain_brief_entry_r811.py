@@ -80,5 +80,8 @@ def test_node_hook_ignores_non_session_events(hub_root):
         pytest.skip("本机无 node，跳过钩子契约实测")
     r = subprocess.run([node, str(REPO / "brain_inject.mjs"), "--agent", "qoder"],
                        input=json.dumps({"hook_event_name": "PreToolUse"}),
-                       capture_output=True, text=True, encoding="utf-8", timeout=30)
+                       capture_output=True, text=True, encoding="utf-8", timeout=30,
+                       env={**__import__("os").environ, "AGENTHUB_ROOT": hub_root,
+                            "AGENTHUB_BRIEF_SCRIPT": str(REPO / "brain_brief.py"),
+                            "AGENTHUB_PYTHON": sys.executable})
     assert r.returncode == 0 and r.stdout.strip() == ""

@@ -29,7 +29,6 @@ processEvents 里段错，junit 缺失 → 整层假红；系统空闲后同一�
 标注「首次崩溃已重跑通过」并计入层汇总；超时不重跑（时间成本翻倍且超时通常是真卡死）。
 """
 import os
-import shutil
 import subprocess
 import sys
 import tempfile
@@ -87,6 +86,7 @@ def _junit_counts(xml_path: Path):
 
 
 SWEEP_BATCH = 20          # 单次删除批上限：宿主 safe-delete 阈值 50，留一半冗余
+STALE_RUN_DIR_HOURS = 24  # 老过一天的临时目录＝死掉的运行留下的（B068 的收尾扫帚）
 
 
 def _sweep_dir(path: Path, batch: int = SWEEP_BATCH) -> tuple:
@@ -124,6 +124,46 @@ def _sweep_dir(path: Path, batch: int = SWEEP_BATCH) -> tuple:
     return removed, failed
 
 
+def _prune_stale_runs(root: Path) -> int:
+    """清掉「死掉的老运行」留下的临时目录，返回清掉的个数。
+
+    B068 把 basetemp 挪进每次运行私有的目录之后，代价是：运行被杀（超时、Ctrl-C、
+    会话回收）就留下一枚孤儿目录，里面装着整个套件的 tmp_path。所以每次起跑先扫一把。
+    只认两种前缀（`agenthub_pytest_*` 本次运行目录、旧版固定名 `bt-*`），且只动
+    mtime 老过 `STALE_RUN_DIR_HOURS` 的——正在跑的运行的 mtime 一直在更新，误删并发
+    运行的 basetemp 会制造比 B068 更难查的假红。删除走 `_sweep_dir` 分片（宿主
+    safe-delete 的批量删保护，R825），清不掉的（句柄还被人握着）只留不报。
+    """
+    if not root.exists():
+        return 0
+    now = time.time()
+    removed = 0
+    for p in sorted(root.glob("agenthub_pytest_*")) + sorted(root.glob("bt-*")):
+        if not p.is_dir():
+            continue
+        try:
+            age_h = (now - p.stat().st_mtime) / 3600.0
+        except OSError:
+            continue
+        if age_h < STALE_RUN_DIR_HOURS:
+            continue
+        _sweep_dir(p)
+        try:
+            p.rmdir()
+            removed += 1
+        except OSError:
+            pass
+    return removed
+
+
+def _prepare_tmp_root() -> Path:
+    """本次运行的私有临时目录：先清老运行，再拿一枚独家的（junit 与 basetemp 都住在里面）。"""
+    root = ROOT / "_pytest_tmp"
+    root.mkdir(parents=True, exist_ok=True)
+    _prune_stale_runs(root)
+    return Path(tempfile.mkdtemp(prefix="agenthub_pytest_", dir=str(root)))
+
+
 def _run_pytest(target: Path, xml_path: Path, timeout_s: int):
     """跑一个目标；超时则杀掉。返回 (rc, timed_out)。
 
@@ -134,7 +174,15 @@ def _run_pytest(target: Path, xml_path: Path, timeout_s: int):
     「假红」（同一目标单独跑 2 passed）。指定 basetemp 后 pytest 不再轮换删除，
     失败才是真失败。
     """
-    base = ROOT / "_pytest_tmp" / ("bt-" + xml_path.stem)
+    base = xml_path.parent / ("bt-" + xml_path.stem)
+    # B068（2026-11-04 实跑撞出来的）：以前这行是 `ROOT/"_pytest_tmp"/("bt-"+stem)`，
+    # 而 stem 只有层名+序号（`bt-unit_1`）——**同一个仓库里两次运行拿到同一个目录**。
+    # pytest 起跑要清空 basetemp（LIFO rm_rf），于是 A 进程删到一半撞上 B 进程正开着的
+    # `hub-root/_hub/brain.db`：unit 层 905 passed / **173 errors**，173 条全是
+    # `PermissionError: [WinError 32] 另一个程序正在使用此文件`，红的是并发不是代码。
+    # 本项目的前提就是多 agent 共用一份文件，同时跑门禁属常态。挪进本次运行私有的
+    # tmp 之后：名字不再重复（并发互删消失），且 pytest 永远拿到空目录、连清都不用清
+    # ——R200/R825 两次「临时目录删除」补丁都卡在「固定名复用」这个前提下，这次把前提去掉。
     # R825：默认让 pytest 自己清（关掉宿主 safe-delete 后是直删，毫秒级）。
     # 只有显式要求（AGENTHUB_RUNALL_SWEEP=1）或关不掉时才走分片兜底——分片删每项
     # 都要过回收站，773 个文件实测 4 分钟，不能放在热路径上。
@@ -171,12 +219,26 @@ def _run_target(target: Path, xml_path: Path, timeout_s: int):
 RETRY_PAUSE_S = 3.0
 
 
+def _discard_run_dir(path: Path) -> None:
+    """收尾清掉本次运行的私有目录——分片删，不用 rmtree。
+
+    B068 之后这枚目录里除了 junit 还装着全部 basetemp（每层几十个 tmp_path + 库文件），
+    一次 `shutil.rmtree` 就是几百项的批量删，正是 R825 量出来的那条宿主沙箱红线
+    （删被拦 → 老目录留在原地）。分片删 + 删不掉不响：起跑时的 `_prune_stale_runs` 兜底。
+    """
+    _sweep_dir(path)
+    try:
+        path.rmdir()
+    except OSError:
+        pass
+
+
 def main() -> int:
     failed = []
     if ENV.get("AGENTHUB_RUNALL_SHIM_OFF"):
         print("· 测试子进程已关掉宿主 safe-delete（临时目录不进回收站，避免批量删被拦）",
               flush=True)
-    tmp = Path(tempfile.mkdtemp(prefix="agenthub_pytest_"))
+    tmp = _prepare_tmp_root()
     try:
         for name, path, per_file, timeout_s in LAYERS:
             targets = (sorted((ROOT / path).glob("test_*.py")) if per_file
@@ -252,7 +314,7 @@ def main() -> int:
             if not ok:
                 failed.append(name)
     finally:
-        shutil.rmtree(tmp, ignore_errors=True)
+        _discard_run_dir(tmp)
     print("\n===== 三层汇总 =====")
     for name, *_ in LAYERS:
         print(f"  {name:<5} {'FAIL' if name in failed else 'PASS'}")

@@ -225,7 +225,7 @@ def test_node_hook_emits_user_prompt_additional_context(hub_root, tmp_path):
     assert "批处理" in hook["additionalContext"]
 
 
-def test_node_hook_ignores_other_events_and_short_prompts(hub_root):
+def test_node_hook_ignores_other_events_and_short_prompts(hub_root, tmp_path):
     node = shutil.which("node") or ("D:/node/node.exe" if Path("D:/node/node.exe").is_file() else "")
     if not node:
         import pytest
@@ -234,7 +234,12 @@ def test_node_hook_ignores_other_events_and_short_prompts(hub_root):
                {"hook_event_name": "UserPromptSubmit", "prompt": "继续"}):
         r = subprocess.run([node, str(REPO / "brain_recall.mjs"), "--agent", "qoder"],
                            input=json.dumps(ev, ensure_ascii=False),
-                           capture_output=True, text=True, encoding="utf-8", timeout=30)
+                           capture_output=True, text=True, encoding="utf-8", timeout=30,
+                           env={**os.environ, "AGENTHUB_ROOT": hub_root,
+                                "AGENTHUB_RECALL_SCRIPT": str(REPO / "brain_recall.py"),
+                                "AGENTHUB_PYTHON": sys.executable,
+                                "AGENTHUB_RECALL_STATE": str(tmp_path / "ign-state.json"),
+                                "AGENTHUB_RECALL_NO_JOURNAL": "1"})
         assert r.returncode == 0 and r.stdout.strip() == "", (ev, r.stdout, r.stderr)
 
 

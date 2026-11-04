@@ -56,6 +56,7 @@ CHECKS = {
     "stalled": ("停滞项目清单（R20）：按最后工作记录/任务活动算真实闲置天数；显式标记属待决策不算故障，活跃项目超 90 天无活动=状态漏标才失败——归档清理供用户拍板", False),
     "dup_mem": ("疑似重复记忆对（Jaccard 检测，给「取代记忆#N」合并决策）", False),
     "error_debt": ("报错欠账账本（R834）：近 7 天工具失败撞过、但大脑答不上来的签名清单——报错即时回忆的空转率与「解决了却没登记」的漏账都在这里显形；同一签名重复撞 ≥3 次仍没答案才报红，一次性失败只报数不催（长期噪音会把通道教成没人看的检查项）。库里已有答案的签名自动收编，不用谁手动销账；三态里的「判不了」是改签名口径前写进去的旧键，既不算欠也不算收编，出窗口自清（R856）", False),
+    "failure_samples": ("失败 payload 采集面（B067/R859）：近 7 天「钩子说这次失败了、但大脑只能落一个空键」的样本长什么样——按形状（异常行/传输层/退出码/只有正文/只有人话/没正文）与 agent、工具分账。欠账账本只留算出来的键，键为空时正文根本没入库，所以「16 次无签名」一直说不出是什么；这一项把那块余量变成能看的证据。样本脱敏后只存前 400 字，不进召回、不进简报", False),
     "compress": ("冷记忆压缩候选（1.2）：retention 低的 project 类记忆中规则抽取持久事实（路径/错误/命令/决策）→ 建议清单，不落库", False),
     "agents": ("各 agent 接入状态（引导是否注入+版本是否当前 / MCP 是否配 agenthub）——核对「谁还没接上大脑」", False),
     "mcp_drift": ("接入参数漂移巡检（R103）：配了 agenthub 但配得不对的入口——--agent 被删（未锁身份，署名闸会持续拦写）/锁名与注册名不符（归属分裂）/server 脚本路径失效（MCP 起不来）/--root 指向别库。这些事后只在越权拦截流水露痕迹，这里事前点名", False),
@@ -94,6 +95,7 @@ PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_ch
                  "backup_health", "rules_health", "brief_hook_health", "link_health", "adherence",
                  "mcp_drift", "usage_health",
                  "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
+                 "failure_samples",
                  "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
 CHECK_FIXES = {
     "adherence": "分三种红各修各的：① 口径未覆盖又装不了新副本 → 先 `python cli.py deploy`（顺带刷新 ~/.agenthub/hooks 副本），让流水带上 src=；② 判官饿着（transcript 占比低 / 单轮证据字数中位数只有几十字）→ 采集侧问题，查 brain_adherence.mjs 是否仍优先用事件自带文本，修法见 R849（本轮工具调用才是证据）；③ 口径正常、采集在跑而采纳率低 → 才是注入精度问题：跑 tools/recall_adherence_report.py 看 by_strength，压掉「只曝光不采纳」的那批（R830 断路器），不是加大注入量。某家有注入账却窗口内零次采集：`python cli.py status` 核对回填钩子，再看 ~/.agenthub/logs/brain-adherence.log 的 skip 原因（hermes 无 Stop 出口不算故障）。④ 会话没闭环（有注入的会话隔了几小时从没被判定，R851）→ 先分清是「宿主压根不发 Stop」还是「钩子没跑」：Qoder Desktop 实测 3 次发言 0 次 Stop，这种家要给补扫通道 `python cli.py hook-install <agent> --events sweep --apply`（挂在 UserPromptSubmit，判的是上一轮），装完再跑一轮本项就会换成真实闭环数",
@@ -112,6 +114,7 @@ CHECK_FIXES = {
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",
     "dup_mem": "hub_memory_supersede 合并重复记忆（保留信息更全/更新的那条）",
+    "failure_samples": "报红的意思是「欠账在涨而采集面一条样本都没有」，不是「失败太多」：① `python cli.py deploy` 刷新 ~/.agenthub/hooks/brain_error_recall.mjs 与 mcp_server/brain*.py 的副本（改源码不改副本＝线上没生效，R840 同款）；② 查环境变量 AGENTHUB_FAIL_SAMPLE 是不是被设成 0（关掉采集）；③ 各家会话要重启一次钩子才会用新副本。样本够了以后这一项就是下一轮归因的原料：prose_only/content_only 占比高 → 说明宿主把非失败事件喂进了失败通道（B045/B066），修判定而不是修词表。",
     "error_debt": "把已解决的修法写回来：hub_report_error(title=报错原文那行, detail=完整报错, undo=怎么修的)——下次同签名自动命中，账本自己收编；没解决别登记（假答案比没答案更贵）。反复撞却没解决的，先看 detail 里那条签名是不是同类问题换了张皮（B046 残缺词元）",
     "record_quality": "hub_log_work 的 content 按四段式写：目的/做了什么/验证结果/如何回滚",
     "date_health": "把 date/valid_until/截止日改成 YYYY-MM-DD（格式歪了到期提醒会静默失效）",
@@ -150,7 +153,7 @@ DB_BACKED_CHECKS = frozenset({
     "db_integrity", "db_health", "audit_chain", "security_health",
     "usage_health", "stale_health", "ghost_memory", "dup_mem", "record_quality",
     "date_health", "tasks_health", "governance_health", "lease_health", "stalled",
-    "error_debt", "adherence",
+    "error_debt", "adherence", "failure_samples",
 })
 _CAUSE_DB_SKIP_WHY = "大脑库不存在（同因跳过，建库/指对根目录后重跑）"
 
@@ -366,6 +369,8 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _dup_mem(root)
     elif name == "error_debt":
         r = _error_debt(root)
+    elif name == "failure_samples":
+        r = _failure_samples(root)
     elif name == "compress":
         r = _compress(root)
     elif name == "agents":
@@ -4058,6 +4063,52 @@ def _error_debt(root: str) -> dict:
     return {"ok": False,
             "summary": head + f"——其中 {len(nag)} 条重复撞 ≥{DEBT_REPEAT_FAIL} 次仍没答案",
             "detail": detail}
+
+
+# 采集面形状读数：这几个标签意味着「宿主确实报了失败，但我们拿不到可判定的正文」，
+# 它们才是 B067 要看的那块余量；exception_line 有正文、本来就能归因，不算异常。
+FAIL_BLIND_SHAPES = ("no_text", "no_error_text", "event_json_dump", "null_event", "bad_json")
+
+
+def _failure_samples(root: str) -> dict:
+    """失败 payload 采集面（B067/R859）：把「无签名触发说不清是什么」变成可核查的样本账。
+
+    报红的条件刻意不是「样本很多」——采集面刚上线时样本多是好事（说明在收）。真正要
+    拦的是**账对不上**：欠账那边有 N 次没签名的触发，采集面却一枚样本都没有，那基本
+    就是「源码改了、线上副本没跟上」（R840 抓过同一类）或采集被环境变量关掉。
+    """
+    if err := _need_root(root):
+        return err
+    try:
+        brain = _import_brain()
+        s = brain.fail_summary(root, days=getattr(brain, "ERROR_DEBT_DAYS", 7), limit=8)
+        debt = brain.error_debt(root, days=getattr(brain, "ERROR_DEBT_DAYS", 7), limit=40)
+    except Exception as e:  # noqa: BLE001
+        return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}",
+                "detail": []}
+    shapes = " ".join(f"{d['k']}×{d['n']}" for d in s["by_shape"][:6])
+    heads = " ".join(f"{d['k']}×{d['n']}" for d in s["by_agent"][:5])
+    unshaped = int(debt.get("miss_unshaped") or 0)
+    head = (f"近 {s['days']} 天失败样本 {s['total']} 枚"
+            + (f"（{shapes}）" if shapes else "")
+            + (f"；按家 {heads}" if heads else ""))
+    detail = [f"[{e['shape']}] {e['agent'] or '?'} · {e['tool'] or '?'} · "
+              f"{e['event'] or '?'} · {int(e['chars'])}字 · {str(e['head'])[:60]}"
+              for e in s["examples"][:6]]
+    if s.get("disabled"):
+        return {"ok": True, "summary": head + "——采集被 AGENTHUB_FAIL_SAMPLE=0 关掉（本次不催）",
+                "detail": detail}
+    if unshaped and not s["total"]:
+        return {"ok": False,
+                "summary": head + f"——欠账那边有 {unshaped} 次无签名触发，采集面却是空的",
+                "detail": detail}
+    if not s["total"]:
+        return {"ok": True, "summary": head + "——窗口内没有无签名触发，采集面闲置正常",
+                "detail": []}
+    blind = sum(d["n"] for d in s["by_shape"] if d["k"] in FAIL_BLIND_SHAPES)
+    tail = (f"（其中 {blind} 枚是「宿主报了失败但正文拿不到」——正是 B045/B066 要看的那批）"
+            if blind else "")
+    return {"ok": True, "summary": head + tail, "detail": detail}
 
 
 # 冷记忆压缩的事实抽取（1.2，先做窄）：四类窄正则，只抽明确可沉淀的持久事实

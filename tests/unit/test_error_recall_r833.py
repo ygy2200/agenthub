@@ -516,16 +516,27 @@ def test_mjs_silent_on_success_and_generic_failure(hub_root, tmp_path):
         assert r.stdout.strip() == "", (ev, r.stdout)
 
 
-def test_mjs_survives_garbage_input():
-    """stdin 是烂 JSON / 空输入也必须 exit 0——钩子坏了不能把用户的会话拖住。"""
+def test_mjs_survives_garbage_input(tmp_path):
+    """stdin 是烂 JSON / 空输入也必须 exit 0——钩子坏了不能把用户的会话拖住。
+
+    `AGENTHUB_ROOT` 必须显式钉到临时目录：不钉时钩子会从 `config.agents.json` 解析出
+    **真实大脑根**，而 R859 的采集面正好会把这类 payload 落库（`bad_json`/`null_event`
+    样本行真的出现在 `D:\\agent资料\\zcode项目记录` 的 `fail_events` 里，head 就是
+    `{not json` 与 `null`——用例污染了宿主，不是代码坏了；与 `test_hit_does_not_sample`
+    当初为 state 文件踩过的是同一个坑）。守卫见 `test_hook_test_isolation_r859.py`。
+    """
     node = _node()
     if not node:
         import pytest
         pytest.skip("没有 node")
+    root = tmp_path / "hub-root"
+    (root / "_hub").mkdir(parents=True)
     for raw in ("", "{not json", "null", '["weird"]'):
         r = subprocess.run([node, str(REPO / "brain_error_recall.mjs")], input=raw,
                            capture_output=True, text=True, timeout=60, cwd=str(REPO),
-                           env={**os.environ,
+                           env={**os.environ, "AGENTHUB_ROOT": str(root),
+                                "AGENTHUB_ERROR_STATE": str(tmp_path / "state.json"),
+                                "AGENTHUB_PYTHON": sys.executable,
                                 "AGENTHUB_ERROR_SCRIPT": str(REPO / "brain_error_recall.py")})
         assert r.returncode == 0, (raw, r.returncode, r.stderr)
 

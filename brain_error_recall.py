@@ -45,6 +45,11 @@ def main(argv=None) -> int:
     ap.add_argument("--no-count", action="store_true",
                     help="只看不记账：不涨 inject_count、不写采纳账本（冒烟/调参用，"
                          "钩子真送达时不要用——曝光账本是假的，R830 断路器会据此冷却真记忆）")
+    ap.add_argument("--event", default="", help="钩子事件名（采集面按事件分账，B067）")
+    ap.add_argument("--sample-only", action="store_true",
+                    help="不落召回、只落一枚失败样本（B067：钩子拿到了失败事件"
+                         "却抽不出报错正文时走这条，否则那 16 次无签名触发永远说不清是什么）")
+    ap.add_argument("--shape", default="", help="显式形状标签（钩子侧已知事件形态时用）")
     args = ap.parse_args(argv)
     try:
         root = (args.root or (core.load_config() or {}).get("root", "") or "").strip()
@@ -57,12 +62,24 @@ def main(argv=None) -> int:
             except Exception:  # noqa: BLE001
                 pass
         if not err.strip():
+            if not args.sample_only:
+                return 0
+        if args.sample_only:
+            # 采集轨道：不查库、不注任何东西，只留一枚脱敏样本供巡检归因（B067）
+            if root:
+                try:
+                    brain.sample_failure(root, agent=agent, tool=args.tool,
+                                         event=args.event, shape=args.shape,
+                                         payload=err, session=args.session)
+                except Exception:  # noqa: BLE001 采集失败不影响会话
+                    pass
             return 0
         kw = {"max_chars": args.max_chars} if args.max_chars > 0 else {}
         res = brain.error_recall(
             root, err, tool=args.tool, agent=agent, cwd=cwd, project=args.project,
             session=args.session, state_path=args.state,
-            update_state=not args.no_state, count=not args.no_count, **kw)
+            update_state=not args.no_state, count=not args.no_count,
+            event=args.event, **kw)
         if not res["text"]:
             return 0
         if root and not args.no_journal:

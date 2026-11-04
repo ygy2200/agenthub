@@ -690,6 +690,24 @@ CREATE INDEX IF NOT EXISTS idx_trig_event ON triggers(on_event, enabled);
 -- 不幂等的写工具让「超时重试」变成「重复记账」——外部研究一致点名这是写工具
 -- 第一优先项（CallSphere/Thomas De Vos/datarekha）。语义：同 (agent, key) 同
 -- 内容 → 重放首次结果；同键不同内容 → 冲突拒收（digest 防键复用）。
+-- B067（R859）失败 payload 采集面：欠账账本只留下「算出来的键」，键为空时正文根本没入库，
+-- 于是「近 7 天 16 次无签名触发」永远说不出是什么——是宿主没给正文、是人话一句、还是
+-- 网页正文被当成报错，三种成因的修法完全不同。这里只存**脱敏后的前 400 字 + 形状标签**，
+-- 不进召回、不进简报，只供巡检读数；到期与超额都自清。
+CREATE TABLE IF NOT EXISTS fail_events (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    ts TEXT DEFAULT "",
+    agent TEXT DEFAULT "",
+    tool TEXT DEFAULT "",
+    event TEXT DEFAULT "",
+    shape TEXT DEFAULT "",
+    sig TEXT DEFAULT "",
+    chars INTEGER DEFAULT 0,
+    head TEXT DEFAULT "",
+    session TEXT DEFAULT ""
+);
+CREATE INDEX IF NOT EXISTS idx_fail_events_ts ON fail_events(ts);
+CREATE INDEX IF NOT EXISTS idx_fail_events_shape ON fail_events(shape, agent);
 CREATE TABLE IF NOT EXISTS idem_keys (
     agent TEXT NOT NULL,
     key TEXT NOT NULL,
@@ -868,11 +886,12 @@ def agent_record_stats(root: str, agent: str, days: int = 30) -> dict:
         return {"days": days, "count": 0, "last": ""}
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 # B11 schema 版本号。约定：新增表/列/迁移时 **+1**，并在本注释里记一笔：
 #   v1 = 基线（本登记落地的时刻；此前所有迁移都靠幂等的 _migrate_columns 逐列 PRAGMA 试探，
 #        能补列但没有版本号——无法回答「这个库现在是哪个版本」「是不是降级运行了」）。
 #   v2 = R6 新增 agent_onboarding（接入验证快照）。
+#   v3 = R859 新增 fail_events（B067 失败 payload 采集面：脱敏样本 + 形状标签）。
 # 故意**不**替换 _migrate_columns：它已幂等且被大量回归覆盖，推翻重来风险远大于收益。
 # 这里只补缺口的一环——版本登记 + 降级检测。
 
@@ -9273,6 +9292,182 @@ def caliber_ts(root: str, key: str) -> str:
         return ""
 
 
+def _fail_redact(text: str) -> str:
+    """存样前脱敏：钩子拿到的正文经常整条包着命令行，命令行里就可能有 token。
+
+    只认「形状的常见形态」，不追求穷尽——采到的样本可能含未识别的凭据，所以另有一条
+    更硬的边界：样本只进本机大脑目录，永不出网、永不进召回与简报（见 `fail_summary`）。
+    """
+    t = re.sub(r"(?i)\b(?:ghp|github_pat|gho|ghu|ghs)_[A-Za-z0-9_]{8,}", "[token]", text or "")
+    t = re.sub(r"\bxox[abprs]-[A-Za-z0-9-]{8,}", "[token]", t)
+    t = re.sub(r"\bAKIA[0-9A-Z]{12,}", "[token]", t)
+    t = re.sub(r"(?i)-----BEGIN [A-Z ]*PRIVATE KEY-----[\s\S]*?-----END [A-Z ]*PRIVATE KEY-----",
+               "[privatekey]", t)
+    t = re.sub(r"(?i)\b(token|secret|password|passwd|api[_-]?key|access[_-]?key)"
+               r"\b\s*[\"']?\s*[:=]\s*[\"']?[^\s\"'&,;]{4,}", r"\1=[redacted]", t)
+    t = re.sub(r"(?i)\bBearer\s+[A-Za-z0-9._\-]{12,}", "Bearer [redacted]", t)
+    return t
+
+
+FAIL_SHAPES = ("exception_line", "transport", "exit_code", "named_phrase",
+               "content_only", "prose_only", "no_text")
+# 「有失败口音」的形状才允许进召回：这四类是报错自己在说话。`content_only`（网页正文/
+# 引号段）、`prose_only`（一句人话）、`no_text`（没正文）不是——它们过去照样能生成 keyed
+# 签名，并把「大脑没答案」的催红推到模型眼前（B045/B066 那条假报错就是这么来的）。
+FAIL_LIVE_SHAPES = ("exception_line", "transport", "exit_code", "named_phrase")
+
+
+def failure_shape(text: str) -> str:
+    """这条 payload 到底像不像一次失败——B045/B066 的前置判定（先分类，再谈修法）。
+
+    为什么不能只靠抽词：R858 之前一直想给召回加「不像报错的词」黑名单（URL、`https:/`
+    这类），那是打地鼠——真库里带引号标题的网页正文照样能生成 keyed 签名（实测）。词表
+    在内容层，问题在**结构层**：成功工具的返回里也可能有 error 字样，而真失败也可能只
+    有一句人话。所以先给形状贴标签，把「这条有没有失败的口音」变成可统计的字段。
+
+    判据顺序即优先级；`content_only` 是专门给 B066 留的那一格（有引号段/URL 却没有任何
+    错误形状）。准确性未经真库标定，R860 拿样本回验（待确认）。
+    """
+    t = (text or "").strip()
+    if not t:
+        return "no_text"
+    if _FAIL_EXC_LINE_RE.search(t):
+        return "exception_line"
+    if _FAIL_TRANSPORT_RE.search(t):
+        return "transport"
+    if _FAIL_EXIT_RE.search(t):
+        return "exit_code"
+    if _ERR_NAMED_RE.search(t) or _FAIL_SHELL_IDIOM_RE.search(t):
+        return "named_phrase"      # `permission denied` / `no such column` 这类没异常名、
+                                   # 但报错成语本身就是招牌的真失败，不能被当成「一句人话」
+    quoted = len(_ERR_QUOTED_RE.findall(t))
+    if quoted >= 2 or (_FAIL_URL_RE.search(t) and not _FAIL_NAMED_VOICE_RE.search(t)):
+        return "content_only"
+    return "prose_only"
+
+
+# 异常/错误行：Python 的 `XxxError: …`、Java/Node 的 `Error: …`、日志式 `[ERROR]`/`FATAL`，
+# 外加 JSON 错误体 `{"error": …}`（各家 CLI 都这么回，键名带引号所以不在行首，单列一支）
+_FAIL_EXC_LINE_RE = re.compile(
+    r"(?im)^\s*(?:Traceback \(most recent call last\)|[A-Za-z_][\w.]*"
+    r"(?:Error|Exception|Warning|Failure)\s*[:：]|"
+    r"(?:error|fatal|critical)\s*[:：]|\[[\s]*ERROR[\s]*\])"
+    r"|(?:[\"'](?:error|errorMessage|exception|failure|errmsg)[\"']\s*[:=])")
+# 传输层失败：没有异常名，但状态码/连接错误本身就是招牌
+_FAIL_TRANSPORT_RE = re.compile(
+    r"(?i)\b(?:HTTP/[0-9.]\s+[45]\d{2}|status\s*(?:code)?\s*[=:]\s*[45]\d{2}|"
+    r"E(?:CONNREFUSED|CONNRESET|ACCES|ADDRINUSE|AI|TIMEDOUT)|timed?\s*out|"
+    r"could not (?:resolve|connect)|connection (?:refused|reset|closed)|"
+    r"certificate verify failed|SSL error)\b")
+# 退出码/命令失败：ASCII 与中文两种口音
+_FAIL_EXIT_RE = re.compile(
+    r"(?i)\b(?:exit(?:ed)?\s*(?:code|with exit code)\s*-?\d+|non-?zero exit|"
+    r"command failed|process exited)\b|退出码|返回码\s*-?\d|命令失败|执行失败")
+_FAIL_URL_RE = re.compile(r"(?i)\bhttps?://\S+")
+# 「查不到/没有/不存在」这类人话否定，算失败口音，不算网页正文
+_FAIL_NAMED_VOICE_RE = re.compile(
+    r"(?i)\b(?:not found|no such|denied|missing|unavailable|refused|forbidden|"
+    r"unauthorized|failed to|cannot|can't|unable to)\b|找不到|不存在|无权限|拒绝|超时")
+# shell/CLI 失败成语（**只用于形状分类，不进 `_ERR_NAMED_RE`**——那支同时喂签名抽取，
+# 动它就等于悄悄改口径，R856 的「登记键==召回键」等值通道会失去历史可比性）。
+# 为什么单列一支：`head: cannot open 'x': No such file or directory`、cmd 的
+# `'tail' is not recognized as an internal or external command` 这类失败没有异常名、
+# 也没有 exit code，只有 shell 自己那句固定说法；R859 第一版把它们判成 `prose_only`
+# 直接静默，而本机会话当天真送达过一条这种形状的召回（journal 12:05:32 · tool=Bash）。
+_FAIL_SHELL_IDIOM_RE = re.compile(
+    r"(?i)(?:\bno such file or directory\b|\bis a directory\b|\bnot a directory\b|"
+    r"\bcannot (?:open|access|find the (?:file|path))\b|\bcan'?t (?:open|read)\b|"
+    r"\bno space left on device\b|\bread-only file system\b|\bdevice or resource busy\b|"
+    r"\btext file busy\b|\bbroken pipe\b|\bsegmentation fault\b|\bcore dumped\b|"
+    r"\bnot recognized as (?:an internal or external command|the name of a cmdlet)\b|"
+    r"\bfatal:|\berrno\s*\d+\b|\benoent|\beacces|\beperm|\benotdir|\beisdir|\beexist\b|"
+    r"\bunexpected (?:eof|token|end of file)\b|"
+    r"没有那个文件或目录|不是内部或外部命令|系统找不到指定的|磁盘空间不足|权限不够)")
+
+
+FAIL_SAMPLE_MAX_CHARS = 400
+FAIL_SAMPLE_DAYS = 30
+FAIL_SAMPLE_ROWS = 3000
+_FAIL_SAMPLE_ENSURED: set = set()   # 进程内已补建过 fail_events 的 root（见 sample_failure）
+
+
+def sample_failure(root: str, *, agent: str = "", tool: str = "", event: str = "",
+                   shape: str = "", sig: str = "", payload: str = "",
+                   session: str = "") -> int:
+    """落一枚失败样本（脱敏 + 截断 + 自清）。写失败静默——采集绝不能拖累召回。"""
+    if not root or os.environ.get("AGENTHUB_FAIL_SAMPLE", "1") == "0":
+        return 0
+    if root not in _FAIL_SAMPLE_ENSURED:
+        # 钩子是一次性子进程，而它自己从不叫 ensure_schema（补建挂在 MCP 启动/导入路径上）。
+        # 本轮之前建的真库里没有 `fail_events` 这一格，INSERT 撞 `no such table` 又被下面
+        # 的 except 静默吃掉——源码有测试、部署也一致、库也好，就是永远收不到样本（真库实测
+        # 复现过：部署后跑 `SELECT … FROM fail_events` 报 no such table）。补建是毫秒级幂等，
+        # 进程内只叫一次。
+        _FAIL_SAMPLE_ENSURED.add(root)
+        try:
+            ensure_schema(root)
+        except sqlite3.Error:
+            pass
+    head = _fail_redact(str(payload or ""))[:FAIL_SAMPLE_MAX_CHARS]
+    sh = shape or failure_shape(payload)
+    # sig 也照样要过脱敏：签名是从**原文**抽的词，凭据被抽成招牌词时（实测
+    # `permission denied, open token=ghp_…` 整枚 token 进了 sig 列），洗 head 不管用。
+    sig_col = _fail_redact(str(sig or ""))[:160]
+    try:
+        with db_conn(root) as conn:
+            cur = conn.execute(
+                "INSERT INTO fail_events (ts, agent, tool, event, shape, sig, chars, head,"
+                " session) VALUES (?,?,?,?,?,?,?,?,?)",
+                (_now(), _norm_agent(agent) or (agent or "").strip(), (tool or "")[:40],
+                 (event or "")[:32], sh, sig_col, len(str(payload or "")), head,
+                 (session or "")[:40]))
+            cutoff = (datetime.datetime.now()
+                      - datetime.timedelta(days=FAIL_SAMPLE_DAYS)).isoformat(timespec="seconds")
+            conn.execute("DELETE FROM fail_events WHERE ts<?", (cutoff,))
+            conn.execute(
+                "DELETE FROM fail_events WHERE id NOT IN "
+                "(SELECT id FROM fail_events ORDER BY id DESC LIMIT ?)", (FAIL_SAMPLE_ROWS,))
+            return int(cur.lastrowid or 0)
+    except sqlite3.Error:
+        return 0
+
+
+def fail_summary(root: str, days: int = 7, limit: int = 12) -> dict:
+    """采集面的读数：按形状/agent/工具看近 N 天的失败样本，供巡检与下一轮归因。"""
+    out = {"days": days, "total": 0, "by_shape": [], "by_agent": [], "by_tool": [],
+           "examples": [], "since": "", "last_ts": "", "disabled":
+               os.environ.get("AGENTHUB_FAIL_SAMPLE", "1") == "0"}
+    if not root or not os.path.isdir(root):
+        return out
+    floor = (datetime.datetime.now()
+             - datetime.timedelta(days=days)).isoformat(timespec="seconds")
+    out["since"] = floor
+    try:
+        with db_conn(root) as conn:
+            conn.row_factory = sqlite3.Row
+            row = conn.execute("SELECT COUNT(*) AS n, MAX(ts) AS last FROM fail_events "
+                               "WHERE ts>=?", (floor,)).fetchone()
+            out["total"] = int(row["n"] or 0)
+            out["last_ts"] = row["last"] or ""
+            for key, sql in (("by_shape", "SELECT shape, COUNT(*) AS n FROM fail_events "
+                              f"WHERE ts>=? GROUP BY shape ORDER BY n DESC"),
+                             ("by_agent", "SELECT agent, COUNT(*) AS n FROM fail_events "
+                              f"WHERE ts>=? GROUP BY agent ORDER BY n DESC"),
+                             ("by_tool", "SELECT tool, COUNT(*) AS n FROM fail_events "
+                              f"WHERE ts>=? GROUP BY tool ORDER BY n DESC")):
+                out[key] = [{"k": r[0] or "(空)", "n": int(r[1])}
+                            for r in conn.execute(sql, (floor,))]
+            out["examples"] = [{"ts": r["ts"], "agent": r["agent"], "tool": r["tool"],
+                                "event": r["event"], "shape": r["shape"], "sig": r["sig"],
+                                "chars": int(r["chars"] or 0), "head": r["head"]}
+                               for r in conn.execute(
+                                   "SELECT * FROM fail_events WHERE ts>=? "
+                                   "ORDER BY id DESC LIMIT ?", (floor, limit))]
+    except sqlite3.Error:
+        pass
+    return out
+
+
 def _log_error_miss(root: str, agent: str, sig: str, terms: list) -> None:
     """大脑被问到了但答不上——这一次问答必须留下证据，否则永远算不出空转率。
 
@@ -9475,7 +9670,8 @@ def _error_headline(text: str, high: list, limit: int = 96) -> str:
 def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
                  cwd: str = "", project: str = "", max_chars: int = ERROR_RECALL_MAX_CHARS,
                  session: str = "", state_path: str = "", update_state: bool = True,
-                 count: bool = True, budget_path: str = "", origin: str = "live") -> dict:
+                 count: bool = True, budget_path: str = "", origin: str = "live",
+                 event: str = "") -> dict:
     """工具失败那一刻的自动回忆（PostToolUseFailure 钩子入口，R833）。
 
     为什么需要它：简报解决开局、按句回忆解决「用户说到某件事」，但模型真正需要
@@ -9499,7 +9695,8 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "error_ids": [],
            "terms": [], "sig": "", "project": "", "chars": 0, "elapsed_ms": 0,
-           "skipped": "", "counted": bool(count), "budget": {}, "self_doc_ids": []}
+           "skipped": "", "counted": bool(count), "budget": {}, "self_doc_ids": [],
+           "shape": ""}
     if not root or not os.path.isdir(root):
         return out
     terms = error_signature_terms(_error_voice(error_text))
@@ -9509,6 +9706,9 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         if count:   # 进分母（大脑确实被问过），不进欠账（没有签名可追）
             try:
                 _log_error_miss(root, _norm_agent(agent) or (agent or "").strip(), "", [])
+                # B067：没签名的这一次光靠分母说不出是什么，落一枚脱敏样本
+                sample_failure(root, agent=agent, tool=tool, event=event, shape="",
+                               sig="", payload=error_text, session=session)
             except sqlite3.Error:
                 pass
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
@@ -9531,6 +9731,30 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         out["skipped"] = "self_tool"
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         return out
+    # 失败口音前置判定（B045/B066）：签名抽得出词不等于这真的是一次失败。
+    #   · 线上实锤：2026-11-03 12:05–12:07 四条 `tool=WebFetch` 的欠账提示，签名分别是
+    #     `https:/ memory`、`https:/ simplemem|simplemem`、`https:/ 2606.14571`、
+    #     `https://memorypapers.org/`——WebFetch 自己失败了，正文里带着它想抓的那篇论文的
+    #     标题与 URL，招牌词于是来自**内容**而不是诊断（journal 里可逐条回查）。
+    #   · 代码层隐患（本轮在部署副本上复现，不是现网发生过的污染）：钩子的 `asText()` 在
+    #     对象里找不到 errorMessage/message/stderr 等键时走 `JSON.stringify` 兜底，整个事件
+    #     JSON 会被当成报错正文递进来，签名成 `iserror`。真库 searches 里**没有** `iserror`
+    #     键的行（取证脚本逐行核过），所以这条只算「已修好的通道」；到底有没有真实宿主喂过
+    #     这种形状，由 fail_events 采集面回答，别拿复现当现网结论。
+    # 两类都不该查库、也不该开口，但要留下样本。
+    shape = failure_shape(error_text)
+    if shape not in FAIL_LIVE_SHAPES:
+        out["skipped"] = "not_failure_voice"
+        out["shape"] = shape
+        if count:
+            try:
+                sample_failure(root, agent=agent, tool=tool, event=event, shape=shape,
+                               sig=sig, payload=error_text, session=session)
+            except sqlite3.Error:
+                pass
+        out["elapsed_ms"] = int((time.time() - t0) * 1000)
+        return out
+    out["shape"] = shape
     # 同会话同签名去重（重试循环刷屏）
     skey = f"{who or '?'}|{session}" if session else ""
     state_file = _recall_state_file(state_path) if state_path else \
@@ -9657,6 +9881,11 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         if count:
             try:
                 _log_error_miss(root, who, sig, terms)
+                # B045/B066：有签名不等于真失败——网页正文里的引号段也能生成 keyed 签名。
+                # 把形状一起落下来，下一轮才判得出「这条 payload 到底是不是失败」。
+                sample_failure(root, agent=agent, tool=tool, event=event,
+                               shape=failure_shape(error_text), sig=sig,
+                               payload=error_text, session=session)
             except sqlite3.Error:
                 pass
         if hint_ok:

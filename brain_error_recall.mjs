@@ -72,6 +72,7 @@ function asText(v, depth = 0) {
 }
 
 /** 从各家事件载荷里捞出「这次失败到底是什么」。拿不到就返回空串（静默）。 */
+let rejectedJson = false;   // 本轮是否因为「正文其实是事件 JSON dump」而拒过一条
 function errorText(ev) {
   for (const k of ['error', 'errorMessage', 'error_message', 'failure',
     'tool_error', 'stderr', 'message']) {
@@ -81,32 +82,100 @@ function errorText(ev) {
   const resp = ev?.tool_response ?? ev?.toolResult ?? ev?.result;
   const isErr = resp?.isError ?? resp?.is_error ?? resp?.error ?? resp?.ok === false;
   const t = asText(resp);
-  if (isErr != null && isErr !== false && t.trim().length >= MIN_ERR_CHARS) return t.trim();
+  if (isErr != null && isErr !== false && t.trim().length >= MIN_ERR_CHARS) {
+    // B045 的成因在这里现形（2026-11-04 采集面实锤）：`isError:true` 而 stderr/stdout
+    // 全空时，`asText` 一路退到 `JSON.stringify(v)`，于是**整个事件 JSON 变成了「报错正文」**——
+    // 钩子把 `{"isError":true,"stdout":"","stderr":""}` 递给召回，签名抽成 `iserror`，
+    // 主人看到的欠账提示是「刚撞的：{"isError":true…}」。这不是报错，是挽具自己造的假报错。
+    // 所以：一段 JSON dump 不算报错正文，交回上层走采集轨道（只采不注）。
+    if (/^\s*[{[]/.test(t)) {
+      try { JSON.parse(t); rejectedJson = true; logLine(`reject: 事件 JSON 被当报错正文 tool=${String(ev.tool_name || '').slice(0, 24)}`); return ''; } catch { /* 解析不了就不是 dump，继续 */ }
+    }
+    return t.trim();
+  }
   return '';
+}
+
+function resolveRoot(ev) {
+  const cwd = ev.cwd || ev.workingDirectory || ev.cwdPath || process.cwd();
+  let rootArg = process.env.AGENTHUB_ROOT || '';
+  if (!rootArg && existsSync(CONFIG)) {
+    try { rootArg = String(JSON.parse(readFileSync(CONFIG, 'utf8')).root || ''); } catch { /* ignore */ }
+  }
+  return { cwd, rootArg };
+}
+
+function agentName(ev) {
+  const argv = process.argv.slice(2);
+  const ai = argv.indexOf('--agent');
+  return (ai >= 0 ? argv[ai + 1] : '') || ev.agent || process.env.AGENTHUB_AGENT || '';
+}
+
+/** 只采不注：把拿不到正文的失败事件交给 python 侧落一枚脱敏样本（B067）。 */
+function sampleOnly(shape, raw, ev, event) {
+  try {
+    if (!existsSync(SCRIPT)) { logLine(`skip(sample): ${SCRIPT} 不存在`); return; }
+    if (process.env.AGENTHUB_FAIL_SAMPLE === '0') return;
+    const { cwd, rootArg } = resolveRoot(ev);
+    const tool = String(ev.tool_name || ev.toolName || '');
+    const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
+    const args = [SCRIPT, '--sample-only', '--shape', shape, '--agent', agentName(ev),
+      '--cwd', cwd, '--tool', tool, '--session', session, '--event', String(event || ''),
+      '--error', String(raw || '').slice(0, 4000)];
+    if (rootArg) args.push('--root', rootArg);
+    const r = spawnSync(pickPython(), args, {
+      encoding: 'utf8', timeout: 5000,
+      env: { ...process.env, PYTHONIOENCODING: 'utf-8', PYTHONUTF8: '1' },
+    });
+    if (r.status !== 0) {
+      logLine(`sample-fail rc=${r.status} err=${String(r.stderr || '').slice(0, 120)}`);
+    }
+  } catch (e) {
+    logLine(`sample-throw ${String(e && e.message || e).slice(0, 120)}`);
+  }
 }
 
 try {
   const raw = await readStdin();
   let ev = {};
-  try { ev = raw.trim() ? JSON.parse(raw) : {}; } catch { ev = {}; }
+  let broken = '';
+  try {
+    ev = raw.trim() ? JSON.parse(raw) : {};
+    if (ev === null || typeof ev !== 'object') { broken = 'null_event'; ev = {}; }
+  } catch { broken = 'bad_json'; ev = {}; }
   const event = String(ev.hook_event_name || ev.hookEventName || ev.event || '');
   const en = event.toLowerCase().replace(/[_-]/g, '');
   const isFailure = en === 'posttoolusefailure';
   const isPost = en === 'posttooluse';
-  if (!isFailure && !isPost) process.exit(0);
+  if (!isFailure && !isPost) {
+    // 事件名都拿不到时先留一枚样本再退出。日志里那条 `Cannot read properties of null
+    // (reading 'hook_event_name')` 就是 stdin 给了 `null`——宿主确实调了钩子，我们却
+    // 什么都不知道。这类形状是 B067 三种成因里的第 ② 种，不采就等于永远只能猜。
+    if (broken) sampleOnly(broken, raw, ev, event);
+    process.exit(0);
+  }
 
   const tool = String(ev.tool_name || ev.toolName || '');
   const err = errorText(ev);
   if (!err) {
-    if (isFailure) logLine(`skip: 拿不到报错正文 tool=${tool.slice(0, 24)}`);
+    if (isFailure) {
+      // B067：宿主确实报了「这次工具失败」，可我们抽不出正文——这正是那 16 次无签名触发
+      // 的入口。以前只写一行本地日志就退出，大脑里什么都不留，于是谁也说不清它是
+      // 「事件形状拿不到正文」还是「本来就只有一句人话」。现在落一枚脱敏样本，只采不注。
+      logLine(`skip: 拿不到报错正文 tool=${tool.slice(0, 24)}`);
+      // 分成两格记：`no_error_text` 是「事件里根本没有正文」，`event_json_dump` 是
+      // 「有正文、但那段正文其实就是事件自己」（B045 的 asText 兜底路径）。B045 至今
+      // 标着「待确认」，缺的就是这个计数——采到哪一种，修法完全不同。
+      sampleOnly(rejectedJson ? 'event_json_dump' : 'no_error_text', raw, ev, event);
+    } else if (broken) {
+      sampleOnly(broken, raw, ev, event);
+    }
     process.exit(0);
   }
 
-  const argv = process.argv.slice(2);
-  const ai = argv.indexOf('--agent');
-  const agent = (ai >= 0 ? argv[ai + 1] : '') || ev.agent || process.env.AGENTHUB_AGENT || '';
+  const agent = agentName(ev);
   const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
-  const cwd = ev.cwd || ev.workingDirectory || ev.cwdPath || process.cwd();
+  const { cwd, rootArg } = resolveRoot(ev);
   if (!existsSync(SCRIPT)) { logLine(`skip: ${SCRIPT} 不存在`); process.exit(0); }
 
   // 命令/入参一起给：报错正文常常只说「exit code 1」，失败的那条命令才是检索线索。
@@ -121,11 +190,8 @@ try {
   const payload = (oneLine ? `失败调用：${oneLine}\n` : '') + err.slice(0, 6000);
 
   const args = [SCRIPT, '--agent', agent, '--cwd', cwd, '--tool', tool,
-    '--session', session, '--max-chars', String(MAX_CHARS), '--error', payload];
-  let rootArg = process.env.AGENTHUB_ROOT || '';
-  if (!rootArg && existsSync(CONFIG)) {
-    try { rootArg = String(JSON.parse(readFileSync(CONFIG, 'utf8')).root || ''); } catch { /* ignore */ }
-  }
+    '--session', session, '--max-chars', String(MAX_CHARS), '--event', event,
+    '--error', payload];
   if (rootArg) args.push('--root', rootArg);
   if (process.env.AGENTHUB_ERROR_STATE) args.push('--state', process.env.AGENTHUB_ERROR_STATE);
   if (process.env.AGENTHUB_ERROR_NO_JOURNAL === '1') args.push('--no-journal');
