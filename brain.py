@@ -6157,12 +6157,19 @@ PUSH_THROTTLE_MIN = 10   # 同 agent+project 重复心跳的免推窗口（分�
 # 零采纳的过期验收记忆）。主动检索与 hub_memory_read 完全不受影响——那才是「要用时自己查」。
 IMMUNE_INJECT_MIN = 5
 IMMUNE_WINDOW_DAYS = 30
+# R868：主动搜索过 ≥3 次的记忆不冷却。曝光免疫只该判「塞到眼前也没人用」；一条
+# 被 hub_search/hub_memory_read 主动查过多次的记忆，恰恰证明它有用——真库 #113
+# 被推 5 次零采纳、却被主动搜了 24 次，旧规则把它一起静音了。主动搜索不是「采纳」，
+# 但它比被动曝光强，足以推翻「推了也没用」的判定。
+IMMUNE_USE_MIN = 3
 
 
 def is_exposure_immune(mem: dict, now: "datetime.datetime | None" = None) -> bool:
-    """纯函数：这条记忆是不是「推了也没用」的（R830）。给 SQL 之外的通道复用。"""
+    """纯函数：这条记忆是不是「推了也没用」的（R830）；主动搜过多次的不算（R868）。"""
     if int(mem.get("adopt_count") or 0) > 0:
         return False                       # 被证实采纳过 → 它是有效结论，不冷却
+    if int(mem.get("use_count") or 0) >= IMMUNE_USE_MIN:
+        return False                       # 主动搜索过 → 有人真的在用它，别静音
     if int(mem.get("inject_count") or 0) < IMMUNE_INJECT_MIN:
         return False                       # 样本还不够，别急着判死
     last = _parse_ts(mem.get("last_inject"))
@@ -6176,11 +6183,14 @@ def _immune_sql() -> tuple:
     要排除这些行的那一侧自己加 NOT——`NOT(cond)` 才只挡免疫行；反过来若把 NOT 写进本函数，
     `NOT(a AND b AND c)` 在 a 为假时结果是真，等于把全库都判成免疫（2026-11-01 实测：
     505 条里 477 条被判冷却，正是这么来的）。
-    COALESCE(last_inject,'') 不能省：NULL>=x 在 SQLite 里是 NULL，整行会被 WHERE 当假丢掉。"""
+    COALESCE(last_inject,'') 不能省：NULL>=x 在 SQLite 里是 NULL，整行会被 WHERE 当假丢掉。
+    R868：use_count 条件必须与 is_exposure_immune 同款，否则 SQL 通道与 Python 通道
+    对同一条记忆给出相反判定（真库 #113 会被推送侧静音、统计侧却显示未静音）。"""
     cutoff = (datetime.datetime.now()
               - datetime.timedelta(days=IMMUNE_WINDOW_DAYS)).strftime("%Y-%m-%dT%H:%M:%S")
-    return ("(inject_count>=? AND adopt_count=0 AND COALESCE(last_inject,'')>=?)",
-            [IMMUNE_INJECT_MIN, cutoff])
+    return ("(inject_count>=? AND adopt_count=0 AND COALESCE(use_count,0)<?"
+            " AND COALESCE(last_inject,'')>=?)",
+            [IMMUNE_INJECT_MIN, IMMUNE_USE_MIN, cutoff])
 
 
 def recall_for(root: str, project: str, agent: str = "") -> list:
