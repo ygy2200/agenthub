@@ -10509,6 +10509,28 @@ def _state_card_theme(content: str) -> str:
     return ""
 
 
+def _progress_rounds(content: str) -> list:
+    """只把「这轮干了什么」里的 R 号当进度，不把「下一步 R867」当进度（R867）。
+
+    实锤：R866 记录的正文是「目的：R866 …。下一步方向：R867 …」，旧实现扫全文
+    取最大值，卡片从 866 直接跳到 867——下一轮开局就报「已到 867」，等于虚报一轮。
+    优先级：目的段 > 下一步标记之前的正文 > 全文兜底（保持旧行为，照顾没有「目的」
+    的历史记录）。
+    """
+    text = content or ""
+    m = STATE_PURPOSE_RE.search(text)
+    if m:
+        rounds = [int(x.group(1)) for x in STATE_ROUND_RE.finditer(m.group(1))]
+        if rounds:
+            return rounds
+    head = re.split(r"(?:下一步方向|下一步|下一轮|下一批|next\b)", text,
+                    maxsplit=1, flags=re.I)[0]
+    rounds = [int(x.group(1)) for x in STATE_ROUND_RE.finditer(head)]
+    if rounds:
+        return rounds
+    return [int(x.group(1)) for x in STATE_ROUND_RE.finditer(text)]
+
+
 def _state_card_next(content: str) -> list:
     m = STATE_NEXT_RE.search(content or "")
     if not m:
@@ -10559,7 +10581,7 @@ def sync_state_card(root: str, project: str, content: str, agent: str = "",
         target_rounds = int(data.get("target_rounds"))
     except (TypeError, ValueError):
         target_rounds = 0
-    rounds = [int(m.group(1)) for m in STATE_ROUND_RE.finditer(content)]
+    rounds = _progress_rounds(content)
     # 远期目标/历史引用不算进度：上限 = 当前 +20，且低于 target_rounds
     cap = (cur + 20) if cur >= 0 else 9999
     if target_rounds > 0:
