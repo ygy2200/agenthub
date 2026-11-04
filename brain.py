@@ -8970,6 +8970,37 @@ ERROR_DEBT_DAYS = 7
 ERROR_DEBT_HINT_TOP = 2
 ERROR_DEBT_HINT_CHARS = 320
 
+# B040（R855）「机制说明」这枚标记：内容在讲这套机制怎么运作的记忆（记忆 #509 是原型——
+# 它拿 `winerror 5` 当反例讲精度闸门），与「这条报错怎么修」在文本上长得一模一样，
+# 于是被报错召回当成现成修法递上去。真库实测：WinError 5 一撞，#509 就是被注的第一条。
+# 判据不猜正文（「拿 X 当反例」和「X 的修法是」分不开），改成写入口自己声明：
+# tags 里带这一枚的记忆，报错召回不当修法用、欠账不拿它销账；检索/简报/看板照旧可见——
+# 被拦的只是「当成答案」这条路。为什么用中文标签：`_register_tags` 会把它当普通标签
+# 注册进 tag_schema，GUI 标签页里认得出来，写记忆的人也写得对。
+SELF_DOC_TAG = "机制说明"
+
+
+def _tag_tokens(raw) -> set:
+    """标签串 → 小写词集合（与 `_norm_tags` 同一套切分：半角/全角逗号）。"""
+    return {t.strip().lower() for t in re.split(r"[,，]", str(raw or "")) if t.strip()}
+
+
+def _is_self_doc(mem) -> bool:
+    """这条记忆是不是「机制说明」而不是「修法」。
+
+    只看标记、不看正文措辞：逐项相等匹配，所以 `机制说明补充` 这类别的标签不会误伤
+    （用 `in` 判子串会把它们一起拦住——R855 反证用例专门钉这条）。
+    兼容两种行形态：search_memories 回 dict，_error_covered 里拿的是 sqlite3.Row。
+    """
+    try:
+        tags = mem.get("tags")
+    except AttributeError:
+        try:
+            tags = mem["tags"]
+        except (IndexError, KeyError, TypeError):
+            return False
+    return SELF_DOC_TAG.lower() in _tag_tokens(tags)
+
 # 报错签名里「一眼认得出来源」的形态。与自然语言检索词（extract_prompt_terms）不同：
 # 报错的区分度全在标识符上——异常类名、错误码、被点名的列/文件/包。拿「报错」「失败」
 # 这种词去查等于没查，所以高价值词（w=3）必须至少命中一个才允许注入。
@@ -9255,6 +9286,11 @@ def _error_covered(root: str, terms: list, cap: int = 300) -> bool:
                 except sqlite3.Error:
                     continue          # errors.sig 列在旧库可能还没迁出来
                 for r in rows:
+                    # B040：机制说明不是答案。它命中招牌词是因为正文在**讲**这串词，
+                    # 拿它销账会让「撞过但没答案」的欠账凭空消失（R855 实测：
+                    # 只有 #509 时旧码判 covered=True，账本报「已有答案、下次会自动命中」）。
+                    if tbl == "memories" and _is_self_doc(r):
+                        continue
                     if _err_accept(terms, " ".join(str(r[c] or "")
                                                    for c in cols).lower()):
                         return True
@@ -9373,11 +9409,14 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     `count=False` 只看不记账（冒烟探针用）：曝光账本（inject_count）一旦把试跑的
     查询算成送达，R830 的免疫断路器就会拿假数据冷却真记忆。返回的 `counted` 回显
     这个开关（含各 skip 分支），意思是「本次允不允许记账」，不是「账本动了没」。
+    tags 里带 `SELF_DOC_TAG`（机制说明）的记忆不当修法用（B040）：它们讲的是这套机制
+    本身，招牌词是当例子引用的，注上去等于让模型照设计文档改代码；命中的 id 回在
+    `self_doc_ids` 里，可观测但不上墙。
     """
     t0 = time.time()
     out = {"text": "", "memory_ids": [], "record_ids": [], "error_ids": [],
            "terms": [], "sig": "", "project": "", "chars": 0, "elapsed_ms": 0,
-           "skipped": "", "counted": bool(count), "budget": {}}
+           "skipped": "", "counted": bool(count), "budget": {}, "self_doc_ids": []}
     if not root or not os.path.isdir(root):
         return out
     terms = error_signature_terms(_error_voice(error_text))
@@ -9442,6 +9481,11 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         low = body.lower()
         if not _accept(low):
             continue                      # 精度闸门：一个招牌词都没命中就不要上墙
+        if _is_self_doc(r):
+            # B040：机制说明命中招牌词是**必然**的（它就是在讲这些招牌词），但它不是修法——
+            # 注上去模型会照着一份「设计文档」去改代码。记下 id 只为可观测，不进上下文。
+            out["self_doc_ids"].append(r.get("id"))
+            continue
         hit = sum(1 for t, w in terms if t in low)
         spec = hit + sum(w for t, w in terms if t in low)
         kind = r.get("kind") or "note"
