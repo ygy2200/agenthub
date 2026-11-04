@@ -9358,6 +9358,35 @@ _ERR_ESCAPE_ONLY_RE = re.compile(r"(?:(?:\\u[0-9a-f]{4}|\\x[0-9a-f]{2})|[\u2018\
 _ERR_FILE_RE = re.compile(r"\b[\w.-]+\.(?:py|mjs|js|json|exe|dll|so|db|sqlite|md|bat|cmd"
                           r"|spec|txt|log|yaml|yml|toml|cpp|cc|c|h|hpp|ps1|sh)\b")
 _ERR_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]{2,}(?:[_-][a-z0-9]+)+\b")
+# R865：诊断成语（英语 shell/文件系统层）。它们描述「失败本身」，不是报错提到的对象，
+# 所以进签名当 w=3 锚点。`_FAIL_SHELL_IDIOM_RE` 同时喂形状分类，R859 定过「别动它」；
+# 这一支只收能当招牌的短语，别把 `fatal:`、`errno N` 这类泛前缀带进签名键。
+_ERR_IDIOM_TERM_RE = re.compile(
+    r"(?i)(?:\bno such file or directory\b|\bis a directory\b|\bnot a directory\b|"
+    r"\bcannot (?:open|access|find the (?:file|path))\b|\bcan'?t (?:open|read)\b|"
+    r"\bno space left on device\b|\bread-only file system\b|\bdevice or resource busy\b|"
+    r"\btext file busy\b|\bbroken pipe\b|\bsegmentation fault\b|\bcore dumped\b|"
+    r"\bnot recognized as (?:an internal or external command|the name of a cmdlet)\b|"
+    r"\bunexpected (?:eof|token|end of file)\b)")
+# HTTP 状态只在「有方法/状态前缀」时才当招牌：裸 3 位数在日志里太容易是编号。
+_ERR_HTTP_CODE_RE = re.compile(
+    r"(?i)\b(?:HTTP/\S+\s+|status(?:\s+code)?\s*[:=]?\s*|"
+    r"(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+\S+\s+)([45]\d{2})\b")
+# 能单独认出「这是哪一类失败」的诊断词（不是被报错提到的文件名/标识符）。
+_ERR_ANCHOR_RE = re.compile(
+    r"(?i)(?:no such (?:file|column|table|function|view|index)|no module named|"
+    r"cannot (?:open|access|find)|can'?t (?:open|read)|permission denied|"
+    r"access is denied|command not found|not recognized as|is a directory|"
+    r"not a directory|no space left|read-only file system|device or resource busy|"
+    r"text file busy|broken pipe|segmentation fault|core dumped|timed? out|"
+    r"connection (?:refused|reset)|could not (?:resolve|connect)|"
+    r"unexpected (?:eof|token|end of file)|missing \d|invalid (?:value|argument|state|path)|"
+    r"exceeds|corrupt|winerror \d+|errno \d+|status(?:\s+code)?[ :=]+[45]\d{2}|"
+    r"http/[\d.]+ [45]\d{2}|[45]\d{2} (?:not found|bad request|unauthorized|forbidden|"
+    r"internal server error|bad gateway|service unavailable|gateway timeout)|not found)")
+# 只说「有问题」、不指向具体东西的弱锚点：单独命中不认，必须再有第二条独立证据。
+_ERR_WEAK_ANCHORS = frozenset(("not found", "denied", "refused", "missing", "corrupt",
+                               "invalid", "exceeds"))
 # 反复出现在每条报错里的词：命中它们不证明任何相关性（照 R826 的「泛词不注入」口径）。
 _ERR_STOP = frozenset({"error", "errors", "exception", "traceback", "failed", "failure",
                        "warning", "unknown", "invalid", "cannot", "unable", "not",
@@ -9402,6 +9431,27 @@ def _err_distinctive(term: str) -> bool:
     if any(ch in t for ch in "_.-/"):
         return True
     return " " in t
+
+
+def _err_anchor(term: str) -> bool:
+    """这个词是不是「诊断本身」（失败成语/错误码/状态码），而不是报错提到的对象。
+
+    R865：对象词单独命中不再算数——`head: cannot open 'README.md'` 的招牌本该是
+    「cannot open / no such file or directory」，旧口径却拿 README.md 当身份，
+    在真库里注出两条只提到 README 的无关记录。异常类名仍不算锚点（R826 口径），
+    它只在「没有锚点可依」时按旧规则参与。
+    """
+    t = (term or "").strip().lower()
+    if not t or not _err_distinctive(t):
+        return False
+    if re.fullmatch(r"[45]\d{2}", t):
+        return True
+    return bool(_ERR_ANCHOR_RE.search(t))
+
+
+def _err_weak_anchor(term: str) -> bool:
+    """弱锚点：只说明「有问题」，不指向具体东西（not found / denied / invalid…）。"""
+    return (term or "").strip().lower() in _ERR_WEAK_ANCHORS
 
 
 def _error_clean(text: str) -> str:
@@ -9451,8 +9501,24 @@ def error_signature_terms(text: str, cap: int = 24) -> list:
     for m in _ERR_NAMED_RE.finditer(t):
         seg = m.group(0)
         add(seg, 3)
+        # 成语的「干净头部」也是锚点：`permission denied, open 'x.exe'` 的尾部是对象/
+        # 上下文，而记忆里通常只写 `permission denied`（R865 回归：R859 的用例因为
+        # 只剩带尾部的长短语而退回欠账）。只看逗号/冒号/左括号，不拆英文空格。
+        head = re.split(r"[,:;（(]", seg, maxsplit=1)[0].strip()
+        if head and head != seg:
+            add(head, 3)
         for w in re.findall(r"[a-z]{4,}", seg.lower()):        # 短语同时给单词补召回
             add(w, 1)
+    # R865：没有异常名的壳层失败也要有「身份」（head/cp 的 cannot open、no such file…）。
+    # 这些成语进签名当锚点，引号里的文件名退成对象词，不再单独决定这是哪条报错。
+    for m in _ERR_IDIOM_TERM_RE.finditer(t):
+        add(m.group(0), 3)
+    for m in _ERR_HTTP_CODE_RE.finditer(t):
+        # 4xx/5xx 是 HTTP 失败的身份；`add` 会按「纯数字」挡掉它，这里按语境放行。
+        code = m.group(1)
+        if code not in seen:
+            seen.add(code)
+            out.append((code, 3))
     for m in _ERR_FILE_RE.finditer(t):
         add(Path(m.group(0)).name, 2)
     for m in _ERR_SNAKE_RE.finditer(t):
@@ -9519,8 +9585,10 @@ def error_sig_of(text: str) -> str:
     （error_recall 的去重键）必须走同一个函数，否则「登记一次下次秒命中」就是空话。
 
     R856：先 `_error_span` 剪掉说明文字再抽词——同一个函数不够，两边**输入形状**也得对齐。
+    R865：再走 `_diagnosis_span` 只留错误行——stdout 里的文件名不能当身份。
     """
-    terms = error_signature_terms(_error_voice(_error_span(text or "")))
+    terms = error_signature_terms(
+        _error_voice(_diagnosis_span(_error_span(text or ""))))
     if not terms or not any(w >= 3 for _, w in terms):
         return ""
     return _error_sig_key(terms)
@@ -9555,12 +9623,24 @@ def _err_accept(terms: list, low: str) -> bool:
       · 能单独钉住这条报错的词（带编号/带点划线/被点名的标识符/报错成语）才算招牌。
     R834 提出来当模块级函数：欠账账本判「库里现在是否已有答案」要用**同一把尺子**，
     两处各写一遍必然漂移（闸门本身判据一字未改）。
+
+    R865：以上「一条就够」只对**诊断锚点**成立。文件名/标识符/Object 名是被报错
+    提到的对象，不是身份——`head: cannot open 'README.md'` 只有对象名命中时不能再
+    上墙（真库实测注出两条只提到 README 的无关记录）。规则：
+      ① 命中任一强锚点（成语/错误码/HTTP 4xx-5xx）→ 认；
+      ② 有锚点可依但只命中弱锚点（not found 等）或对象词 → 需要两条独立证据；
+      ③ 整条签名根本没有锚点可依时维持旧口径（独一份招牌词即可）。
     """
     high = [t for t, w in terms if w >= 3]
     if not high or not any(h in low for h in high):
         return False
-    if any(_err_distinctive(h) and h in low for h in high):
-        return True                      # 招牌词独一份，一条就够定身份
+    matched = [h for h in high if h in low and _err_distinctive(h)]
+    if any(_err_anchor(h) and not _err_weak_anchor(h) for h in matched):
+        return True                      # 强锚点独一份，一条就够定身份
+    if any(_err_anchor(h) for h in high):
+        pass                             # 报错有明确身份，但答案只对上了对象/弱词
+    elif matched:
+        return True                      # 无锚点可依：保持 R833 旧口径
     return sum(1 for t, w in terms if w >= 2 and _err_distinctive(t) and t in low) >= 2
 
 
@@ -9691,6 +9771,27 @@ _FAIL_SHELL_IDIOM_RE = re.compile(
     r"\bfatal:|\berrno\s*\d+\b|\benoent|\beacces|\beperm|\benotdir|\beisdir|\beexist\b|"
     r"\bunexpected (?:eof|token|end of file)\b|"
     r"没有那个文件或目录|不是内部或外部命令|系统找不到指定的|磁盘空间不足|权限不够)")
+
+
+def _diagnosis_span(text: str) -> str:
+    """从混合输出里只留下「错误自己在说话」的行（R865）。
+
+    Bash 失败载荷常把正常 stdout 和 traceback 拼在一起。stdout 里的文件名/标题
+    会被签名抽取当成招牌——真库实测：一次失败载荷的 stdout 是检索结果（含
+    `agenthub迭代执行计划.md`、`_gate_r859b.log`），签名就落在这些文件名上，
+    注出两条与真正的 `no such column: date` 毫不相干的旧记录。有错误形状行时
+    只留它们；一行都没有就原样返回，不能把「找不出形状」变成「没有输入」。
+    """
+    lines = str(text or "").splitlines()
+    keep = []
+    for ln in lines:
+        if (_FAIL_EXC_LINE_RE.search(ln) or _FAIL_SHELL_IDIOM_RE.search(ln)
+                or _ERR_NAMED_RE.search(ln) or _ERR_CODE_RE.search(ln)
+                or _ERR_HTTP_CODE_RE.search(ln)
+                or re.search(r"(?i)traceback \(most recent call last\)", ln)
+                or _FAIL_EXIT_RE.search(ln)):
+            keep.append(ln)
+    return "\n".join(keep) if keep else str(text or "")
 
 
 FAIL_SAMPLE_MAX_CHARS = 400
@@ -9963,15 +10064,24 @@ def _error_headline(text: str, high: list, limit: int = 96) -> str:
     模型看不出是哪件事就只能猜，而猜是这条路最贵的错。
     """
     best = ""
+    lines = []
     for ln in _error_clean(text or "").splitlines():
         s = re.sub(r"\s+", " ", ln).strip()
-        if len(s) < 4:
-            continue
-        low = s.lower()
-        if any(h in low for h in high):
-            return _brief_oneline(s, limit)
-        if not best and "失败调用" not in low:
-            best = s
+        if len(s) >= 4:
+            lines.append(s)
+    # R865：先看「错误自己在说话」的行。混入的 stdout 里也可能恰好含招牌词，
+    # 旧逻辑按行序取第一个命中，于是「这次失败」展示成一段检索结果而不是 traceback。
+    shaped = [s for s in lines
+              if (_FAIL_EXC_LINE_RE.search(s) or _FAIL_SHELL_IDIOM_RE.search(s)
+                  or _ERR_NAMED_RE.search(s) or _ERR_CODE_RE.search(s))]
+    for pool in (shaped, lines):
+        for s in pool:
+            low = s.lower()
+            if any(h in low for h in high):
+                return _brief_oneline(s, limit)
+        for s in pool:
+            if "失败调用" not in s.lower():
+                return _brief_oneline(s, limit)
     return _brief_oneline(best or (text or ""), limit)
 
 
@@ -10007,7 +10117,8 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
            "shape": ""}
     if not root or not os.path.isdir(root):
         return out
-    terms = error_signature_terms(_error_voice(error_text))
+    diag = _diagnosis_span(error_text)
+    terms = error_signature_terms(_error_voice(diag))
     if not terms or not any(w >= 3 for _, w in terms):
         # 抽不出高价值签名词 = 这条报错没有可比对的招牌（「命令失败」这种），闭嘴
         out["skipped"] = "no_signature"
@@ -10200,7 +10311,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
             debt = error_debt(root, days=ERROR_DEBT_DAYS, agent=who)
             others = [r for r in debt["rows"]
                       if r["status"] == "open" and r["sig"] != sig][:ERROR_DEBT_HINT_TOP]
-            shown = _error_headline(_error_voice(error_text), high, limit=64)
+            shown = _error_headline(_error_voice(diag), high, limit=64)
             lines = ["【AgentHub 报错欠账 · 大脑没有这条的答案，只在第一次撞上时说一次】",
                      f"刚撞的：{shown}",
                      "解决后顺手一句 hub_report_error(title, detail=报错原文, undo=修法)，"
@@ -10249,7 +10360,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     if not budget["allowed"]:
         out["budget"] = {"used": budget["used"], "limit": budget["limit"],
                          "channel": "error", "bypass": "error_row"}
-    shown = _error_headline(_error_voice(error_text), high)
+    shown = _error_headline(_error_voice(diag), high)
     lines = ["【AgentHub 报错即时回忆 · 自动匹配，没人提醒你查大脑】",
              f"这次失败：{shown}"]
     ids = []
