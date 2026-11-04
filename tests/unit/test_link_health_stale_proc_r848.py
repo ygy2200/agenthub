@@ -42,14 +42,17 @@ def _deployed_brain_md5():
     return hashlib.md5(p.read_bytes()).hexdigest()
 
 
-def _marker(agent, brain_md5):
-    return {"pid": 4242, "agent": agent, "started": brain._now(), "base": str(core.MCP_SERVER_DIR),
+def _marker(agent, brain_md5, root=""):
+    # R870：运行标记是全机共享的，必须带上数据根；不带 root 的标记不能替本库作证。
+    return {"pid": 4242, "agent": agent, "root": str(root),
+            "started": brain._now(), "base": str(core.MCP_SERVER_DIR),
             "fingerprint": {"brain.py": brain_md5}}
 
 
 def test_旧进程不报断而是报待重启(hub, monkeypatch):
     _write(hub, "workbuddy", "brain_brief", "hook", 2)
-    monkeypatch.setattr(core, "runtime_markers", lambda *a, **k: [_marker("workbuddy", "0" * 32)])
+    monkeypatch.setattr(core, "runtime_markers",
+                        lambda *a, **k: [_marker("workbuddy", "0" * 32, root=hub)])
     r = ops._link_health(hub)
     assert r["ok"] is True, r["detail"]
     assert "待重启" in r["summary"]
@@ -62,7 +65,7 @@ def test_进程指纹与部署一致时仍然算断(hub, monkeypatch):
     """进程跑的是新码却一条 via 行都没有——这才可疑，照实报断，别拿「旧进程」当挡箭牌。"""
     _write(hub, "workbuddy", "brain_brief", "hook", 2)
     monkeypatch.setattr(core, "runtime_markers",
-                        lambda *a, **k: [_marker("workbuddy", _deployed_brain_md5())])
+                        lambda *a, **k: [_marker("workbuddy", _deployed_brain_md5(), root=hub)])
     r = ops._link_health(hub)
     assert r["ok"] is False
     assert "工具通道断" in r["summary"]
@@ -79,7 +82,8 @@ def test_旧进程不掩盖另一家的真断(hub, monkeypatch):
     """旧进程只豁免它自己：另一家没进程也没 via 行，仍然要点名。"""
     _write(hub, "workbuddy", "brain_brief", "hook", 2)
     _write(hub, "qoder", "log_work", "cli", 3)
-    monkeypatch.setattr(core, "runtime_markers", lambda *a, **k: [_marker("workbuddy", "0" * 32)])
+    monkeypatch.setattr(core, "runtime_markers",
+                        lambda *a, **k: [_marker("workbuddy", "0" * 32, root=hub)])
     r = ops._link_health(hub)
     assert r["ok"] is False
     head = r["summary"].split("——")[-1].split("（另有")[0]

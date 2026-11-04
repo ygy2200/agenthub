@@ -102,3 +102,21 @@ def test_巡检项已注册():
     assert "link_health" in ops.CHECKS
     assert "link_health" in ops.CHECK_FIXES
     assert "link_health" in ops.PATROL_CHECKS
+
+
+def test_别的数据根的存活进程不作证(hub, monkeypatch):
+    """R870：运行标记是全机共享的，别的根的旧进程不能替本库 agent 证明通道还在。
+
+    实锤：部署一改，生产 workbuddy 的旧进程指纹立刻与磁盘失配，把测试假库里的
+    「工具通道断」误判成「进程活着、只是代码旧」——检查项必须按 root 过滤。
+    """
+    import core  # noqa: PLC0415
+
+    monkeypatch.setattr(core, "runtime_markers", lambda *a, **k: [{
+        "agent": "workbuddy", "root": str(Path(hub) / "别的根"),
+        "base": "C:/fake", "fingerprint": {"brain.py": "stale-digest"},
+        "started": "2026-11-04T00:00:00", "version": "2.41.212"}])
+    _write(hub, "workbuddy", "brain_brief", "hook", 3)
+    r = ops._link_health(hub)
+    assert r["ok"] is False, r
+    assert "工具通道断" in r["summary"] and "workbuddy" in r["summary"]

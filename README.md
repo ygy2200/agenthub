@@ -116,7 +116,7 @@ unified project records, input/output file management, a public memory, capabili
 
 Download the single-file `AgentHub.exe` from [Releases](https://github.com/ygy2200/agenthub/releases), pick your records folder, and connect your agents in the "Connect" page.
 
-Current version **v2.41.219** — full version history in [CHANGELOG.md](CHANGELOG.md).
+Current version **v2.41.220** — full version history in [CHANGELOG.md](CHANGELOG.md).
 
 ## License
 

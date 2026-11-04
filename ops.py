@@ -3051,9 +3051,15 @@ def _link_health(root: str = "") -> dict:
             return ""
 
     cur_brain = _md5(Path(core.MCP_SERVER_DIR) / "brain.py")
+    root_key = os.path.normcase(os.path.abspath(root))
     running: dict = {}
     try:
         for m in core.runtime_markers():
+            # 运行标记是全机共享的：别的数据根上的进程不能替本库的 agent 作证。
+            # R870 实锤：部署一变，别的根的 workbuddy 旧进程指纹立刻失配，
+            # 把测试假库里的「工具通道断」误判成「进程活着只是代码旧」。
+            if os.path.normcase(os.path.abspath(str(m.get("root") or ""))) != root_key:
+                continue
             k = core.agent_key(m.get("agent") or "")
             if k and k not in running:
                 running[k] = m

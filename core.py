@@ -328,6 +328,43 @@ def _marker_staleness() -> dict | None:
     return out
 
 
+def agent_staleness(root: str = "", agent: str = "") -> dict:
+    """某个 agent 在本数据根上的长驻 MCP 进程是否在跑旧代码（R870）。
+
+    为什么单独抽：`runtime_staleness()` 在非 MCP 进程里只回「最差的那个进程」，
+    拿来写会话简报会把别的 agent 的旧进程算到当前 agent 头上。这里按 root+agent
+    过滤运行标记，多个进程取落后文件最多的一个；无匹配标记返回 known=False。
+
+    只读标记，不做任何存活探测——心跳停止的标记会因 TTL 自然消失。
+    """
+    procs = runtime_markers()
+    if not procs:
+        return {"known": False, "count": 0, "stale": [], "agent": agent or ""}
+    root_key = os.path.normcase(os.path.abspath(root)) if root else ""
+    agent_key = (agent or "").strip()
+    pool = []
+    for p in procs:
+        if root_key and os.path.normcase(os.path.abspath(str(p.get("root") or ""))) != root_key:
+            continue
+        if agent_key and (p.get("agent") or "").strip() != agent_key:
+            continue
+        try:
+            info = runtime_staleness(str(p["base"]), str(p["started"]),
+                                     fingerprint=p.get("fingerprint") or None)
+        except (OSError, ValueError, TypeError, AttributeError):
+            continue  # 单条畸形标记只丢弃自身，不拖垮整个视图
+        if not info.get("known"):
+            continue
+        info["pid"] = p.get("pid", 0)
+        info["agent"] = p.get("agent", "")
+        info["version"] = p.get("version", "")
+        pool.append(info)
+    if not pool:
+        return {"known": False, "count": 0, "stale": [], "agent": agent_key}
+    pool.sort(key=lambda x: (x.get("count") or 0, str(x.get("started") or "")), reverse=True)
+    return pool[0]
+
+
 # 工作记录段头：## 或 ### 开头
 HEADER_RE = re.compile(r"^#{2,3}\s+(.+?)\s*$")
 DATE_RE = re.compile(r"(\d{4}-\d{2}-\d{2})")

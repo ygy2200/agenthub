@@ -10630,6 +10630,18 @@ def sync_state_card(root: str, project: str, content: str, agent: str = "",
     if new_ver and (not old_ver or new_ver > old_ver):
         data["version"] = "v" + ".".join(str(x) for x in new_ver)
         changed["version"] = data["version"]
+    # R870：last_round 的轮次/版本必须与卡片本体一致。R861 时代手写的卡片里
+    # round=861 / version=v2.41.212 会和最新 theme 混在一起，简报读 last_round
+    # 就报出旧轮次。这里只镜像卡片当前值，绝不用本条记录的旧轮次回退进度。
+    last = data.get("last_round")
+    if isinstance(last, dict):
+        cur_round = data.get("current_round") if "current_round" in data else data.get("round")
+        if cur_round is not None and last.get("round") != cur_round:
+            last["round"] = cur_round
+            changed["last_round_round"] = cur_round
+        if data.get("version") and last.get("version") != data["version"]:
+            last["version"] = data["version"]
+            changed["last_round_version"] = data["version"]
     if not changed:
         return {}
     data["updated"] = date or datetime.date.today().isoformat()
@@ -10752,6 +10764,17 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                  f"{now:%Y-%m-%d %H:%M}】",
                  f"根目录 {root} ｜ {n_proj} 项目 · {n_rec} 条活跃记录 · {n_mem} 条记忆",
                  f"（这份简报由{via}自动送达，无需用户提醒；细节按下面入口再查，别凭空开工）"]
+        # R870：长驻 MCP 进程不会热加载部署副本。旧进程给出的工具结果/续跑点同步
+        # 都可能落后，必须在简报第一屏说清，否则模型会把旧代码的输出当成现状。
+        try:
+            drift = core.agent_staleness(root, who)
+        except Exception:  # noqa: BLE001 观测失败绝不能拖垮简报
+            drift = {}
+        if drift.get("known") and drift.get("count"):
+            recent = ((drift.get("stale") or [{}])[0].get("file") or "?")
+            lines.append(f"⚠ 本机 {who or '当前 agent'} 的 MCP 进程在跑旧代码："
+                         f"v{drift.get('version') or '?'} · 落后 {drift['count']} 个文件"
+                         f"（最近改动：{recent}）——重启客户端后新工具行为才生效")
         if progress:
             lines.append("")
             lines.append("▸ 团队最近进展")
