@@ -4030,11 +4030,18 @@ def _error_debt(root: str) -> dict:
     except Exception as e:  # noqa: BLE001
         return {"ok": False, "summary": f"查询失败：{type(e).__name__}: {str(e)[:80]}", "detail": []}
     rows, asked, answered = debt["rows"], debt["asked"], debt["answered"]
-    rate = f"· 命中率 {answered * 100 // asked}%" if asked else ""
+    # B063：命中率只算「有错误形状」的触发。分子只数「有签名且有货」，分母掺上
+    # `(no_signature)`（钩子被触发但正文不是报错：一句人话的失败、URL、非异常退出）
+    # 就把钩子触发面当成知识缺口——真库近 7 天 22 条 miss 里 12 条无形状，
+    # 那样报出来的 13% 两头都不像，也没法当趋势看。无形状的触发照旧单列，不蒸发。
+    shaped = int(debt.get("asked_shaped") or 0)
+    rate = f"· 命中率 {answered * 100 // shaped}%" if shaped else ""
     head = (f"近 {debt['window_days']} 天报错回忆被问 {asked} 次{rate}，"
             f"没答案 {debt['open']} 条 / 已收编 {debt['resolved']} 条")
     if debt.get("unjudgeable"):
         head += f" / 判不了 {debt['unjudgeable']} 条（改签名口径前写进去的旧键，出窗口自清）"
+    if debt.get("miss_unshaped"):
+        head += f"（另有 {debt['miss_unshaped']} 次非报错触发，不进命中率）"
     if debt["distinct"] > debt["sampled"]:
         # 判定只做了重复次数最高的那批，别把「没判」说成「没欠」
         head += f"（窗口共 {debt['distinct']} 类签名，本次判了 {debt['sampled']} 类）"

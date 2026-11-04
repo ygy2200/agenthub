@@ -9378,7 +9378,8 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
     """
     out = {"rows": [], "open": 0, "resolved": 0, "asked": 0, "answered": 0,
            "miss_rows": 0, "skipped_legacy": 0, "since": "", "window_days": days,
-           "unjudgeable": 0, "distinct": 0, "sampled": 0, "calibrated": False}
+           "unjudgeable": 0, "distinct": 0, "sampled": 0, "calibrated": False,
+           "miss_keyed": 0, "miss_unshaped": 0, "asked_shaped": 0}
     if not root or not os.path.isdir(root):
         return out
     since = caliber_ts(root, "searches_error_hits")
@@ -9396,6 +9397,14 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
             miss_rows = conn.execute(
                 "SELECT COUNT(*) AS n FROM searches WHERE tool='error_recall_miss'"
                 " AND ts>=? AND (?='' OR agent=?)", (floor, who, who)).fetchone()["n"]
+            # B063：miss 里掺着 `(no_signature)`——钩子被触发了、但正文抽不出错误形状
+            # （命令失败说了句人话、URL、非异常退出）。它们是真触发，得看得见；
+            # 但不能进命中率的分母：分子只数「有签名且有货」，掺进来就是把钩子触发面
+            # 当成知识缺口（真库近 7 天 22 条 miss 里 12 条无形状，13% 那个数两头都不像）。
+            miss_keyed = conn.execute(
+                "SELECT COUNT(*) AS n FROM searches WHERE tool='error_recall_miss'"
+                " AND query<>'' AND query<>'(no_signature)' AND ts>=? AND (?='' OR agent=?)",
+                (floor, who, who)).fetchone()["n"]
             answered = conn.execute(
                 "SELECT COUNT(*) AS n FROM searches WHERE tool='error_recall' AND hits>0"
                 " AND ts>=? AND (?='' OR agent=?)", (floor, who, who)).fetchone()["n"]
@@ -9416,7 +9425,10 @@ def error_debt(root: str, days: int = 7, agent: str = "", limit: int = 20) -> di
         return out
     out["answered"] = int(answered or 0)
     out["miss_rows"] = int(miss_rows or 0)
+    out["miss_keyed"] = int(miss_keyed or 0)
+    out["miss_unshaped"] = max(0, out["miss_rows"] - out["miss_keyed"])
     out["asked"] = out["answered"] + out["miss_rows"]
+    out["asked_shaped"] = out["answered"] + out["miss_keyed"]
     out["skipped_legacy"] = int(legacy or 0) + int(unanchored or 0)
     out["distinct"] = int(distinct or 0)
     out["calibrated"] = bool(since)

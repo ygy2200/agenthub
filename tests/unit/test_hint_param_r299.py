@@ -74,6 +74,11 @@ def test_create_project_accepts_the_hinted_param(hub_root):
 
 
 def test_bootstrap_version_bumped_for_stale_detection():
-    """内容变了版本必须变，否则旧块（含错提示）不会被识别为过时。"""
-    assert core.BOOTSTRAP_VERSION == "6"
+    """内容变了版本必须变，否则旧块（含错提示）不会被识别为过时。
+
+    R299 当时钉的是字面量 "6"。那枚钉子每次改内容都要来拆一次，久了就变成「顺手把数字
+    改掉」的机械动作，反而不再是哨兵——真正会红的是「块里写的版本 ≠ BOOTSTRAP_VERSION」，
+    也就是下面这条。每次真实内容变更的版本号由**那一轮自己的用例**钉住
+    （v7 见 tests/unit/test_bootstrap_v7_r858.py）。
+    """
     assert f"agenthub:version:{core.BOOTSTRAP_VERSION}" in core.bootstrap_text("/x")

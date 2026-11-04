@@ -58,8 +58,13 @@ if "CODEBUDDY_SAFE_DELETE_ENABLED" in ENV:
     ENV["CODEBUDDY_SAFE_DELETE_ENABLED"] = "0"
     ENV["AGENTHUB_RUNALL_SHIM_OFF"] = "1"
 # (层名, 路径, 是否逐文件独立进程, 单目标超时秒)
+# B064：unit 是**一批**跑完（1000+ 用例），300s 是贴边值——2026-11-04 实测空载 246–256s，
+# 同一份代码在并行负载下跑到 300s 被杀：junit 还没落盘 → 整层报「0 tests；1 个目标异常」，
+# 日志里明明跑到 97% 且有一个 F，汇总却一个名字都给不出来。超时的作用是抓真卡死，
+# 不是给套件限速——余量按倍数给（≥3× 实测），并把实测基线记在下面的常量里，降档会红。
+UNIT_MEASURED_S = 256      # 2026-11-04 v2.41.208 空载实测（unit 单层 1032 条）
 LAYERS = (
-    ("unit", "tests/unit", False, 300),
+    ("unit", "tests/unit", False, 900),
     ("gui", "tests/gui", True, 300),
     ("e2e", "tests/e2e", False, 600),
 )

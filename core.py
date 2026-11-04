@@ -1019,7 +1019,11 @@ def init_hub(root: str) -> str:
 BOOTSTRAP_BEGIN = "<!-- agenthub:begin -->"
 BOOTSTRAP_END = "<!-- agenthub:end -->"
 # 引导块格式版本：内容格式变更时 +1，让 bootstrap_version() 识别「注入了但过时」的块
-BOOTSTRAP_VERSION = "6"  # v6（2026-10-29）：建项目示例改回真参数名 project=（v5 一直写 name=，
+BOOTSTRAP_VERSION = "7"  # v7（2026-11-04）：补两条「机制已经会做、但只有代码知道」的事——
+# ①撞报错时大脑会自动递上次的修法，前提是解决那次用 hub_report_error 登记过（B060/B061 修通后
+# 这条收益第一次真的兑现得了，之前引导里只写了义务没写回报）；②讲这套机制自己的说明文必须带
+# tags=机制说明（B040：这类正文里全是报错词，不带标记就被当「上次的修法」召回，把讲坑当答案）。
+# v6（2026-10-29）：建项目示例改回真参数名 project=（v5 一直写 name=，
 # 而 hub_create_project 的必填参数是 project——照抄指引必然报「必填参数 project 缺失」）
 
 # 注：引导注入目标已统一到下方 AGENT_ADAPTERS（单一事实来源）。
@@ -1038,6 +1042,9 @@ def bootstrap_text(root: str) -> str:
   ① hub_log_work(project, agent, content)，content 含 目的/做了什么/验证结果/如何回滚——记录直接进大脑数据库，不要再手写工作记录.md 文件
   ② 有跨会话价值的知识立即 hub_memory_write(content, kind, tags)：环境事实 fact / 用户偏好 preference / 踩坑 lesson / 项目进展 project，重要条目 pinned: true
   ③ 收尾前跑一次 hub_ops_run 自检。三步做完才算"交付完成"，不是把活干完就算完
+- 写「讲这套机制本身」的记忆（钩子怎么记账、签名怎么算、某个 hub_ 工具怎么实现）必须带 tags=机制说明：
+  这类正文里天然全是报错词和文件名，不带标记就会被报错召回当成「上次这么修的」递回给你——
+  大脑对带标记的条目另算（不当答案销账），漏标记的代价由事后清洗来还
 - 干完活顺手 hub_distill 看一眼蒸馏候选：有「目的」结论但还没沉淀成记忆的，
   用自己的判断精炼成一条 hub_memory_write（你刚干完活最懂上下文——日记会膨胀，笔记本只留精华）
 - 修正旧记忆别删：写一条新记忆并在开头标注「取代记忆#N」+错在哪，由全员共同裁决旧条目（免疫协议）
@@ -1049,6 +1056,9 @@ def bootstrap_text(root: str) -> str:
 - 若某个 hub_ 工具不在你的工具列表里（本接入可能按 profile 精简了工具面）：藏起≠禁用——
   hub_search_tools 搜全量工具、hub_call_tool 直接调用（写工具同样受 dry_run/confirm/审计约束）
 - 出错/受阻/踩坑：hub_report_error(title, detail, undo) 登记，undo 写回滚方式，方便任何人查询和撤销
+- 【报错这条为什么值得登记】你下次再撞同签名报错，钩子会**自动**把上次的修法递到你眼前（不用你提醒、
+  也不用你搜）——但它只在库里真登记过那次修法时才有货。所以解决完一条报错就登记：
+  detail 带报错原文（招牌词在那儿，签名从它算），undo/正文写清「怎么修的」；只写在对话里＝下次自己重新撞一遍
 - 长任务开工先 hub_heartbeat(agent, project)：同项目有其他 agent 在干时会收到预警，防止撞车
 - 重复检查别手写：hub_ops_list 有现成检查项（环境预检 env/语法检查 py_compile/回归 regression/
   部署一致性 deploy_diff/停滞项目 stalled…），hub_ops_run(name, target) 一条命令出精简摘要——
