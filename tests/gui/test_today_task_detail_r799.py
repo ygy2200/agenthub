@@ -4,6 +4,8 @@
 交接时最先被问的是「这单要什么、什么时候要」，桌面原来只能看标题。
 选中任务后可补说明、改截止日（管理通道，别人持有的任务也能补），清空即取消。
 """
+from datetime import date, timedelta
+
 from helpers import boot_window, settle
 
 
@@ -37,6 +39,7 @@ def test_detail_and_due_roundtrip(qapp, hub_root):
 
     brain.init_db(hub_root)
     tid = _insert(hub_root, "R799 补详情任务")
+    due = (date.today() + timedelta(days=30)).isoformat()
     w = boot_window(qapp, hub_root)
     try:
         page = w.today_page
@@ -47,16 +50,16 @@ def test_detail_and_due_roundtrip(qapp, hub_root):
         assert _select(page, tid), "新任务没进可认领队列"
         assert page.detailBtn.isEnabled()
 
-        page.save_details("验收：桌面能补说明并回读\n第二行", "2026-11-05")
+        page.save_details("验收：桌面能补说明并回读\n第二行", due)
         settle(qapp, 0.5)
         row = brain.task_get(hub_root, tid)
         assert "桌面能补说明" in row["detail"]
-        assert row["due"] == "2026-11-05"
+        assert row["due"] == due
 
         page.reload()
         settle(qapp, 0.5)
         assert _select(page, tid)
-        assert "截止:2026-11-05" in _row_text(page, tid)
+        assert f"截止:{due}" in _row_text(page, tid)
         tip = page._task_tip(page._item2task[id(page.listw.currentItem())],
                              "ready", "R799 补详情任务")
         assert "桌面能补说明" in tip, "详情应能在行的 tooltip 里回读"
