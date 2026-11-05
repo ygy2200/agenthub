@@ -199,6 +199,62 @@ NET_RETRIES = 3
 NET_BACKOFF = 0.5
 
 
+def _curl_fallback(opener, url, method, data, timeout):
+    """R890 / B076：urllib 在环境变量代理下报网络层错误时，用 curl 走**同一条**
+    代理把同一个请求再发一次。只换传输栈，不换代理、不放宽任何闸门。
+
+    R885 实测定性：首次 `--check` 的 SSL EOF 是偶发抖动（urllib 同代理 3/3 200、
+    curl 200、git ls-remote 通、二次 --check 通过），不是代理故障、不是稳定缺陷。
+    真缺口只是韧性：R852 在「用户已配代理」时短路「不猜第二条路」，抖动耗尽
+    NET_RETRIES 后没有别的传输栈可用，只能靠人重跑。
+
+    返回 (status, body, headers)；curl 缺失/非 0 退出/超时/输出不可解析一律 None，
+    由调用方按原路重试，绝不静默吞错，也绝不把 HTTP 4xx 当网络错误。
+    """
+    # R852 同款准入：装置传的假 opener / 预检传的 None 既没有 token 也没有代理标记，
+    # 替它兜底只会拿空鉴权去撞真网络（R890 首版实测把两条既有回归带红）。
+    if getattr(opener, "_agenthub_proxy", None) is None:
+        return None
+    proxy = (os.environ.get("HTTPS_PROXY") or os.environ.get("https_proxy")
+             or os.environ.get("ALL_PROXY") or os.environ.get("all_proxy")
+             or (DEFAULT_PROXY_CANDIDATES[0] if DEFAULT_PROXY_CANDIDATES else ""))
+    token = getattr(opener, "_agenthub_token", "")
+    body = None if data is None else (
+        data if isinstance(data, bytes) else json.dumps(data).encode())
+    secs = max(1, int(timeout))
+    cmd = ["curl", "-sS", "--http1.1", "-X", method or "GET",
+           "--max-time", str(secs),
+           "-H", f"Authorization: Bearer {token}",
+           "-H", "Accept: application/vnd.github+json",
+           "-H", "User-Agent: agenthub-release",
+           "-w", "\n__AGENTHUB_HTTP_STATUS__%{http_code}"]
+    if proxy:
+        cmd += ["--proxy", proxy]
+    if body is not None:
+        cmd += ["-H", "Content-Type: application/json", "--data-binary", "@-"]
+    cmd.append(url)
+    try:
+        r = subprocess.run(cmd, input=body, capture_output=True, timeout=secs + 10)
+    except (OSError, subprocess.TimeoutExpired, ValueError):
+        return None
+    if r.returncode != 0:
+        return None
+    out = r.stdout or b""
+    mark = b"\n__AGENTHUB_HTTP_STATUS__"
+    if mark not in out:
+        return None
+    payload, tail = out.rsplit(mark, 1)
+    try:
+        status = int(tail.strip()[:3])
+    except (ValueError, IndexError):
+        return None
+    try:
+        parsed = json.loads(payload) if payload.strip() else {}
+    except ValueError:
+        parsed = {}
+    return status, parsed, {}
+
+
 def _call_retry(opener, url, method=None, data=None, timeout=120):
     for attempt in range(NET_RETRIES):
         target = _route(opener)
@@ -212,6 +268,15 @@ def _call_retry(opener, url, method=None, data=None, timeout=120):
                 got = _via_proxy(opener, url, method, data, timeout)
                 if got is not None:
                     return got
+                # R890：`_via_proxy` 没换成功（尤其 R852「用户已配代理不猜第二条路」
+                # 那处短路）时，用 curl 同代理兜底一次。只在环境变量确实配了代理时做，
+                # 免得 R852 的直连用例误触发真网请求；只兜当前请求，不记通道。
+                if _env_proxy_set():
+                    got = _curl_fallback(opener, url, method, data, timeout)
+                    if got is not None:
+                        print("网络：urllib 传输栈失败，这个请求改走 curl（同代理、同一请求）")
+                        return got
+                    print("网络：curl 同代理兜底也不可用——按原路重试，预检会如实报错")
             if attempt == NET_RETRIES - 1:
                 raise
         time.sleep(NET_BACKOFF * (attempt + 1))
