@@ -47,7 +47,8 @@ def main(argv=None) -> int:
         if root and not args.no_journal:
             try:
                 core.journal(root, agent or "unknown", "brain_brief", "session",
-                             note=f"{len(res['text'])} chars · project={res['project'] or '-'}")
+                             note=(f"{len(res['text'])} chars · project={res['project'] or '-'}"
+                                   f" · rules={res.get('stats', {}).get('rules', 0)}"))
             except Exception:  # noqa: BLE001 流水失败不影响简报
                 pass
         if args.json:

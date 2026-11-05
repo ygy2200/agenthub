@@ -10936,6 +10936,18 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                 " LIMIT 40")]
             rules_all = [r for r in rules_all
                          if "必做" in _tag_tokens(r.get("tags")) and not _is_self_doc(r)]
+            # R884：其他 agent 最近 7 天沉淀的踩坑。共同记忆不能只靠「轮到自己踩」
+            # 才被读到——同一条坑别人已经花过时间，开局就该看见。
+            week_ago = (datetime.datetime.now() - datetime.timedelta(days=7)
+                        ).isoformat(timespec="seconds")
+            lsql = ("SELECT id,kind,content,agent,tags FROM memories WHERE " + _live_sql()
+                    + " AND kind='lesson' AND updated>=?")
+            largs = [week_ago]
+            if who:
+                lsql += " AND COALESCE(agent,'')<>?"
+                largs.append(who)
+            lsql += " ORDER BY updated DESC, id DESC LIMIT 8"
+            lessons_raw = [dict(r) for r in conn.execute(lsql, largs)]
             proj = None
             proj_recs, proj_mem = [], []
             if pname:
@@ -10992,14 +11004,7 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                 lines.append(f"- #{m['id']} {_brief_rule_line(m['content'], 120)}")
             if len(rules_all) > 8:
                 lines.append(f"  已列 8/{len(rules_all)} 条；更多 hub_memory_read(query=\"必做\")")
-        if progress:
-            lines.append("")
-            lines.append("▸ 团队最近进展")
-            for r in progress:
-                head = _brief_title(r["title"]) or record_outline(r.get("content", ""))
-                lines.append(f"- [{_brief_oneline(r['project'], 26)}] "
-                             f"{_brief_oneline(head, 42)}"
-                             f"（{r['agent'] or '其他'} · {r['date']}）")
+        rule_ids = {m["id"] for m in rules_all[:8]}
         if pname and proj:
             lines.append("")
             if inferred_recent:
@@ -11022,7 +11027,25 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                 lines.append(f"  更多：hub_memory_read(query=\"{pname} 关键词\") / hub_search(keyword=…)")
             # R838：把「干到哪了」摆到简报里，别让每个新会话都从头翻台账
             lines.extend(_state_card_lines(state_card))
-        rule_ids = {m["id"] for m in rules_all[:8]}
+        lessons = [m for m in lessons_raw
+                   if not _is_self_doc(m) and m["id"] not in seen
+                   and m["id"] not in rule_ids
+                   and m["id"] not in {p["id"] for p in pinned}][:2]
+        if lessons:
+            lines.append("")
+            lines.append("▸ 最近团队踩坑（其他 agent · 7 天内，自动共享）")
+            for m in lessons:
+                lines.append(f"- #{m['id']} [{m['agent'] or '其他'}] "
+                             f"{_brief_oneline(m['content'], 90)}")
+        # R883：当前项目的「干到哪了」比团队新闻更能决定下一步；团队进展后置。
+        if progress:
+            lines.append("")
+            lines.append("▸ 团队最近进展")
+            for r in progress:
+                head = _brief_title(r["title"]) or record_outline(r.get("content", ""))
+                lines.append(f"- [{_brief_oneline(r['project'], 26)}] "
+                             f"{_brief_oneline(head, 42)}"
+                             f"（{r['agent'] or '其他'} · {r['date']}）")
         if pinned:
             lines.append("")
             lines.append("▸ 置顶记忆（主人/团队重点）")
@@ -11058,7 +11081,12 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
         out.update({"text": text, "project": pname, "truncated": truncated,
                     "elapsed_ms": int((time.time() - t0) * 1000),
                     "stats": {"projects": n_proj, "records": n_rec, "memories": n_mem,
-                              "unread": sig["fresh"], "ready": tcounts.get("ready", 0)}})
+                              "unread": sig["fresh"], "ready": tcounts.get("ready", 0),
+                              # R883：规则簿送达是「不用提醒也能用」的前提，流水可复核
+                              "rules": len(rules_all[:8]),
+                              "rules_total": len(rules_all),
+                              "rule_ids": [m["id"] for m in rules_all[:8]],
+                              "lessons": len(lessons)}})
         return out
     except (sqlite3.Error, OSError, ValueError):
         return out
