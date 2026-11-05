@@ -24,9 +24,13 @@ import sys
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent.parent
+TOOLS_DIR = Path(__file__).resolve().parent
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+if str(TOOLS_DIR) not in sys.path:
+    sys.path.insert(0, str(TOOLS_DIR))
 
+import _console  # noqa: E402,F401  R222：会 print 的独立脚本必须先装 UTF-8 守卫
 import ops  # noqa: E402
 
 # R886 的 15 条用例按 audit(db_path) 取证；保留同名入口，避免两处实现漂移。
