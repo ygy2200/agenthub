@@ -4290,6 +4290,19 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
         tgt = str(arguments.get("target", "")).strip()
         r = ops.run_check(cname, tgt, root)
         lines = [("✓" if r.get("ok") else "✗") + f" {cname}：{r.get('summary', '')}"]
+        # R888 / B093：R870 的「旧进程自述」漏了这个出口。R887 实测 deploy 16/16 之后
+        # hub_ops_run(stale_health) 仍吐旧摘要，新点名对走 MCP 的调用方完全不可见，
+        # 而回复毫无征兆 —— 检查结果会被当成现状，比「没部署」更难排查。
+        # 只补自述，不擅自改成自动热重载（部署≠生效、重启各 agent 是既定运维口径）。
+        try:
+            warn = _runtime_warn()
+        except Exception as e:  # noqa: BLE001  版本探针不能拖垮检查本身
+            warn = ""
+            lines.append(f"  ⚠ 版本探针不可用（{type(e).__name__}）：{e}")
+        if warn:
+            lines.insert(1, f"  {warn}")
+            lines.append("  ↑ 以上结论由旧代码算出，不代表当前源码；部署副本已是新版，"
+                         "重启本 agent 会话/客户端后重跑")
         lines += [f"  {d}" for d in r.get("detail", [])[:8]]
         return "\n".join(lines)
 
