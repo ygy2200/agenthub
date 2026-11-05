@@ -130,6 +130,23 @@ def main() -> int:
             if e["injected"] and not e["fingerprintable"]:
                 print("  （error 档还抽不出指纹——先别按采纳率判它好坏，先看送达数：cli.py doctor --only brief_hook_health）")
 
+    # R881/B089：R879 的策略层到底有没有用，靠这两档对比说话。样本不足只报数，
+    # 不许下结论——30 笔判过是能看清差距的最小观察线（本库自设，非外部区间）。
+    if st.get("by_directive"):
+        print("\n策略档位（R879：标【必须照做】的到底更听不听；样本不足时只报数）：")
+        label = {"required": "required 必须照做", "supportive": "supportive 背景参考",
+                 "unknown": "unknown 旧行无档位"}
+        for t, b in sorted(st["by_directive"].items(),
+                           key=lambda kv: -kv[1]["injected"]):
+            print(f"  {label.get(t, t):<20} 注入 {b['injected']:>4}  "
+                  f"可指纹 {b['fingerprintable']:>4}  判过 {b['judged']:>4}  "
+                  f"被用 {b['used']:>3}  账面 {b['rate']}%  观测 {b['observed_rate']}%")
+        req = st["by_directive"].get("required", {}).get("judged", 0)
+        sup = st["by_directive"].get("supportive", {}).get("judged", 0)
+        if req < 30 or sup < 30:
+            print(f"  样本不足（判过 required {req} / supportive {sup}，观察线 30 笔）："
+                  "只报数，不对两档优劣下结论（B089 待确认）")
+
     # R829：曝光与采纳是两本账。只看采纳率回答不了「该动谁」——这两张榜才是动作清单。
     ev = brain.exposure_vs_adoption(root)
     print(f"\n全库累计：曝光 {ev['inject_total']} 次 · 证实采纳 {ev['adopt_total']} 次")

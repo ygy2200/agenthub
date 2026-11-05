@@ -495,7 +495,9 @@ CREATE TABLE IF NOT EXISTS recall_adherence (
     cited INTEGER DEFAULT 0,
     used INTEGER DEFAULT 0,
     decided_at TEXT DEFAULT "",
-    origin TEXT DEFAULT "live"        -- R853：live=生产钩子，eval/probe=装置；账只认 live
+    origin TEXT DEFAULT "live",       -- R853：live=生产钩子，eval/probe=装置；账只认 live
+    directive TEXT DEFAULT ''        -- R881/B089：R879 的策略档位 required/supportive；
+                                     -- 采集口径上线前的旧行为空，统计归 unknown 不冒充
 );
 CREATE INDEX IF NOT EXISTS idx_adherence_session ON recall_adherence(session, ts);
 CREATE INDEX IF NOT EXISTS idx_adherence_ts ON recall_adherence(ts);
@@ -1523,6 +1525,11 @@ def _migrate_columns(root: str) -> None:
         dcols = {r["name"] for r in conn.execute("PRAGMA table_info(recall_adherence)")}
         if "decided_at" not in dcols:
             conn.execute('ALTER TABLE recall_adherence ADD COLUMN decided_at TEXT DEFAULT ""')
+        # R881/B089：采纳账记策略档位。只走 ALTER（不放 SCHEMA 的 executescript——
+        # 老库在那个阶段还没新列，记忆 #323），且 dcols 一次取定、重复跑不会
+        # duplicate column（记录 #3391 的多进程首启竞态）。
+        if "directive" not in dcols:
+            conn.execute('ALTER TABLE recall_adherence ADD COLUMN directive TEXT DEFAULT ""')
         if "origin" not in dcols:
             conn.execute('ALTER TABLE recall_adherence ADD COLUMN origin TEXT DEFAULT "live"')
             # 回填只跑一次（新库为空操作）：按会话形状把存量装置行标成 probe。
@@ -8632,12 +8639,15 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
     for r in picked:
         fp = recall_fingerprints(str(r.get("content") or "") + " " + str(r.get("tags") or ""),
                                  pool_texts=pool_texts, prompt=prompt)
+        # R881：档位由写入口按同一套结构化判据算（与 prompt_recall 渲染同源），
+        # 不另设口径、不事后猜。历史行空值留给统计归 unknown。
         rows.append((now, session, agent or "", int(r.get("id") or 0), project or "",
-                     strength, json.dumps(fp, ensure_ascii=False), origin))
+                     strength, json.dumps(fp, ensure_ascii=False), origin,
+                     directive_tier(r)))
     with db_conn(root) as conn:
         conn.executemany(
             "INSERT INTO recall_adherence(ts, session, agent, memory_id, project, strength,"
-            " fp, origin) VALUES(?,?,?,?,?,?,?,?)", rows)
+            " fp, origin, directive) VALUES(?,?,?,?,?,?,?,?,?)", rows)
         # 有界：只留最近 ADHERENCE_KEEP_DAYS 天，行数超上限时删最旧的
         conn.execute("DELETE FROM recall_adherence WHERE ts < ?",
                      (_days_ago(ADHERENCE_KEEP_DAYS),))
@@ -8753,11 +8763,13 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
            "unjudgeable": 0, "unobserved": 0, "unobserved_tail": 0, "unobserved_gap": 0,
            "unobserved_gap_old": 0, "capture_start": "",
            "judged_unused": 0, "judged_used": 0,
-           "judged": 0, "observed_rate": 0.0, "device_rows": 0}
+           "judged": 0, "observed_rate": 0.0, "device_rows": 0,
+           "by_directive": {}}     # R881：required/supportive/unknown 三档，合计必须等于顶层
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
             "SELECT strength, fp, used, decided_at, memory_id, ts, agent, session,"
-            " COALESCE(origin,'live') AS origin FROM recall_adherence WHERE ts>=?",
+            " COALESCE(origin,'live') AS origin, COALESCE(directive,'') AS directive"
+            " FROM recall_adherence WHERE ts>=?",
             (since,))]
         try:
             cap = conn.execute(
@@ -8778,6 +8790,22 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
     # 下一句发言，单轮会话甚至永远等不到（这台宿主不发 Stop 时尤其明显）；同一会话
     # 后面还发过言（有更晚的注入）却仍没判到，才是采集通道漏了。两种成因修法相反，
     # 混成一个数会把结构性上限读成产品质量差。
+    # R881：策略档位分账。空档位＝R879 上线前的历史行，单独归 unknown，
+    # 不许冒充 supportive——否则「标了必须照做有没有更好用」的对比会被旧数据污染。
+    # 三档预置：报表要能显示「required 0 笔」（新机制还没被生产命中这个事实本身
+    # 就是信息），不能让空档整段消失（R833 在 by_strength 上踩过同一个坑）。
+    dbuckets = {t: {"injected": 0, "fingerprintable": 0, "used": 0,
+                    "judged": 0, "unobserved": 0}
+                for t in ("required", "supportive", "unknown")}
+
+    def _dbucket(r):
+        tier = (r.get("directive") or "").strip().lower()
+        if tier not in ("required", "supportive"):
+            tier = "unknown"
+        return dbuckets.setdefault(
+            tier, {"injected": 0, "fingerprintable": 0, "used": 0,
+                   "judged": 0, "unobserved": 0})
+
     last_ts = {}
     fped = []
     for r in rows:
@@ -8796,18 +8824,25 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
     for r in fped:
         s = r.get("strength") or "strong"
         b = buckets.setdefault(s, {"injected": 0, "fingerprintable": 0, "used": 0})
+        d = _dbucket(r)
         b["injected"] += 1
         b["fingerprintable"] += 1
+        d["injected"] += 1
+        d["fingerprintable"] += 1
         out["fingerprintable"] += 1
         # used=1 必然是判过的（唯一写入口 mark_recall_used 同时写 decided_at）；
         # R852 之前的老行没有判过标记，按 used 归位比按空 decided_at 归成「未观测」诚实。
         if r.get("used"):
             out["judged_used"] += 1
             b["used"] += 1
+            d["used"] += 1
+            d["judged"] += 1
         elif (r.get("decided_at") or "").strip():
             out["judged_unused"] += 1
+            d["judged"] += 1
         else:
             out["unobserved"] += 1
+            d["unobserved"] += 1
             key = (r.get("agent") or "", r.get("session") or "")
             if (r.get("ts") or "") == last_ts.get(key):
                 out["unobserved_tail"] += 1
@@ -8828,8 +8863,16 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
         s = r.get("strength") or "strong"
         b = buckets.setdefault(s, {"injected": 0, "fingerprintable": 0, "used": 0})
         b["injected"] += 1
+        _dbucket(r)["injected"] += 1   # 判不了的行也是 injected 的诚实部分
     for b in buckets.values():
         b["rate"] = round(b["used"] / b["fingerprintable"] * 100, 1) if b["fingerprintable"] else 0.0
+    for d in dbuckets.values():
+        d["rate"] = (round(d["used"] / d["fingerprintable"] * 100, 1)
+                     if d["fingerprintable"] else 0.0)
+        d["observed_rate"] = (round(d["used"] / d["judged"] * 100, 1)
+                              if d["judged"] else 0.0)
+    # 记忆 #546：分档与顶层必须同口径，合计对不上会让人做反动作（单测钉住）。
+    out["by_directive"] = dbuckets
     out["used"] = out["judged_used"]
     out["judged"] = out["judged_used"] + out["judged_unused"]
     out["rate"] = round(out["used"] / out["fingerprintable"] * 100, 1) if out["fingerprintable"] else 0.0
