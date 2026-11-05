@@ -8550,6 +8550,14 @@ def _recall_rare_threshold(n: int) -> float:
 # 相对阈值只做一件事：后位候选必须达到首位得分的这个比例才跟上来。设为 0.62 是让
 # 「同一件事的不同侧面」留下、把「只是都碰到了同一个泛词」的挤掉；<=0 即关闭（回放对照用）。
 RECALL_REL_MARGIN = 0.62
+# R899（B071）：语义分进重排。词法打分能回答「命中了什么词」，答不了「说的是不是同一
+# 件事」——#08「两个 PyInstaller 产物怎么比较依赖多少」的期望答案 mem#486 词法分
+# 22.24、排第 4，输给三条把这句话当例子引用的评测记忆（24.85 / 22.67 / 22.67）。
+# 语义路给 mem#486 0.66（该查询下的第 1 名），给那三条 0。同库 A/B（12 条样本，
+# 只加这一项）：8/10 → 9/10，其余 8 条命中一条不掉，泄漏判定不变。
+# 权重 10 是「0.66 × 10 ≈ 6.6 分」的量级——够翻 2–3 分的排序差，又不足以让一条
+# 语义相似但词法零命中的候选越级（那种要靠 B071 后半段的闸门救援，另立一轮）。
+RECALL_SEM_RERANK_W = 10.0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
 RECALL_RECORD_CAP = 2        # 记录通道（过程证据）每次最多几条
 
@@ -9148,7 +9156,13 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     out = {"text": "", "memory_ids": [], "record_ids": [], "terms": [],
            "elapsed_ms": 0, "project": "", "chars": 0, "system_message": False,
            "muted": 0, "skipped": "", "budget": {}, "semantic_bridge": 0,
-           "context_used": False, "directive_required": 0}
+           "context_used": False, "directive_required": 0,
+           # R898：候选为什么没进注入，分四类计数。此前只有 muted 与「有没有命中」，
+           # 于是「答案没被召回」和「答案被闸门删了」在报表上长得一模一样——R898 量
+           # #02/#08 两条 miss 时只能靠外部脚本复算才能区分，这里把它变成函数输出。
+           "dropped": {"hit": 0, "rare": 0, "immune": 0, "cap": 0},
+           # R899：本轮拿到语义分的候选条数（0 = 语义路没预热/未启用，走纯词法）
+           "sem_scored": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9214,6 +9228,17 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                  for r in mems]
     mem_idf = _recall_idf(mem_texts, terms)
     mem_idf_raw = _recall_idf(mem_texts, terms, weighted=False)
+    # R899：只在语义路已预热时取分（模型没加载就返回空表，钩子路径不会被拖慢）。
+    # fail-open：任何异常都退回纯词法，召回宁可少一项信号，不能因为可选能力炸掉。
+    sem_map = {}
+    try:
+        for _eid, _rrf, _row in _semantic_rank(root, prompt, "memories", limit=40):
+            _sim = float(_row.get("_semantic_sim") or 0.0)
+            if _sim > 0:
+                sem_map[int(_row.get("id") or _eid)] = _sim
+    except Exception:  # noqa: BLE001 可选能力，见上
+        sem_map = {}
+    out["sem_scored"] = len(sem_map)
     # R830：免疫判定要 inject/adopt/last_inject 三个值，行里带没带取决于走了哪条检索
     # 通道（BM25/语义的 SELECT 列不全），所以统一回查一次，不信行里带的。
     try:
@@ -9234,10 +9259,12 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # 推了 ≥5 次、零采纳、还在 30 天窗口内 → 这条进来只会稀释整块注入的可信度。
             # 只是不「主动塞给」模型：它照旧能被 hub_search 检索到（主动拉取那条路）。
             muted += 1
+            out["dropped"]["immune"] += 1
             continue
         body = str(r.get("content") or "") + " " + str(r.get("tags") or "")
         hit = _recall_hit_score(terms, body)
         if hit < need:
+            out["dropped"]["hit"] += 1
             continue
         wid = _recall_weighted_hit(terms, mem_idf, body)
         # 这一条命中的词里，最稀有的那个有多稀有（不带权重）——R826 的分流门槛。
@@ -9264,15 +9291,27 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                 memory_freshness(r).get("state"), 0.0)
         except Exception:  # noqa: BLE001 新鲜度异常不影响召回
             pass
+        _sim = sem_map.get(int(r.get("id") or 0), 0.0)
+        if _sim:
+            r["_recall_sim"] = round(_sim, 3)
+            spec += RECALL_SEM_RERANK_W * _sim
         scored.append((spec, r))
     scored.sort(key=lambda x: (-x[0], -(x[1].get("adopt_count") or 0),
                                -(x[1].get("use_count") or 0), -x[1].get("id", 0)))
     # R826：**逐条**筛「至少命中一个稀有词」的，而不是整批判弱。
     # 整批判会误伤：提问里既有泛词也有精确词时（「qfluentwidgets 中文被截断」），
     # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
-    strong = [(s, r) for s, r in scored
-              if float(r.get("_recall_best") or 0.0) >= _recall_rare_threshold(len(mems))]
+    rare_line = _recall_rare_threshold(len(mems))
+    strong = []
+    for pair in scored:
+        if float(pair[1].get("_recall_best") or 0.0) >= rare_line:
+            strong.append(pair)
+        else:
+            # 只命中泛词的候选不是「没查到」——它们确实命中了词，只是命中的词在
+            # 这批候选里到处都是。分开计数才能回答「答案是被删了还是没排上」。
+            out["dropped"]["rare"] += 1
     picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
+    out["dropped"]["cap"] = max(0, len(strong) - len(picked))
     rescue = 0
     # R861：救援的边界是「词法**一条候选都没有**」，不是「词法没挑出强的」。
     # 后者（scored 非空、strong 空）是 R825/R826 的领域：泛词命中的摘要会误导，

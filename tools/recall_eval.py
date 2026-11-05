@@ -151,6 +151,17 @@ def _bodies(root: str, kind: str, ids) -> dict:
         conn.close()
 
 
+def _drop_s(res) -> str:
+    """把「候选为什么没进注入」压成一行（R898）。
+
+    没有这行时，报表上「答案被稀有词闸门删了」和「答案根本没进候选池」都显示成
+    一个 ✗——R898 量 #02/#08 只能另写脚本复算。四类口径见 brain.prompt_recall。
+    """
+    d = (res or {}).get("dropped") or {}
+    return (f"drop=hit:{int(d.get('hit') or 0)}/rare:{int(d.get('rare') or 0)}"
+            f"/immune:{int(d.get('immune') or 0)}/cap:{int(d.get('cap') or 0)}")
+
+
 def _classify(prompt, accepts, out, root):
     """给一条样本定性：hit / leak / gap / miss，并给出泄漏证据。
 
@@ -206,13 +217,15 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         cls, span, leak_id = _classify(prompt, accepts, res, root)
         counts[cls] += 1
         rows.append((i, prompt, accepts, why, cls, span, leak_id,
-                     _ids_of(res, "mem"), _ids_of(res, "rec"), res.get("terms")))
+                     _ids_of(res, "mem"), _ids_of(res, "rec"), res.get("terms"),
+                     _drop_s(res)))
         if verbose:
             mark = {"hit": "✓", "leak": "!", "gap": "∅", "miss": "✗"}[cls]
             want_s = "|".join(f"{k}#{v}" for k, v in accepts)
             extra = f" leaked={leak_id}({span}字)" if cls == "leak" else ""
             print(f"[{i:02d}] {mark} want={want_s} top3={_ids_of(res, 'mem')}"
-                  f"/{_ids_of(res, 'rec')}{extra} terms={res.get('terms')}", file=stream)
+                  f"/{_ids_of(res, 'rec')}{extra} {_drop_s(res)}"
+                  f" terms={res.get('terms')}", file=stream)
 
     total = sum(counts.values())
     scored = total - counts["leak"]
@@ -223,11 +236,11 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     print(f"  四类：命中 {counts['hit']} · 词汇鸿沟(该路零候选) {counts['gap']}"
           f" · 排序未命中 {counts['miss']} · 题面泄漏 {counts['leak']}"
           f"   合计 {total} = 总样本", file=stream)
-    for i, prompt, accepts, why, cls, span, leak_id, mems, recs, terms in rows:
+    for i, prompt, accepts, why, cls, span, leak_id, mems, recs, terms, drop_s in rows:
         want_s = "|".join(f"{k}#{v}" for k, v in accepts)
         if cls == "miss":
             print(f"  漏：{prompt}\n      期望 {want_s}（{why}）实际 mem={mems} rec={recs}"
-                  f" · terms={terms}", file=stream)
+                  f" · {drop_s} · terms={terms}", file=stream)
         elif cls == "gap":
             print(f"  空：{prompt}\n      期望 {want_s}（{why}）两路零候选 · terms={terms}",
                   file=stream)
