@@ -7945,6 +7945,20 @@ def _brief_oneline(text: str, limit: int) -> str:
     return s if len(s) <= limit else s[: max(1, limit - 1)] + "…"
 
 
+def _brief_rule_line(text: str, limit: int) -> str:
+    """规则行优先在句读处收尾：在 120 字硬切会把「**Why**」切成「**Why*…」，
+    规则本身被切半比少显示后半句更糟。找不到句读才退回硬切。"""
+    s = " ".join((text or "").split())
+    if len(s) <= limit:
+        return s
+    cut = s[:limit]
+    for sep in ("。", "；", "！", "？", ";", "，", ","):
+        i = cut.rfind(sep)
+        if i >= limit * 0.55:
+            return cut[: i + 1] + "…"
+    return cut[: limit - 1] + "…"
+
+
 def _brief_title(text: str) -> str:
     """记录标题去掉「2026-10-30（qoder）· 」前缀——日期与作者已在行尾列出，重复只占预算。"""
     raw = (text or "").strip()
@@ -10913,6 +10927,15 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
             pinned = [dict(r) for r in conn.execute(
                 "SELECT id,kind,content FROM memories WHERE " + _live_sql()
                 + " AND pinned=1 ORDER BY updated DESC, id DESC LIMIT 3")]
+            # R882：共享规则簿。只认写入口显式声明的 tags=必做（精确匹配），
+            # 不把 kind=preference 全量搬进来——规则段一旦变成「所有偏好」，
+            # 又会退化成模型静默忽略的长背景（R879 的 StratMem-Bench 依据）。
+            rules_all = [dict(r) for r in conn.execute(
+                "SELECT id,kind,content,tags FROM memories WHERE " + _live_sql()
+                + " AND tags LIKE '%必做%' ORDER BY pinned DESC, updated DESC, id DESC"
+                " LIMIT 40")]
+            rules_all = [r for r in rules_all
+                         if "必做" in _tag_tokens(r.get("tags")) and not _is_self_doc(r)]
             proj = None
             proj_recs, proj_mem = [], []
             if pname:
@@ -10961,6 +10984,14 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
             lines.append(f"⚠ 本机 {who or '当前 agent'} 的 MCP 进程在跑旧代码："
                          f"v{drift.get('version') or '?'} · 落后 {drift['count']} 个文件"
                          f"（最近改动：{recent}）——重启客户端后新工具行为才生效")
+        if rules_all:
+            # 放最前：规则被后面的团队进展/项目近况挤掉，就等于没送达。
+            lines.append("")
+            lines.append("▸ 必做规则（用户硬约束 · 所有 agent 每次开工自动送达，动手前先落实）")
+            for m in rules_all[:8]:
+                lines.append(f"- #{m['id']} {_brief_rule_line(m['content'], 120)}")
+            if len(rules_all) > 8:
+                lines.append(f"  已列 8/{len(rules_all)} 条；更多 hub_memory_read(query=\"必做\")")
         if progress:
             lines.append("")
             lines.append("▸ 团队最近进展")
@@ -10991,11 +11022,12 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                 lines.append(f"  更多：hub_memory_read(query=\"{pname} 关键词\") / hub_search(keyword=…)")
             # R838：把「干到哪了」摆到简报里，别让每个新会话都从头翻台账
             lines.extend(_state_card_lines(state_card))
+        rule_ids = {m["id"] for m in rules_all[:8]}
         if pinned:
             lines.append("")
             lines.append("▸ 置顶记忆（主人/团队重点）")
             for m in pinned:
-                if m["id"] in seen:
+                if m["id"] in seen or m["id"] in rule_ids:
                     continue
                 lines.append(f"- #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 110)}")
         todo = []
