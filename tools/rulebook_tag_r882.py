@@ -28,6 +28,7 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 import brain  # noqa: E402
 import core  # noqa: E402
+import _console  # noqa: E402,F401  控制台 UTF-8 守卫（R179）
 
 core.JOURNAL_SINK = brain.journal_add
 
