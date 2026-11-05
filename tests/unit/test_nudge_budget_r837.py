@@ -152,31 +152,8 @@ def test_error_row_bypasses_budget(hub_root, tmp_path):
 
     额度挡的是「有记忆但没现成修法」的泛注入；登记过的同类故障是现成修法，是这条通道
     存在的理由——第 7 次撞上也该给，否则最该看见的那条会被前面几条泛记忆挤掉
-    （R834 的「登记→再撞→秒命中」回环用例就是撞在这条上才暴露的）。
-    """
-    brain.init_db(hub_root)
-    detail = "Error: ENOENT: no such file or directory, open 'a.mjs'"
-    info = brain.error_add(hub_root, "workbuddy", "钩子脚本没挂载", detail=detail,
-                           undo="重装钩子", return_info=True)
-    budget = tmp_path / "nudge.json"
-    now = datetime.now().isoformat(timespec="seconds")
-    budget.write_text(json.dumps({"v": 1, "sessions": {
-        "workbuddy|sx": {"error": {"n": 99, "ts": now}, "ts": now}}}, ensure_ascii=False),
-        encoding="utf-8")
-    out = brain.error_recall(hub_root, detail, agent="workbuddy", session="sx",
-                             state_path=str(tmp_path / "s.json"),
-                             budget_path=str(budget))
-    assert out["text"] and out["error_ids"], out
-    assert info["id"] in out["error_ids"], out
-    assert out["budget"].get("bypass") == "error_row", out["budget"]
-
-
-def test_error_row_bypasses_budget(hub_root, tmp_path):
-    """errors 表里登记过的修法不受额度限制。
-
-    额度挡的是「有记忆但没现成修法」的泛注入；登记过的同类故障是现成修法，是这条通道
-    存在的理由——第 7 次撞上也该给，否则最该看见的那条会被前面几条泛记忆挤掉
-    （R834 的「登记→再撞→秒命中」回环用例就是撞在这条上才暴露的）。
+    （R834 的「登记→再撞→秒命中」回环用例就是撞在这条上才暴露的）。    R897 注：本函数此前在本文件里重复定义了两遍（同内容），后一份把前一份遮死——
+    用例数不变、谁也没发现。删掉重复的那份，只留这一份。
     """
     brain.init_db(hub_root)
     detail = "Error: ENOENT: no such file or directory, open 'a.mjs'"

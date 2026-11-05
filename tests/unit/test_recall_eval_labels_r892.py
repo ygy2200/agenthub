@@ -113,9 +113,10 @@ def test_leak_span_ignores_wrapping_and_case():
 
 
 def test_leak_floor_scales_with_prompt_length():
+    """R895 收严后比例是 70%：60 字提问的下限是 42（旧值 40% 时为 24）。"""
     assert recall_eval.leak_floor("短问题") == recall_eval.LEAK_MIN_CHARS
     long_prompt = "一" * 60
-    assert recall_eval.leak_floor(long_prompt) == 24
+    assert recall_eval.leak_floor(long_prompt) == 42
 
 
 def test_dataset_widens_audited_samples_and_fills_blank_label():

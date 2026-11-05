@@ -9392,8 +9392,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         try:
             journal_add(root, who, "brain_nudge_skip", "prompt",
-                        f"used={budget['used']}/{budget['limit']} "
-                        f"session={(session or '')[:8]}")
+                        note=f"used={budget['used']}/{budget['limit']} "
+                             f"session={(session or '')[:8]}")
         except sqlite3.Error:
             pass
         return out
@@ -9461,8 +9461,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     if rescue:
         try:
             journal_add(root, who, "brain_recall_semantic_bridge", "prompt",
-                        f"n={rescue} ids={','.join(str(i) for i in out['memory_ids'])} "
-                        f"min={_RECALL_SEM_MIN}")
+                        note=f"n={rescue} ids={','.join(str(i) for i in out['memory_ids'])} "
+                             f"min={_RECALL_SEM_MIN} origin={origin}")
         except sqlite3.Error:
             pass
     if out["memory_ids"]:
@@ -10563,7 +10563,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         out["elapsed_ms"] = int((time.time() - t0) * 1000)
         try:
             journal_add(root, who, "brain_nudge_skip", "error",
-                        f"used={budget['used']}/{budget['limit']} sig={sig[:40]}")
+                        note=f"used={budget['used']}/{budget['limit']} sig={sig[:40]}")
         except sqlite3.Error:
             pass
         return out

@@ -112,8 +112,8 @@ def _sweep_dir(path: Path, batch: int = SWEEP_BATCH) -> tuple:
         try:
             os.remove(f)
             removed += 1
-        except OSError:
-            failed += 1
+        except Exception:  # noqa: BLE001 R896：宿主 safe-delete 可能抛非 OSError 的
+            failed += 1        # 拦截信号（见 _discard_run_dir），清不掉只算失败数，不许中断
         if i % batch == 0:
             time.sleep(0.01)      # 让回收站/杀软跟上，避免瞬时句柄堆积
     for dirpath, dirnames, _ in os.walk(path, topdown=False):
@@ -226,12 +226,30 @@ def _discard_run_dir(path: Path) -> None:
     B068 之后这枚目录里除了 junit 还装着全部 basetemp（每层几十个 tmp_path + 库文件），
     一次 `shutil.rmtree` 就是几百项的批量删，正是 R825 量出来的那条宿主沙箱红线
     （删被拦 → 老目录留在原地）。分片删 + 删不掉不响：起跑时的 `_prune_stale_runs` 兜底。
+
+    R896：**收尾失败绝不能改结论**。宿主 safe-delete 的批量删保护在 2026-11-05 实跑时
+    从 `finally` 里冒出来（三层全 PASS、日志却没有汇总行、RC=1），把全绿伪装成失败；
+    这里连 rmdir 一起吞掉，异常一律不外抛。
     """
-    _sweep_dir(path)
     try:
+        _sweep_dir(path)
         path.rmdir()
-    except OSError:
+    except Exception:  # noqa: BLE001 见 docstring：清不掉有起跑扫帚兜底
         pass
+
+
+def _cleanup_quietly(path: Path) -> None:
+    """R896：收尾失败只告警，不改结论。
+
+    为什么单独一层：`_discard_run_dir` 吞 Exception 还不够——宿主 safe-delete 在批量删
+    被拦时抛的可能不是 Exception（2026-11-05 实测把三层全 PASS 变成 RC=1）。这里连
+    SystemExit 一起接住：清理是旁路，门禁结论只能由测试结果决定。
+    """
+    try:
+        _discard_run_dir(path)
+    except BaseException as e:  # noqa: BLE001 见 docstring
+        print(f"! 本次临时目录未清理（{type(e).__name__}: {e}）；"
+              f"不影响测试结论，下次起跑会扫掉", flush=True)
 
 
 def _pick_layers(argv):
@@ -339,7 +357,8 @@ def main(argv=None) -> int:
             if not ok:
                 failed.append(name)
     finally:
-        _discard_run_dir(tmp)
+        # R896：收尾在 finally 里，异常会盖掉上面的「三层汇总」并让进程 RC=1。
+        _cleanup_quietly(tmp)
     print(f"\n===== {'层汇总' if partial else '三层汇总'} =====")
     for name, *_ in layers:
         print(f"  {name:<5} {'FAIL' if name in failed else 'PASS'}")

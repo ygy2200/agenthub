@@ -28,6 +28,10 @@ def test_readme_points_to_changelog():
     assert (ROOT / "CHANGELOG.md").is_file()
     import agenthub_mcp as m
     assert m.SERVER_INFO["version"] in readme
+    # R895：README 有中英两行版本；旧断言只查「版本号出现过」，中文行停在 v2.41.228
+    # （差 8 个版本）也照样绿。现在两行都点名。
+    assert f"当前版本 **v{m.SERVER_INFO['version']}**" in readme, \
+        "README 中文版本行没跟上 SERVER_INFO"
     long_rows = [ln for ln in readme.split("\n") if ln.startswith("| v2.")]
     assert long_rows == [], f"README 又长出版本历史表（{len(long_rows)} 行），应写进 CHANGELOG.md"
 
