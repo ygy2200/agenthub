@@ -1484,6 +1484,99 @@ def _suggest_line(s: dict) -> str:
             + (f"；{s['note']}" if s.get("note") else "") + "）")
 
 
+def supersede_declaration_audit(root: str) -> dict:
+    """R887：取代声明未裁决的只读审计（R886 量具的核心逻辑收编进 ops）。
+
+    为什么要挪进来：桌面版 exe 只打包主程序 + bundle，`tools/` 不在包里，
+    体检若去 import tools 脚本会在桌面版静默失明。核心逻辑住在 ops.py（已打包），
+    `tools/supersede_declaration_audit.py` 退化成命令行薄包装。
+
+    root 可以是数据根（含 _hub/brain.db），也可以直接是 .db 路径（CLI 兼容）。
+    全程 `mode=ro`，**不写库、不自动裁决**——13 条 live 目标里混着局部取代、
+    补充而非取代、续写仍有效，纯文本正则连否定句都分不出（依据见
+    output/迭代依据-外部取证与取代声明断层-2026-11-05.md）。
+    """
+    import re
+    import sqlite3
+    from pathlib import Path
+
+    decl_re = re.compile(r"取代(?:记忆)?\s*#?\s*(\d+)")
+    # 命中任一即表示「不是整条取代」，只能提示人工判定。顺序＝优先级。
+    rules = (
+        ("补充而非取代", ("补充而非取代", "而非取代", "补充而非")),
+        ("续写仍有效", ("仍有效", "续写", "内容仍")),
+        ("局部取代", ("部分取代", "的修法部分", "的修法", "第③条", "第②条", "第①条", "部分")),
+    )
+    classes = ("未见限定词", "局部取代", "续写仍有效", "补充而非取代")
+    # B040 自指污染：讲这套机制本身的记忆会引用「#13 取代 #12」当例句。
+    self_tags = ("机制说明",)
+    self_body = ("取代声明 ≠", "取代声明审计", "B092", "本工具只读", "外部取证", "量具")
+    retired = ("retired", "expired", "superseded")
+
+    def is_selfdoc(row):
+        tags = str(row.get("tags") or "")
+        body = str(row.get("content") or "")
+        return any(t in tags for t in self_tags) or any(m in body for m in self_body)
+
+    def classify(text):
+        for label, words in rules:
+            if any(w in text for w in words):
+                return label
+        return "未见限定词"
+
+    p = Path(root)
+    db = p if p.suffix == ".db" else p / "_hub" / "brain.db"
+    con = sqlite3.connect("file:" + str(db).replace("\\", "/") + "?mode=ro", uri=True)
+    con.row_factory = sqlite3.Row
+    try:
+        rows = {r["id"]: dict(r) for r in con.execute("SELECT * FROM memories")}
+    finally:
+        con.close()
+
+    declarations, skipped = [], []
+    for mid, row in rows.items():
+        body = str(row.get("content") or "")
+        ids = decl_re.findall(body)
+        if not ids:
+            continue
+        if is_selfdoc(row):
+            skipped.append(mid)
+            continue
+        declarations.append((mid, ids, body))
+
+    pending, resolved, dangling = [], [], []
+    seen = set()
+    for mid, ids, body in declarations:
+        cls = classify(body)
+        for raw in ids:
+            tid = int(raw)
+            if tid == mid or (mid, tid) in seen:
+                continue
+            seen.add((mid, tid))
+            target = rows.get(tid)
+            if target is None:
+                dangling.append({"decl": mid, "target": tid, "class": cls})
+                continue
+            sup = int(target.get("superseded_by") or 0)
+            live = sup == 0 and (target.get("status") or "active") not in retired
+            item = {"decl": mid, "target": tid, "class": cls,
+                    "target_status": target.get("status"), "target_superseded_by": sup}
+            (pending if live else resolved).append(item)
+
+    return {
+        "total_memories": len(rows),
+        "declarations": len(declarations),
+        "distinct_pairs": len(seen),
+        "pending": pending,
+        "resolved": resolved,
+        "dangling": dangling,
+        "skipped_selfdoc": skipped,
+        "distinct_live_targets": sorted({x["target"] for x in pending}),
+        "by_class": {c: sum(1 for x in pending if x["class"] == c) for c in classes},
+        "note": "启发式分类不是裁决；pending 是「声明对」，distinct_live_targets 才是被点名的旧记忆条数。",
+    }
+
+
 def _stale_health(root: str) -> dict:
     """陈旧健康（D3/R3，2026-10-18；R4 2026-10-19 升级为新鲜度状态机）：① supersede
     泄漏硬不变量；② 全库新鲜度分布 + 最陈的几条。
@@ -1564,15 +1657,38 @@ def _stale_health(root: str) -> dict:
     stale_n = dist["stale"] + dist["expired"]
     detail = [f"{st.upper()} #{r['id']}（{brain.KIND_CN.get(r['kind'], r['kind'])}，"
               f"{age:.0f} 天未复核）：{(r['content'] or '')[:50]}" for age, r, st in worst[:8]]
+    # ③ R887：正文取代声明未裁决的只读点名。R886 的量具要人主动跑脚本才看得见，
+    #    等于「还得有人记得」——正是主人那句「完全不智能」的同款病。这里让它随每次
+    #    体检自动送达。三条边界：① 待人工判定是提示不是故障，ok 不因它变 False；
+    #    ② 泄漏硬不变量在上面已直接 return，点名不许盖住它；③ 审计挂了 fail-open
+    #    但留痕可见，不许静默失明（记忆 #514 的口径）。
+    decl_note, decl_detail = "", []
+    try:
+        a = supersede_declaration_audit(root)
+        n_pairs = len(a["pending"])
+        n_targets = len(a["distinct_live_targets"])
+        if n_pairs:
+            ids = "、".join(f"#{i}" for i in a["distinct_live_targets"][:8])
+            if n_targets > 8:
+                ids += f" 等 {n_targets} 条"
+            decl_note = f"；取代声明未裁决 {n_pairs} 组（涉及 {n_targets} 条旧记忆）"
+            decl_detail.append(
+                f"取代声明未裁决：{ids} 仍为现行（正文写了「取代记忆#N」却没调取代工具）；"
+                f"裁决入口 hub_memory_write(supersedes=旧id) 或 hub_memory_supersede(keep_id, drop_id)。"
+                f"分类是提示不是裁决，须逐条人工判定，勿自动回填。")
+    except Exception as e:  # noqa: BLE001  体检不因一次审计异常整体挂掉
+        decl_detail.append(f"取代声明审计不可用（{type(e).__name__}）：{e}")
+    detail += decl_detail
     if stale_n:
         return {"ok": True,
                 "summary": f"无 supersede 泄漏；新鲜度分布 fresh {dist['fresh']} / "
                            f"stale {dist['stale']} / expired {dist['expired']}"
                            + (f" / unknown {dist['unknown']}" if dist["unknown"] else "")
-                           + f"（共 {total} 条现行；复核看 hub_memory_read 的新鲜度标注）",
+                           + f"（共 {total} 条现行；复核看 hub_memory_read 的新鲜度标注）"
+                           + decl_note,
                 "detail": detail}
     return {"ok": True,
-            "summary": f"无 supersede 泄漏；{total} 条现行记忆全部在新鲜窗口内",
+            "summary": f"无 supersede 泄漏；{total} 条现行记忆全部在新鲜窗口内" + decl_note,
             "detail": detail}
 
 
