@@ -1770,11 +1770,42 @@ def _graph_health(root: str) -> dict:
     return {"ok": ok, "summary": summary, "detail": lines[:8]}
 
 
+def _disk_server_files(target: Path) -> tuple:
+    """从**磁盘上的** core.py 现读 SERVER_FILES（B078）。
+
+    修之前会怎样失败：`DEPLOY_FILES` 是 import 时的快照，而 MCP server 是长驻进程。
+    R861 给 `core.SERVER_FILES` 加了 emb_onnx.py 之后，`hub_ops_run(deploy_diff)` 仍按
+    旧清单比对，把磁盘上真实存在、也真被 deploy 复制的文件报成「部署残留（疑似下线
+    模块的幽灵）」——一条假缺陷会诱人去删真文件，真漂移反倒被这行噪声盖住。
+    读不到/算不出（core.py 缺失、清单不是字面量）就退回内存里那份：量具不能因为解析
+    失败连体检都不给，但**能读磁盘就必须读磁盘**。
+    """
+    try:
+        tree = ast.parse((target / "core.py").read_text(encoding="utf-8", errors="replace"))
+    except (OSError, SyntaxError, ValueError):
+        return tuple(DEPLOY_FILES)
+    for node in tree.body:
+        if not isinstance(node, ast.Assign):
+            continue
+        names = [t.id for t in node.targets if isinstance(t, ast.Name)]
+        if "SERVER_FILES" not in names:
+            continue
+        try:
+            val = ast.literal_eval(node.value)
+        except (ValueError, TypeError, SyntaxError):
+            break
+        if isinstance(val, (tuple, list)) and val and all(isinstance(x, str) for x in val):
+            return tuple(val)
+        break
+    return tuple(DEPLOY_FILES)
+
+
 def _deploy_diff(target: Path) -> dict:
     if not (target / "ui.py").is_file():
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 ui.py）", "detail": []}
+    files = _disk_server_files(target)
     diffs = []
-    for name in DEPLOY_FILES:
+    for name in files:
         src, dst = target / name, DEPLOY_DIR / name
         if not src.is_file():
             diffs.append(f"{name}: 源码缺失")
@@ -1791,16 +1822,22 @@ def _deploy_diff(target: Path) -> dict:
             if "__pycache__" in p.parts or "_bak" in p.parts:
                 continue
             rel = p.relative_to(DEPLOY_DIR).as_posix()
-            if rel not in DEPLOY_FILES:
+            if rel not in files:
                 ghosts.append(f"{rel}: 部署残留（源码清单里没有，疑似下线模块的幽灵）")
     except OSError:
         ghosts = []
     if ghosts:
         diffs.extend(ghosts[:4])  # 进 detail 供人看，但不计入 ok（残留不该阻断发布）
+    # 磁盘清单比本进程内存清单多出来的项：说明这轮 deploy 带了新模块，而当前进程还
+    # 按老清单自述——点名它，别让「重启 MCP 才更新」这件运维事实沉默（R888 同款口径）。
+    stale = [f for f in files if f not in DEPLOY_FILES]
+    drift = (f"，清单按磁盘 core.py 现算（本进程内存清单缺 {len(stale)} 项："
+             f"{'、'.join(stale[:3])}，重启 MCP 后自述才更新）") if stale else ""
     return {"ok": not any(d for d in diffs if "残留" not in d),
-            "summary": f"{len(DEPLOY_FILES) - len([d for d in diffs if '残留' not in d])}/{len(DEPLOY_FILES)}"
+            "summary": f"{len(files) - len([d for d in diffs if '残留' not in d])}/{len(files)}"
                        f" 与部署一致（{DEPLOY_DIR}）"
                        + (f"，另有部署残留 {len(ghosts)} 个" if ghosts else "")
+                       + drift
                        + ("" if not diffs else "：" + "、".join(diffs[:4])),
             "detail": diffs[:8]}
 
