@@ -1389,8 +1389,10 @@ def _migrate_columns(root: str) -> None:
         ecols = {r["name"] for r in conn.execute("PRAGMA table_info(errors)")}
         # R834 B041 签名沉淀：登记时就把签名词存成结构化字段（与 _error_sig_key 同键），
         # 下次同签名报错按 sig 精确匹配——靠 title/detail 的中文 prose 碰运气不是沉淀。
+        # R929：pre_sig 是存量签名重签（`resign_error_sigs`）的旧键留证列，只走 ALTER。
         for col, ddl in (("repeat_count", "INTEGER DEFAULT 1"), ("last_ts", "TEXT DEFAULT ''"),
-                         ("last_detail", "TEXT DEFAULT ''"), ("sig", "TEXT DEFAULT ''")):
+                         ("last_detail", "TEXT DEFAULT ''"), ("sig", "TEXT DEFAULT ''"),
+                         ("pre_sig", "TEXT DEFAULT ''")):
             if col not in ecols:
                 conn.execute(f"ALTER TABLE errors ADD COLUMN {col} {ddl}")
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
@@ -10146,9 +10148,104 @@ def error_signature_terms(text: str, cap: int = 24) -> list:
 
 
 def _error_sig_key(terms: list) -> str:
-    """同一会话里判定「这条报错是不是已经说过」的稳定键。"""
-    top = sorted(t for t, w in terms[:6] if w >= 2)
-    return "|".join(top[:4])
+    """同一会话里判定「这条报错是不是已经说过」的稳定键。
+
+    R929：前 4 位**按权重**取，不按字母取。旧写法 `sorted(...)[:4]` 把
+    `error_signature_terms` 已经排好的 (-权重, 词) 整段抹平，于是 w=3 的招牌（异常名 /
+    引号里的成语 / 错误码）会被 4 个字母序更靠前的 w=2 文件名挤出去——真库 #19 实测旧键
+    `layout_stress|layout_stress.py|setstylesheet|test_contrast` 里一个招牌都没有，而
+    `深底浅字错配` / `页面是否真的刷了底` 才是认出这条报错的依据。两个方向的坏消息都实：
+    同一条报错换个文件名组合就漂（欠账永不收编），只含通用文件名的键又会把不相干的失败
+    并成一个键（把 A 的修法安到 B 上）。同权重内仍按字母排——键必须与 terms 的次序无关。
+    """
+    top = sorted([(t, w) for t, w in terms if w >= 2], key=lambda tw: (-tw[1], tw[0]))
+    return "|".join(t for t, _ in top[:4])
+
+
+def _error_sig_key_legacy(terms: list) -> str:
+    """R929 **之前**那把尺子（截 6 个 → 滤 w>=2 → 按字母取 4），冻在这儿不改。
+
+    唯一用途：存量 `errors.sig` 重签时的 provenance 判据要能证明「这行确实是旧尺子刻的」。
+    动它一个字符，判据就开始替历史猜身份——那是比不重签更坏的结果。
+    """
+    return "|".join(sorted(t for t, w in terms[:6] if w >= 2)[:4])
+
+
+def _error_sig_terms(detail: str, title: str) -> list:
+    """登记通道写 `errors.sig` 时真正喂进去的那段文字（`error_sig_of(detail) or
+    error_sig_of(title)`，见 `error_add`）。复算存量必须走同一个**输入形状**：
+    R856 的教训是「同一个函数不够，输入形状也得对齐」，本轮第一次取证用
+    `title + " " + detail` 拼接复算，量出「27 条里 17 条复现不了」——那 17 条是判据自己
+    造的假数，按登记形状复算是 27/27 全可复现。
+    """
+    for text in (detail or "", title or ""):
+        terms = error_signature_terms(
+            _error_voice(_diagnosis_span(_error_span(text or ""))))
+        if terms and any(w >= 3 for _, w in terms):
+            return terms
+    return []
+
+
+def resign_error_sigs(root: str, apply: bool = False, limit: int = 0) -> dict:
+    """把存量 `errors.sig` 按当前尺子重签（保守；默认只报数不写库）。
+
+    为什么不能只改代码：`errors.sig` 是登记时算好存下来的，`_error_covered` 第一道走
+    「键逐字相等」——R834 的承诺（登记一次、下次同签名秒命中）就靠那一枪。尺子换了不给
+    旧行换键，等于把已登记的修法整批降级成模糊匹配。
+
+    口径照 R926（历史证据不许改写）：
+      · **先问是不是已经在新尺子上**：新键==存量 → `same`，一个字都不写；      · 旧键==存量而新键不同 → `drifted`，才是本轮要动的行；
+      · 两个键都不是 → `unreproducible`（登记后正文被改过 / 更早的算法），原样不动；
+      · 存量 sig 为空（R834 之前的行）→ `no_sig`，补一把当前键，`pre_sig=NULL`——
+        NULL 是「本轮首次补键」标记，与未触碰行的空串分开，回滚才能还原成空 sig；
+      · 旧键原样落 `pre_sig`，可复核、可回滚；幂等：跑第二遍 drifted=0。
+
+    管理通道自己负责迁列（`pre_sig` 是本轮新加的 ALTER 列）：调用方可能是没跑过
+    `init_db` 的老库，判据不能靠调用顺序——线上实锤：`sqlite3.OperationalError:
+    no such column: pre_sig`。
+    """
+    ensure_schema(root)
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, title, COALESCE(detail,'') AS detail, COALESCE(sig,'') AS sig,"
+            " status FROM errors ORDER BY id")]
+    stats = {"scanned": len(rows), "resigned": 0, "drifted": 0, "same": 0,
+             "no_sig": 0, "no_terms": 0, "unreproducible": 0,
+             "applied": bool(apply), "samples": []}
+    updates = []
+    for r in rows:
+        cur = str(r.get("sig") or "")
+        terms = _error_sig_terms(r.get("detail") or "", r.get("title") or "")
+        if not terms:
+            stats["no_terms"] += 1
+            continue
+        new = _error_sig_key(terms)
+        if cur == new:
+            stats["same"] += 1
+            continue
+        if not cur:
+            stats["no_sig"] += 1
+            old = None
+        elif cur == _error_sig_key_legacy(terms):
+            stats["drifted"] += 1
+            old = cur
+        else:
+            stats["unreproducible"] += 1
+            continue
+        if limit and len(updates) >= int(limit):
+            continue
+        stats["samples"].append({"id": r["id"], "old": old or "", "new": new,
+                                 "status": r.get("status") or "",
+                                 "kind": "first_key" if old is None else "drift"})
+        updates.append((new, old, r["id"]))
+    if apply and updates:
+        with db_conn(root) as conn:
+            conn.executemany("UPDATE errors SET sig=?, pre_sig=? WHERE id=?", updates)
+        stats["resigned"] = len(updates)
+        journal_add(root, "hub", "brain_resign_error_sig", target="errors",
+                    note=f"重签 {stats['drifted']} 条签名键 + 补 {stats['no_sig']} 条空键"
+                         f"（扫 {stats['scanned']}·判不了 {stats['unreproducible']}）")
+    return stats
 
 
 # 中文句读：人在写说明时才会用的标点。ASCII 报错正文（异常名、错误码、被点名的标识符）
