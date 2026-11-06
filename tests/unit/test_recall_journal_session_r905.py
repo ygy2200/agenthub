@@ -10,6 +10,10 @@ journal note 里既没有 session 也没有 origin——`--session` 参数其实
 修之前会怎样失败：
   ① note 里没有 origin=/session= → 前两条红；
   ② 按会话聚合的探针不存在 → AttributeError，后两条红。
+
+R935 口径修订：探针不再走 `journal_list`（500 行展示夹子会让「窗口 30 天」只看得到
+最近几百行），改走 `brain.journal_window`，返回 `(rows, capped)`——本文件三条探针夹具
+随之 patch 新读取器，断言本身没动。
 """
 import sys
 from pathlib import Path
@@ -74,7 +78,7 @@ def test_session_probe_groups_hint_by_session(monkeypatch):
         {"ts": "2026-11-06T09:11:00", "action": "brain_recall",
          "note": "300 chars · mem=[] · ctx=0 · terms=x · origin=probe · session=s-B"},
     ]
-    monkeypatch.setattr(brain, "journal_list", lambda *a, **k: fake)
+    monkeypatch.setattr(brain, "journal_window", lambda *a, **k: (fake, False))
     data = probe.collect("x", days=30)
     assert data["sessions"]["s-A"]["hint"] == 4, data["sessions"]
     assert data["sessions"]["s-A"]["streak"] == 4, data["sessions"]
@@ -95,7 +99,7 @@ def test_session_probe_marks_legacy_rows_unknown(monkeypatch):
         {"ts": "2026-11-06T09:00:00", "action": "brain_recall",
          "note": "300 chars · mem=[] · ctx=0 · terms=x · origin=live · session=s-A"},
     ]
-    monkeypatch.setattr(brain, "journal_list", lambda *a, **k: fake)
+    monkeypatch.setattr(brain, "journal_window", lambda *a, **k: (fake, False))
     data = probe.collect("x", days=30)
     assert data["legacy"] == 1, data
     assert "s-A" in data["sessions"] and "unknown" not in data["sessions"], data
@@ -108,7 +112,7 @@ def test_session_probe_refuses_to_conclude_without_session_rows(monkeypatch):
     import hint_session_probe_r905 as probe
     fake = [{"ts": "2026-11-01T09:00:00", "action": "brain_recall",
              "note": "300 chars · mem=[] · ctx=0 · terms=x"} for _ in range(3)]
-    monkeypatch.setattr(brain, "journal_list", lambda *a, **k: fake)
+    monkeypatch.setattr(brain, "journal_window", lambda *a, **k: (fake, False))
     data = probe.collect("x", days=30)
     assert data["sessions"] == {} and data["legacy"] == 3
     text = probe.render(data)

@@ -42,20 +42,21 @@ def parse_note(note: str) -> dict:
     }
 
 
-def collect(root: str, days: int = 30, limit: int = 20000) -> dict:
-    """只读 journal，按 session 聚合 hint 次数与最长连发。"""
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    rows = brain.journal_list(root, limit=limit) or []
+def collect(root: str, days: int = 30, limit: int = None) -> dict:
+    """只读 journal，按 session 聚合 hint 次数与最长连发。
+
+    R935：改走 `brain.journal_window`（B108 同款病）。原来是 `journal_list(limit=20000)`，
+    被 500 行展示夹子夹住——brain_recall 是高频流水，500 行连一天都盖不住，
+    表头却写着「窗口 30 天」。
+    """
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else ""
+    rows, capped = brain.journal_window(root, actions=("brain_recall",),
+                                       cutoff=cutoff, limit=limit)
     sessions = defaultdict(lambda: {"total": 0, "hint": 0, "streak": 0,
                                     "cur": 0, "origins": defaultdict(int)})
     legacy = 0
     used = 0
     for r in rows:
-        if str(r.get("action") or "") != "brain_recall":
-            continue
-        ts = str(r.get("ts") or "")[:10]
-        if days > 0 and ts and ts < cutoff:
-            continue
         p = parse_note(r.get("note"))
         used += 1
         if not p["session"]:
@@ -74,14 +75,20 @@ def collect(root: str, days: int = 30, limit: int = 20000) -> dict:
         cell.pop("cur", None)
         cell["origins"] = dict(cell["origins"])
     return {"sessions": dict(sessions), "legacy": legacy, "used": used,
-            "days": days, "cutoff": cutoff}
+            "days": days, "cutoff": cutoff, "capped": bool(capped),
+            "cap": (brain.JOURNAL_WINDOW_CAP if not limit or int(limit) <= 0
+                    else int(limit))}
 
 
 def render(data: dict) -> str:
     peak_hint = max((c["hint"] for c in data["sessions"].values()), default=0)
     peak_streak = max((c["streak"] for c in data["sessions"].values()), default=0)
     out = [f"hint 会话分布 | 窗口 {data['days']} 天（>= {data['cutoff']}）"
-           f" | brain_recall 流水 {data['used']} 行", ""]
+           f" | brain_recall 流水 {data['used']} 行（窗口上限 {data.get('cap', '—')}）", ""]
+    if data.get("capped"):
+        out.append(f"  ⚠ 窗口内流水已达上限 {data.get('cap')} 行，本次被截断——"
+                   f"下面只是可得样本，别按 {data['days']} 天口径下结论。")
+        out.append("")
     for sid, c in sorted(data["sessions"].items(),
                          key=lambda kv: -kv[1]["hint"])[:8]:
         origins = "/".join(f"{k}:{v}" for k, v in sorted(c["origins"].items()))
@@ -92,7 +99,9 @@ def render(data: dict) -> str:
                f"legacy（无 session）{data['legacy']} 行")
     if data["legacy"]:
         out.append("  legacy 行单列，不冒充任何会话（R905 之前写的流水没有 session 字段）。")
-    if not data["sessions"]:
+    if data.get("capped"):
+        out.append("判定：窗口被截断，本轮**不据此**改 B048 状态——先调大 --limit 或收窄 --days 读全再说。")
+    elif not data["sessions"]:
         # 记忆 #566：结构性零样本 ≠ 真没攒够。新格式刚上线时全是 legacy 行，
         # 此时说「与 R902 一致」是拿零样本冒充结论，必须明说不下结论。
         out.append("判定：尚无带 session 的样本（全是 legacy）——**不下结论**。")

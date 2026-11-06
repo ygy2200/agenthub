@@ -126,7 +126,7 @@ def test_origin_report_refuses_to_conclude_without_live(monkeypatch):
         {"ts": "2026-11-06T09:01:00", "action": "brain_recall_semantic_bridge",
          "note": "n=1 origin=probe"},
     ]
-    monkeypatch.setattr(brain, "journal_list", lambda *a, **k: fake)
+    monkeypatch.setattr(brain, "journal_window", lambda *a, **k: (fake, False))
     data = rep.collect("x", days=30)
     assert data["counts"]["brain_recall_sem_rescue"]["eval"] == 1
     assert data["counts"]["brain_recall_semantic_bridge"]["probe"] == 1
@@ -145,6 +145,6 @@ def test_origin_report_counts_live_separately(monkeypatch):
         {"ts": "2026-11-06T09:02:00", "action": "brain_recall_sem_rescue",
          "note": "n=1 origin=eval"},
     ]
-    monkeypatch.setattr(brain, "journal_list", lambda *a, **k: fake)
+    monkeypatch.setattr(brain, "journal_window", lambda *a, **k: (fake, False))
     text = rep.render(rep.collect("x", days=30))
     assert "累计触发 2 次" in text, text

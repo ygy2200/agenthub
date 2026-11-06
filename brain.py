@@ -12481,9 +12481,46 @@ def journal_verify(root: str, max_breaks: int = 5) -> dict:
 
 
 def journal_list(root: str, limit: int = 200) -> list:
+    """列最近几条流水（展示用）。limit 夹在 500 以内——**别拿它算窗口口径**，
+    真库 9843 行里 500 行只覆盖两天；要按天/按 action 统计走 `journal_window`（B108）。"""
     with db_conn(root) as conn:
         return [dict(r) for r in conn.execute(
             "SELECT * FROM journal ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),))]
+
+
+JOURNAL_WINDOW_CAP = 5000  # 窗口口径的行数上限：显著高于展示夹子，又不至于无界扫库
+
+
+def journal_window(root: str, actions=(), cutoff: str = "", limit: int = None) -> tuple:
+    """按**窗口**读流水（B108）：`(rows, capped)`，rows 是 dict（ts/agent/action/target/note）。
+
+    为什么单独开这一条口子：`journal_list` 为了展示安全把 limit 夹在 500，而救援分档、
+    采纳率这类「30 天口径」的报表都要按 action+时间统计——夹子一撞，报表算的其实是
+    「最近 500 行里的比例」，R933 只能给它加一句免责声明。这里把口径做实：
+    ① `actions` 先收窄（走 idx_journal_action_ts，行数从万级掉到百级）；
+    ② 只取需要的列，不把 prev_hash/hash 拖进内存；
+    ③ `cutoff` 用 `substr(ts,1,10)` 按日期比，坏时间戳自然落在窗口外，不猜；
+    ④ 真的读到上限时 `capped=True`，调用方必须说破——静默截断正是本轮要修的病。
+    上限在调用时读模块常量（不绑进默认参数），测试才压得动它；`limit<=0` 视为「用默认上限」，
+    免得 CLI 的 0 被读成「只取一行」。
+    """
+    try:
+        cap = JOURNAL_WINDOW_CAP if not limit or int(limit) <= 0 else int(limit)
+    except (TypeError, ValueError):
+        cap = JOURNAL_WINDOW_CAP
+    sql = ("SELECT ts, agent, action, target, note FROM journal"
+           " WHERE substr(ts,1,10) >= ?")
+    args = [cutoff or ""]
+    acts = [a for a in (actions or ()) if a]
+    if acts:
+        sql += " AND action IN (" + ",".join("?" * len(acts)) + ")"
+        args.extend(acts)
+    sql += " ORDER BY id LIMIT ?"
+    args.append(cap + 1)   # 多取一行：判断是否撞上限，不用另跑 COUNT
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(sql, args)]
+    capped = len(rows) > cap
+    return (rows[:cap], capped) if capped else (rows, False)
 
 
 SECURITY_WINDOW_DAYS = 7  # R90 安全态势默认窗口：拦截是低频事件，7 天足够发现配置漂移

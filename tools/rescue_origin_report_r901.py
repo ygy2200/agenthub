@@ -38,15 +38,17 @@ def _origin_of(note: str) -> str:
     return m.group(1) if m and m.group(1) in ORIGINS else "unknown"
 
 
-def collect(root: str, days: int = 30, limit: int = 20000,
-             switch_ts: str = "") -> dict:
+def collect(root: str, days: int = 30, limit: int = None,
+            switch_ts: str = "") -> dict:
     """只读 journal，按 (action, origin) 出计数与最近一次时间。
 
-    R933 补：同时记下**实际扫到的最早一行**。`brain.journal_list` 有单次行数上限，
-    请求 30 天常常只拿回两三天；报表不说破这点，`live` 计数就会被读成整窗口的答案。
+    R933 补「实得最早一行」，R935 把口径本身做实：改用 `brain.journal_window`
+    按 action+窗口读（B108）。此前走 `journal_list`，limit 被夹在 500——请求 30 天
+    实际只扫到最近两天，live 计数是「可得样本」而不是「窗口样本」，报表只能免责声明。
+    现在窗口读全，`capped` 只在真撞到窗口上限时才真，`covered` 就是它的反面。
     """
-    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
-    rows = brain.journal_list(root, limit=limit) or []
+    cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d") if days > 0 else ""
+    rows, capped = brain.journal_window(root, actions=ACTIONS, cutoff=cutoff, limit=limit)
     counts = {a: Counter() for a in ACTIONS}
     last = {a: "" for a in ACTIONS}
     all_ts = [str(r.get("ts") or "") for r in rows if r.get("ts")]
@@ -57,31 +59,28 @@ def collect(root: str, days: int = 30, limit: int = 20000,
             continue
         full = str(r.get("ts") or "")
         ts = full[:10]
-        if days > 0 and ts and ts < cutoff:
-            continue
         o = _origin_of(r.get("note"))
         counts[action][o] += 1
         if o == "live":
             live_ts.append(full)
         if ts > last[action]:
             last[action] = ts
-    earliest = min(all_ts) if all_ts else ""
-    covered = bool(all_ts) and earliest[:10] <= cutoff
+    cap = brain.JOURNAL_WINDOW_CAP if not limit or int(limit) <= 0 else int(limit)
     return {"counts": counts, "last": last, "total_rows": len(rows),
-            "days": days, "cutoff": cutoff, "earliest": earliest,
-            "covered": covered, "requested_limit": limit, "live_ts": live_ts,
-            "switch_ts": switch_ts,
+            "days": days, "cutoff": cutoff, "earliest": min(all_ts) if all_ts else "",
+            "capped": bool(capped), "covered": not capped, "cap": cap,
+            "live_ts": live_ts, "switch_ts": switch_ts,
             "live_after_switch": len([t for t in live_ts if switch_ts and t >= switch_ts])}
 
 
 def render(data: dict, switch_ts: str = "") -> str:
-    out = [f"语义救援触发分档 | 窗口 {data['days']} 天（>= {data['cutoff']}）"
-           f" | journal 扫描 {data['total_rows']} 行（请求 limit={data.get('requested_limit', '—')}）", ""]
+    out = [f"语义救援触发分档 | 窗口 {data['days']} 天（>= {data['cutoff'] or '不限'}）"
+           f" | 按窗口聚合读 {data['total_rows']} 行（窗口上限 {data.get('cap', '—')}）", ""]
     if data.get("earliest"):
         out.append(f"实得行最早 {data['earliest']}")
-    if data.get("total_rows") and not data.get("covered"):
-        out.append(f"  ⚠ 扫描范围未覆盖请求窗口 {data['days']} 天（journal_list 有单次行数上限）"
-                   f"——下面分档是**可得样本**，不是整窗口统计，别按 {data['days']} 天口径下结论。")
+    if data.get("capped"):
+        out.append(f"  ⚠ 窗口内流水已达上限 {data.get('cap')} 行，本次被截断——下面分档是**可得样本**，"
+                   f"不是整窗口统计；要读全就调大 --limit 或收窄 --days。")
     out.append("")
     live_total = 0
     for a in ACTIONS:
@@ -123,7 +122,8 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="")
     ap.add_argument("--days", type=int, default=30)
-    ap.add_argument("--limit", type=int, default=20000)
+    ap.add_argument("--limit", type=int, default=0,
+                    help="窗口行数上限，0=用 brain.JOURNAL_WINDOW_CAP（不是 journal_list 的 500）")
     ap.add_argument("--switch-ts", default="",
                     help="生产语义开关生效时间（默认取 ~/.workbuddy/mcp.json 的修改时间）")
     ap.add_argument("--out", default="")
@@ -134,7 +134,7 @@ def main() -> int:
         cfg = Path.home() / ".agenthub" / "config.json"
         root = str(json.loads(cfg.read_text(encoding="utf-8")).get("root") or "")
     switch_ts = args.switch_ts or _prod_switch_ts()
-    text = render(collect(root, args.days, args.limit, switch_ts=switch_ts))
+    text = render(collect(root, args.days, args.limit or None, switch_ts=switch_ts))
     print(text)
     if args.out:
         p = Path(args.out)
