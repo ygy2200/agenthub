@@ -8559,6 +8559,28 @@ RECALL_REL_MARGIN = 0.62
 # 语义相似但词法零命中的候选越级（那种要靠 B071 后半段的闸门救援，另立一轮）。
 RECALL_SEM_RERANK_W = 10.0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
+# R900（B099）：闸门救援**默认关闭**，只在 A/B 量具里切档。为什么默认关而不是直接
+# 合入：外部证据三条都指向「别让语义路接管排序」——① RRF 的分数是排名共识不是相关性，
+# 救不了没有任何一路召回的候选，也不能拿来当置信闸门（srcecde.me 2026）；
+# ② weakest-link：弱路会给每个候选非零票，把强路拖下来（Wang et al. 2025）；
+# ③ 小样本下标定融合权重不如凸组合 sample-efficient（Bruch et al. 2022）。
+# R899 已用凸组合（spec += W×sim）修好重排；这里只回答一个更窄的问题：**被稀有词
+# 闸门删掉、但至少还在词法候选池里**的候选，能不能靠「语义排名靠前」补回来。
+# 三条硬边界防止开洞：① 必须是语义 topN（不是语义路里排第 23 名那种）；
+# ② 最多救 1 条；③ 只翻 rare 这一类丢弃，hit/immune 两类结构性判定不翻案。
+# R901 合入默认：R900 同库 A/B（23 条语料、剔除 2 条泄漏后分母恒 21）实测
+# replace/0.60–0.62 平台段 15/21→17/21（+9.6pp），2/2 救援精准、零转丢失、
+# top3 非期望候选 -2 格；append 档证伪（7 次救援只 2 次有用、噪声 +3）。
+# 0.64 起收益减半，故取平台上沿 0.62。四道护栏见上，任何一道都不许顺手放宽。
+# 待确认（tools/rescue_origin_report_r901.py 负责攒证据）：① A/B 跑在已预热真库上，
+# 钩子路径语义冷启动约 1.0s，真实会话收益未量；② 0.62 距噪声峰值 0.5942 仅
+# 0.026，换语料/换编码器需复标；③ 21 条分母上单条翻转 = 4.8pp，样本仍薄。
+# 一键回滚：把本行改回 "off"（行为等同 R899，观测字段保留）。
+RECALL_SEM_RESCUE_MODE = "replace"  # off | append(只补位) | replace(换掉语义最弱的一条)
+RECALL_SEM_RESCUE_SIM = 0.62        # 高于「无意义句」噪声峰值 0.5942（记忆 #542）
+RECALL_SEM_RESCUE_TOPN = 3       # 只认语义排名前 3
+RECALL_SEM_RESCUE_MAX = 1
+RECALL_SEM_RESCUE_MARGIN = 0.10  # replace 时，新候选必须比被换掉的明显更相近
 RECALL_RECORD_CAP = 2        # 记录通道（过程证据）每次最多几条
 
 # R827：fingeprint 抽取。思路照 Grimoire 的实测结论——「让 agent 写引用标签没用
@@ -9162,7 +9184,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            # #02/#08 两条 miss 时只能靠外部脚本复算才能区分，这里把它变成函数输出。
            "dropped": {"hit": 0, "rare": 0, "immune": 0, "cap": 0},
            # R899：本轮拿到语义分的候选条数（0 = 语义路没预热/未启用，走纯词法）
-           "sem_scored": 0}
+           "sem_scored": 0,
+           # R900：闸门救援实际放进注入的条数（默认 0；-1 表示本档未启用）
+           "sem_rescued": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9302,7 +9326,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     # 整批判会误伤：提问里既有泛词也有精确词时（「qfluentwidgets 中文被截断」），
     # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
     rare_line = _recall_rare_threshold(len(mems))
-    strong = []
+    strong, weak = [], []
     for pair in scored:
         if float(pair[1].get("_recall_best") or 0.0) >= rare_line:
             strong.append(pair)
@@ -9310,8 +9334,54 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # 只命中泛词的候选不是「没查到」——它们确实命中了词，只是命中的词在
             # 这批候选里到处都是。分开计数才能回答「答案是被删了还是没排上」。
             out["dropped"]["rare"] += 1
+            weak.append(pair)   # R900：留作闸门救援的候选集，默认不启用
     picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     out["dropped"]["cap"] = max(0, len(strong) - len(picked))
+    # R900（B099）两阶段闸门救援：先按语义分取前 N 当「准入名单」，再与词法结果融合。
+    # 只在开关非 off 且语义路真出了分时生效；语义没预热/异常 → 与旧码逐字段一致。
+    # 用同一函数做 A/B（tools/semantic_rescue_ab_r900.py 只切常量），避免离屏模拟器
+    # 与线上形状不一致（记忆 #511：夹具不是生产形状等于没测）。
+    if RECALL_SEM_RESCUE_MODE != "off" and sem_map and weak:
+        eligible = {int(i) for i, _ in
+                    sorted(sem_map.items(), key=lambda kv: -kv[1])[:RECALL_SEM_RESCUE_TOPN]}
+        cand = [(s, r) for s, r in weak
+                if int(r.get("id") or 0) in eligible
+                and sem_map.get(int(r.get("id") or 0), 0.0) >= RECALL_SEM_RESCUE_SIM]
+        cand.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
+        cand = cand[:RECALL_SEM_RESCUE_MAX]
+        added = []
+        if RECALL_SEM_RESCUE_MODE == "append":
+            # 只补位：一条强命中都不挤掉。picked 满 3 时这档天然零效果。
+            room = RECALL_PICK_CAP - len(picked)
+            added = [r for _, r in cand[:max(0, room)]]
+        elif RECALL_SEM_RESCUE_MODE == "replace" and picked and cand:
+            # 替换：新候选必须比被换掉的那条「语义明显更近」，否则不动。
+            best_sim = sem_map.get(int(cand[0][1].get("id") or 0), 0.0)
+            worst_i, worst_sim = -1, float("inf")
+            for i, r in enumerate(picked):
+                sim = sem_map.get(int(r.get("id") or 0), 0.0)
+                if sim < worst_sim:
+                    worst_i, worst_sim = i, sim
+            if best_sim - worst_sim >= RECALL_SEM_RESCUE_MARGIN:
+                picked = picked[:worst_i] + picked[worst_i + 1:]
+                added = [cand[0][1]]
+                # 换掉的那条回到 cap 计数里，口径仍是「没进注入」
+                out["dropped"]["cap"] += 1
+        if added:
+            picked = list(picked) + added
+            out["sem_rescued"] = len(added)
+            out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - len(added))
+            # R901：救援触发留流水，按 origin 分档（live/probe/eval）。默认档一上线，
+            # 没有观测出口就没人能回答「真实会话里到底触发几次」，下一轮又得靠猜。
+            # 只写 note、不碰 backup——journal_add 第 5 个位置参数是 backup（记忆 #569）。
+            try:
+                journal_add(root, who, "brain_recall_sem_rescue", "prompt",
+                            note=f"n={len(added)} mode={RECALL_SEM_RESCUE_MODE} "
+                                 f"sim={RECALL_SEM_RESCUE_SIM:.2f} "
+                                 f"ids={','.join(str(int(r.get('id') or 0)) for r in added)} "
+                                 f"origin={origin}")
+            except sqlite3.Error:
+                pass
     rescue = 0
     # R861：救援的边界是「词法**一条候选都没有**」，不是「词法没挑出强的」。
     # 后者（scored 非空、strong 空）是 R825/R826 的领域：泛词命中的摘要会误导，

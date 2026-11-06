@@ -29,6 +29,24 @@ R892 修之前会怎样失败（R891 真库只读审计的三条实锤，都是�
      R895 从 40% 收到 70%，依据 R893-E 全库误伤面 314→5 条次，见 LEAK_MIN_RATIO）。
   ③ **无标注样本长期空转**：#12 注释写「待积累结论」，可答案 mem#503（单次删除
      ≥50 项被沙箱拦）早已存在且稳定命中——空标注让它永远不计分。现在补标。
+
+R900 扩样口径（12 → 23 条）：B099 要定「闸门救援/融合权重」，12 条样本（其中 2 条
+题面泄漏被剔，实际分母 10）不够定任何参数——单条样本的翻转就是 10 个百分点。
+新增 11 条时立了四条规矩，防止把评测集调成「只量自己改得动的那部分」：
+  ① **按预设难度类型挑，不按命中挑**：五类各有样本——闸门 1、词汇鸿沟 3（提问用词
+     ≠库里说法）、多答案 5、跨项目 1（红色沙漠）、机制自指 1（讲召回本身）。挑完
+     才跑，命中与否如实记进台账，不因为「不好看」就删条目。记录路样本(#11)在旧 12
+     条里，本轮没新增。
+  ② 提问写口语、不抄记忆正文，避免又造出一批题面泄漏；每条标注都回查真库该 id
+     存在且 status=active、superseded_by=0（R900 实测 21 个候选答案全在，零缺失）。
+  ③ 合格答案不唯一的仍用集合（R891 教训）：#13/#16/#17/#18/#20/#21/#23。
+  ④ **分难度报分，不看单一聚合分**：8 条容易样本能把 1 条闸门样本的增益稀释成
+     ±0，而 B099 要定的正是闸门那一档的参数。所以每条 why 用「类型：说明」写法，
+     报分时按类型汇总（见 DIFFICULTY_TAGS）。
+外部依据：混合检索的增益必须在自己的语料上量，不能照搬公开基准——1854 条查询的
+8 条件消融里 hybrid RRF 0.358 反而低于 vector-only 0.396（Superlinked，见
+output/迭代台账-R900-2026-11-06.md）；凸组合在小样本下比 RRF 更 sample-efficient
+（Bruch et al. 2022）。所以本轮只扩样本与做 A/B 量具，权重不许拿 12 条标定。
 """
 import argparse
 import os
@@ -58,6 +76,26 @@ LEAK_SCAN_CHARS = 80
 # ≥ floor 10）。代价：只抄半句题面的污染会漏判——当前 12 条样本无此形态，待扩样本。
 LEAK_MIN_RATIO = 0.7
 
+# 难度类型（R900）：写在样本 why 的「类型：」前缀里。分类型报分不是为了好看——
+# R900 扩到 23 条后聚合分 71.4%，其中「其他」（旧 12 条里能命中的那批）是 9/10，
+# 而闸门类 0/1、跨项目 0/1。B099 要定的是闸门档参数，看聚合分会被容易样本稀释成
+# 噪声。顺序即报表顺序（先难后易）。
+DIFFICULTY_TAGS = ("闸门", "词汇鸿沟", "多答案", "跨项目", "机制自指")
+OTHER_TAG = "其他"
+
+
+def _tag_of(why) -> str:
+    """按 why 的前缀归难度类型；没写的（R900 之前的老样本）归「其他」。
+
+    只认前缀而不是「包含」：说明里偶尔会提到别的类型（例：「多答案：闸门删了它」），
+    用包含匹配会让一条样本同时落进两个桶。
+    """
+    s = str(why or "")
+    for t in DIFFICULTY_TAGS:
+        if s.startswith(t):
+            return t
+    return OTHER_TAG
+
 # (提问, 期望, 说明)。期望写法两种：
 #   ("mem", 457)                        只认这一条（旧写法，仍兼容）
 #   (("mem", 463), ("mem", 371))        任一条在 top3 即算命中（合格答案不唯一时用）
@@ -81,6 +119,38 @@ CASES = [
      "SINK 未设 / 伪造 HOME 造零判定假信号"),
     ("工作台每组只显示二十条没有出口", ("rec", 3636), "分页出口是记录不是记忆"),
     ("大量删除被沙箱拦住提示 SAFE_DELETE_BULK", ("mem", 503), "R891 补标：答案早已存在"),
+    # ↓ R900 新增 11 条：难度类型写在 why 里，便于按类看增益而不是只看一个聚合分。
+    # 全部答案 id 已回查真库（status=active、superseded_by=0，2026-11-06）。
+    ("改完 mcp 配置之后 hub 工具一个都不见了，客户端也不报错",
+     (("mem", 518), ("mem", 519)),
+     "词汇鸿沟：库里说「授权作废/静默不加载」，提问说「工具不见了」"),
+    ("批处理里加了中文注释，怎么命令自己跑起来了", ("mem", 528),
+     "词汇鸿沟：cmd 把多字节 rem 行拆碎当命令"),
+    ("SQL 条件里写 NOT 为什么把不该选的都选了", ("mem", 507),
+     "闸门类：命中词全是泛词（SQL/条件/NOT）"),
+    ("缓存什么时候该失效，用文件修改时间行不行",
+     (("mem", 414), ("mem", 412)),
+     "多答案：失效键必须对应被读的那份数据"),
+    ("采纳率低得离谱，先查哪里",
+     (("mem", 520), ("mem", 524), ("mem", 546)),
+     "多答案：判官采集侧 / 分母三态 / 分档同口径"),
+    ("钩子改完部署也全绿，线上怎么还是老样子",
+     (("mem", 512), ("mem", 511)),
+     "多答案：三层陈旧 / 夹具形状不是生产形状"),
+    ("GUI 测试里等窗口空闲一直超时", ("mem", 475),
+     "词汇鸿沟：库里讲 _workers，提问讲「等空闲超时」"),
+    ("exe 双击没反应，是不是打包坏了",
+     (("mem", 435), ("mem", 504)),
+     "多答案：单实例守卫秒退 / exe 无 CLI 入口"),
+    ("游戏一启动就卡住不动，先查哪",
+     (("mem", 489), ("mem", 476)),
+     "跨项目：红色沙漠——netstat 看 TCP / 服务被禁用静默秒退"),
+    ("语义检索为什么调阈值没用",
+     (("mem", 542), ("mem", 571)),
+     "机制自指：噪声峰值高于漏召回 / 语义信号被闲置"),
+    ("怎么确认 GitHub 上的 exe 真的发出去了",
+     (("mem", 554), ("mem", 447), ("mem", 484)),
+     "多答案：三层证据链 / digest 字段 / 附件列表前端懒加载"),
 ]
 
 
@@ -192,6 +262,23 @@ def _classify(prompt, accepts, out, root):
     return "miss", 0, ""
 
 
+def _tag_summary(by_tag: dict) -> str:
+    """把 {类型: [命中, 计分]} 压成「闸门 0/1（0%）· 其他 9/10（90%）」一行。
+
+    分母为 0 的类型（样本全被判题面泄漏）不打印——印出「0/0（0%）」会被读成
+    「这一类全错」，实际是这一类一条都没计分。R900 的 23 条里还没有这种类型，
+    但扩样后会遇到（某类只写了 1 条而它恰好泄漏）。
+    """
+    order = list(DIFFICULTY_TAGS) + [OTHER_TAG]
+    parts = []
+    for t in order:
+        v = by_tag.get(t)
+        if not v or not v[1]:
+            continue
+        parts.append(f"{t} {v[0]}/{v[1]}（{v[0] / v[1] * 100:.0f}%）")
+    return " · ".join(parts)
+
+
 def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         out_stream=None) -> int:
     """跑基线。recall_fn 只为测试注入假检索——量具本身不该依赖真库才能被验证。"""
@@ -201,6 +288,7 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     stream = out_stream or sys.stdout
     state = Path(tempfile.mkdtemp(prefix="recall_eval_")) / "state.json"
     counts = {"hit": 0, "gap": 0, "miss": 0, "leak": 0}
+    by_tag = {}  # 难度类型 -> [命中, 计分]；泄漏样本不进计分
     rows = []
     for i, (prompt, want, why) in enumerate(cases, 1):
         accepts = _accepts(want)
@@ -216,6 +304,11 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
             continue
         cls, span, leak_id = _classify(prompt, accepts, res, root)
         counts[cls] += 1
+        cell = by_tag.setdefault(_tag_of(why), [0, 0])
+        if cls != "leak":
+            cell[1] += 1
+            if cls == "hit":
+                cell[0] += 1
         rows.append((i, prompt, accepts, why, cls, span, leak_id,
                      _ids_of(res, "mem"), _ids_of(res, "rec"), res.get("terms"),
                      _drop_s(res)))
@@ -236,6 +329,7 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     print(f"  四类：命中 {counts['hit']} · 词汇鸿沟(该路零候选) {counts['gap']}"
           f" · 排序未命中 {counts['miss']} · 题面泄漏 {counts['leak']}"
           f"   合计 {total} = 总样本", file=stream)
+    print(f"  分难度：{_tag_summary(by_tag)}", file=stream)
     for i, prompt, accepts, why, cls, span, leak_id, mems, recs, terms, drop_s in rows:
         want_s = "|".join(f"{k}#{v}" for k, v in accepts)
         if cls == "miss":
