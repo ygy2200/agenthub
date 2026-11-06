@@ -115,7 +115,8 @@ def scan(root):
         "hypothetical": [],
     }
     for row in rows:
-        terms = brain._error_sig_terms(row["detail"], row["title"])
+        terms = brain._error_sig_terms(row["detail"], row["title"],
+                                       normalize_mojibake=False)
         if not terms:
             continue
         before = brain._error_sig_key(terms)

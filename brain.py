@@ -20,6 +20,7 @@ import sqlite3
 import sys
 import threading
 import time
+import unicodedata
 from collections import Counter
 from contextlib import contextmanager
 from pathlib import Path
@@ -1389,10 +1390,10 @@ def _migrate_columns(root: str) -> None:
         ecols = {r["name"] for r in conn.execute("PRAGMA table_info(errors)")}
         # R834 B041 签名沉淀：登记时就把签名词存成结构化字段（与 _error_sig_key 同键），
         # 下次同签名报错按 sig 精确匹配——靠 title/detail 的中文 prose 碰运气不是沉淀。
-        # R929：pre_sig 是存量签名重签（`resign_error_sigs`）的旧键留证列，只走 ALTER。
+        # R929/R931：每一代重签用独立旧键留证列，回滚不得覆盖上一代证据。
         for col, ddl in (("repeat_count", "INTEGER DEFAULT 1"), ("last_ts", "TEXT DEFAULT ''"),
                          ("last_detail", "TEXT DEFAULT ''"), ("sig", "TEXT DEFAULT ''"),
-                         ("pre_sig", "TEXT DEFAULT ''")):
+                         ("pre_sig", "TEXT DEFAULT ''"), ("pre_sig_r930", "TEXT DEFAULT ''")):
             if col not in ecols:
                 conn.execute(f"ALTER TABLE errors ADD COLUMN {col} {ddl}")
         tcols = {r["name"] for r in conn.execute("PRAGMA table_info(tasks)")}
@@ -10062,7 +10063,69 @@ def _error_clean(text: str) -> str:
     return t
 
 
-def error_signature_terms(text: str, cap: int = 24) -> list:
+_MOJIBAKE_COMMON_CJK = set(
+    "的一是不了在人我有他这个中大来上国个到说们为子和你地出道也时年得就那要下以生会自着去之过家学对"
+    "可她里后小么心多天而能好都然没日于起还发成事只作当想看文无开手十用主行方又如前所本见经头面公同"
+    "三已老从动两长知民样现分将外但身些与意此进制法月理流量看板更新成功错误页面文件路径读取写回快捷方式"
+)
+_MOJIBAKE_MARKERS = set("ÃÂâæçðñ")
+
+
+def _mojibake_badness(text: str) -> int:
+    return sum(ch == "�" or ch in _MOJIBAKE_MARKERS
+               or unicodedata.category(ch) in {"Cc", "Co", "Cs"} for ch in text)
+
+
+def _mojibake_strict_roundtrip(text: str, encoding: str):
+    if not text or "�" in text:
+        return None
+    try:
+        repaired = text.encode(encoding, "strict").decode("utf-8", "strict")
+        if not repaired or repaired == text or "�" in repaired:
+            return None
+        if repaired.encode("utf-8", "strict").decode(encoding, "strict") != text:
+            return None
+        return repaired
+    except (UnicodeEncodeError, UnicodeDecodeError):
+        return None
+
+
+def assess_mojibake(text: str) -> list:
+    candidates = []
+    for encoding in ("cp936", "latin1"):
+        repaired = _mojibake_strict_roundtrip(text, encoding)
+        if repaired is None:
+            continue
+        before_badness = _mojibake_badness(text)
+        after_badness = _mojibake_badness(repaired)
+        before_common = sum(ch in _MOJIBAKE_COMMON_CJK for ch in text)
+        after_common = sum(ch in _MOJIBAKE_COMMON_CJK for ch in repaired)
+        after_cjk = sum("\u3400" <= ch <= "\u9fff" for ch in repaired)
+        if encoding == "cp936":
+            evidence = (after_cjk >= 2 and after_common > before_common
+                        and after_badness <= before_badness)
+        else:
+            evidence = (len(repaired.strip()) >= 2 and after_badness < before_badness
+                        and any(unicodedata.category(ch).startswith("L") for ch in repaired))
+        candidates.append({
+            "term": text, "repaired": repaired, "encoding": encoding,
+            "roundtrip": True, "evidence_enough": bool(evidence),
+            "badness_before": before_badness, "badness_after": after_badness,
+            "common_before": before_common, "common_after": after_common,
+            "cjk_after": after_cjk,
+        })
+    return candidates
+
+
+def choose_mojibake_repair(text: str):
+    candidates = assess_mojibake(text)
+    if len(candidates) != 1 or not candidates[0]["evidence_enough"]:
+        return None
+    return candidates[0]
+
+
+def error_signature_terms(text: str, cap: int = 24,
+                          normalize_mojibake: bool = True) -> list:
     """从一条报错里抽出签名词，返回 [(term, weight)]，高价值词在前。
 
     权重含义：3=异常类名/错误码/被点名的标识符/报错成语（认出这条报错就靠它）；
@@ -10074,7 +10137,13 @@ def error_signature_terms(text: str, cap: int = 24) -> list:
     out, seen, num_names = [], set(), set()
 
     def add(term: str, weight: int) -> None:
-        term = re.sub(r"\s+", " ", (term or "").strip().strip(":.,;!?«»“”")).lower()
+        term = re.sub(r"\s+", " ", (term or "").strip().strip(":.,;!?«»“”"))
+        if normalize_mojibake:
+            choice = choose_mojibake_repair(term)
+            if choice is not None:
+                term = choice["repaired"]
+        # 必须先修再小写化：Ã→ã 会改变 Latin-1 字节，原本可逆的 café 乱码就修不回来。
+        term = term.lower()
         if len(term) < 3 or term in seen or term in _ERR_STOP or term.isdigit():
             return
         # R839：`'\u2018'` 这类「出问题的那个字符」不是身份，是位置。它每换一个字符
@@ -10171,7 +10240,7 @@ def _error_sig_key_legacy(terms: list) -> str:
     return "|".join(sorted(t for t, w in terms[:6] if w >= 2)[:4])
 
 
-def _error_sig_terms(detail: str, title: str) -> list:
+def _error_sig_terms(detail: str, title: str, normalize_mojibake: bool = True) -> list:
     """登记通道写 `errors.sig` 时真正喂进去的那段文字（`error_sig_of(detail) or
     error_sig_of(title)`，见 `error_add`）。复算存量必须走同一个**输入形状**：
     R856 的教训是「同一个函数不够，输入形状也得对齐」，本轮第一次取证用
@@ -10180,7 +10249,8 @@ def _error_sig_terms(detail: str, title: str) -> list:
     """
     for text in (detail or "", title or ""):
         terms = error_signature_terms(
-            _error_voice(_diagnosis_span(_error_span(text or ""))))
+            _error_voice(_diagnosis_span(_error_span(text or ""))),
+            normalize_mojibake=normalize_mojibake)
         if terms and any(w >= 3 for _, w in terms):
             return terms
     return []
@@ -10215,7 +10285,9 @@ def resign_error_sigs(root: str, apply: bool = False, limit: int = 0) -> dict:
     updates = []
     for r in rows:
         cur = str(r.get("sig") or "")
-        terms = _error_sig_terms(r.get("detail") or "", r.get("title") or "")
+        # R929 的取证与新键都冻结在乱码规范化之前；R931 另有独立迁移，不能在这里顺带改代。
+        terms = _error_sig_terms(r.get("detail") or "", r.get("title") or "",
+                                 normalize_mojibake=False)
         if not terms:
             stats["no_terms"] += 1
             continue
@@ -10245,6 +10317,54 @@ def resign_error_sigs(root: str, apply: bool = False, limit: int = 0) -> dict:
         journal_add(root, "hub", "brain_resign_error_sig", target="errors",
                     note=f"重签 {stats['drifted']} 条签名键 + 补 {stats['no_sig']} 条空键"
                          f"（扫 {stats['scanned']}·判不了 {stats['unreproducible']}）")
+    return stats
+
+
+def resign_mojibake_error_sigs(root: str, apply: bool = False, limit: int = 0) -> dict:
+    """只迁移能由 R929 权重键或更早 legacy 键证明来源的乱码签名，旧键独立留在 pre_sig_r930。"""
+    if apply:
+        ensure_schema(root)
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, title, COALESCE(detail,'') AS detail, COALESCE(sig,'') AS sig,"
+            " status FROM errors ORDER BY id")]
+    stats = {"scanned": len(rows), "resigned": 0, "changed": 0, "same": 0,
+             "empty": 0, "no_terms": 0, "unreproducible": 0,
+             "applied": bool(apply), "samples": []}
+    updates = []
+    for row in rows:
+        detail, title = row.get("detail") or "", row.get("title") or ""
+        raw_terms = _error_sig_terms(detail, title, normalize_mojibake=False)
+        if not raw_terms:
+            stats["no_terms"] += 1
+            continue
+        normalized_terms = _error_sig_terms(detail, title, normalize_mojibake=True)
+        cur = str(row.get("sig") or "")
+        new = _error_sig_key(normalized_terms)
+        if raw_terms == normalized_terms or cur == new:
+            stats["same"] += 1
+            continue
+        if not cur:
+            stats["empty"] += 1
+            continue
+        provenance = {_error_sig_key(raw_terms), _error_sig_key_legacy(raw_terms)}
+        if cur not in provenance:
+            stats["unreproducible"] += 1
+            continue
+        stats["changed"] += 1
+        if limit and len(updates) >= int(limit):
+            continue
+        stats["samples"].append({"id": row["id"], "old": cur, "new": new,
+                                 "status": row.get("status") or "", "kind": "mojibake"})
+        updates.append((new, cur, row["id"]))
+    if apply and updates:
+        with db_conn(root) as conn:
+            conn.executemany(
+                "UPDATE errors SET sig=?, pre_sig_r930=? WHERE id=?", updates)
+        stats["resigned"] = len(updates)
+        journal_add(root, "hub", "brain_resign_mojibake_error_sig", target="errors",
+                    note=f"乱码签名重签 {len(updates)} 行（候选 {stats['changed']}·"
+                         f"判不了 {stats['unreproducible']}·空键不动 {stats['empty']}）")
     return stats
 
 
