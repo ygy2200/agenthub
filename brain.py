@@ -8582,6 +8582,26 @@ RECALL_SEM_RESCUE_TOPN = 3       # 只认语义排名前 3
 RECALL_SEM_RESCUE_MAX = 1
 RECALL_SEM_RESCUE_MARGIN = 0.10  # replace 时，新候选必须比被换掉的明显更相近
 RECALL_RECORD_CAP = 2        # 记录通道（过程证据）每次最多几条
+# R907（B103 归因）：**不依赖语义模型**的弱候选兜底，默认关闭，只给 A/B 量具切档。
+# 动机是 R906 全量归因的两个硬数字：51 个期望答案里 12 个死于稀有词闸门（最大
+# 淘汰原因），而 32 条样本 sem_scored 全为 0 —— R901 的 replace/0.62 语义救援在
+# 评测/钩子路径结构性零触发，靠调语义权重救不了这 12 条。外部依据也指向「先修
+# 召回，别先调排序」（menuagentic hybrid-search-and-reranking）。
+# 四条护栏：① 只在 strong 一条都没有时补位，绝不挤掉任何强命中；② 最多 1 条；
+# ③ 要求命中不同检索词数 >= 阈值（多词共现是「在讲同一件事」的弱证据，单个
+#    泛词不是）；④ 默认 off，A/B 未证明「增益>0 且噪声不增」就不许合入默认。
+# 一键回滚：把本行改回 0（行为等同 R905，观测字段保留）。
+RECALL_WEAK_PICK_MIN = 0     # 0=off；>0 时为最少命中的不同检索词数
+
+
+def _recall_distinct_hits(terms: list, row: dict) -> int:
+    """命中了几个**不同**检索词（R907）。
+
+    `_recall_hit_score` 是权重和，不能当「命中几个词」用：一个高权重大词就能顶出
+    hit=5，实际只命中 1 个词。多词共现才是有意义的弱证据。
+    """
+    low = (str(row.get("content") or "") + " " + str(row.get("tags") or "")).lower()
+    return sum(1 for t, _ in terms if t in low)
 
 # R827：fingeprint 抽取。思路照 Grimoire 的实测结论——「让 agent 写引用标签没用
 # （qwen 即使被要求也只有 14% 会写）」，所以判「这条记忆有没有被用」只能靠**内容里
@@ -9186,7 +9206,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            # R899：本轮拿到语义分的候选条数（0 = 语义路没预热/未启用，走纯词法）
            "sem_scored": 0,
            # R900：闸门救援实际放进注入的条数（默认 0；-1 表示本档未启用）
-           "sem_rescued": 0}
+           "sem_rescued": 0,
+           # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
+           "weak_picked": 0, "weak_picked_id": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9337,6 +9359,21 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             weak.append(pair)   # R900：留作闸门救援的候选集，默认不启用
     picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     out["dropped"]["cap"] = max(0, len(strong) - len(picked))
+    # R907：稀有词闸门把答案全删光、语义路又没预热时的窄兜底（默认 off）。
+    # 只在「一条强命中都没有」时补，且最多 1 条——R826 的实测结论仍然成立：有候选
+    # 却每条都只命中泛词时该克制，这里只处理两个极端同时出现的场景，且必须靠 A/B
+    # 证明增益与噪声才允许开默认档。补位后 R861 语义桥的 `not picked` 条件不再满足，
+    # 这正是想要的：桥本身在这条路径上也拿不到向量。
+    if RECALL_WEAK_PICK_MIN > 0 and not picked and weak:
+        cands = [(s, r) for s, r in weak
+                 if _recall_distinct_hits(terms, r) >= RECALL_WEAK_PICK_MIN]
+        if cands:
+            cands.sort(key=lambda x: (-_recall_distinct_hits(terms, x[1]),
+                                      -float(x[0]), -int(x[1].get("id") or 0)))
+            picked = [cands[0][1]]
+            out["weak_picked"] = 1
+            out["weak_picked_id"] = int(cands[0][1].get("id") or 0)
+            out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - 1)
     # R900（B099）两阶段闸门救援：先按语义分取前 N 当「准入名单」，再与词法结果融合。
     # 只在开关非 off 且语义路真出了分时生效；语义没预热/异常 → 与旧码逐字段一致。
     # 用同一函数做 A/B（tools/semantic_rescue_ab_r900.py 只切常量），避免离屏模拟器
