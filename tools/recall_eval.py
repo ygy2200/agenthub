@@ -367,11 +367,60 @@ def db_key(fp: dict) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
+def _registry_semantic_flag():
+    """R936/B109：读 Windows 继承型环境变量（用户级 + 机器级）。
+
+    MCP 进程由宿主拉起；若在 HKCU\\Environment 或 HKLM\\...\\Environment 设了
+    AGENTHUB_SEMANTIC，新启动的进程会继承。非 Windows / 读不到一律返回空，
+    绝不猜——「读不到」不等于「没设」。
+    返回 (value_or_None, 来源路径)。
+    """
+    try:
+        import winreg  # noqa: PLC0415 - 仅 Windows 需要
+    except ImportError:
+        return None, ""
+    machine = r"SYSTEM\CurrentControlSet\Control\Session Manager\Environment"
+    for hive, sub, where in (
+        (winreg.HKEY_CURRENT_USER, r"Environment", "HKCU\\Environment"),
+        (winreg.HKEY_LOCAL_MACHINE, machine, "HKLM\\...\\Environment"),
+    ):
+        try:
+            with winreg.OpenKey(hive, sub) as key:
+                val, _ = winreg.QueryValueEx(key, "AGENTHUB_SEMANTIC")
+            if str(val).strip():
+                return str(val).strip(), where
+        except OSError:
+            continue
+    return None, ""
+
+
+def inherited_semantic_flag(environ=None):
+    """mcp.json 没写 AGENTHUB_SEMANTIC 时，MCP 进程实际会继承哪一个值。
+
+    顺序：进程环境 os.environ -> 注册表 User -> 注册表 Machine。
+    返回 (value_or_None, 来源说明)。注册表这路只保证「新启动的进程会继承」，
+    正在跑的进程未必，所以来源串必须带这个限定，不许伪装成确定生效。
+    """
+    env = os.environ if environ is None else environ
+    val = (env.get("AGENTHUB_SEMANTIC") or "").strip()
+    if val:
+        return val, "进程环境 os.environ"
+    reg, where = _registry_semantic_flag()
+    if reg:
+        return reg, f"注册表 {where}（仅新启动进程继承）"
+    return None, "未设置（默认语义开）"
+
+
 def production_semantic_enabled(config_path: str = "") -> tuple:
     """读取当前生产 MCP 的语义开关；配置不可读时返回未知，不猜成关闭。
 
     关闭判据用 `brain.sem_env_off`（四个词），不在这里重新发明——R933 前这里写死
     「== "0" 才算关」，与 brain 的实际开关不一致。
+
+    R936/B109：mcp.json 缺键时**不等于**「没设」——宿主环境/注册表里的值会被 MCP
+    进程继承。以前缺键一律判开，于是「进程环境设 0」这个本来同构的档被误报成
+    「非生产同构」，A/B 结论被无端作废（端到端用例已复现该误判）。
+    优先级：mcp.json 的 env 是显式覆盖 > 进程继承 > 注册表 > 默认开。
     """
     path = Path(config_path) if config_path else Path.home() / ".workbuddy" / "mcp.json"
     try:
@@ -380,9 +429,16 @@ def production_semantic_enabled(config_path: str = "") -> tuple:
     except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
         return None, f"生产配置不可读：{path}（{e}）"
     flag = env.get("AGENTHUB_SEMANTIC")
+    if flag is not None:
+        source = f"{path} · mcp.json env.AGENTHUB_SEMANTIC={flag}（显式键优先）"
+    else:
+        inherited, from_where = inherited_semantic_flag()
+        flag = inherited
+        source = f"{path} · mcp.json 未设 AGENTHUB_SEMANTIC，回落 {from_where}"
+        if inherited is not None:
+            source += f" -> AGENTHUB_SEMANTIC={inherited}"
     enabled = not brain.sem_env_off(flag)
-    shown = "(unset)" if flag is None else str(flag)
-    return enabled, f"{path} · AGENTHUB_SEMANTIC={shown}"
+    return enabled, source
 
 
 def production_parity(fp: dict, config_path: str = "") -> tuple:
