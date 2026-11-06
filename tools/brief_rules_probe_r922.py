@@ -129,8 +129,10 @@ def main(argv=None) -> int:
     print(f"必做规则 {n} 条 · 可指纹 {fped} 条（{ratio * 100:.1f}%）"
           f" · 近 {args.days} 天简报送达 {dv['total']} 次")
     print("送达分列：", " · ".join(f"{k}={v}" for k, v in sorted(dv["by_target"].items())) or "无")
-    print("规则字符量 ", rule_chars, "／简报预算 ", brain.BRIEF_MAX_CHARS,
-          "→ 规则占了 {:.0f}%".format(100 * rule_chars / max(1, brain.BRIEF_MAX_CHARS)))
+    # R924 更正：这一行以前写成「规则占了 108%」，把「原文字数总和」当成了「简报里占的字数」——
+    # 渲染时每条走 `_brief_rule_line(content, 120)`，实占 950 字（见 tools/brief_layout_probe_r924.py）。
+    # 口径写清楚，别再拿它当分段预算的依据。
+    print("规则原文字数合计", rule_chars, "（不是渲染量；简报实占见 brief_layout_probe_r924）")
     for d in detail:
         print(f"  #{d['id']:<4} fp={d['fp_n']} {d['tokens']}  {d['title']}")
     print(f"判定：{verdict}（判据写在前：可指纹≥{FP_RATIO_OK:.0%} 且送达≥{DELIVERIES_MIN} 才接通道）")
