@@ -6352,6 +6352,32 @@ def _memory_counters(root: str, ids: list) -> dict:
     return out
 
 
+def _memory_dates(root: str, ids: list) -> dict:
+    """R913：注入文本里带上记忆日期，让模型能自己判断陈旧。
+
+    外部依据（buildwithaitoday《Memory Retrieval》）："Expose the date in the
+    injected text: a memory block that reads '[2026-08-14] moved to Denver' lets
+    the model reason about staleness, and one that omits dates does not." 本仓
+    记录通道一直带 date，记忆通道只带 #id/kind/命中注脚，模型看到一条三个月前的
+    结论和今天的结论长得一模一样。`updated` 优先、`created` 兜底（改过的结论按
+    最后修改时间算），取前 10 位 YYYY-MM-DD。
+    与 _memory_counters 同款回查：检索有三条通道，行里带哪些列不保证。
+    """
+    want = [int(i) for i in (ids or []) if str(i).lstrip("-").isdigit()]
+    if not want:
+        return {}
+    marks = ",".join("?" * len(want))
+    out = {}
+    with db_conn(root) as conn:
+        for r in conn.execute(
+                f"SELECT id, COALESCE(NULLIF(updated,''), created) AS d FROM memories "
+                f"WHERE id IN ({marks})", want):
+            d = str(r["d"] or "")[:10]
+            if len(d) == 10 and d[4] == "-":
+                out[int(r["id"])] = d
+    return out
+
+
 def _bump_access(root: str, ids: list, now: str = "") -> None:
     """命中即记一次唤起（use_count+1 + last_hit）——**只给主动检索用**（R829 口径切分）。
     主动拉取（hub_search / 拦截命中）才是「这条记忆有用」的证据，被动推给对方看一眼不是：
@@ -9578,6 +9604,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         proof = _memory_counters(root, [r.get("id") for r in picked])
     except sqlite3.Error:
         proof = {}   # 计数只是可信度注脚，查不到宁可少一句话也不闭嘴
+    try:
+        dates = _memory_dates(root, [r.get("id") for r in picked])
+    except sqlite3.Error:
+        dates = {}   # R913 日期同样是注脚，查不到就省略，不许影响召回
     for r in ordered:
         pc = proof.get(int(r.get("id") or 0), {})
         adopt, used = int(pc.get("adopt_count") or 0), int(pc.get("use_count") or 0)
@@ -9586,9 +9616,11 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         why = (f"语义桥 {float(r['_semantic_bridge']):.2f}" if r.get("_semantic_bridge")
                else f"命中 {r.get('_recall_hit') or 0}")
         mark = "【必须照做】" if directive_tier(r) == "required" else ""
+        date_s = dates.get(int(r.get("id") or 0), "")
+        date_part = f"[{date_s}] " if date_s else ""
         lines.append(f"· {mark}#{r.get('id')} [{r.get('kind') or 'note'}] "
                      f"{_brief_oneline(str(r.get('content') or ''), 150)}"
-                     f"（{why}；{tag}）")
+                     f"（{date_part}{why}；{tag}）")
     if rec_rows:
         lines.append("相关历史：")
         for r in rec_rows:

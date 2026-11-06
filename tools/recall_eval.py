@@ -394,6 +394,31 @@ def env_guard_line(root: str = "") -> str:
             f" · 语义路预期 {'开' if fp['semantic_expected'] else '关'}")
 
 
+def gap_stages(root: str, prompt: str, accepts, res: dict) -> dict:
+    """R912：把一条 gap 样本的期望答案逐个归因，返回 {阶段: 条数}。
+
+    R904 的报表写「该路连候选都没有，属召回上限问题」——R906 用逐阶段诊断实锤
+    这是**错的**：三条 gap 的 4 个答案全在 40 条候选池里、全过 hit 闸门、全被
+    稀有词闸门删。错误措辞会把下一轮引向「扩召回/调权重」，而真问题在闸门。
+    延迟 import 避免与 gap_diagnose_r906 的模块级 import 形成环。诊断是只读的，
+    出问题就 fail-soft 记 unknown，绝不让报表因为可选诊断炸掉。
+    """
+    try:
+        import gap_diagnose_r906 as gd
+        rep = gd.diagnose_one(root, prompt, list(accepts), recall_out=res)
+        out = {}
+        for a in rep["answers"]:
+            s = str(a.get("stage") or "unknown")
+            out[s] = out.get(s, 0) + 1
+        return out
+    except Exception:  # noqa: BLE001 可选诊断
+        return {"unknown": 1}
+
+
+def _stage_s(stages: dict) -> str:
+    return " · ".join(f"{k} {v}" for k, v in sorted(stages.items()))
+
+
 def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         out_stream=None) -> int:
     """跑基线。recall_fn 只为测试注入假检索——量具本身不该依赖真库才能被验证。"""
@@ -417,6 +442,7 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     sem_hits = 0
     by_tag = {}  # 难度类型 -> [命中, 计分]；泄漏与零候选样本不进分类型计分
     gap_rows = []  # R904：两路零候选的样本编号，单独归类
+    gap_stage_counts = {}  # R912：逐答案归因汇总
     rows = []
     for i, (prompt, want, why) in enumerate(cases, 1):
         accepts = _accepts(want)
@@ -443,9 +469,14 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
                 cell[0] += 1
         if cls == "gap":
             gap_rows.append(i)
+        # R912：只对 gap 样本做逐答案归因（非 gap 不触发，省掉 29 次重复检索）
+        stages = gap_stages(root, prompt, accepts, res) if cls == "gap" else {}
+        if stages:
+            for k, v in stages.items():
+                gap_stage_counts[k] = gap_stage_counts.get(k, 0) + v
         rows.append((i, prompt, accepts, why, cls, span, leak_id,
                      _ids_of(res, "mem"), _ids_of(res, "rec"), res.get("terms"),
-                     _drop_s(res)))
+                     _drop_s(res), _stage_s(stages)))
         if verbose:
             mark = {"hit": "✓", "leak": "!", "gap": "∅", "miss": "✗"}[cls]
             want_s = "|".join(f"{k}#{v}" for k, v in accepts)
@@ -466,16 +497,19 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     print(f"  分难度：{_tag_summary(by_tag)}", file=stream)
     if gap_rows:
         ids_s = ",".join(f"#{i}" for i in gap_rows)
-        print(f"  零候选：{len(gap_rows)} 条（样本 {ids_s}）——该路连候选都没有，"
-              "属召回上限问题，调排序权重无效；不计入分类型分母", file=stream)
-    for i, prompt, accepts, why, cls, span, leak_id, mems, recs, terms, drop_s in rows:
+        print(f"  零候选：{len(gap_rows)} 条（样本 {ids_s}）——期望答案所在那一路无 top3；"
+              "不计入分类型分母", file=stream)
+        print(f"  逐答案归因：{_stage_s(gap_stage_counts) or '无'}。"
+              "R906 实锤：答案多数已在候选池、过 hit 闸门、被稀有词闸门删，"
+              "不是「没召回」；调排序权重无效，先查闸门", file=stream)
+    for i, prompt, accepts, why, cls, span, leak_id, mems, recs, terms, drop_s, gap_line in rows:
         want_s = "|".join(f"{k}#{v}" for k, v in accepts)
         if cls == "miss":
             print(f"  漏：{prompt}\n      期望 {want_s}（{why}）实际 mem={mems} rec={recs}"
                   f" · {drop_s} · terms={terms}", file=stream)
         elif cls == "gap":
-            print(f"  空：{prompt}\n      期望 {want_s}（{why}）两路零候选 · terms={terms}",
-                  file=stream)
+            print(f"  空：{prompt}\n      期望 {want_s}（{why}）该路无 top3"
+                  f" · 归因：{gap_line or 'unknown'} · terms={terms}", file=stream)
         elif cls == "leak":
             print(f"  污染：{prompt}\n      {leak_id} 正文抄了提问原文 {span} 字（不计分母）"
                   f"（{why}）", file=stream)
