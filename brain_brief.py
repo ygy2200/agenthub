@@ -32,6 +32,8 @@ def main(argv=None) -> int:
     ap.add_argument("--agent", default="", help="会话 agent 名")
     ap.add_argument("--cwd", default="", help="工作目录（用于推断项目）")
     ap.add_argument("--project", default="", help="显式项目（优先于 cwd 推断）")
+    ap.add_argument("--session", default="",
+                    help="会话号（R923：有它才能把简报的必做规则记进采纳账）")
     ap.add_argument("--max-chars", type=int, default=0, help="字符预算，默认 3600")
     ap.add_argument("--json", action="store_true", help="输出 JSON（测试/脚本用）")
     ap.add_argument("--no-journal", action="store_true", help="不写 brain_brief 流水（测试用）")
@@ -50,6 +52,15 @@ def main(argv=None) -> int:
                              note=(f"{len(res['text'])} chars · project={res['project'] or '-'}"
                                    f" · rules={res.get('stats', {}).get('rules', 0)}"))
             except Exception:  # noqa: BLE001 流水失败不影响简报
+                pass
+        if root and args.session:
+            # R923：规则簿是改变行为最硬的一路，以前完全不进采纳账，required 档
+            # 因此永远攒不出样本；记账失败一样不许影响简报本身（钩子 fail-open）。
+            try:
+                brain.brief_rules_adherence(
+                    root, args.session, agent=agent, project=res.get("project") or "",
+                    rule_ids=(res.get("stats") or {}).get("rule_ids") or [])
+            except Exception:  # noqa: BLE001
                 pass
         if args.json:
             print(json.dumps({"ok": True, **res}, ensure_ascii=False))

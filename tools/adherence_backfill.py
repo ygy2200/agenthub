@@ -241,10 +241,14 @@ def read_events(path: Path) -> list:
 
 def unobserved_sessions(root: str, days: int, only: list[str] | None = None) -> list[dict]:
     since = (datetime.now() - timedelta(days=max(1, days))).strftime("%Y-%m-%dT%H:%M:%S")
+    # R923：生产来历由 brain.PRODUCTION_ORIGINS 单一事实源给出（live+brief）——
+    # 写死 'live' 会让简报规则永远进不了补扫范围，required 档 again 空转。
+    origins = list(brain.PRODUCTION_ORIGINS)
+    marks = ",".join("?" * len(origins))
     sql = ("SELECT session, agent, COUNT(*) n, MIN(ts) first_ts, MAX(ts) last_ts"
-           " FROM recall_adherence WHERE COALESCE(origin,'live')='live' AND used=0"
-           " AND ts>=?")
-    args = [since]
+           f" FROM recall_adherence WHERE COALESCE(origin,'live') IN ({marks})"
+           " AND used=0 AND ts>=?")
+    args = origins + [since]
     if only:
         sql += " AND session IN (" + ",".join("?" * len(only)) + ")"
         args += list(only)

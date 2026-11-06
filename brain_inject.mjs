@@ -62,7 +62,10 @@ try {
   if (!existsSync(SCRIPT)) { logLine(`skip: ${SCRIPT} 不存在`); process.exit(0); }
 
   const py = pickPython();
+  // R923：会话号一起传给简报入口——没有它，必做规则的注入就无法回头判定有没有被照做
+  const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
   const args = [SCRIPT, '--agent', agent, '--cwd', cwd, '--max-chars', String(MAX_CHARS)];
+  if (session) args.push('--session', session);
   let rootArg = process.env.AGENTHUB_ROOT || '';
   if (!rootArg && existsSync(CONFIG)) {
     try { rootArg = String(JSON.parse(readFileSync(CONFIG, 'utf8')).root || ''); } catch { /* ignore */ }
@@ -78,7 +81,7 @@ try {
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: { hookEventName: 'SessionStart', additionalContext: capped },
   }));
-  logLine(`inject ${capped.length} chars agent=${agent || '?'} cwd=${cwd}`);
+  logLine(`inject ${capped.length} chars agent=${agent || '?'} session=${session || '-'} cwd=${cwd}`);
 } catch (e) {
   try { logLine(`error: ${e && e.message}`); } catch { /* ignore */ }
   process.exit(0);

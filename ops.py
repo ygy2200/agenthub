@@ -3325,6 +3325,9 @@ def _adherence_health(root: str = "") -> dict:
     detail: list = []
     try:
         st = _brain.recall_adherence_stats(root, days=7)
+        # R923：生产来历走同一个事实源（live+brief），别在这儿再写死 'live'
+        origin_args = list(_brain.PRODUCTION_ORIGINS)
+        marks = ",".join("?" * len(origin_args))
         with _brain.db_conn(root) as conn:
             runs = [dict(r) for r in conn.execute(
                 "SELECT agent, ts, note FROM journal WHERE action='brain_adherence' AND ts>=?"
@@ -3334,8 +3337,8 @@ def _adherence_health(root: str = "") -> dict:
                 " SUM(CASE WHEN used=0 AND COALESCE(decided_at,'')='' THEN 1 ELSE 0 END)"
                 " AS pending FROM recall_adherence"
                 " WHERE ts>=? AND agent<>'' AND session<>''"
-                " AND COALESCE(origin,'live')='live' GROUP BY agent, session"
-                " ORDER BY last_ts DESC", (d7,))]
+                f" AND COALESCE(origin,'live') IN ({marks}) GROUP BY agent, session"
+                " ORDER BY last_ts DESC", (d7, *origin_args))]
     except Exception as e:  # noqa: BLE001 库不可用时不硬判（同 link_health：不和 db_integrity 抢根因）
         return {"ok": True, "summary": f"采纳账：读不到数据（{str(e)[:60]}），本轮不判定",
                 "detail": []}

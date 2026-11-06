@@ -83,7 +83,7 @@ def main() -> int:
 
     st = brain.recall_adherence_stats(root, a.days)
     print(f"窗口：近 {st['window_days']} 天（大脑根：{root}）")
-    print(f"注入记录  {st['injected']} 条（生产 origin=live）"
+    print(f"注入记录  {st['injected']} 条（生产 origin=live 逐句回忆 + brief 简报规则）"
           + (f" · 另有 {st['device_rows']} 条是 eval/probe 装置写的，已从下面所有账里排除"
              if st.get("device_rows") else ""))
     print(f"可指纹    {st['fingerprintable']} 条"

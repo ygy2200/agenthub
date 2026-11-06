@@ -8678,6 +8678,13 @@ _FP_PATTERNS = (
 )
 _FP_STOP = {"true", "false", "none", "null", "utf-8", "utf8", "sha256", "md5"}
 ADHERENCE_KEEP_DAYS = 30  # 采纳跟踪表的保留窗口（照 Grimoire 的 30 天 bounded table）
+# R923：注入来历里哪些算**生产**。`live`=逐句回忆（UserPromptSubmit），
+# `brief`=SessionStart 简报的必做规则——R882 的规则簿是改变 agent 行为最硬的一路，
+# 以前完全不记账，于是 R879 的 required 档在采纳账上永远是空集（2026-11-06 实测
+# 判过 182 笔里 required 0 笔）。`eval/probe` 仍按 R853 隔离在分母外：装置跑的注入
+# 不会交证据，混进来就是把「测不了」算成「没被用」。
+PRODUCTION_ORIGINS = ("live", "brief")
+DEVICE_ORIGINS = ("eval", "probe")
 
 
 def _days_ago(days: int) -> str:
@@ -8747,7 +8754,7 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
         return 0
     now = _now()
     origin = (origin or "live").strip().lower()
-    if origin not in ("live", "eval", "probe"):
+    if origin not in PRODUCTION_ORIGINS + DEVICE_ORIGINS:
         # 认不出的来历按装置处理：生产路径一律走默认值不传参，会传乱码的只有评测/探针；
         # 反过来把乱码当 live，就等于让装置继续混进分母（R853 要治的就是这个）。
         origin = "probe"
@@ -8768,6 +8775,39 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
         conn.execute("DELETE FROM recall_adherence WHERE ts < ?",
                      (_days_ago(ADHERENCE_KEEP_DAYS),))
     return len(rows)
+
+
+def brief_rules_adherence(root: str, session: str, agent: str = "", project: str = "",
+                          rule_ids: list = None) -> int:
+    """R923：SessionStart 简报送的「必做规则」记一笔采纳账（`origin=brief`）。
+
+    为什么只记规则段：口径必须能复核。「简报里哪几条是硬约束」由 `session_brief`
+    的取数决定（tags 精确含「必做」），它的 `stats.rule_ids` 就是唯一事实源；
+    近况/踩坑那些行本来也会被 `prompt_recall` 在说到的那一句重复注入并记账，
+    两头都记会把同一件事曝光两次。
+
+    没有 `session` 一律不记：简报行要靠**同一会话后面的产出**判定（R828 的采集面），
+    没有会话号的行永远落在「未观测」——把它塞进分母就是 R853 治过的那个病。
+    """
+    if not session or not rule_ids:
+        return 0
+    ids = []
+    for raw in rule_ids:
+        try:
+            ids.append(int(raw))
+        except (TypeError, ValueError):
+            continue
+    if not ids:
+        return 0
+    marks = ",".join("?" * len(ids))
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            f"SELECT id,kind,content,tags FROM memories WHERE id IN ({marks})", ids)]
+    if not rows:
+        return 0
+    return _record_adherence(root, session, agent, rows, project,
+                             strength="brief", prompt="", pool_texts=None,
+                             origin="brief")
 
 
 def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
@@ -8824,7 +8864,7 @@ def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
             judged_ids.append(r["id"])
             if any(tok and tok in low for tok in fp):
                 hit_ids.append(r["id"])
-                if (r.get("origin") or "live") == "live":
+                if (r.get("origin") or "live") in PRODUCTION_ORIGINS:
                     out["memory_ids"].append(r["memory_id"])
                 else:
                     out["device_matched"] += 1
@@ -8862,7 +8902,8 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
         `observed_rate` = used / 判过的笔数，只有这个分母没有「没判过」掺水，可用于定罪；
       · 平均记忆年龄 = 被注入记忆的创建时间均值，对照 7–30 天（太短=只靠近期记忆，
         太长=旧结论权重过高）；
-      · 只算 `origin='live'`（R853）。真库实测近 30 天 181 行里 116 行是 eval/probe
+      · 只算生产来历 `PRODUCTION_ORIGINS`＝live（逐句回忆）+ brief（R923 起的简报规则簿）
+        （R853）。真库实测近 30 天 181 行里 116 行是 eval/probe
         装置写的：它们永远不会被判定（没有对应的产出文本），全落在「未观测」——
         于是「账面 7.8%」和「采集侧饿着」被装置放大成同一种症状，`device_rows`
         单独报出来，让「排除多少」这件事本身可核查。
@@ -8896,8 +8937,8 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
             pass
     if not rows:
         return out
-    device_rows = sum(1 for r in rows if (r.get("origin") or "live") != "live")
-    rows = [r for r in rows if (r.get("origin") or "live") == "live"]
+    device_rows = sum(1 for r in rows if (r.get("origin") or "live") not in PRODUCTION_ORIGINS)
+    rows = [r for r in rows if (r.get("origin") or "live") in PRODUCTION_ORIGINS]
     out["device_rows"] = device_rows
     if not rows:
         return out
