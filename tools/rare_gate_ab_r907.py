@@ -91,6 +91,7 @@ def main() -> int:
 
     buf = io.StringIO()
     buf.write(f"R907 弱候选兜底 A/B | 真库 {root} | 样本 {len(cases)} 条\n")
+    buf.write(ev.env_guard_line(root) + "\n")
     buf.write(f"档位（最少命中不同检索词数，0=off）：{configs}\n")
     buf.write("判据：Δrate>0 且 Δ噪声<=0 且 补位精准率>0 才允许改默认档\n\n")
     try:

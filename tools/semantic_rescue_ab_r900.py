@@ -100,6 +100,7 @@ def main() -> int:
 
     buf = io.StringIO()
     buf.write(f"R900 闸门救援 A/B | 真库 {root} | 样本 {len(cases)} 条\n")
+    buf.write(ev.env_guard_line(root) + "\n")
     buf.write(f"配置：{configs}\n\n")
     # 先独立探测一次 off 档拿剔除集，再让**所有**档（含正式 off）用同一口径跑。
     # 第一版在这里偷懒：第一档跑完才算出 leak_ids，于是 off 的 per_case 比后续档

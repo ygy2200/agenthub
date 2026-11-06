@@ -312,6 +312,88 @@ def _tag_summary(by_tag: dict) -> str:
     return " · ".join(parts)
 
 
+def env_fingerprint(root: str = "") -> dict:
+    """R908：把「这轮数字是在什么环境下跑出来的」变成报表的一部分。
+
+    实锤（R907）：同一份代码、同一个真库，`D:/python311/python.exe`（numpy /
+    onnxruntime / torch 全在，语义路生效）跑出 Recall@3 24/31=77.4%、题面泄漏 1 条；
+    默认 python 3.13（三个依赖全无，语义路关闭）跑出 20/29=69.0%、泄漏 3 条。
+    差 8.4pp 全来自运行环境，跟召回代码一字无关。生产 MCP 又是第三种组合
+    （3.11 + `AGENTHUB_SEMANTIC=0`）。不带指纹的跨轮比较等于拿噪声当结论。
+
+    真库指纹单独算：评测集绑活库，库每天在写新记忆/记录，连泄漏样本数都会变。
+    """
+    import hashlib
+    import importlib.util
+    import platform
+    deps = {m: bool(importlib.util.find_spec(m))
+            for m in ("numpy", "onnxruntime", "torch")}
+    sem_env = os.environ.get("AGENTHUB_SEMANTIC", "") or "(unset)"
+    n_mem, n_rec, latest = -1, -1, ""
+    try:
+        conn = sqlite3.connect(str(brain.db_path(root)))
+        n_mem = int(conn.execute("SELECT count(*) FROM memories").fetchone()[0])
+        n_rec = int(conn.execute("SELECT count(*) FROM records").fetchone()[0])
+        latest = str(conn.execute("SELECT max(updated) FROM memories").fetchone()[0] or "")[:19]
+        conn.close()
+    except (sqlite3.Error, OSError, TypeError):
+        pass
+    return {"python": platform.python_version(), "executable": sys.executable,
+            "AGENTHUB_SEMANTIC": sem_env, "deps": deps,
+            # 生产 MCP 显式设 0；只要它为 0 就关，否则看依赖在不在
+            "semantic_expected": sem_env != "0" and any(deps.values()),
+            "memories": n_mem, "records": n_rec, "max_updated": latest,
+            "cases": len(CASES)}
+
+
+def env_key(fp: dict) -> str:
+    """只把影响召回行为的**环境**因素压成短哈希（不含真库内容）。"""
+    import hashlib
+    parts = [str(fp.get("python")), str(fp.get("AGENTHUB_SEMANTIC")),
+             ",".join(f"{k}={int(v)}" for k, v in sorted((fp.get("deps") or {}).items())),
+             str(fp.get("cases"))]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def db_key(fp: dict) -> str:
+    """真库指纹：条数 + 最新更新时间。库一变，跨轮数字就不可直接比。"""
+    import hashlib
+    parts = [str(fp.get("memories")), str(fp.get("records")), str(fp.get("max_updated"))]
+    return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
+
+
+def production_parity(fp: dict) -> tuple:
+    """R910：这次 A/B 的召回行为与生产 MCP 同构吗？
+
+    生产（~/.workbuddy/mcp.json）= 3.11 + `AGENTHUB_SEMANTIC=0` → 语义路关闭。
+    R908 实测 B 档（3.11 + 显式 0）与 C 档（3.13 无依赖）结果逐字段相同
+    （都是 20/29=69.0%、sem_scored 0/32），所以**行为等价的判据是「语义路关」**，
+    而不是解释器版本。语义开着的环境（R900/R901 的 A/B 标定环境）与生产不同构：
+    R910 实测同一份 replace/0.62 在语义关时救援次数 0、+0.0pp，语义开时 3 次、
+    +6.7pp。拿后者的数字改前者的默认档，就是 R901 的错。
+    """
+    if fp.get("semantic_expected"):
+        return False, "语义路预期为开（生产 MCP 显式关闭语义）"
+    why = "语义路关闭，与生产 MCP 行为等价"
+    if fp.get("AGENTHUB_SEMANTIC") != "0":
+        why += "；但靠依赖缺失而非显式开关，建议显式设 AGENTHUB_SEMANTIC=0 复跑"
+    return True, why
+
+
+def env_guard_line(root: str = "") -> str:
+    """给所有 A/B 量具共用的报表头：指纹 + 生产同构判定 + 警告。
+
+    守卫必须**在数字之前**打印：R900/R901 的教训是「结论写完后没人回头核对环境」。
+    """
+    fp = env_fingerprint(root)
+    ok, why = production_parity(fp)
+    tag = "生产同构" if ok else "⚠ 非生产同构"
+    warn = "" if ok else "  ⚠ 本结果不得据此改生产默认档（R910）"
+    return (f"R908/R910 环境守卫：env={env_key(fp)} db={db_key(fp)} · {tag}（{why}）{warn}\n"
+            f"  Python {fp['python']} · AGENTHUB_SEMANTIC={fp['AGENTHUB_SEMANTIC']}"
+            f" · 语义路预期 {'开' if fp['semantic_expected'] else '关'}")
+
+
 def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         out_stream=None) -> int:
     """跑基线。recall_fn 只为测试注入假检索——量具本身不该依赖真库才能被验证。"""
@@ -319,8 +401,20 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     cases = cases if cases is not None else CASES
     recall = recall_fn or brain.prompt_recall
     stream = out_stream or sys.stdout
+    # R908：数字之前先把环境摆出来，否则跨轮比较没有上下文。
+    fp = env_fingerprint(root)
+    dep_s = "/".join(k for k, v in fp["deps"].items() if v) or "无"
+    print(f"运行环境：Python {fp['python']} · AGENTHUB_SEMANTIC={fp['AGENTHUB_SEMANTIC']}"
+          f" · 依赖 {dep_s} · 语义路预期 {'开' if fp['semantic_expected'] else '关'}",
+          file=stream)
+    print(f"  环境指纹 env={env_key(fp)} · 真库指纹 db={db_key(fp)}"
+          f"（memories {fp['memories']} / records {fp['records']}"
+          f" / 最新 {fp['max_updated']}）", file=stream)
+    _ok, _why = production_parity(fp)
+    print(f"  生产同构：{'是' if _ok else '否'}（{_why}）", file=stream)
     state = Path(tempfile.mkdtemp(prefix="recall_eval_")) / "state.json"
     counts = {"hit": 0, "gap": 0, "miss": 0, "leak": 0}
+    sem_hits = 0
     by_tag = {}  # 难度类型 -> [命中, 计分]；泄漏与零候选样本不进分类型计分
     gap_rows = []  # R904：两路零候选的样本编号，单独归类
     rows = []
@@ -336,6 +430,7 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         except Exception as e:  # noqa: BLE001 量具不能因为单条炸掉而中断
             print(f"[{i:02d}] ERROR {prompt!r}: {e}", file=stream)
             continue
+        sem_hits += int(int((res.get("sem_scored") or 0) if isinstance(res, dict) else 0) > 0)
         cls, span, leak_id = _classify(prompt, accepts, res, root)
         counts[cls] += 1
         cell = by_tag.setdefault(_tag_of(why), [0, 0])
@@ -384,6 +479,9 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         elif cls == "leak":
             print(f"  污染：{prompt}\n      {leak_id} 正文抄了提问原文 {span} 字（不计分母）"
                   f"（{why}）", file=stream)
+    print(f"  语义生效样本：{sem_hits}/{total} 条 sem_scored>0", file=stream)
+    print(f"⚠ 可比性：本轮数字只在 env={env_key(fp)} 且 db={db_key(fp)} 相同的轮次间可比；"
+          "环境或真库指纹不同的两轮差异不能归因给代码（R908）", file=stream)
     return 0 if rate >= 80.0 else 1
 
 
