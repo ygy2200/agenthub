@@ -473,6 +473,60 @@ def _find_asset(opener, base: str, rel_id, name: str):
     return None
 
 
+def _post_asset(opener, upload_url: str, progress, total: int, timeout: float):
+    """把给定的进度流 POST 一次（调用方负责造 progress，失败文案要报「传了多少」）。"""
+    req = urllib.request.Request(upload_url, data=progress, method="POST")
+    req.add_header("Content-Type", "application/octet-stream")
+    req.add_header("Content-Length", str(total))
+    with opener.open(req, timeout=timeout) as r:
+        return json.loads(r.read())
+
+
+def _via_proxy_upload(opener, upload_url: str, exe: Path, total: int, timeout: float):
+    """R921：附件上传自己直连失败时，把同一份附件经候选代理再传一次。
+
+    为什么不能只靠 `_route`：`api.github.com` 与 `uploads.github.com` 是两个主机，
+    实测存在「API 换到代理就通、上传从没换过」的形态；而上传用的是原始 opener，
+    连 API 早就换好的通道都没沿用（2026-11-06 v2.41.244：Release 停在草稿、
+    release.bat 第 5 步 ABORT，日志里「后续请求沿用」和 10060 挨在同一屏）。
+
+    准入与 `_via_proxy` 完全一致：只认本模块 `_opener()` 造的连接、一个进程只扫一遍
+    候选、用户显式配了环境变量代理就不猜第二条路。返回 (asset, progress)：
+    asset 里带 `error` 键 = 通道通了但对方给了状态码（换路只解决「连不上」，
+    不放宽任何闸门）；返回 None = 不换路，调用方按原路继续重试。
+    """
+    if getattr(opener, "_agenthub_proxy", None) is None:
+        return None
+    if _PROXY_CHANNEL["tried"] or opener._agenthub_proxy or _env_proxy_set():
+        return None
+    _PROXY_CHANNEL["tried"] = True
+    token = getattr(opener, "_agenthub_token", "")
+    candidates = _proxy_candidates()
+    for p in candidates:
+        cand = _opener(token, proxy=p)
+        retry = _UploadProgress(exe, total)
+        try:
+            asset = _post_asset(cand, upload_url, retry, total, timeout)
+        except urllib.error.HTTPError as e:
+            # 通道是通的（对方给了状态码）：记住它，后续尝试不再回直连撞第二遍
+            _PROXY_CHANNEL["opener"] = cand
+            _PROXY_CHANNEL["name"] = f"代理 {p}"
+            print(f"网络：直连 uploads.github.com 不通，附件上传改走本机代理 {p}"
+                  f"（后续请求沿用），但 GitHub 返回 HTTP {e.code}")
+            return {"error": f"HTTP {e.code} {e.reason}"}, retry
+        except (urllib.error.URLError, TimeoutError, OSError):
+            continue
+        _PROXY_CHANNEL["opener"] = cand
+        _PROXY_CHANNEL["name"] = f"代理 {p}"
+        print(f"网络：直连 uploads.github.com 不通，这个附件改走本机代理 {p}"
+              f"（后续请求沿用）")
+        asset["_rerouted"] = True
+        return asset, retry
+    print(f"网络：直连与候选代理（{'、'.join(candidates) or '无'}）都不通——"
+          f"附件上传照直连继续重试，失败会如实报错")
+    return None
+
+
 def _upload_asset(opener, upload_url: str, base: str, rel_id, asset_name: str,
                   exe: Path, timeout: float):
     """POST exe；中断后有限重试，先按远端附件表对账再决定要不要重传（R765）。
@@ -489,11 +543,7 @@ def _upload_asset(opener, upload_url: str, base: str, rel_id, asset_name: str,
     for attempt in range(1, attempts + 1):
         progress = _UploadProgress(exe, total)
         try:
-            req = urllib.request.Request(upload_url, data=progress, method="POST")
-            req.add_header("Content-Type", "application/octet-stream")
-            req.add_header("Content-Length", str(total))
-            with opener.open(req, timeout=timeout) as r:
-                asset = json.loads(r.read())
+            asset = _post_asset(_route(opener), upload_url, progress, total, timeout)
             asset["_attempts"] = attempt
             asset["_elapsed"] = time.time() - t0
             return asset, progress
@@ -501,7 +551,16 @@ def _upload_asset(opener, upload_url: str, base: str, rel_id, asset_name: str,
             last = f"HTTP {e.code} {e.reason}"
         except (urllib.error.URLError, TimeoutError, OSError, NetworkError) as e:
             last = str(getattr(e, "reason", e) or e)
-        found = _find_asset(opener, base, rel_id, asset_name)
+            # R921：直连撞不上就地把同一份附件经代理再传一次，不额外消耗尝试数
+            rerouted, progress = _via_proxy_upload(opener, upload_url, exe, total,
+                                                   timeout) or (None, progress)
+            if rerouted is not None:
+                if not rerouted.get("error"):
+                    rerouted["_attempts"] = attempt
+                    rerouted["_elapsed"] = time.time() - t0
+                    return rerouted, progress
+                last = rerouted["error"]
+        found = _find_asset(_route(opener), base, rel_id, asset_name)
         if found and int(found.get("size") or 0) == total:
             return ({"state": found.get("state", "uploaded"),
                      "browser_download_url": found.get("browser_download_url", ""),
