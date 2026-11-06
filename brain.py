@@ -8677,6 +8677,13 @@ _FP_PATTERNS = (
     re.compile(r"\b[A-Za-z]+(?:[A-Z][a-z0-9]+)+\b"),
 )
 _FP_STOP = {"true", "false", "none", "null", "utf-8", "utf8", "sha256", "md5"}
+# R925：招牌 token 的尾巴要在「不可能原样出现在产出里」的那个字符上断开。
+# Windows 路径那条正则（`[^\s\"'<>|*?]+`）会一路吞到下一个空格，于是从正文里抽出来的是
+# `…\skill.md`（作者` / `…generate_204`` / `e:\legionzone；确认健康时`——反引号与中文标点
+# 不会出现在命令或回答里，substring 命中恒为 0（2026-11-06 真库取证：近 800 笔注入里
+# 120 个 token 受影响、涉及 10 条记忆，这 10 条一笔都没被判过「用上」）。
+# 这轮只改「怎么切」：长度下限、停用词、提问去重、池内 df 四道过滤与命中判据一律不动。
+_FP_CUT = re.compile(r"[`'\"“”‘’（）()【】〔〕「」『』，。、；：！？…\s]")
 ADHERENCE_KEEP_DAYS = 30  # 采纳跟踪表的保留窗口（照 Grimoire 的 30 天 bounded table）
 # R923：注入来历里哪些算**生产**。`live`=逐句回忆（UserPromptSubmit），
 # `brief`=SessionStart 简报的必做规则——R882 的规则簿是改变 agent 行为最硬的一路，
@@ -8713,7 +8720,7 @@ def recall_fingerprints(text: str, pool_texts: list = None, prompt: str = "",
     cands, seen = [], set()
     for pat in _FP_PATTERNS:
         for m in pat.finditer(text):
-            tok = m.group(0).strip().rstrip(".,;:)）】」")
+            tok = _FP_CUT.split(m.group(0))[0].strip().rstrip(".,;:)）】」")
             low = tok.lower()
             if len(low) < 4 or low in seen or low in _FP_STOP:
                 continue
