@@ -19,6 +19,10 @@ import sys
 from pathlib import Path
 
 ROOT_DIR = Path(__file__).resolve().parent.parent
+sys.path.insert(0, str(ROOT_DIR))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console  # noqa: E402,F401  R911：会 print 的独立脚本必须装 UTF-8 守卫
+
 EVAL = ROOT_DIR / "tools" / "recall_eval.py"
 PY311 = Path("D:/python311/python.exe")
 
