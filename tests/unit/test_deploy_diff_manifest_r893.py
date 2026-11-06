@@ -72,7 +72,11 @@ def test_true_ghost_is_still_named(tmp_path, monkeypatch):
 
 
 def test_unparsable_manifest_falls_back_to_memory(tmp_path, monkeypatch):
-    """清单不是字面量（被别人改成计算式）时退回内存那份，不能把体检整成异常。"""
+    """清单不是字面量（被别人改成计算式）时退回内存那份，不能把体检整成异常。
+
+    「退回哪份清单」这件事本身由 R934 的 test_deploy_manifest_fallback_loud_r934.py
+    钉住——本用例只管体检不炸，不管它静默。
+    """
     src, deploy = _seed(tmp_path)
     (src / "core.py").write_text('SERVER_FILES = tuple(["a.py"])\n', encoding="utf-8")
     monkeypatch.setattr(ops, "DEPLOY_DIR", deploy)
@@ -110,4 +114,5 @@ def test_disk_reader_sees_subpackage_entries(tmp_path):
     src.mkdir()
     (src / "core.py").write_text(
         'SERVER_FILES = ("a.py", "my/__init__.py")\n', encoding="utf-8")
-    assert ops._disk_server_files(Path(src)) == ("a.py", "my/__init__.py")
+    # R934 起返回 (files, note)，note 空 = 磁盘清单确实读到了
+    assert ops._disk_server_files(Path(src)) == (("a.py", "my/__init__.py"), "")

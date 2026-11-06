@@ -1770,20 +1770,26 @@ def _graph_health(root: str) -> dict:
     return {"ok": ok, "summary": summary, "detail": lines[:8]}
 
 
+MANIFEST_FALLBACK_MARK = "清单退回本进程内存快照"
+
+
 def _disk_server_files(target: Path) -> tuple:
-    """从**磁盘上的** core.py 现读 SERVER_FILES（B078）。
+    """从**磁盘上的** core.py 现读 SERVER_FILES（B078），返回 `(files, note)`。
 
     修之前会怎样失败：`DEPLOY_FILES` 是 import 时的快照，而 MCP server 是长驻进程。
     R861 给 `core.SERVER_FILES` 加了 emb_onnx.py 之后，`hub_ops_run(deploy_diff)` 仍按
     旧清单比对，把磁盘上真实存在、也真被 deploy 复制的文件报成「部署残留（疑似下线
     模块的幽灵）」——一条假缺陷会诱人去删真文件，真漂移反倒被这行噪声盖住。
-    读不到/算不出（core.py 缺失、清单不是字面量）就退回内存里那份：量具不能因为解析
-    失败连体检都不给，但**能读磁盘就必须读磁盘**。
+    `note == ""` 表示磁盘清单读到了；读不到/算不出（core.py 缺失、清单不是字面量）
+    退回内存里那份，但把原因放进 `note` 让调用方说破（R934）：静默回落会让报表用
+    **本进程旧快照**的数量说「N/N 与部署一致」，全绿恰恰是最坏的信号——2026-10-13
+    core 清单缺 api.py 那次，检查说一致、实际没部署。量具不能因为解析失败连体检都不给，
+    但**能读磁盘就必须读磁盘**，退回了就得让人看见退回了。
     """
     try:
         tree = ast.parse((target / "core.py").read_text(encoding="utf-8", errors="replace"))
-    except (OSError, SyntaxError, ValueError):
-        return tuple(DEPLOY_FILES)
+    except (OSError, SyntaxError, ValueError) as e:
+        return tuple(DEPLOY_FILES), f"core.py 读不到/语法错（{type(e).__name__}）"
     for node in tree.body:
         if not isinstance(node, ast.Assign):
             continue
@@ -1793,17 +1799,17 @@ def _disk_server_files(target: Path) -> tuple:
         try:
             val = ast.literal_eval(node.value)
         except (ValueError, TypeError, SyntaxError):
-            break
+            return tuple(DEPLOY_FILES), "core.py 的 SERVER_FILES 是计算式，ast 解析不到字面量"
         if isinstance(val, (tuple, list)) and val and all(isinstance(x, str) for x in val):
-            return tuple(val)
-        break
-    return tuple(DEPLOY_FILES)
+            return tuple(val), ""
+        return tuple(DEPLOY_FILES), "core.py 的 SERVER_FILES 不是字符串字面量序列"
+    return tuple(DEPLOY_FILES), "core.py 里没有 SERVER_FILES 赋值"
 
 
 def _deploy_diff(target: Path) -> dict:
     if not (target / "ui.py").is_file():
         return {"ok": False, "summary": "target 不是 AgentHub 源码目录（缺 ui.py）", "detail": []}
-    files = _disk_server_files(target)
+    files, manifest_note = _disk_server_files(target)
     diffs = []
     for name in files:
         src, dst = target / name, DEPLOY_DIR / name
@@ -1833,13 +1839,24 @@ def _deploy_diff(target: Path) -> dict:
     stale = [f for f in files if f not in DEPLOY_FILES]
     drift = (f"，清单按磁盘 core.py 现算（本进程内存清单缺 {len(stale)} 项："
              f"{'、'.join(stale[:3])}，重启 MCP 后自述才更新）") if stale else ""
+    # 回落必须说破：这时报表里的 N 是本进程内存清单的条数，不是磁盘清单的。只报不阻断
+    # （解析失败是量具的局限，不该把发布卡死），但「一致」二字不许独占结论。
+    # 2026-10-13 那次 core 清单缺 api.py，静默回落报「一致」而实际没部署。
+    lines = diffs
+    if manifest_note:
+        lines = [f"清单来源：{manifest_note}，{MANIFEST_FALLBACK_MARK}"] + diffs
+        fallback = (f"，⚠ {MANIFEST_FALLBACK_MARK}——下面 {len(files)} 项是按 import 时那份老快照比的，"
+                    f"覆盖可能不完整（新增模块不在检查范围内，原因见 detail[0]）")
+    else:
+        fallback = ""
     return {"ok": not any(d for d in diffs if "残留" not in d),
             "summary": f"{len(files) - len([d for d in diffs if '残留' not in d])}/{len(files)}"
                        f" 与部署一致（{DEPLOY_DIR}）"
                        + (f"，另有部署残留 {len(ghosts)} 个" if ghosts else "")
                        + drift
-                       + ("" if not diffs else "：" + "、".join(diffs[:4])),
-            "detail": diffs[:8]}
+                       + fallback
+                       + ("" if not lines else "：" + "、".join(lines[:4])),
+            "detail": lines[:8]}
 
 
 def _file_hash(path: Path, algo: str = "md5") -> str:
