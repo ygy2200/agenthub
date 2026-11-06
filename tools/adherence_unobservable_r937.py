@@ -24,12 +24,11 @@ from pathlib import Path
 ROOT = Path(__file__).resolve().parents[1]
 if str(ROOT) not in sys.path:
     sys.path.insert(0, str(ROOT))
+TOOLS = Path(__file__).resolve().parent
+if str(TOOLS) not in sys.path:
+    sys.path.insert(0, str(TOOLS))
 
-try:
-    sys.stdout.reconfigure(encoding="utf-8")
-except Exception:  # noqa: BLE001
-    pass
-
+import _console  # noqa: E402,F401  R222 结构性门禁：会 print 的脚本必须装 UTF-8 守卫
 import brain  # noqa: E402
 
 DB = Path(r"D:\agent资料\zcode项目记录\_hub\brain.db")
