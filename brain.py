@@ -9909,6 +9909,14 @@ _ERR_NUMCODE_RE = re.compile(r"(?i)\b(winerror|oserror|errno|error|status|code)"
 # 里就出现过 "code: 1"）。只放行大值（HTTP 404/500 那种才有意义）。
 _ERR_EXITY_NAMES = frozenset(("exit", "code", "status", "rc"))
 _ERR_IPPORT_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b")
+# R927：URL 的形状。清洗时收成 `scheme://host`——主机名是「连不上谁」这条报错唯一的身分，
+# 路径/query 每次都不一样，留着只会把签名搅成噪音（真库欠账 `https:/ memory`、
+# `https:/ simplemem|simplemem`、`https:/ 2606.14571` 三条，前缀全是下面那条去路径规则
+# 咬碎 URL 剩下的常数碎片）。
+_ERR_URL_RE = re.compile(r"\b(https?):/+([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])(?:[/?#]\S*)?")
+# 不配当身份的两种词：进程级指针地址（0x + 去掉前导 0 仍 ≥9 位十六进制；8 位的
+# NTSTATUS/HRESULT 0xC0000005、0x80070005 照旧算招牌），以及带 scheme 的 URL 碎片/整体。
+_ERR_VOLATILE_RE = re.compile(r"0x0*[0-9a-f]{9,}|https?:/", re.I)
 _ERR_NAMED_RE = re.compile(r"(?i)\b(?:no such (?:column|table|function|view|index)"
                            r"|no module named|cannot find (?:name|module)"
                            r"|unrecognized (?:option|argument)|unknown (?:option|command)"
@@ -10022,6 +10030,10 @@ def _error_clean(text: str) -> str:
     """报错正文压成可检索的形状：去栈脚手架、去路径前缀、去挽具套话、去时间戳。"""
     t = _ERR_BOILER_RE.sub(" ", text or "")
     t = _ERR_NOISE_RE.sub(" ", t)
+    # R927：URL 先收成 scheme://host。下面那条「去路径前缀」不分 URL，
+    # `https://api.github.com/repos/x/y` 会被咬成 `https:/`——身分（主机）丢了，
+    # 剩下的碎片每条抓网报错都有，等于给签名加了个常数锚点。
+    t = _ERR_URL_RE.sub(lambda m: f"{m.group(1)}://{m.group(2)}", t)
     t = re.sub(r"[A-Za-z]:\\\\?[^\s\"'<>|]*[\\/]", " ", t)      # D:\a\b\ → 空格
     t = re.sub(r"/(?:[\w.-]+/){2,}", " ", t)                     # /a/b/c/ → 空格
     t = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?\b", " ", t)
@@ -10046,6 +10058,11 @@ def error_signature_terms(text: str, cap: int = 24) -> list:
         # R839：`'\u2018'` 这类「出问题的那个字符」不是身份，是位置。它每换一个字符
         # 就让去重键漂一次，`seen_this_session` 于是失效——同一会话把同一条报错注两遍。
         if _ERR_ESCAPE_ONLY_RE.fullmatch(term):
+            return
+        # R927：指针地址与 URL 碎片/整体不是身份。地址每个进程都变（真库实锤：
+        # `0x000001c2896d3ac0|syntaxerror|…` 这条欠账永不复现，修法登记上去也命中不了），
+        # `https:/` 这种碎片每条抓网报错都有，留着会把两条不同的报错收成同一个签名。
+        if _ERR_VOLATILE_RE.search(term):
             return
         seen.add(term)
         out.append((term, weight))
@@ -10096,6 +10113,11 @@ def error_signature_terms(text: str, cap: int = 24) -> list:
             add(w, 2)
     for m in _ERR_IPPORT_RE.finditer(t):
         add(m.group(0), 2)
+    # R927：URL 主机与 IP:port 同档——`127.0.0.1:7890` 早就是身份了，「连不上谁」的
+    # 域名同理。不补这一档，挡掉碎片只会让所有网络报错塌成同一个键（把「GitHub 要走
+    # 镜像」的修法安到「本地服务没起」上，误配比空转更坏）。
+    for m in _ERR_URL_RE.finditer(t):
+        add(m.group(2), 2)
     # 编号已经跟名字绑成招牌（winerror 5），再留裸名（winerror）等于给 WinError 32 那条
     # 旧坑开后门——同一条编号规则的另一面（R833 冒烟实测：5 是拒绝访问，32 是文件被占用）。
     out = [(x, w) for x, w in out if x not in num_names]

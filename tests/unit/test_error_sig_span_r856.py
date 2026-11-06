@@ -110,15 +110,21 @@ def test_debt_detail_leads_with_the_identity_word(hub_root):
 
 
 def test_old_shape_key_is_a_third_state_not_debt(hub_root):
-    """旧算法写进去的正文形状键（真库实测：`https://memorypapers.org/` 这类检索词）判不了，
-    既不许算成「已收编」（假装没问题），也不许算成「欠账」（催一条根本没法登记的账）。
+    """旧算法写进去的正文形状键判不了，既不许算成「已收编」（假装没问题），
+    也不许算成「欠账」（催一条根本没法登记的账）。
 
     R856 修完在真库看到的：窗口里 4 条签名拆不出任何词，全是修复前的残留——新代码不再
     产生它们，但它们还要在 7 天窗口里挂几天。三态记录让读数说得清「几条欠、几条判不了」。
+
+    R927 换了样本并说明为什么：原来用的 `https://memorypapers.org/` 在新算法下**能**拆出
+    主机名（w=2 身份，见 test_error_sig_r927），不再属于「判不了」那一态；真正抽不出词的
+    形状是纯检索词。三态判定本身一字没改，改的只是用来代表它的那个串。
     """
     brain.init_db(hub_root)
-    legacy = "https://memorypapers.org/"
+    legacy = "记忆 论文 检索 结果"
     assert brain._debt_sig_terms(legacy) == [], brain._debt_sig_terms(legacy)
+    assert brain._debt_sig_terms("https://memorypapers.org/"), \
+        "URL 形状现在要能拆出主机名（R927）"
     brain._log_error_miss(hub_root, "qoder", legacy, [])
     d = brain.error_debt(hub_root, days=7)
     assert d["asked"] == 1, d
