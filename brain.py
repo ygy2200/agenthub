@@ -8585,6 +8585,32 @@ RECALL_REL_MARGIN = 0.62
 # 语义相似但词法零命中的候选越级（那种要靠 B071 后半段的闸门救援，另立一轮）。
 RECALL_SEM_RERANK_W = 10.0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
+# R916：词法候选池深度。R915 只读探针（32 条语料 / 50 个期望答案）实测：
+#   limit=40 → 44 进池；100 → 48；200/400 仍 48（平台段）。
+# 4 个答案是**纯截断**（#02 mem#503 / #03 mem#463 / #20 mem#435 / #21 mem#476，
+# 最小可用 limit 都是 100），另 2 个是真词汇鸿沟（扩到 400 也不进池）。
+# 默认值保持 40（先 A/B 再决定），一键回滚把本行改回 40 即可。
+# 注意：池变大同时会改变 idf 与 rare_line（_recall_rare_threshold(len(mems))），
+# 所以必须同库 A/B 同时报收益与噪声，不许只看 Recall@3。
+RECALL_POOL_LIMIT = 40
+# R918：全库稀有度救援，**默认关闭**，只在 A/B 量具里切档。
+# R917 只读探针（14 条 rare_gate 答案）按预设判据把「全盘接管 rare 判定」证伪了
+# （corpus_rare 6/14 = 42.9% < 50%，8 条闸门判对）。但 6 条真误杀里，#24「组管」
+# 全库出现率 1.32%、#26「帧生」1.41%、#10「简报」1.02% —— 恰好是三条 gap 中的
+# 两条。所以只开一个更窄的口子：**仅当词法一条强命中都没有时**，用全库 df 给
+# weak 候选复核一次，最多补 1 条。与 R907 的「多词共现」启发式不同，这里的准入
+# 信号是全库文档频率（硬信号），且 R907 已被 R909 证伪、两者默认都关。
+RECALL_CORPUS_RESCUE = "off"      # off | gap(仅 picked 全空时)
+RECALL_CORPUS_RARE_RATIO = 0.02  # 全库活跃行出现率 <=2% 视为稀有（R917 判据）
+# R919 关账：针对 rare_gate（R906 量出的最大淘汰原因，12/51 个期望答案）的
+# **三条词法侧补位方向已全部在生产同构环境 A/B 证伪**，不要重开：
+#   ① R907 多词共现补位 → R909 生产同构 0/3 精准、噪声 +3、Δrate +0.0pp；
+#   ② R916 扩池 40→60/100/200 → +3.4pp 但噪声 +2~5、耗时 +32~206ms，
+#      且转命中的不是探针标出的那 4 条（idf 被稀释，收益来自别处）；
+#   ③ R918 全库 df 稀有度救援 → 救援 2~3 次精准 0、噪声 +2~3、Δrate +0.0pp。
+# 结论：词法侧的稀有词闸门删掉的候选，靠启发式补位救不回来；要么走语义路
+# （R901 的 replace/0.62，需 AGENTHUB_SEMANTIC 非 0，R914 已切换待重启验收），
+# 要么回头查标注/语料质量。三个开关默认全关，保留只为可复跑的 A/B 证据。
 # R900（B099）：闸门救援**默认关闭**，只在 A/B 量具里切档。为什么默认关而不是直接
 # 合入：外部证据三条都指向「别让语义路接管排序」——① RRF 的分数是排名共识不是相关性，
 # 救不了没有任何一路召回的候选，也不能拿来当置信闸门（srcecde.me 2026）；
@@ -9234,7 +9260,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            # R900：闸门救援实际放进注入的条数（默认 0；-1 表示本档未启用）
            "sem_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
-           "weak_picked": 0, "weak_picked_id": 0}
+           "weak_picked": 0, "weak_picked_id": 0,
+           # R918：全库稀有度救援（默认 off），A/B 量具据此计触发与精准率
+           "corpus_rescued": 0, "corpus_rescued_id": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9290,8 +9318,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         # gate=False：覆盖度闸门按「查询词命中比例」删候选，对一句自然语言太严——
         # 真实库实测会把 #487（批处理括号教训，命中 8 分）直接删掉，只留 3 条泛化记忆。
         # 召回层有自己的命中阈值与重排，宽召回 + 严重排比窄召回更可靠。
-        mems = search_memories(root, query, limit=40, count_hits=False,
-                               semantic=False, gate=False)
+        mems = search_memories(root, query, limit=RECALL_POOL_LIMIT,
+                               count_hits=False, semantic=False, gate=False)
     except sqlite3.Error:
         return out
     # R825：先算池内区分度，再打分。这一步不动召回集（谁会进候选），只动排序——
@@ -9400,6 +9428,33 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             out["weak_picked"] = 1
             out["weak_picked_id"] = int(cands[0][1].get("id") or 0)
             out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - 1)
+    # R918：全库稀有度救援。四条护栏：① 只在 picked 全空（词法结构性失明）时跑；
+    # ② 最多补 1 条；③ 准入信号是全库 df 出现率，不是池内启发式；④ 默认 off。
+    # 读不了全库统计就整段跳过（fail-open），绝不因为可选能力影响即时回忆。
+    if RECALL_CORPUS_RESCUE == "gap" and not picked and weak:
+        try:
+            df_corpus, n_total = _token_stats(root, [t for t, _ in terms])
+        except Exception:  # noqa: BLE001
+            df_corpus, n_total = {}, 0
+        if n_total > 0:
+            cands = []
+            for s, r in weak:
+                low = (str(r.get("content") or "") + " " +
+                       str(r.get("tags") or "")).lower()
+                matched = [t for t, _ in terms if t in low]
+                if not matched:
+                    continue
+                ratio = min(df_corpus.get(t, n_total) / float(n_total)
+                            for t in matched)
+                if ratio <= RECALL_CORPUS_RARE_RATIO:
+                    cands.append((s, r, ratio))
+            if cands:
+                cands.sort(key=lambda x: (-float(x[0]), x[2],
+                                          -int(x[1].get("id") or 0)))
+                picked = [cands[0][1]]
+                out["corpus_rescued"] = 1
+                out["corpus_rescued_id"] = int(cands[0][1].get("id") or 0)
+                out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - 1)
     # R900（B099）两阶段闸门救援：先按语义分取前 N 当「准入名单」，再与词法结果融合。
     # 只在开关非 off 且语义路真出了分时生效；语义没预热/异常 → 与旧码逐字段一致。
     # 用同一函数做 A/B（tools/semantic_rescue_ab_r900.py 只切常量），避免离屏模拟器
