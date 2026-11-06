@@ -101,12 +101,18 @@ def main(argv=None) -> int:
         if not res["text"]:
             return 0
         if root and not args.no_journal:
+            # R905：补 origin= 与 session=。两者本来就是 main 的参数（mjs 钩子第 64
+            # 行一直在传 session），只是写流水时漏了。没有它们，B048 量化只能按
+            # 「单日 + agent」近似（R902 的精度边界），且分不清装置流量与真实会话。
+            # 不回填历史行：流水是哈希链，改历史会断链；旧行由探针单列 legacy。
             try:
                 core.journal(
                     root, agent or "unknown", "brain_recall", "prompt",
                     note=(f"{len(res['text'])} chars · mem={res['memory_ids']} "
                           f"· ctx={1 if res.get('context_used') else 0} "
-                          f"· terms={' '.join(res['terms'])[:120]}"))
+                          f"· terms={' '.join(res['terms'])[:120]}"
+                          f" · origin={args.origin}"
+                          f" · session={(args.session or 'none')[:40]}"))
             except Exception:  # noqa: BLE001 流水失败不影响召回
                 pass
         if args.json:

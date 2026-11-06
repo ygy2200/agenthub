@@ -50,7 +50,10 @@ def test_new_cases_cover_every_difficulty_tag():
     这条钉的是「按难度挑样本」这个口径本身：如果以后有人把难样本删掉、只留
     容易的，聚合分会好看，但这里的集合会缩小 —— 分母被悄悄调过，报表就骗人。
     """
-    new = recall_eval.CASES[12:]
+    # R904 又在末尾追加了 9 条跨项目样本（23→32）。本用例只负责钉住 R900 那 11 条
+    # 的五类齐全，切片必须停在第 23 条——写成 CASES[12:] 会在扩样后假红，
+    # 红因是断言过期不是量具缺陷（记忆 #493 同族）。
+    new = recall_eval.CASES[12:23]
     assert len(new) == 11, len(new)
     tags = {recall_eval._tag_of(why) for _, _, why in new}
     assert tags == set(recall_eval.DIFFICULTY_TAGS), tags

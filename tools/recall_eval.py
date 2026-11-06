@@ -47,6 +47,16 @@ R900 扩样口径（12 → 23 条）：B099 要定「闸门救援/融合权重�
 8 条件消融里 hybrid RRF 0.358 反而低于 vector-only 0.396（Superlinked，见
 output/迭代台账-R900-2026-11-06.md）；凸组合在小样本下比 RRF 更 sample-efficient
 （Bruch et al. 2022）。所以本轮只扩样本与做 A/B 量具，权重不许拿 12 条标定。
+
+R904 扩样（23 → 32 条）+ 口径修正：R900 之后分难度报表里「闸门 0/1（0%）」看着像
+排序没调好，实际那条是 #15「SQL 条件里写 NOT」，**该路连一个候选都没有**（gap）。
+调排序权重、调语义阈值都救不回一条根本没进候选池的答案——把它算进难度类型的分母，
+会诱使下一轮继续在权重上打转。修法：gap 仍计入聚合分母（它是真实的召回失败），
+但**不进分类型分母**，另起一行「零候选：N 条（样本 #…）」点名，并写明
+「属召回上限问题，调排序权重无效」。同时补 9 条跨项目真实问答（红色沙漠 /
+按进程流量管控 / CS2 / PromptPop / NVIDIA App / 看门狗2 六个项目），
+why 格式统一「跨项目：<项目>·<说明>」，逐条回查真库 12 个标注 id 全 active。
+新增样本按项目挑、不按能不能命中挑，命中率如实记进台账。
 """
 import argparse
 import os
@@ -151,6 +161,29 @@ CASES = [
     ("怎么确认 GitHub 上的 exe 真的发出去了",
      (("mem", 554), ("mem", 447), ("mem", 484)),
      "多答案：三层证据链 / digest 字段 / 附件列表前端懒加载"),
+    # ↓ R904 新增 9 条：跨项目真实问答。why 带「跨项目：<项目>·<说明>」，
+    # 便于按项目去重核对覆盖面。12 个标注 id 已回查真库 active / superseded_by=0。
+    ("模组管理器卸载的时候会动我另外放进去的文件吗", ("mem", 488),
+     "跨项目：红色沙漠模组管理·DMM Unmount 只还原 paz，不碰 bin64"),
+    ("游戏里帧生成和 DLSS 两项突然不见了是不是游戏文件坏了",
+     (("mem", 495), ("mem", 497)),
+     "跨项目：红色沙漠模组管理·侧载注入器 / NVIDIA App DLSS Override 才是主因"),
+    ("红色沙漠想开帧生成到底该装哪个",
+     (("mem", 500), ("mem", 501)),
+     "跨项目：红色沙漠模组管理·MFG Unlocker 与结案结论"),
+    ("界面切完页马上查键盘焦点为什么一个控件都找不到", ("mem", 480),
+     "跨项目：按进程流量管控-调研·切页动画约 200ms 未走完，子件 isVisible 仍 False"),
+    ("GitHub 上都发新版了桌面快捷方式怎么还停在老版本", ("mem", 485),
+     "跨项目：按进程流量管控-调研·只验向外那一侧，本机 .lnk 静默停在旧版"),
+    ("CS2 一开局就卡死是声卡驱动的问题吗",
+     (("mem", 229), ("mem", 211)),
+     "跨项目：CS2-偶发完全卡死排查·根因更正为 DX11 渲染器 use-after-free"),
+    ("requirements 里明明写了这个包为什么运行时还是没有", ("mem", 369),
+     "跨项目：PromptPop·声明三周从未安装，测试 skip 掩盖"),
+    ("NVIDIA App 为什么不走我设的系统代理", ("mem", 202),
+     "跨项目：NVIDIA App-走代理·不读 Windows 系统代理，只能 TUN"),
+    ("看门狗2 那个 RedirectorData 到底算不算模组", ("mem", 308),
+     "跨项目：看门狗2-模组管理器·本质是官方加载器的数据目录"),
 ]
 
 
@@ -288,7 +321,8 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
     stream = out_stream or sys.stdout
     state = Path(tempfile.mkdtemp(prefix="recall_eval_")) / "state.json"
     counts = {"hit": 0, "gap": 0, "miss": 0, "leak": 0}
-    by_tag = {}  # 难度类型 -> [命中, 计分]；泄漏样本不进计分
+    by_tag = {}  # 难度类型 -> [命中, 计分]；泄漏与零候选样本不进分类型计分
+    gap_rows = []  # R904：两路零候选的样本编号，单独归类
     rows = []
     for i, (prompt, want, why) in enumerate(cases, 1):
         accepts = _accepts(want)
@@ -305,10 +339,15 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
         cls, span, leak_id = _classify(prompt, accepts, res, root)
         counts[cls] += 1
         cell = by_tag.setdefault(_tag_of(why), [0, 0])
-        if cls != "leak":
+        # R904：gap 是该路连候选都没有，属召回上限，不是排序没调好。它仍计入
+        # 聚合分母（真实的召回失败），但不进分类型分母，免得「闸门 0/1」被误读成
+        # 「调权重就能救」——见 test_recall_eval_gap_r904.py。
+        if cls not in ("leak", "gap"):
             cell[1] += 1
             if cls == "hit":
                 cell[0] += 1
+        if cls == "gap":
+            gap_rows.append(i)
         rows.append((i, prompt, accepts, why, cls, span, leak_id,
                      _ids_of(res, "mem"), _ids_of(res, "rec"), res.get("terms"),
                      _drop_s(res)))
@@ -330,6 +369,10 @@ def run(verbose: bool = False, root: str = "", cases=None, recall_fn=None,
           f" · 排序未命中 {counts['miss']} · 题面泄漏 {counts['leak']}"
           f"   合计 {total} = 总样本", file=stream)
     print(f"  分难度：{_tag_summary(by_tag)}", file=stream)
+    if gap_rows:
+        ids_s = ",".join(f"#{i}" for i in gap_rows)
+        print(f"  零候选：{len(gap_rows)} 条（样本 {ids_s}）——该路连候选都没有，"
+              "属召回上限问题，调排序权重无效；不计入分类型分母", file=stream)
     for i, prompt, accepts, why, cls, span, leak_id, mems, recs, terms, drop_s in rows:
         want_s = "|".join(f"{k}#{v}" for k, v in accepts)
         if cls == "miss":

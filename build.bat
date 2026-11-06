@@ -1,32 +1,41 @@
 @echo off
 chcp 65001 >nul
-rem AgentHub 打包脚本：产出 dist\AgentHub.exe（约49MB），并复制到桌面
-rem 排除清单是实测瘦身的关键：分析期会把 site-packages 无关全家桶收进 PYZ，
-rem 不排除则 exe 达 361MB；排除后 49MB。新增依赖若运行时报缺模块，从清单摘掉对应项。
-rem ⚠ win32print 绝不能排除：qframelesswindow（qfluentwidgets 依赖）运行时必需，
-rem   误排会导致启动崩（且 windowed 模式进程仍存活，需用 MainWindowTitle 验证）。
+rem AgentHub build script: produces dist\AgentHub.exe (~49MB) and copies it to Desktop.
+rem NOTE: keep this file ASCII-only. cmd reads batch files by byte blocks under its
+rem OEM codepage, so non-ASCII on an EXECUTED line (including rem/echo) gets split
+rem and the tail is run as a command. R903: 5 fake "is not recognized" lines showed
+rem up in the R901 release log; echo also does NOT reset ERRORLEVEL, which can bias
+rem the following `if errorlevel 1` gates. Guard: tests/unit/test_build_bat_ascii_r903.py
+rem Exclude list is the key to size: Analysis pulls whole site-packages into PYZ;
+rem without it the exe is 361MB, with it 49MB. If a runtime import fails, drop that
+rem module from the list.
+rem Never exclude win32print: qframelesswindow (qfluentwidgets dep) needs it at
+rem runtime; excluding it crashes startup while the windowed process stays alive,
+rem so verify with MainWindowTitle instead of process existence.
 cd /d "%~dp0"
-rem ⚠ 禁用 UPX（--noupx）：UPX 压缩 Qt 官方 DLL 会破坏图形管线——实测表现为
-rem   窗口首次启动不渲染内容（全透明）、文字模糊发虚（2026-10-09 用户报「接入页字看不清」）。
-rem 构建清单（R3）：start 必须在 PyInstaller 之前——mtime 判不出「构建中段改的源码」，
-rem 只有构建前快照的源码哈希才能证明 exe 冻结的是哪一版。
-echo [1/4] 构建清单 start（快照源码哈希）...
+rem Never use UPX (--noupx): it breaks Qt DLLs - first launch renders nothing
+rem (fully transparent) and text looks blurry (user report 2026-10-09).
+rem Build manifest (R3): start must run BEFORE PyInstaller. mtime cannot detect a
+rem source file edited mid-build; only a pre-build source hash proves what the exe froze.
+echo [1/4] build manifest start (snapshot source hashes)...
 D:\python311\python.exe cli.py build-manifest start
 if errorlevel 1 (
-  echo 构建清单 start 失败
+  echo build manifest start failed
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
-rem 随包运行时文件：MCP 服务端 + 钩子脚本。exe 的 __file__ 在临时解包目录，
-rem 不 --add-data 进去，桌面版的部署服务端/安装钩子会复制 0 个文件而静默失效。
-echo [1.5/4] 打包运行时文件到 build\bundle...
+rem Bundled runtime files: MCP server + hook scripts. Inside the exe __file__ points
+rem to a temp unpack dir; without --add-data the desktop deploy/install would copy
+rem 0 files and fail silently.
+echo [1.5/4] bundling runtime files into build\bundle...
 D:\python311\python.exe cli.py bundle
 if errorlevel 1 (
-  echo 运行时文件打包失败
+  echo runtime bundle failed
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
-rem R861：ONNX 编码器不进 exe——numpy 已排除、权重也不打包，带上它只会白涨 14MB
+rem R861: the ONNX encoder is NOT bundled - numpy is excluded and weights are not
+rem packed; shipping it would only add 14MB.
 D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx --name AgentHub ^
   --icon assets\agenthub.ico --add-data "assets\agenthub.ico;." --add-data "build\bundle;." ^
   --exclude-module aiohttp --exclude-module aiohappyeyeballs --exclude-module aiosignal --exclude-module yarl --exclude-module multidict --exclude-module frozenlist --exclude-module propcache ^
@@ -42,14 +51,14 @@ D:\python311\python.exe -m PyInstaller --noconfirm --windowed --onefile --noupx 
   --exclude-module onnxruntime --exclude-module tokenizers --exclude-module sentence_transformers ^
   main.py
 if errorlevel 1 (
-  echo 打包失败
+  echo packaging failed
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
-echo [2/4] 构建清单 finish（记录 exe sha256）...
+echo [2/4] build manifest finish (record exe sha256)...
 D:\python311\python.exe cli.py build-manifest finish
 if errorlevel 1 (
-  echo 构建清单 finish 失败
+  echo build manifest finish failed
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
@@ -59,16 +68,15 @@ if errorlevel 1 (
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
-echo [3/4] 发布一致性检查（清单/源码/桌面副本哈希）...
+echo [3/4] release consistency check (manifest / source / desktop hash)...
 D:\python311\python.exe cli.py release
 if errorlevel 1 (
-  echo 发布检查未通过：exe 与源码或桌面副本不一致
+  echo release check failed: exe differs from source or desktop copy
   if not defined AGENTHUB_NOPAUSE pause
   exit /b 1
 )
-echo [4/4] 完成：桌面 AgentHub.exe
+echo [4/4] done: Desktop AgentHub.exe
 if not defined AGENTHUB_NOPAUSE pause
 rem B057: explicit zero - without it the exit code is whatever the last real
 rem command left behind (release.bat gates `call build.bat` on errorlevel)
 exit /b 0
-
