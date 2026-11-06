@@ -8675,7 +8675,12 @@ _FP_PATTERNS = (
     re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d+)?\b"),       # IP[:port]
     re.compile(r"(?<![\w-])--[a-z][\w-]{2,}"),                  # --flag
     re.compile(r"\b[A-Z][A-Z0-9_]{3,}\b"),                      # ENV_VAR
-    re.compile(r"\bv?\d+\.\d+(?:\.\d+)?\b"),                    # 版本号
+    # R928：版本号不许从点号后面起头，后面还跟着 `.数字` 也不算版本。旧写法
+    # `\bv?\d+\.\d+(?:\.\d+)?\b` 会在 `127.0.0.1:7890` 里咬出 `127.0.0`、在
+    # `0.0.0.0:7890` 里咬出 `0.0.0`（实测）——那是 IP 的一段，比 IP 本身更宽（`0.0.0`
+    # 能匹配任何版本号的 0.0.0），白占一个 ≤6 的名额还给判定放进一条松判据。
+    # 真版本照旧：v2.41.244 / 2.40.7 / 3.11.9 都能命中。
+    re.compile(r"(?<![\w.])v?\d+\.\d+(?:\.\d+)?(?!\.\d)"),      # 版本号
     re.compile(r"\b[a-z][a-z0-9]*(?:_[a-z0-9]+)+\b"),           # snake_case
     # camelCase / PascalCase：必须允许大写开头——`CArchiveReader` 正是这类招牌词，
     # 只写 [a-z]+ 会一个都抽不到（2026-10-31 实测）。
@@ -8833,23 +8838,34 @@ def refingerprint_rows(root: str, days: int = ADHERENCE_KEEP_DAYS,
     四条硬约束，越界就是改写历史证据：
       · 只动 `used=0` 的行——已经领过功的证据不重写；
       · 新值 = 旧 token 逐个按 `_FP_CUT` 截干净，**不新增** token（新增等于替当年没注入的
-        内容领功）；且截完每个都还要在「当前记忆正文」新抽出的集合里（子集判据）。
-        记忆正文被改过 → 不满足 → 跳过，绝不替它猜当年注入了什么；
+        内容领功）；且每个截干净的 token 都要**逐字还在当前记忆正文里**（provenance 判据）。
+        正文里已经没有 → 跳过，绝不替它猜当年注入了什么。
+        R928 之前这里要的是「token 仍在当前正文**新抽出的集合**里」（子集判据）——判过严：
+        抽取器只有 6 词/160 字预算，正文后来写长了就会把老 token 挤出今天的清单，于是
+        「今天的清单装不下」被误读成「这个词不是这条记忆的身分」（真库 471 候选跳过 253，
+        逐条看过原因不是正文改过）。在正文里 = 身分成立，不在 = 正文改过，够了；
       · 旧值原样落 `pre_fp`，判据可复核、可回滚；
       · 窗口与采纳账保留窗口同口径（`days`），幂等：干净行不进候选，跑第二遍 resigned=0。
 
     `apply=False` 时只回候选数与样例，写库要显式传 True。`limit`>0 时本轮最多写这么多行
-    （首批上线用，便于小步观察）。返回 scanned/candidates/resigned/skipped/clean/applied/
-    samples。
+    （首批上线用，便于小步观察）。
+
+    R928：候选与 resigned 另按 `origin` 分生产/装置两段（`prod_*` / `device_*`）。
+    装置行（eval/probe）永远不会交证据，混在总数里会把优先级估高一个量级——R925 那句
+    「18 条记忆 120 个 token 受影响」实际生产侧只有 21 行。分段由函数自己报，不靠调用方
+    记得去看 origin。返回 scanned/candidates/resigned/skipped/clean/applied/days/samples
+    加四段 prod_ / device_ 计数。
     """
     since = _days_ago(max(1, int(days)))
     with db_conn(root) as conn:
         rows = [dict(r) for r in conn.execute(
-            "SELECT id, memory_id, fp, used FROM recall_adherence"
+            "SELECT id, memory_id, fp, used, origin FROM recall_adherence"
             " WHERE ts>=? AND used=0 ORDER BY id", (since,))]
     stats = {"scanned": len(rows), "candidates": 0, "resigned": 0, "skipped": 0,
-             "clean": 0, "applied": bool(apply), "days": int(days), "samples": []}
-    fresh_cache: dict = {}
+             "clean": 0, "applied": bool(apply), "days": int(days), "samples": [],
+             "prod_candidates": 0, "device_candidates": 0,
+             "prod_resigned": 0, "device_resigned": 0}
+    body_cache: dict = {}
     updates = []
     for r in rows:
         try:
@@ -8862,30 +8878,34 @@ def refingerprint_rows(root: str, days: int = ADHERENCE_KEEP_DAYS,
             stats["clean"] += 1
             continue
         stats["candidates"] += 1
+        prod = str(r.get("origin") or "").strip().lower() in PRODUCTION_ORIGINS
+        stats["prod_candidates" if prod else "device_candidates"] += 1
         mid = int(r.get("memory_id") or 0)
-        if mid not in fresh_cache:
+        if mid not in body_cache:
             with db_conn(root) as conn:
                 m = conn.execute("SELECT content, tags FROM memories WHERE id=?",
                                  (mid,)).fetchone()
-            fresh_cache[mid] = (recall_fingerprints(
-                str(m["content"] or "") + " " + str(m["tags"] or ""))
-                if m else None)
-        fresh = set(fresh_cache[mid] or [])
-        if not fresh or not all(t and t in fresh for t in cleaned):
+            body_cache[mid] = ((str(m["content"] or "") + " " + str(m["tags"] or ""))
+                               .lower() if m else "")
+        body = body_cache[mid]
+        if not body or not all(t and t.lower() in body for t in cleaned):
             stats["skipped"] += 1
             continue
         if limit and len(updates) >= int(limit):
             continue
-        stats["samples"].append({"id": r["id"], "memory_id": mid,
+        stats["samples"].append({"id": r["id"], "memory_id": mid, "origin": r.get("origin"),
                                  "old": toks, "new": cleaned})
-        updates.append((json.dumps(cleaned, ensure_ascii=False), str(r["fp"]), r["id"]))
+        updates.append((json.dumps(cleaned, ensure_ascii=False), str(r["fp"]), r["id"], prod))
     if apply and updates:
         with db_conn(root) as conn:
             conn.executemany("UPDATE recall_adherence SET fp=?, pre_fp=? WHERE id=?",
-                             updates)
+                             [(u[0], u[1], u[2]) for u in updates])
         stats["resigned"] = len(updates)
+        stats["prod_resigned"] = sum(1 for u in updates if u[3])
+        stats["device_resigned"] = stats["resigned"] - stats["prod_resigned"]
         journal_add(root, "hub", "brain_refingerprint", target="recall_adherence",
-                    note=f"重签 {len(updates)} 行指纹（候选 {stats['candidates']}"
+                    note=f"重签 {len(updates)} 行指纹（生产 {stats['prod_resigned']}"
+                         f"·装置 {stats['device_resigned']}·候选 {stats['candidates']}"
                          f"·跳过 {stats['skipped']}）窗口 {stats['days']} 天")
     return stats
 

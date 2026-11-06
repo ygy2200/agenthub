@@ -30,21 +30,41 @@ NEVER = re.compile(r"[`'\"“”‘’（）()【】〔〕「」『』，。、�
 
 
 def _dirty_ledger(root: str) -> dict:
-    """当前账本里「判不死」的量：不可匹配 token 数 + 涉及行数/记忆数。"""
-    out = {"tokens": 0, "rows": 0, "memories": set()}
+    """当前账本里「判不死」的量：不可匹配 token 数 + 涉及行数/记忆数。
+
+    R928：分段报 origin。装置行（eval/probe）永远不会交证据，混在总数里会把优先级估高
+    一个量级——R925 那句「18 条记忆 120 个 token 受影响」实测生产侧只有 21 行。
+    """
+    out = {"tokens": 0, "rows": 0, "memories": set(),
+           "prod_tokens": 0, "prod_rows": 0, "prod_memories": set(),
+           "device_tokens": 0, "device_rows": 0, "device_memories": set()}
     with brain.db_conn(root) as conn:
-        for r in conn.execute("SELECT memory_id, fp FROM recall_adherence"):
+        for r in conn.execute("SELECT memory_id, fp, origin FROM recall_adherence"):
             try:
                 toks = json.loads(r["fp"] or "[]")
             except ValueError:
                 continue
             bad = [t for t in toks if isinstance(t, str) and NEVER.search(t)]
-            if bad:
-                out["tokens"] += len(bad)
-                out["rows"] += 1
-                out["memories"].add(int(r["memory_id"] or 0))
-    out["memories"] = len(out["memories"])
+            if not bad:
+                continue
+            mid = int(r["memory_id"] or 0)
+            side = ("prod" if str(r["origin"] or "").strip().lower()
+                    in brain.PRODUCTION_ORIGINS else "device")
+            out["tokens"] += len(bad)
+            out["rows"] += 1
+            out["memories"].add(mid)
+            out[side + "_tokens"] += len(bad)
+            out[side + "_rows"] += 1
+            out[side + "_memories"].add(mid)
+    for k in ("memories", "prod_memories", "device_memories"):
+        out[k] = len(out[k])
     return out
+
+
+def _ledger_line(tag: str, d: dict, side: str = "") -> str:
+    p = f"{side}_" if side else ""
+    return (f"{tag}：判不死的 token {d[p + 'tokens']} 个 · 行 {d[p + 'rows']}"
+            f" · 记忆 {d[p + 'memories']} 条")
 
 
 def _stats_line(root: str) -> str:
@@ -83,16 +103,23 @@ def main() -> int:
         return undo(root)
 
     before = _dirty_ledger(root)
-    print(f"重签前：判不死的 token {before['tokens']} 个 · 行 {before['rows']} · 记忆 {before['memories']} 条")
+    print(_ledger_line("重签前", before))
+    print("   " + _ledger_line("生产·只有这一栏交证据", before, "prod")
+          + " · " + _ledger_line("装置", before, "device"))
     got = brain.refingerprint_rows(root, days=args.days, apply=args.apply, limit=args.limit)
     print(f"扫描 {got['scanned']} 行（窗口 {got['days']} 天）"
-          f"→ 候选 {got['candidates']} · 已重签 {got['resigned']} · 跳过 {got['skipped']}"
+          f"→ 候选 {got['candidates']}（生产 {got['prod_candidates']}"
+          f"·装置 {got['device_candidates']}）"
+          f" · 已重签 {got['resigned']}（生产 {got['prod_resigned']}"
+          f"·装置 {got['device_resigned']}）"
+          f" · 跳过 {got['skipped']}"
           f" · 本就干净 {got['clean']} · 写库={'是' if got['applied'] else '否(dry-run)'}")
     for s in got["samples"][:8]:
-        print(f"  #{s['memory_id']} 旧 {s['old']}")
+        print(f"  #{s['memory_id']} [{s.get('origin')}] 旧 {s['old']}")
         print(f"       新 {s['new']}")
     after = _dirty_ledger(root)
-    print(f"重签后：判不死的 token {after['tokens']} 个 · 行 {after['rows']} · 记忆 {after['memories']} 条")
+    print(_ledger_line("重签后", after))
+    print("   " + _ledger_line("生产", after, "prod") + " · " + _ledger_line("装置", after, "device"))
     print("采纳账三态：" + _stats_line(root))
     if args.json_out:
         Path(args.json_out).write_text(json.dumps(
