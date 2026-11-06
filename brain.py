@@ -1548,6 +1548,11 @@ def _migrate_columns(root: str) -> None:
                 "  FROM recall_adherence)"
                 " WHERE s LIKE 'eval-%' OR s LIKE 'probe%' OR s LIKE 'smoke-%'"
                 "   OR s LIKE 'test-r%' OR s LIKE 'e2e-%')")
+        # R926：历史指纹重签（`refingerprint_rows`）的旧值留证列。只走 ALTER（同上，
+        # 不放 SCHEMA 的 executescript）。没有它，重签就是把「当年注入时看到的那把尺子」
+        # 抹掉——判据必须可复核、可回滚。
+        if "pre_fp" not in dcols:
+            conn.execute('ALTER TABLE recall_adherence ADD COLUMN pre_fp TEXT DEFAULT ""')
         # R852/R853 两次改了采纳账的分子分母（判定即盖章、只认 live），历史行不改写：
         # 没有锚点，跨变更点的比率会把「修前没盖章」读成「修后没判过」（同 §R834 锚点教训）。
         conn.execute("INSERT OR IGNORE INTO meta(key,value)"
@@ -8815,6 +8820,74 @@ def brief_rules_adherence(root: str, session: str, agent: str = "", project: str
     return _record_adherence(root, session, agent, rows, project,
                              strength="brief", prompt="", pool_texts=None,
                              origin="brief")
+
+
+def refingerprint_rows(root: str, days: int = ADHERENCE_KEEP_DAYS,
+                       apply: bool = False, limit: int = 0) -> dict:
+    """把历史采纳账里带脏尾巴的指纹按当前切法重签（保守；默认只报数不写库）。
+
+    为什么需要单独一步：`fp` 是**落库时算好的**，`mark_recall_used` 只拿存下来的串做
+    substring。R925 修的是抽取器，旧账上还刻着坏尺子——回填通道再怎么跑也判不动它们
+    （2026-11-06 真库取证：18 条记忆 25 个 token 不可匹配，这批记忆历史 judged_used=0）。
+
+    四条硬约束，越界就是改写历史证据：
+      · 只动 `used=0` 的行——已经领过功的证据不重写；
+      · 新值 = 旧 token 逐个按 `_FP_CUT` 截干净，**不新增** token（新增等于替当年没注入的
+        内容领功）；且截完每个都还要在「当前记忆正文」新抽出的集合里（子集判据）。
+        记忆正文被改过 → 不满足 → 跳过，绝不替它猜当年注入了什么；
+      · 旧值原样落 `pre_fp`，判据可复核、可回滚；
+      · 窗口与采纳账保留窗口同口径（`days`），幂等：干净行不进候选，跑第二遍 resigned=0。
+
+    `apply=False` 时只回候选数与样例，写库要显式传 True。`limit`>0 时本轮最多写这么多行
+    （首批上线用，便于小步观察）。返回 scanned/candidates/resigned/skipped/clean/applied/
+    samples。
+    """
+    since = _days_ago(max(1, int(days)))
+    with db_conn(root) as conn:
+        rows = [dict(r) for r in conn.execute(
+            "SELECT id, memory_id, fp, used FROM recall_adherence"
+            " WHERE ts>=? AND used=0 ORDER BY id", (since,))]
+    stats = {"scanned": len(rows), "candidates": 0, "resigned": 0, "skipped": 0,
+             "clean": 0, "applied": bool(apply), "days": int(days), "samples": []}
+    fresh_cache: dict = {}
+    updates = []
+    for r in rows:
+        try:
+            toks = [str(t) for t in json.loads(r["fp"])]
+        except Exception:  # noqa: BLE001 更早的版本存过非 JSON 值：跳过而不是炸判据
+            stats["skipped"] += 1
+            continue
+        cleaned = [_FP_CUT.split(t)[0].strip().rstrip(".,;:)）】」") for t in toks]
+        if cleaned == toks:
+            stats["clean"] += 1
+            continue
+        stats["candidates"] += 1
+        mid = int(r.get("memory_id") or 0)
+        if mid not in fresh_cache:
+            with db_conn(root) as conn:
+                m = conn.execute("SELECT content, tags FROM memories WHERE id=?",
+                                 (mid,)).fetchone()
+            fresh_cache[mid] = (recall_fingerprints(
+                str(m["content"] or "") + " " + str(m["tags"] or ""))
+                if m else None)
+        fresh = set(fresh_cache[mid] or [])
+        if not fresh or not all(t and t in fresh for t in cleaned):
+            stats["skipped"] += 1
+            continue
+        if limit and len(updates) >= int(limit):
+            continue
+        stats["samples"].append({"id": r["id"], "memory_id": mid,
+                                 "old": toks, "new": cleaned})
+        updates.append((json.dumps(cleaned, ensure_ascii=False), str(r["fp"]), r["id"]))
+    if apply and updates:
+        with db_conn(root) as conn:
+            conn.executemany("UPDATE recall_adherence SET fp=?, pre_fp=? WHERE id=?",
+                             updates)
+        stats["resigned"] = len(updates)
+        journal_add(root, "hub", "brain_refingerprint", target="recall_adherence",
+                    note=f"重签 {len(updates)} 行指纹（候选 {stats['candidates']}"
+                         f"·跳过 {stats['skipped']}）窗口 {stats['days']} 天")
+    return stats
 
 
 def mark_recall_used(root: str, session: str, text: str, window_h: int = 24,
