@@ -9936,7 +9936,8 @@ _ERR_IPPORT_RE = re.compile(r"\b\d{1,3}(?:\.\d{1,3}){3}(?::\d{2,5})?\b")
 # 路径/query 每次都不一样，留着只会把签名搅成噪音（真库欠账 `https:/ memory`、
 # `https:/ simplemem|simplemem`、`https:/ 2606.14571` 三条，前缀全是下面那条去路径规则
 # 咬碎 URL 剩下的常数碎片）。
-_ERR_URL_RE = re.compile(r"\b(https?):/+([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])(?:[/?#]\S*)?")
+_ERR_URL_RE = re.compile(r"\b(https?):/+([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])"
+                         r"(?::(\d{2,5}))?(?:[/?#]\S*)?")
 # 不配当身份的两种词：进程级指针地址（0x + 去掉前导 0 仍 ≥9 位十六进制；8 位的
 # NTSTATUS/HRESULT 0xC0000005、0x80070005 照旧算招牌），以及带 scheme 的 URL 碎片/整体。
 _ERR_VOLATILE_RE = re.compile(r"0x0*[0-9a-f]{9,}|https?:/", re.I)
@@ -10056,7 +10057,9 @@ def _error_clean(text: str) -> str:
     # R927：URL 先收成 scheme://host。下面那条「去路径前缀」不分 URL，
     # `https://api.github.com/repos/x/y` 会被咬成 `https:/`——身分（主机）丢了，
     # 剩下的碎片每条抓网报错都有，等于给签名加了个常数锚点。
-    t = _ERR_URL_RE.sub(lambda m: f"{m.group(1)}://{m.group(2)}", t)
+    t = _ERR_URL_RE.sub(
+        lambda m: f"{m.group(1)}://{m.group(2)}"
+                  f"{':' + m.group(3) if m.group(3) else ''}", t)
     t = re.sub(r"[A-Za-z]:\\\\?[^\s\"'<>|]*[\\/]", " ", t)      # D:\a\b\ → 空格
     t = re.sub(r"/(?:[\w.-]+/){2,}", " ", t)                     # /a/b/c/ → 空格
     t = re.sub(r"\b\d{4}-\d{2}-\d{2}[T ]\d{2}:\d{2}(?::\d{2})?\b", " ", t)
@@ -10135,6 +10138,7 @@ def error_signature_terms(text: str, cap: int = 24,
     if not t.strip():
         return []
     out, seen, num_names = [], set(), set()
+    url_matches = list(_ERR_URL_RE.finditer(t))
 
     def add(term: str, weight: int) -> None:
         term = re.sub(r"\s+", " ", (term or "").strip().strip(":.,;!?«»“”"))
@@ -10170,7 +10174,9 @@ def error_signature_terms(text: str, cap: int = 24,
         add(m.group(0), 3)
     for m in _ERR_QUOTED_RE.finditer(t):
         add(m.group(1), 3)
-    for m in _ERR_NAMED_RE.finditer(t):
+    # 诊断成语只留失败本身；URL/IP 是对象，由下面的原子身份位单独抽取。
+    named_t = _ERR_IPPORT_RE.sub(" ", _ERR_URL_RE.sub(" ", t))
+    for m in _ERR_NAMED_RE.finditer(named_t):
         seg = m.group(0)
         add(seg, 3)
         # 成语的「干净头部」也是锚点：`permission denied, open 'x.exe'` 的尾部是对象/
@@ -10203,12 +10209,12 @@ def error_signature_terms(text: str, cap: int = 24,
         if re.search(r"[A-Z]", w[1:]) or "_" in w:
             add(w, 2)
     for m in _ERR_IPPORT_RE.finditer(t):
+        if any(u.start() <= m.start() and m.end() <= u.end() for u in url_matches):
+            continue
         add(m.group(0), 2)
-    # R927：URL 主机与 IP:port 同档——`127.0.0.1:7890` 早就是身份了，「连不上谁」的
-    # 域名同理。不补这一档，挡掉碎片只会让所有网络报错塌成同一个键（把「GitHub 要走
-    # 镜像」的修法安到「本地服务没起」上，误配比空转更坏）。
-    for m in _ERR_URL_RE.finditer(t):
-        add(m.group(2), 2)
+    # R932：host:port 是 URL 的唯一原子身份；URL 内不再补一份裸 IP，URL 外的代理地址照留。
+    for m in url_matches:
+        add(m.group(2) + (":" + m.group(3) if m.group(3) else ""), 2)
     # 编号已经跟名字绑成招牌（winerror 5），再留裸名（winerror）等于给 WinError 32 那条
     # 旧坑开后门——同一条编号规则的另一面（R833 冒烟实测：5 是拒绝访问，32 是文件被占用）。
     out = [(x, w) for x, w in out if x not in num_names]
