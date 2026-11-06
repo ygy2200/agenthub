@@ -56,12 +56,44 @@ def _verdict(rate: float, judged: int) -> str:
     return "在本库正常线以上"
 
 
+EMPTY_FP_WHERE = "fp is null or trim(fp) in ('','[]')"
+
+
+def explain_empty(root: str, days: int = 30) -> dict:
+    """R938/B088：把「判不了」按来历(origin)与成因(fp_reason)分栏，只读。
+
+    不回填历史行：R834 锚点教训——跨口径变更点的比率不可比；采集上线前的
+    空值单列 `legacy`，不冒充新口径。装置行(eval/probe)与生产行(live/brief)
+    必须分开报（大脑记忆 #581），拿总数谈优先级会把装置噪声当需求。
+    """
+    cutoff = brain._days_ago(days)
+    by_origin, by_reason = {}, {}
+    prod = dev = 0
+    with brain.db_conn(root) as conn:
+        rows = conn.execute(
+            "SELECT origin, fp_reason, count(*) FROM recall_adherence "
+            f"WHERE {EMPTY_FP_WHERE} AND ts >= ? GROUP BY 1,2", (cutoff,)).fetchall()
+    for origin, reason, n in rows:
+        o = origin or "(blank)"
+        r = reason or "legacy"
+        by_origin[o] = by_origin.get(o, 0) + n
+        by_reason[r] = by_reason.get(r, 0) + n
+        if o in brain.PRODUCTION_ORIGINS:
+            prod += n
+        elif o in brain.DEVICE_ORIGINS:
+            dev += n
+    return {"by_origin": by_origin, "by_reason": by_reason,
+            "production": prod, "device": dev, "total": prod + dev}
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--days", type=int, default=brain.ADHERENCE_KEEP_DAYS)
     ap.add_argument("--mark", default="", help="要标记采纳的 session")
     ap.add_argument("--text", default="", help="这一轮的产出文本（用来匹配指纹）")
     ap.add_argument("--root", default="")
+    ap.add_argument("--explain-empty", action="store_true",
+                    help="R938：按来历/成因分栏报出「判不了」的注入行（只读）")
     a = ap.parse_args()
     root = a.root or _root()
     if not root:
@@ -70,6 +102,14 @@ def main() -> int:
     # 报表脚本跑在 MCP 服务进程之外，老库可能还没补过列（2026-11-01 实测直接
     # OperationalError: no such column: inject_count）。init_db 幂等，先补schema再查。
     brain.init_db(root)
+
+    if a.explain_empty:
+        e = explain_empty(root, a.days)
+        print("空指纹注入行（按来历 / 成因分栏，只读，不回填历史行）")
+        print(f"  生产 {e['production']} · 装置 {e['device']} · 合计 {e['total']}")
+        print(f"  按来历：{e['by_origin']}")
+        print(f"  按成因：{e['by_reason']}  （legacy = 采集上线前的历史行）")
+        return 0
 
     if a.mark:
         if not a.text:

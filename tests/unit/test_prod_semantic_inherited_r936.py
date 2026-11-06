@@ -104,3 +104,13 @@ def test_all_off_words_judged_by_brain_not_reimplemented(monkeypatch, tmp_path):
         monkeypatch.setenv("AGENTHUB_SEMANTIC", word)
         enabled, _ = ev.production_semantic_enabled(_config(tmp_path))
         assert enabled is False, word
+
+
+def test_explicit_environ_isolates_from_host(monkeypatch, tmp_path):
+    """跨进程对照要能隔离宿主：显式给 environ 就不被当前 shell 的值带偏。"""
+    _clean_env(monkeypatch)
+    monkeypatch.setenv("AGENTHUB_SEMANTIC", "0")
+    enabled, source = ev.production_semantic_enabled(
+        _config(tmp_path), environ={})
+    assert enabled is True
+    assert "(unset)" in source

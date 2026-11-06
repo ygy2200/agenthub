@@ -497,8 +497,10 @@ CREATE TABLE IF NOT EXISTS recall_adherence (
     used INTEGER DEFAULT 0,
     decided_at TEXT DEFAULT "",
     origin TEXT DEFAULT "live",       -- R853：live=生产钩子，eval/probe=装置；账只认 live
-    directive TEXT DEFAULT ''        -- R881/B089：R879 的策略档位 required/supportive；
+    directive TEXT DEFAULT '',       -- R881/B089：R879 的策略档位 required/supportive；
                                      -- 采集口径上线前的旧行为空，统计归 unknown 不冒充
+    fp_reason TEXT DEFAULT ''        -- R938/B088：抽不出指纹的成因（no_tokens/in_prompt/
+                                     -- pool_common/too_short_or_stop/ok）；老行留空=legacy
 );
 CREATE INDEX IF NOT EXISTS idx_adherence_session ON recall_adherence(session, ts);
 CREATE INDEX IF NOT EXISTS idx_adherence_ts ON recall_adherence(ts);
@@ -1556,6 +1558,10 @@ def _migrate_columns(root: str) -> None:
         # 抹掉——判据必须可复核、可回滚。
         if "pre_fp" not in dcols:
             conn.execute('ALTER TABLE recall_adherence ADD COLUMN pre_fp TEXT DEFAULT ""')
+        # R938/B088：空指纹成因。历史行不回填（R834 锚点教训：跨口径变更点的
+        # 比率不可比），留空由报表单列 legacy，不冒充新口径。
+        if "fp_reason" not in dcols:
+            conn.execute('ALTER TABLE recall_adherence ADD COLUMN fp_reason TEXT DEFAULT ""')
         # R852/R853 两次改了采纳账的分子分母（判定即盖章、只认 live），历史行不改写：
         # 没有锚点，跨变更点的比率会把「修前没盖章」读成「修后没判过」（同 §R834 锚点教训）。
         conn.execute("INSERT OR IGNORE INTO meta(key,value)"
@@ -8769,6 +8775,58 @@ def recall_fingerprints(text: str, pool_texts: list = None, prompt: str = "",
     return out
 
 
+def recall_fp_reason(text: str, pool_texts: list = None, prompt: str = "",
+                     limit: int = 6) -> str:
+    """R938/B088：回答「这笔注入为什么抽不出指纹」。只读诊断，不参与抽取。
+
+    与 `recall_fingerprints` 的过滤链逐条对齐（长度/停用词/去重 -> 提问去重 ->
+    池内 df>2），逐级关掉过滤器，找出「最后一道把候选清空」的关卡：
+      ok / no_tokens / too_short_or_stop / in_prompt / pool_common
+    `no_tokens` = 正文里一个招牌形态都没有（纯自然语言行为规则），是**结构性
+    不可判**，不是抽取器缺陷——补抽取器也抽不出不存在的路径/版本号。
+
+    R937 真库取证：144 条空 fp 里 128 条是装置行、生产仅 16 条；生产 16 条里
+    12 条是同一条必做规则 mem#268，全部 no_tokens。历史行没存当时的 prompt /
+    候选池，in_prompt / pool_common 无法事后复现，故不回填、留 legacy。
+    """
+    if not text:
+        return "no_tokens"
+    low_prompt = (prompt or "").lower()
+    pool = [str(t).lower() for t in (pool_texts or [])]
+
+    def _raw():
+        for pat in _FP_PATTERNS:
+            for m in pat.finditer(text):
+                yield (_FP_CUT.split(m.group(0))[0]
+                       .strip().rstrip(".,;:)）】」").lower())
+
+    cands, seen = [], set()
+    for low in _raw():
+        if len(low) < 4 or low in seen or low in _FP_STOP:
+            continue
+        if low_prompt and low in low_prompt:
+            continue
+        if pool and sum(1 for t in pool if low in t) > 2:
+            continue
+        seen.add(low)
+        cands.append(low)
+    if cands:
+        return "ok"
+    raw_all = list(_raw())
+    if not raw_all:
+        return "no_tokens"
+    basic = [x for x in raw_all if len(x) >= 4 and x not in _FP_STOP]
+    if not basic:
+        return "too_short_or_stop"
+    no_prompt = [x for x in basic if not (low_prompt and x in low_prompt)]
+    if not no_prompt:
+        return "in_prompt"
+    if pool and not [x for x in set(no_prompt)
+                     if sum(1 for t in pool if x in t) <= 2]:
+        return "pool_common"
+    return "too_short_or_stop"
+
+
 def _record_adherence(root: str, session: str, agent: str, picked: list,
                       project: str, strength: str, prompt: str,
                       pool_texts: list = None, origin: str = "live") -> int:
@@ -8790,17 +8848,21 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
         origin = "probe"
     rows = []
     for r in picked:
-        fp = recall_fingerprints(str(r.get("content") or "") + " " + str(r.get("tags") or ""),
-                                 pool_texts=pool_texts, prompt=prompt)
+        fp_text = str(r.get("content") or "") + " " + str(r.get("tags") or "")
+        fp = recall_fingerprints(fp_text, pool_texts=pool_texts, prompt=prompt)
+        # R938：抽不出指纹时把「为什么」随本笔落账（带当时的提问与候选池）。
+        # 诊断只读、不参与抽取；历史行缺这两样输入，一律不回填。
+        fp_reason = ("ok" if fp else recall_fp_reason(
+            fp_text, pool_texts=pool_texts, prompt=prompt))
         # R881：档位由写入口按同一套结构化判据算（与 prompt_recall 渲染同源），
         # 不另设口径、不事后猜。历史行空值留给统计归 unknown。
         rows.append((now, session, agent or "", int(r.get("id") or 0), project or "",
                      strength, json.dumps(fp, ensure_ascii=False), origin,
-                     directive_tier(r)))
+                     directive_tier(r), fp_reason))
     with db_conn(root) as conn:
         conn.executemany(
             "INSERT INTO recall_adherence(ts, session, agent, memory_id, project, strength,"
-            " fp, origin, directive) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            " fp, origin, directive, fp_reason) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
         # 有界：只留最近 ADHERENCE_KEEP_DAYS 天，行数超上限时删最旧的
         conn.execute("DELETE FROM recall_adherence WHERE ts < ?",
                      (_days_ago(ADHERENCE_KEEP_DAYS),))

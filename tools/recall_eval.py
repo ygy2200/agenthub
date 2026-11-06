@@ -411,7 +411,7 @@ def inherited_semantic_flag(environ=None):
     return None, "未设置（默认语义开）"
 
 
-def production_semantic_enabled(config_path: str = "") -> tuple:
+def production_semantic_enabled(config_path: str = "", environ=None) -> tuple:
     """读取当前生产 MCP 的语义开关；配置不可读时返回未知，不猜成关闭。
 
     关闭判据用 `brain.sem_env_off`（四个词），不在这里重新发明——R933 前这里写死
@@ -421,6 +421,7 @@ def production_semantic_enabled(config_path: str = "") -> tuple:
     进程继承。以前缺键一律判开，于是「进程环境设 0」这个本来同构的档被误报成
     「非生产同构」，A/B 结论被无端作废（端到端用例已复现该误判）。
     优先级：mcp.json 的 env 是显式覆盖 > 进程继承 > 注册表 > 默认开。
+    `environ` 可显式传入以隔离当前宿主（跨进程对照/测试用）；None = 读真实 os.environ。
     """
     path = Path(config_path) if config_path else Path.home() / ".workbuddy" / "mcp.json"
     try:
@@ -432,11 +433,14 @@ def production_semantic_enabled(config_path: str = "") -> tuple:
     if flag is not None:
         source = f"{path} · mcp.json env.AGENTHUB_SEMANTIC={flag}（显式键优先）"
     else:
-        inherited, from_where = inherited_semantic_flag()
+        inherited, from_where = inherited_semantic_flag(environ=environ)
         flag = inherited
-        source = f"{path} · mcp.json 未设 AGENTHUB_SEMANTIC，回落 {from_where}"
-        if inherited is not None:
-            source += f" -> AGENTHUB_SEMANTIC={inherited}"
+        # 保留 `AGENTHUB_SEMANTIC=(unset)` 这个可机读片段：R933 起的报表/用例
+        # 都按它识别「配置没写」，改成纯中文说明会把外部解析悄悄打断（全量门禁
+        # 实锤 1 条红）。新增的回落来源追加在后面，不改旧片段。
+        shown = "(unset)" if inherited is None else str(inherited)
+        source = (f"{path} · AGENTHUB_SEMANTIC={shown} · mcp.json 未设该键，"
+                  f"回落 {from_where}")
     enabled = not brain.sem_env_off(flag)
     return enabled, source
 
