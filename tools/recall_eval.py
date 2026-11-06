@@ -59,6 +59,7 @@ why 格式统一「跨项目：<项目>·<说明>」，逐条回查真库 12 个
 新增样本按项目挑、不按能不能命中挑，命中率如实记进台账。
 """
 import argparse
+import json
 import os
 import sqlite3
 import sys
@@ -318,8 +319,10 @@ def env_fingerprint(root: str = "") -> dict:
     实锤（R907）：同一份代码、同一个真库，`D:/python311/python.exe`（numpy /
     onnxruntime / torch 全在，语义路生效）跑出 Recall@3 24/31=77.4%、题面泄漏 1 条；
     默认 python 3.13（三个依赖全无，语义路关闭）跑出 20/29=69.0%、泄漏 3 条。
-    差 8.4pp 全来自运行环境，跟召回代码一字无关。生产 MCP 又是第三种组合
-    （3.11 + `AGENTHUB_SEMANTIC=0`）。不带指纹的跨轮比较等于拿噪声当结论。
+    差 8.4pp 全来自运行环境，跟召回代码一字无关。生产档是什么组合**不写死在这里**：
+    R914 前是 3.11 + `AGENTHUB_SEMANTIC=0`，R914 删掉该键后是 3.11 + 语义开，
+    由 `production_semantic_enabled` 现读 `~/.workbuddy/mcp.json`。
+    不带指纹的跨轮比较等于拿噪声当结论。
 
     真库指纹单独算：评测集绑活库，库每天在写新记忆/记录，连泄漏样本数都会变。
     """
@@ -340,8 +343,10 @@ def env_fingerprint(root: str = "") -> dict:
         pass
     return {"python": platform.python_version(), "executable": sys.executable,
             "AGENTHUB_SEMANTIC": sem_env, "deps": deps,
-            # 生产 MCP 显式设 0；只要它为 0 就关，否则看依赖在不在
-            "semantic_expected": sem_env != "0" and any(deps.values()),
+            # R933：判据用 brain.sem_env_off（0/false/no/off 都算关）。此前只认 "0"，
+            # 生产若设 false 就会「实际关、指纹说开」，同构守卫的判定直接反过来。
+            "semantic_expected": (not brain.sem_env_off(
+                os.environ.get("AGENTHUB_SEMANTIC"))) and any(deps.values()),
             "memories": n_mem, "records": n_rec, "max_updated": latest,
             "cases": len(CASES)}
 
@@ -362,31 +367,47 @@ def db_key(fp: dict) -> str:
     return hashlib.sha256("|".join(parts).encode("utf-8")).hexdigest()[:12]
 
 
-def production_parity(fp: dict) -> tuple:
-    """R910：这次 A/B 的召回行为与生产 MCP 同构吗？
+def production_semantic_enabled(config_path: str = "") -> tuple:
+    """读取当前生产 MCP 的语义开关；配置不可读时返回未知，不猜成关闭。
 
-    生产（~/.workbuddy/mcp.json）= 3.11 + `AGENTHUB_SEMANTIC=0` → 语义路关闭。
-    R908 实测 B 档（3.11 + 显式 0）与 C 档（3.13 无依赖）结果逐字段相同
-    （都是 20/29=69.0%、sem_scored 0/32），所以**行为等价的判据是「语义路关」**，
-    而不是解释器版本。语义开着的环境（R900/R901 的 A/B 标定环境）与生产不同构：
-    R910 实测同一份 replace/0.62 在语义关时救援次数 0、+0.0pp，语义开时 3 次、
-    +6.7pp。拿后者的数字改前者的默认档，就是 R901 的错。
+    关闭判据用 `brain.sem_env_off`（四个词），不在这里重新发明——R933 前这里写死
+    「== "0" 才算关」，与 brain 的实际开关不一致。
     """
-    if fp.get("semantic_expected"):
-        return False, "语义路预期为开（生产 MCP 显式关闭语义）"
-    why = "语义路关闭，与生产 MCP 行为等价"
-    if fp.get("AGENTHUB_SEMANTIC") != "0":
+    path = Path(config_path) if config_path else Path.home() / ".workbuddy" / "mcp.json"
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+        env = data["mcpServers"]["agenthub"].get("env") or {}
+    except (OSError, json.JSONDecodeError, KeyError, TypeError) as e:
+        return None, f"生产配置不可读：{path}（{e}）"
+    flag = env.get("AGENTHUB_SEMANTIC")
+    enabled = not brain.sem_env_off(flag)
+    shown = "(unset)" if flag is None else str(flag)
+    return enabled, f"{path} · AGENTHUB_SEMANTIC={shown}"
+
+
+def production_parity(fp: dict, config_path: str = "") -> tuple:
+    """当前评测的语义行为是否与 **此时** 的生产 MCP 配置一致。"""
+    production, source = production_semantic_enabled(config_path)
+    if production is None:
+        return False, source
+    current = bool(fp.get("semantic_expected"))
+    state = "开" if current else "关"
+    production_state = "开" if production else "关"
+    if current != production:
+        return False, f"当前语义路{state}，生产语义路{production_state}（{source}）"
+    why = f"语义路{state}，与生产 MCP 配置一致（{source}）"
+    if not current and fp.get("AGENTHUB_SEMANTIC") != "0":
         why += "；但靠依赖缺失而非显式开关，建议显式设 AGENTHUB_SEMANTIC=0 复跑"
     return True, why
 
 
-def env_guard_line(root: str = "") -> str:
+def env_guard_line(root: str = "", config_path: str = "") -> str:
     """给所有 A/B 量具共用的报表头：指纹 + 生产同构判定 + 警告。
 
     守卫必须**在数字之前**打印：R900/R901 的教训是「结论写完后没人回头核对环境」。
     """
     fp = env_fingerprint(root)
-    ok, why = production_parity(fp)
+    ok, why = production_parity(fp, config_path=config_path)
     tag = "生产同构" if ok else "⚠ 非生产同构"
     warn = "" if ok else "  ⚠ 本结果不得据此改生产默认档（R910）"
     return (f"R908/R910 环境守卫：env={env_key(fp)} db={db_key(fp)} · {tag}（{why}）{warn}\n"

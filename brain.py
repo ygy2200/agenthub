@@ -7132,8 +7132,17 @@ _SEM_CJK_RE = re.compile(r"[\u4e00-\u9fff]")
 # 开关：AGENTHUB_SEMANTIC=0/false/no/off 关掉整条语义路（读、写、后台预热一起关），
 # 检索降级为 LIKE+BM25 两路——语义本就是可选第三路，全程 fail-open，关掉不掉功能。
 # 定位：MCP/CLI 长驻会话建议关（省 2GB/进程），GUI 单进程可保留（用户可见召回收益）。
-_SEM_ENABLED = str(os.environ.get("AGENTHUB_SEMANTIC", "1")).strip().lower() not in (
-    "0", "false", "no", "off")
+_SEM_OFF_VALUES = ("0", "false", "no", "off")
+
+
+def sem_env_off(value) -> bool:
+    """AGENTHUB_SEMANTIC 的关闭判据。**外部读配置的量具/开关工具都调这里**：
+    R933 实测两处各自发明「只有 "0" 算关」，于是 `false/no/off` 会被生产同构守卫
+    报成「语义开」——判据分叉的代价是把对照结论指向反方向。"""
+    return str("1" if value is None else value).strip().lower() in _SEM_OFF_VALUES
+
+
+_SEM_ENABLED = not sem_env_off(os.environ.get("AGENTHUB_SEMANTIC"))
 
 
 def _st_cls():
@@ -8617,7 +8626,8 @@ RECALL_CORPUS_RARE_RATIO = 0.02  # 全库活跃行出现率 <=2% 视为稀有（
 #      且转命中的不是探针标出的那 4 条（idf 被稀释，收益来自别处）；
 #   ③ R918 全库 df 稀有度救援 → 救援 2~3 次精准 0、噪声 +2~3、Δrate +0.0pp。
 # 结论：词法侧的稀有词闸门删掉的候选，靠启发式补位救不回来；要么走语义路
-# （R901 的 replace/0.62，需 AGENTHUB_SEMANTIC 非 0，R914 已切换待重启验收），
+# （R901 的 replace/0.62，需 AGENTHUB_SEMANTIC 非关闭值；R914 已切换、R933 按生产
+#  配置现读验收：语义开 24/31=77.4%、救援 3 次 +6.7pp；语义关 20/29=69.0%、零救援），
 # 要么回头查标注/语料质量。三个开关默认全关，保留只为可复跑的 A/B 证据。
 # R900（B099）：闸门救援**默认关闭**，只在 A/B 量具里切档。为什么默认关而不是直接
 # 合入：外部证据三条都指向「别让语义路接管排序」——① RRF 的分数是排名共识不是相关性，

@@ -38,30 +38,51 @@ def _origin_of(note: str) -> str:
     return m.group(1) if m and m.group(1) in ORIGINS else "unknown"
 
 
-def collect(root: str, days: int = 30, limit: int = 20000) -> dict:
-    """只读 journal，按 (action, origin) 出计数与最近一次时间。"""
+def collect(root: str, days: int = 30, limit: int = 20000,
+             switch_ts: str = "") -> dict:
+    """只读 journal，按 (action, origin) 出计数与最近一次时间。
+
+    R933 补：同时记下**实际扫到的最早一行**。`brain.journal_list` 有单次行数上限，
+    请求 30 天常常只拿回两三天；报表不说破这点，`live` 计数就会被读成整窗口的答案。
+    """
     cutoff = (datetime.now() - timedelta(days=days)).strftime("%Y-%m-%d")
     rows = brain.journal_list(root, limit=limit) or []
     counts = {a: Counter() for a in ACTIONS}
     last = {a: "" for a in ACTIONS}
+    all_ts = [str(r.get("ts") or "") for r in rows if r.get("ts")]
+    live_ts = []
     for r in rows:
         action = str(r.get("action") or "")
         if action not in counts:
             continue
-        ts = str(r.get("ts") or "")[:10]
+        full = str(r.get("ts") or "")
+        ts = full[:10]
         if days > 0 and ts and ts < cutoff:
             continue
         o = _origin_of(r.get("note"))
         counts[action][o] += 1
+        if o == "live":
+            live_ts.append(full)
         if ts > last[action]:
             last[action] = ts
+    earliest = min(all_ts) if all_ts else ""
+    covered = bool(all_ts) and earliest[:10] <= cutoff
     return {"counts": counts, "last": last, "total_rows": len(rows),
-            "days": days, "cutoff": cutoff}
+            "days": days, "cutoff": cutoff, "earliest": earliest,
+            "covered": covered, "requested_limit": limit, "live_ts": live_ts,
+            "switch_ts": switch_ts,
+            "live_after_switch": len([t for t in live_ts if switch_ts and t >= switch_ts])}
 
 
-def render(data: dict) -> str:
+def render(data: dict, switch_ts: str = "") -> str:
     out = [f"语义救援触发分档 | 窗口 {data['days']} 天（>= {data['cutoff']}）"
-           f" | journal 扫描 {data['total_rows']} 行", ""]
+           f" | journal 扫描 {data['total_rows']} 行（请求 limit={data.get('requested_limit', '—')}）", ""]
+    if data.get("earliest"):
+        out.append(f"实得行最早 {data['earliest']}")
+    if data.get("total_rows") and not data.get("covered"):
+        out.append(f"  ⚠ 扫描范围未覆盖请求窗口 {data['days']} 天（journal_list 有单次行数上限）"
+                   f"——下面分档是**可得样本**，不是整窗口统计，别按 {data['days']} 天口径下结论。")
+    out.append("")
     live_total = 0
     for a in ACTIONS:
         c = data["counts"][a]
@@ -71,6 +92,14 @@ def render(data: dict) -> str:
         out.append(line)
         live_total += c["live"]
     out.append("")
+    st = switch_ts or data.get("switch_ts") or ""
+    if st:
+        pre = [t for t in data.get("live_ts") or [] if t < st]
+        out.append(f"生产开关切换：{st}")
+        if pre:
+            out.append(f"  ⚠ {len(pre)} 笔 live 行早于生产开关（{', '.join(pre[:5])}）"
+                       f"——不能当成开关生效后的收益；开关后 live={data.get('live_after_switch', 0)} 笔。")
+        out.append("")
     if live_total == 0:
         out.append("判定：真实会话（origin=live）触发 0 次 —— 样本不足，**不下结论**。")
         out.append("      probe/eval 的触发数只证明装置在跑，不能当成线上收益。")
@@ -81,11 +110,22 @@ def render(data: dict) -> str:
     return "\n".join(out) + "\n"
 
 
+def _prod_switch_ts() -> str:
+    """生产 MCP 配置的落盘时刻 ≈ R914 语义开关的实际生效时间；读不到就留空，不猜。"""
+    try:
+        p = Path.home() / ".workbuddy" / "mcp.json"
+        return datetime.fromtimestamp(p.stat().st_mtime).strftime("%Y-%m-%dT%H:%M:%S")
+    except OSError:
+        return ""
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="")
     ap.add_argument("--days", type=int, default=30)
     ap.add_argument("--limit", type=int, default=20000)
+    ap.add_argument("--switch-ts", default="",
+                    help="生产语义开关生效时间（默认取 ~/.workbuddy/mcp.json 的修改时间）")
     ap.add_argument("--out", default="")
     args = ap.parse_args()
     root = args.root
@@ -93,7 +133,8 @@ def main() -> int:
         import json
         cfg = Path.home() / ".agenthub" / "config.json"
         root = str(json.loads(cfg.read_text(encoding="utf-8")).get("root") or "")
-    text = render(collect(root, args.days, args.limit))
+    switch_ts = args.switch_ts or _prod_switch_ts()
+    text = render(collect(root, args.days, args.limit, switch_ts=switch_ts))
     print(text)
     if args.out:
         p = Path(args.out)

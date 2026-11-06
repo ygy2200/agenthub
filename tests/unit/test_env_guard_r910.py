@@ -10,6 +10,7 @@ R910 实测（同一份代码 / 同一真库 / 同一批语料）：
 显式写「不得据此改生产默认档」。旧码没有 production_parity/env_guard_line，
 本文件在旧码上 import 即红。
 """
+import json
 import sys
 from pathlib import Path
 
@@ -32,33 +33,45 @@ def _fp(**over):
     return base
 
 
-def test_semantic_on_is_not_production_parity():
-    ok, why = ev.production_parity(_fp())
+def _config(tmp_path, flag="0"):
+    path = tmp_path / "mcp.json"
+    path.write_text(json.dumps({
+        "mcpServers": {"agenthub": {
+            "command": "D:/python311/python.exe",
+            "env": {"AGENTHUB_SEMANTIC": flag}}}
+    }), encoding="utf-8")
+    return str(path)
+
+
+def test_semantic_on_is_not_historical_semantic_off_parity(tmp_path):
+    ok, why = ev.production_parity(_fp(), config_path=_config(tmp_path))
     assert ok is False
     assert "语义" in why
 
 
-def test_explicit_semantic_off_is_production_parity():
+def test_explicit_semantic_off_is_semantic_off_parity(tmp_path):
     ok, why = ev.production_parity(
-        _fp(AGENTHUB_SEMANTIC="0", semantic_expected=False))
+        _fp(AGENTHUB_SEMANTIC="0", semantic_expected=False),
+        config_path=_config(tmp_path))
     assert ok is True, why
-    assert "行为等价" in why
+    assert "语义路关" in why
 
 
-def test_dependency_free_off_still_warns_to_set_flag():
-    """3.13 无依赖时行为确实等价，但要提醒显式设 0 复跑（R908 的 B/C 对照）。"""
+def test_dependency_free_off_still_warns_to_set_flag(tmp_path):
+    """无依赖时行为确实等价，但要提醒显式设 0 复跑（R908 的 B/C 对照）。"""
     ok, why = ev.production_parity(
         _fp(python="3.13.14", AGENTHUB_SEMANTIC="(unset)",
             deps={"numpy": False, "onnxruntime": False, "torch": False},
-            semantic_expected=False))
+            semantic_expected=False),
+        config_path=_config(tmp_path))
     assert ok is True
     assert "AGENTHUB_SEMANTIC=0" in why
 
 
-def test_guard_line_warns_when_not_parity(hub_root):
+def test_guard_line_warns_when_not_parity(hub_root, tmp_path):
     import brain
     brain.init_db(str(hub_root))
-    line = ev.env_guard_line(str(hub_root))
+    line = ev.env_guard_line(str(hub_root), config_path=_config(tmp_path))
     for needle in ("env=", "db=", "不得据此改生产默认档",
                    "非生产同构", "AGENTHUB_SEMANTIC"):
         assert needle in line, (needle, line)

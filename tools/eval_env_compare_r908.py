@@ -3,9 +3,9 @@
 
 R907 发现同一份代码、同一个真库，换解释器就从 24/31=77.4% 掉到 20/29=69.0%。
 本工具把三种环境一次性跑出来，落成对照表，供以后每轮回放时核对：
-  A. py311 + 语义开（历史 A/B 的环境，R900/R901 在这上面标定参数）
-  B. py311 + AGENTHUB_SEMANTIC=0（**生产 MCP 同构**，`~/.workbuddy/mcp.json`）
-  C. py313 无语义依赖（工具链默认 python，语义路自然关闭）
+  A. py311 + 当前 `~/.workbuddy/mcp.json` 的生产语义配置
+  B. py311 + AGENTHUB_SEMANTIC=0（固定关闭对照）
+  C. 工具链默认 python（语义路取决于它自己的依赖；与 A 同指纹时由 dup_notes 说破）
 
 口径不变：每档都跑同一个 `tools/recall_eval.py`，只改解释器与环境变量。
 用法：
@@ -14,6 +14,7 @@ R907 发现同一份代码、同一个真库，换解释器就从 24/31=77.4% �
 """
 import argparse
 import os
+import re
 import subprocess
 import sys
 from pathlib import Path
@@ -22,13 +23,15 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _console  # noqa: E402,F401  R911：会 print 的独立脚本必须装 UTF-8 守卫
+import recall_eval as ev  # noqa: E402
 
 EVAL = ROOT_DIR / "tools" / "recall_eval.py"
 PY311 = Path("D:/python311/python.exe")
 
 
 def _find_default_python() -> str:
-    """找那个没有语义依赖的默认 python（3.13）。"""
+    """工具链默认 python（R907 时是 3.13 依赖全无；R933 实测已变成依赖齐全的 3.11，
+    是否还是独立对照由 dup_notes 按指纹判定，不靠这里的假设）。"""
     import shutil
     p = shutil.which("python")
     return p or sys.executable
@@ -61,18 +64,49 @@ def _run(label: str, exe: str, env_extra: dict) -> dict:
     return out
 
 
+def _configs(py311: str, py313: str, config_path: str = "") -> list:
+    enabled, _source = ev.production_semantic_enabled(config_path)
+    if enabled is None:
+        return []
+    a_state = "开" if enabled else "关"
+    a_env = {} if enabled else {"AGENTHUB_SEMANTIC": "0"}
+    # C 档只说「默认档」：它有没有语义依赖要跑了才知道。写死「无语义依赖」在 R933
+    # 实测是假话——默认 python 已是依赖齐全的 3.11，与 A 档同指纹。
+    return [
+        (f"A py311 生产配置（语义{a_state}）", py311, a_env),
+        ("B py311 语义关（固定关闭对照）", py311, {"AGENTHUB_SEMANTIC": "0"}),
+        (f"C {Path(py313).name} 默认档（语义跟随依赖）", py313, {}),
+    ]
+
+
+_ENV_KEY_RE = re.compile(r"env=([0-9a-f]{6,})")
+
+
+def dup_notes(rows: list) -> list:
+    """同 env 指纹的两档跑的是同一套召回行为，不是独立对照——报表必须自己说破。"""
+    groups = {}
+    for r in rows:
+        m = _ENV_KEY_RE.search(str(r.get("fp_line") or ""))
+        if not m:
+            continue
+        groups.setdefault(m.group(1), []).append(str(r.get("label") or "?").split()[0])
+    return [f"  ⚠ 同环境指纹 {k}：{'/'.join(v)} 是同一套召回行为，不构成独立对照"
+            for k, v in groups.items() if len(v) > 1]
+
+
 def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default="")
     ap.add_argument("--py311", default=str(PY311))
     ap.add_argument("--py313", default="")
+    ap.add_argument("--config", default="", help="生产 MCP 配置（默认 ~/.workbuddy/mcp.json）")
     args = ap.parse_args()
     py313 = args.py313 or _find_default_python()
-    cfgs = [
-        ("A py311 语义开（历史 A/B 环境）", args.py311, {}),
-        ("B py311 语义关（生产 MCP 同构）", args.py311, {"AGENTHUB_SEMANTIC": "0"}),
-        (f"C {Path(py313).name} 无语义依赖", py313, {}),
-    ]
+    enabled, source = ev.production_semantic_enabled(args.config)
+    if enabled is None:
+        print(f"无法验收生产语义路：{source}")
+        return 2
+    cfgs = _configs(args.py311, py313, args.config)
     rows = [_run(*c) for c in cfgs]
     lines = ["R908 三种运行环境评测基线对照（同一份代码 / 同一个真库 / 同一批 32 条语料）", ""]
     for r in rows:
@@ -84,8 +118,10 @@ def main() -> int:
             if r.get(k):
                 lines.append("  " + r[k])
         lines.append("")
-    lines.append("结论：三档的 env 指纹不同 → 按 R908 口径，Recall@3 数字不得跨档直接比较；")
-    lines.append("生产行为以 B 档（AGENTHUB_SEMANTIC=0）为准，A 档只是历史 A/B 的标定环境。")
+    lines += dup_notes(rows)
+    lines.append("")
+    lines.append("结论：A 档按当前生产 MCP 配置运行；A/B 的唯一行为差异是语义开关，可直接对照。")
+    lines.append(f"当前生产语义配置：{source}")
     text = "\n".join(lines) + "\n"
     print(text, end="")
     if args.out:

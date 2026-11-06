@@ -30,6 +30,7 @@ ROOT_DIR = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 import _console  # noqa: E402,F401
+import brain  # noqa: E402  R933：关闭判据用 brain.sem_env_off，别在工具里另发明一套
 
 KEY = "AGENTHUB_SEMANTIC"
 SERVER = "agenthub"
@@ -49,8 +50,9 @@ def status(path: Path) -> dict:
         return {"exists": False, "path": str(path)}
     data = load(path)
     env = server_env(data)
-    return {"exists": True, "path": str(path), "flag": env.get(KEY, "(unset)"),
-            "semantic": "off" if env.get(KEY) == "0" else "on",
+    flag = env.get(KEY)
+    return {"exists": True, "path": str(path), "flag": "(unset)" if flag is None else str(flag),
+            "semantic": "off" if brain.sem_env_off(flag) else "on",
             "command": data["mcpServers"][SERVER].get("command", ""),
             "servers": len(data.get("mcpServers", {}))}
 
