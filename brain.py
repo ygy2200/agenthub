@@ -8696,6 +8696,14 @@ RECALL_CONF_MIN = 0.0
 # 保留默认关而非常开的理由与 R899/R901/R943 同款：只允许同库 A/B 证明「假阳性下降
 # 且 Recall@3 不掉」后才改默认档；判据写在 tools/abstention_floor_ab_r946.py 里。
 RECALL_ABSTAIN_MIN_COV = 0.0
+# R953（B116）：时间限窗「只约束候选、不重排」。R948 真库对照 8 组里 6/8 去掉时间词
+# 后注入逐条相同、含时间词档注入 5 条中 4 条日期越窗——记忆召回路径此前一次都没接
+# _parse_time_range（记录检索接了，但那是加分重排）。默认 0=off，与 R899/R901/R943/
+# R946 同款：只允许同库 A/B 证明「越窗率下降且 Recall@3 不掉」后才改默认档。
+# R946 实测动评分会把 Recall@3 打掉 19.4pp，所以这里只从候选池删行：打分用的
+# idf 锁在过滤前的完整池（绝不间接改剩余候选的分数与顺序），rare_line 则仍按
+# 实际池自适应（R871），不人为抬高准入线。
+RECALL_TIME_WINDOW = 0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
 # R916：词法候选池深度。R915 只读探针（32 条语料 / 50 个期望答案）实测：
 #   limit=40 → 44 进池；100 → 48；200/400 仍 48（平台段）。
@@ -9570,7 +9578,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
            "weak_picked": 0, "weak_picked_id": 0,
            # R918：全库稀有度救援（默认 off），A/B 量具据此计触发与精准率
-           "corpus_rescued": 0, "corpus_rescued_id": 0}
+           "corpus_rescued": 0, "corpus_rescued_id": 0,
+           # R953：时间限窗诊断。time_window=[lo,hi]，空数组 = 默认关或这句没时间词；
+           # time_window_dropped = 因日期越窗被剔掉的候选条数（记忆+记录合并计）。
+           "time_window": [], "time_window_dropped": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9632,10 +9643,32 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         return out
     # R825：先算池内区分度，再打分。这一步不动召回集（谁会进候选），只动排序——
     # 把「命中了一堆泛词」和「命中了一个精确词」区分开。
+    # R953（B116）：时间限窗只在这句话真带时间词时生效；默认关时连正则都不跑
+    # （钩子路径上任何为实验付的固定成本最终都会变成用户感知的延迟）。
+    trange = _parse_time_range(prompt) if RECALL_TIME_WINDOW > 0 else None
+    if trange:
+        out["time_window"] = [trange[0], trange[1]]
+    # 打分用的 idf 一律按**过滤前的完整池**算：删一条越窗旧候选若顺带改了 idf，
+    # 剩下候选的分数和顺序都会变——那是重排不是约束（R946 实锤代价）。
     mem_texts = [str(r.get("content") or "") + " " + str(r.get("tags") or "")
                  for r in mems]
     mem_idf = _recall_idf(mem_texts, terms)
     mem_idf_raw = _recall_idf(mem_texts, terms, weighted=False)
+    if trange:
+        # 日期口径复用 R913 的 _memory_dates（updated 优先 / created 兜底 / 按 id 批查），
+        # 不信行里带没带 created——三条检索通道 SELECT 的列不保证一致。
+        try:
+            mdates = _memory_dates(root, [r.get("id") for r in mems])
+        except sqlite3.Error:
+            mdates = {}
+        kept = []
+        for r in mems:
+            d = mdates.get(int(r.get("id") or 0), "") or _row_date(r)
+            if d and not (trange[0] <= d <= trange[1]):
+                out["time_window_dropped"] += 1
+                continue
+            kept.append(r)   # 取不到日期一律 fail-open 保留：宁可少滤也不误杀
+        mems = kept
     # R899：只在语义路已预热时取分（模型没加载就返回空表，钩子路径不会被拖慢）。
     # fail-open：任何异常都退回纯词法，召回宁可少一项信号，不能因为可选能力炸掉。
     sem_map = {}
@@ -9729,6 +9762,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     # R826：**逐条**筛「至少命中一个稀有词」的，而不是整批判弱。
     # 整批判会误伤：提问里既有泛词也有精确词时（「qfluentwidgets 中文被截断」），
     # 排序第一那条可能只命中泛词，整批就被砍了——真正精确的那条明明在第 2 位。
+    # R953：idf 锁在完整池（不重排）；rare_line 仍按当前实际参与比较的池缩放
+    # （R871 自适应），不人为抬高准入线——否则删掉越窗候选会把窗内候选一起判弱。
     rare_line = _recall_rare_threshold(len(mems))
     strong, weak = [], []
     for pair in scored:
@@ -9849,11 +9884,21 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         recs = search_records(root, query, limit=30)
     except sqlite3.Error:
         recs = []
-    rec_scored = []
-    now_dt = datetime.datetime.now()
+    # R953：记录路同样受窗口约束，口径与记忆路一致。
     rec_texts = [str(r.get("title") or "") + " " + str(r.get("content") or "") for r in recs]
     rec_idf = _recall_idf(rec_texts, terms)
     rec_idf_raw = _recall_idf(rec_texts, terms, weighted=False)
+    if trange:
+        kept = []
+        for r in recs:
+            d = _row_date(r)          # 记录行带 date 列；取不到日期 fail-open 保留
+            if d and not (trange[0] <= d <= trange[1]):
+                out["time_window_dropped"] += 1
+                continue
+            kept.append(r)
+        recs = kept
+    rec_scored = []
+    now_dt = datetime.datetime.now()
     for r in recs:
         title = str(r.get("title") or "")
         body = title + " " + str(r.get("content") or "")
