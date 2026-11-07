@@ -8709,6 +8709,14 @@ RECALL_ABSTAIN_MIN_COV = 0.0
 # 越窗错答案、3 组保留窗内答案，没有一组「窗内有用答案被误删」。
 # 回滚：本行改回 0 即恢复 R952 及以前的旧行为。
 RECALL_TIME_WINDOW = 1
+# R960（B118）：窗内候选的命中门槛放宽，默认 0=off。R955/R956 只读取证：
+# 开窗后「上周的踩坑经验有哪些」窗内确有 15 条候选，却全被 hit 闸门删光
+# （need=2，只命中 1 个词就出局）。时间窗已把窗外噪声挡掉，窗内再守 need=2
+# 等于双重过滤。只在「开窗 + 确认日期落在窗内」的候选上把 need 降到 1；
+# 无日期 fail-open 候选不打标、不放宽，否则无日期噪声一起灌进来。
+# 与 R946 同款纪律：只允许同库 A/B 证明「零注入下降且 Recall@3/噪声不退化」
+# 后才改默认档。回滚：本行改回 0，生产行为逐位恢复 R959。
+RECALL_TIME_HIT_RELAX = 0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
 # R916：词法候选池深度。R915 只读探针（32 条语料 / 50 个期望答案）实测：
 #   limit=40 → 44 进池；100 → 48；200/400 仍 48（平台段）。
@@ -9586,7 +9594,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "corpus_rescued": 0, "corpus_rescued_id": 0,
            # R953：时间限窗诊断。time_window=[lo,hi]，空数组 = 默认关或这句没时间词；
            # time_window_dropped = 因日期越窗被剔掉的候选条数（记忆+记录合并计）。
-           "time_window": [], "time_window_dropped": 0}
+           "time_window": [], "time_window_dropped": 0,
+           # R960：本轮因窗内放宽而多放进打分的候选条数（记忆+记录合并计）。
+           "time_hit_relaxed": 0}
     if not root or not os.path.isdir(root):
         return out
     if _looks_like_system_message(prompt):
@@ -9672,6 +9682,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             if d and not (trange[0] <= d <= trange[1]):
                 out["time_window_dropped"] += 1
                 continue
+            # R960：只有「确认窗内」的候选才够格享受放宽；取不到日期的
+            # fail-open 候选不打标，保持原门槛，不许把噪声一起放进来。
+            if d:
+                r["_tw_inside"] = 1
             kept.append(r)   # 取不到日期一律 fail-open 保留：宁可少滤也不误杀
         mems = kept
     # R899：只在语义路已预热时取分（模型没加载就返回空表，钩子路径不会被拖慢）。
@@ -9718,9 +9732,16 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             continue
         body = str(r.get("content") or "") + " " + str(r.get("tags") or "")
         hit = _recall_hit_score(terms, body)
-        if hit < need:
+        # R960：默认关时 eff_need 恒等于 need（逐位零回归）；开窗+放宽时
+        # 只把确认窗内候选的门槛降到 1。不动 spec / idf / rare_line。
+        eff_need = (1 if (RECALL_TIME_HIT_RELAX > 0 and r.get("_tw_inside"))
+                    else need)
+        if hit < eff_need:
             out["dropped"]["hit"] += 1
             continue
+        # 只数「旧门槛下本会被删、因放宽才进打分池」的；本就能过的强候选不算。
+        if eff_need < need and hit < need:
+            out["time_hit_relaxed"] += 1
         wid = _recall_weighted_hit(terms, mem_idf, body)
         # R943：置信度分档的过滤档（默认 0=off）。放在 hit 闸门之后计数，口径是
         # 「本来能参与打分、被置信度线删掉」——与 dropped.hit/rare 互不重叠。
@@ -9900,6 +9921,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             if d and not (trange[0] <= d <= trange[1]):
                 out["time_window_dropped"] += 1
                 continue
+            if d:
+                r["_tw_inside"] = 1   # R960：同记忆路，只放宽确认窗内的记录
             kept.append(r)
         recs = kept
     rec_scored = []
@@ -9908,8 +9931,12 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         title = str(r.get("title") or "")
         body = title + " " + str(r.get("content") or "")
         hit = _recall_hit_score(terms, body)
-        if hit < need:
+        eff_need = (1 if (RECALL_TIME_HIT_RELAX > 0 and r.get("_tw_inside"))
+                    else need)
+        if hit < eff_need:
             continue
+        if eff_need < need and hit < need:
+            out["time_hit_relaxed"] += 1
         spec = _recall_weighted_hit(terms, rec_idf, body) * 2.2 \
             + _recall_hit_score(terms, title)
         if pname and (r.get("project") or "") == pname:
