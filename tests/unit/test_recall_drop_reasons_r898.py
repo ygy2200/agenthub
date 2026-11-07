@@ -42,7 +42,10 @@ def test_dropped_counters_exist_even_when_nothing_is_searched(hub_root, tmp_path
     import brain
     brain.init_db(str(hub_root))
     out = _recall(hub_root, "继续", tmp_path)
-    assert out["dropped"] == {"hit": 0, "rare": 0, "immune": 0, "cap": 0}, out["dropped"]
+    # R943 把 dropped 扩到五类（增 conf，默认恒 0）：本条的意图是「量具读不到键就炸」，
+    # 所以断言四类原键仍在且全 0，而不是锁死字典的全集。
+    assert set(out["dropped"]) >= {"hit", "rare", "immune", "cap"}, out["dropped"]
+    assert all(out["dropped"][k] == 0 for k in ("hit", "rare", "immune", "cap")), out["dropped"]
 
 
 def test_hit_shortfall_counted_and_not_injected(hub_root, tmp_path, monkeypatch):

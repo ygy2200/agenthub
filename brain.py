@@ -6392,6 +6392,32 @@ def _memory_dates(root: str, ids: list) -> dict:
     return out
 
 
+def _memory_confidence(root: str, ids: list) -> dict:
+    """R943：批量取候选的 confidence（{id: float}），供分档 A/B 用。
+
+    为什么要回查而不是信行里带的：检索有三条通道（LIKE/BM25/语义），各自 SELECT 的
+    列不完整，只有 LIKE 路是 `SELECT *`；一条只在 BM25 路出现的候选行里就没有
+    confidence，按「缺失=1.0」处理会把低置信候选当成满置信。与 _memory_counters /
+    _memory_dates 同款一次批查。
+
+    只在 RECALL_CONF_W>0 或 RECALL_CONF_MIN>0 时被调用（默认关 → 钩子路径零额外
+    SQL，单次召回的耗时不许因为一个实验开关变差）。
+    """
+    want = [int(i) for i in (ids or []) if str(i).lstrip("-").isdigit()]
+    if not want:
+        return {}
+    marks = ",".join("?" * len(want))
+    out = {}
+    with db_conn(root) as conn:
+        for r in conn.execute(
+                f"SELECT id, confidence FROM memories WHERE id IN ({marks})", want):
+            try:
+                out[int(r["id"])] = float(r["confidence"])
+            except (TypeError, ValueError):
+                out[int(r["id"])] = 1.0
+    return out
+
+
 def _bump_access(root: str, ids: list, now: str = "") -> None:
     """命中即记一次唤起（use_count+1 + last_hit）——**只给主动检索用**（R829 口径切分）。
     主动拉取（hub_search / 拦截命中）才是「这条记忆有用」的证据，被动推给对方看一眼不是：
@@ -8607,6 +8633,17 @@ RECALL_REL_MARGIN = 0.62
 # 权重 10 是「0.66 × 10 ≈ 6.6 分」的量级——够翻 2–3 分的排序差，又不足以让一条
 # 语义相似但词法零命中的候选越级（那种要靠 B071 后半段的闸门救援，另立一轮）。
 RECALL_SEM_RERANK_W = 10.0
+# R943（B112）：confidence 分档实验的两个旋钮——**默认全关，只为可复跑的只读 A/B 保留**。
+# 现状（R939 量化 + R943 复核）：confidence 列 591 条里 526 条恒 1.0，全库唯一的读取点是
+# 记忆去重的 `_MEM_QUALS` 质量裁决，检索路径一次都没读过它——所以「按置信度分档」在
+# 生产上等于不存在。两个旋钮代表两种可能的分档用法：
+#   RECALL_CONF_W   ：重排时 spec += W*(conf-1) 降权（conf=1.0 时零影响）
+#   RECALL_CONF_MIN ：低于该值直接不进候选（0=off）
+# 保留而不删的理由与 R907/R918 同款：默认档位下行为一字不变（关闭时**一次库都不查**，
+# spec 项也不加），量具 tools/confidence_ab_r943.py 只切这两个常量即可复跑；
+# A/B 结论（改动任何一条检索结论了吗）写在量具 docstring 与本轮台账里。
+RECALL_CONF_W = 0.0
+RECALL_CONF_MIN = 0.0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
 # R916：词法候选池深度。R915 只读探针（32 条语料 / 50 个期望答案）实测：
 #   limit=40 → 44 进池；100 → 48；200/400 仍 48（平台段）。
@@ -9470,7 +9507,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            # R898：候选为什么没进注入，分四类计数。此前只有 muted 与「有没有命中」，
            # 于是「答案没被召回」和「答案被闸门删了」在报表上长得一模一样——R898 量
            # #02/#08 两条 miss 时只能靠外部脚本复算才能区分，这里把它变成函数输出。
-           "dropped": {"hit": 0, "rare": 0, "immune": 0, "cap": 0},
+           # R943 增 conf：仅当 RECALL_CONF_MIN>0（A/B 档）时可能非零，默认永远 0。
+           "dropped": {"hit": 0, "rare": 0, "immune": 0, "cap": 0, "conf": 0},
            # R899：本轮拿到语义分的候选条数（0 = 语义路没预热/未启用，走纯词法）
            "sem_scored": 0,
            # R900：闸门救援实际放进注入的条数（默认 0；-1 表示本档未启用）
@@ -9561,6 +9599,15 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         acct = _memory_counters(root, [r.get("id") for r in mems])
     except sqlite3.Error:
         acct = {}
+    # R943：confidence 分档（默认关）。关闭时连这条 SQL 都不发——钩子路径上任何
+    # 「为实验付的固定成本」最终都会变成用户感知的延迟。读库失败按满置信处理
+    # （fail-open）：一个可选的排序信号不许把整轮召回带走。
+    conf_map: dict = {}
+    if RECALL_CONF_W > 0 or RECALL_CONF_MIN > 0:
+        try:
+            conf_map = _memory_confidence(root, [r.get("id") for r in mems])
+        except sqlite3.Error:
+            conf_map = {}
     muted = 0
     scored = []
     for r in mems:
@@ -9583,6 +9630,12 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             out["dropped"]["hit"] += 1
             continue
         wid = _recall_weighted_hit(terms, mem_idf, body)
+        # R943：置信度分档的过滤档（默认 0=off）。放在 hit 闸门之后计数，口径是
+        # 「本来能参与打分、被置信度线删掉」——与 dropped.hit/rare 互不重叠。
+        conf = float(conf_map.get(int(r.get("id") or 0), 1.0))
+        if RECALL_CONF_MIN > 0 and conf < RECALL_CONF_MIN:
+            out["dropped"]["conf"] += 1
+            continue
         # 这一条命中的词里，最稀有的那个有多稀有（不带权重）——R826 的分流门槛。
         # 必须用小写体比对：正文里写的是「PyInstaller」，检索词全小写，直接 in 会
         # 全部判不中，ASCII 标识符等于没参与打分（2026-10-31 实测踩到）。
@@ -9594,6 +9647,11 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         r["_recall_best"] = best_raw
         kind = r.get("kind") or "note"
         spec = wid * 2.2 + kind_weights.get(kind, 0.4) + (0.8 if r.get("pinned") else 0)
+        # R943：置信度降权档（默认 0=off）。写成 (conf-1) 而不是乘性系数：conf=1.0 时
+        # 严格加 0.0，保证默认全 1.0 的真库上 A/B 的两档**逐位相同**——差异只可能来自
+        # 真正低于 1.0 的那些行，量具据此判断「分档到底动没动任何一条结论」。
+        if RECALL_CONF_W > 0:
+            spec += RECALL_CONF_W * (conf - 1.0)
         if pname and (r.get("project") or "") == pname:
             spec += 1.0
         elif not r.get("project"):
