@@ -8644,6 +8644,14 @@ RECALL_SEM_RERANK_W = 10.0
 # A/B 结论（改动任何一条检索结论了吗）写在量具 docstring 与本轮台账里。
 RECALL_CONF_W = 0.0
 RECALL_CONF_MIN = 0.0
+# R946（B114）：弃答地板，默认 0=off。相对 top-k 的结构性洞——只要候选池非空，
+# 过稀有词闸门的头几条就一定被注入；「命中一个外壳实体词、核心意图词在库里零命中」
+# 这整类从来没被拦过。R945 真库基线：有效 9 条里 4 条假阳性（44.4%），纯陌生组
+# 4/4 全对、近形诱饵组 4/5 中招。coverage 低于此线时清空 picked/rec_rows，复用
+# R826 已有的「库里没有能当结论的东西」文案，不发明第二套话术。
+# 保留默认关而非常开的理由与 R899/R901/R943 同款：只允许同库 A/B 证明「假阳性下降
+# 且 Recall@3 不掉」后才改默认档；判据写在 tools/abstention_floor_ab_r946.py 里。
+RECALL_ABSTAIN_MIN_COV = 0.0
 RECALL_PICK_CAP = 3          # 记忆通道每次最多几条
 # R916：词法候选池深度。R915 只读探针（32 条语料 / 50 个期望答案）实测：
 #   limit=40 → 44 进池；100 → 48；200/400 仍 48（平台段）。
@@ -9511,6 +9519,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "dropped": {"hit": 0, "rare": 0, "immune": 0, "cap": 0, "conf": 0},
            # R899：本轮拿到语义分的候选条数（0 = 语义路没预热/未启用，走纯词法）
            "sem_scored": 0,
+           # R946：提问词在候选池（记忆+记录）里的覆盖率，只读诊断，默认也输出。
+           "term_coverage": 0.0, "abstained": 0, "abstain_dropped": 0,
            # R900：闸门救援实际放进注入的条数（默认 0；-1 表示本档未启用）
            "sem_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
@@ -9823,6 +9833,16 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     rec_strong = [(s, r) for s, r in rec_scored
                   if float(r.get("_recall_best") or 0.0) >= _recall_rare_threshold(len(recs))]
     rec_rows = _recall_pick_margin(rec_strong, RECALL_RECORD_CAP)
+    # R946（B114）：弃答地板。覆盖率按「记忆池 + 记录池」合并算——只算记忆池会把
+    # 「答案只在记录路」的样本误判成无答案（recall_eval #11 的标签就是 rec 路）。
+    # 两池都是本轮已取回的候选，不额外查库；默认阈值 0 时这段只填诊断字段。
+    _pool_lc = [s.lower() for s in list(mem_texts) + list(rec_texts)]
+    _matched = sum(1 for t, _ in terms if any(t in s for s in _pool_lc))
+    out["term_coverage"] = round(_matched / max(1, len(terms)), 3)
+    if RECALL_ABSTAIN_MIN_COV > 0 and out["term_coverage"] < RECALL_ABSTAIN_MIN_COV:
+        out["abstained"] = 1
+        out["abstain_dropped"] = len(picked) + len(rec_rows)
+        picked, rec_rows = [], []
     # R836：叮嘱型提示不当检索词——相关历史不给口语切片噪声。
     # R863：这句虽是「继续」，但检索词来自上一轮话题（context_used），历史照常给。
     if _is_coaching_prompt(prompt) and not out["context_used"]:
