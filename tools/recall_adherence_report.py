@@ -67,22 +67,34 @@ def explain_empty(root: str, days: int = 30) -> dict:
     必须分开报（大脑记忆 #581），拿总数谈优先级会把装置噪声当需求。
     """
     cutoff = brain._days_ago(days)
-    by_origin, by_reason = {}, {}
+    by_origin, by_reason, by_strength = {}, {}, {}
     prod = dev = 0
+    # R964/B042：第三维「档位」。R950 复评时 error 档只按总数挂着，看不出它
+    # 到底有没有被判、判不了是生产行还是装置行。按 (origin, reason, strength)
+    # 三键分组，一次查询同时喂三张表，不给钩子/报表路径加固定成本。
     with brain.db_conn(root) as conn:
         rows = conn.execute(
-            "SELECT origin, fp_reason, count(*) FROM recall_adherence "
-            f"WHERE {EMPTY_FP_WHERE} AND ts >= ? GROUP BY 1,2", (cutoff,)).fetchall()
-    for origin, reason, n in rows:
+            "SELECT origin, fp_reason, COALESCE(strength,'(blank)'), count(*) "
+            "FROM recall_adherence "
+            f"WHERE {EMPTY_FP_WHERE} AND ts >= ? GROUP BY 1,2,3", (cutoff,)).fetchall()
+    for origin, reason, strength, n in rows:
         o = origin or "(blank)"
         r = reason or "legacy"
+        s = strength or "(blank)"
         by_origin[o] = by_origin.get(o, 0) + n
         by_reason[r] = by_reason.get(r, 0) + n
+        b = by_strength.setdefault(
+            s, {"total": 0, "production": 0, "device": 0, "by_reason": {}})
+        b["total"] += n
+        b["by_reason"][r] = b["by_reason"].get(r, 0) + n
         if o in brain.PRODUCTION_ORIGINS:
             prod += n
+            b["production"] += n
         elif o in brain.DEVICE_ORIGINS:
             dev += n
+            b["device"] += n
     return {"by_origin": by_origin, "by_reason": by_reason,
+            "by_strength": by_strength,
             "production": prod, "device": dev, "total": prod + dev}
 
 
@@ -109,6 +121,18 @@ def main() -> int:
         print(f"  生产 {e['production']} · 装置 {e['device']} · 合计 {e['total']}")
         print(f"  按来历：{e['by_origin']}")
         print(f"  按成因：{e['by_reason']}  （legacy = 采集上线前的历史行）")
+        # R964/B042：档位分栏。error 样本不足只报数，不对该档优劣下结论
+        # （30 笔判过是本库自设的最小观察线，见 by_directive 段）。
+        print(f"  按档位：{dict((k, v['total']) for k, v in e['by_strength'].items())}")
+        for name, b in sorted(e["by_strength"].items(),
+                              key=lambda kv: -kv[1]["total"]):
+            print(f"    {name:<10} 共 {b['total']:>4}"
+                  f"（生产 {b['production']} · 装置 {b['device']}）"
+                  f"  成因 {b['by_reason']}")
+        eb = e["by_strength"].get("error", {}).get("total", 0)
+        if eb < 30:
+            print(f"  error 档判不了仅 {eb} 条（观察线 30 笔）：只报数，"
+                  "不对该档优劣下结论（B042 仍待样本）")
         return 0
 
     if a.mark:
