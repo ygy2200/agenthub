@@ -7014,10 +7014,42 @@ def _month_from_token(t: str) -> int | None:
     return _CN_MONTH.get(t)
 
 
+_CN_TIME_DIGIT = {"一": 1, "二": 2, "两": 2, "三": 3, "四": 4, "五": 5,
+                  "六": 6, "七": 7, "八": 8, "九": 9}
+
+
+def _int_from_time_token(t: str):
+    """R949：把「3」/「三」/「十」/「十一」/「二十」/「二十三」转成 1..999。
+
+    解析不出来返回 None，调用方据此 fail-open——**绝不悄悄塞一个默认值进去**。
+    「给个看似合理的错区间」比「没解析出来」更坏：调用方无从察觉（记忆 #169）。
+    """
+    t = (t or "").strip()
+    if t.isdigit():
+        v = int(t)
+        return v if 1 <= v <= 999 else None
+    if not t:
+        return None
+    if t == "十":
+        return 10
+    if t.startswith("十"):
+        rest = _CN_TIME_DIGIT.get(t[1:])
+        return 10 + rest if rest else None
+    if "十" in t:
+        hi_s, _, lo_s = t.partition("十")
+        hi = _CN_TIME_DIGIT.get(hi_s)
+        if not hi:
+            return None
+        lo = _CN_TIME_DIGIT.get(lo_s, 0) if lo_s else 0
+        return hi * 10 + lo if (not lo_s or lo) else None
+    return _CN_TIME_DIGIT.get(t)
+
+
 def _parse_time_range(q: str) -> tuple[str, str] | None:
     """P0-2 时间语义解析：把中文相对/绝对时间词转成 [lo, hi] 日期区间（YYYY-MM-DD）。
     无时间词 → None（调用方不触发 boost，fail-open，零回归风险）。
-    支持：最近/近[N][天周月年]、今天、昨天、本周、上周、本月、上个月、X月初/X月。
+    支持：最近/近[N][天周月年]（N 可为阿拉伯或中文数字）、今天、昨天、
+          本周、上周、本月、上个月、X月初/X月。
     口径：以今天为锚；未来月份（如 13 月）回退去年；月初=当月 1~10 日，整月=全月。
     解析失败/畸形 → None（绝不抛异常、绝不返回错误区间污染排序）。"""
     q = (q or "").strip()
@@ -7025,14 +7057,26 @@ def _parse_time_range(q: str) -> tuple[str, str] | None:
         return None
     today = datetime.date.today()
     td = datetime.timedelta
-    # 最近/近（+ 可选 N + 单位），单位可省略（默认 30 天）
-    m = re.search(r"(最近|近)\s*(\d{1,3})?\s*(天|日|周|星期|月|年)?", q)
+    # R949：最近/近 + 数量（阿拉伯**或中文**数字）+ 时间单位。
+    # 旧正则 (\d{1,3})? 只认阿拉伯数字：「最近三天」的「三」匹配不到 group(2)，
+    # 单位又是可选的，整句静默回落成「最近 → 默认 30 天」，给一个看似合理的
+    # 错区间（R948 只读探针实测 2026-10-08~11-07，正确答案应是 11-04~11-07）。
+    # 修法：数量与时间单位**必须成对出现**——「最近一起事故」的「一」后面不是
+    # 单位，不会被当成 1 天；解析不出数量时维持原有默认 30 天，不改旧行为。
+    m = re.search(
+        r"(最近|近)\s*(\d{1,3}|[一二两三四五六七八九十]{1,3})\s*(天|日|周|星期|月|年)",
+        q)
     if m:
-        n = int(m.group(2)) if m.group(2) else 30
-        unit = m.group(3) or "天"
-        days = {"天": n, "日": n, "周": n * 7, "星期": n * 7,
-                "月": n * 30, "年": n * 365}[unit]
-        lo = (today - td(days=days)).isoformat()
+        n = _int_from_time_token(m.group(2))
+        if n:
+            unit = m.group(3)
+            days = {"天": n, "日": n, "周": n * 7, "星期": n * 7,
+                    "月": n * 30, "年": n * 365}[unit]
+            lo = (today - td(days=days)).isoformat()
+            return (lo, today.isoformat())
+    # 只有「最近/近」、没有可解析的数量+单位：维持原有默认 30 天。
+    if re.search(r"最近|近", q):
+        lo = (today - td(days=30)).isoformat()
         return (lo, today.isoformat())
     if re.search(r"今天|今日", q):
         return (today.isoformat(), today.isoformat())
