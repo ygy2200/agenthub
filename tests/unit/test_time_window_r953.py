@@ -10,8 +10,11 @@ R946 又证明动评分/闸门会把代价外溢到 Recall@3（-19.4pp），所�
 R913 的 `_memory_dates`（updated 优先、created 兜底、按 id 回查），
 取不到日期一律 fail-open 保留——宁可少滤也不误杀。
 
-判据口径：默认 0=off；开窗时 `time_window` / `time_window_dropped` 必须可观测；
+判据口径：开窗时 `time_window` / `time_window_dropped` 必须可观测；
 无时间词的提问开关前后逐位相同。旧码上这些字段和常量都不存在 → 全红。
+
+R957：默认档已合入 1（依据 R954/R956）。用例一律显式切 0/1 两档，不把
+当前默认值写死在断言里——默认值是策略，两档差异才是不变量。
 """
 import datetime as dt
 
@@ -39,15 +42,19 @@ def _mem(i, text="门禁结果怎么查"):
     return {"id": i, "content": text, "tags": "", "kind": "lesson"}
 
 
-def test_default_is_off_and_diagnostics_exist(hub_root, tmp_path, monkeypatch):
+def test_default_is_on_and_off_still_observable(hub_root, tmp_path, monkeypatch):
+    """R957：默认档合入 1；显式切 0 仍是一对一的旧行为（回滚出口可验）。"""
     import brain
     brain.init_db(str(hub_root))
-    assert brain.RECALL_TIME_WINDOW == 0
-    _patch(monkeypatch, [_mem(1)])
-    out = _recall(hub_root, "昨天的门禁结果", tmp_path)
-    assert out.get("time_window") == [], out
-    assert out.get("time_window_dropped") == 0, out
-    assert 1 in out["memory_ids"], out["memory_ids"]
+    assert brain.RECALL_TIME_WINDOW == 1
+    _patch(monkeypatch, [_mem(1)], dates={1: dt.date.today().isoformat()})
+    on = _recall(hub_root, "昨天的门禁结果", tmp_path, session="on")
+    assert on["time_window"], on
+    monkeypatch.setattr(brain, "RECALL_TIME_WINDOW", 0)
+    off = _recall(hub_root, "昨天的门禁结果", tmp_path, session="off")
+    assert off.get("time_window") == [], off
+    assert off.get("time_window_dropped") == 0, off
+    assert 1 in off["memory_ids"], off["memory_ids"]
 
 
 def test_enabled_window_drops_out_of_range_memories(hub_root, tmp_path, monkeypatch):
@@ -84,6 +91,7 @@ def test_no_time_word_keeps_behavior_identical(hub_root, tmp_path, monkeypatch):
     brain.init_db(str(hub_root))
     _patch(monkeypatch, [_mem(1), _mem(2)],
            dates={1: "2026-11-01", 2: "2026-11-06"})
+    monkeypatch.setattr(brain, "RECALL_TIME_WINDOW", 0)
     base = _recall(hub_root, "门禁结果怎么查", tmp_path, session="base")
     monkeypatch.setattr(brain, "RECALL_TIME_WINDOW", 1)
     on = _recall(hub_root, "门禁结果怎么查", tmp_path, session="on")
@@ -115,6 +123,7 @@ def test_time_window_does_not_change_scoring_weights(hub_root, tmp_path, monkeyp
     today = dt.date.today().isoformat()
     _patch(monkeypatch, [_mem(1, "门禁结果 甲"), _mem(2, "门禁结果 乙")],
            dates={1: today, 2: today})
+    monkeypatch.setattr(brain, "RECALL_TIME_WINDOW", 0)
     base = _recall(hub_root, "今天的门禁结果甲", tmp_path, session="base")
     monkeypatch.setattr(brain, "RECALL_TIME_WINDOW", 1)
     on = _recall(hub_root, "今天的门禁结果甲", tmp_path, session="on")
