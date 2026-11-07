@@ -93,7 +93,33 @@ function errorText(ev) {
     }
     return t.trim();
   }
+  // R971：命令整体 exit 0、但 stdout 里带 Python traceback（典型：`;` 串联把非零
+  // 退出码吃掉）。宿主不会标 isError，旧逻辑整段静默跳过——大脑明明登记过同类修法
+  // （R970 真库实测 error_recall 能命中 #20/#29），却卡在最后一百米递不出来。
+  // 只认**结构化** traceback，不认普通 "Error"/"ERROR" 字样，防误报灌上下文。
+  const out = asText(resp?.stdout ?? resp?.output ?? resp?.content ?? resp?.text ?? resp ?? '');
+  const tb = extractTraceback(out);
+  if (tb) {
+    logLine('traceback_from_stdout: isError 缺失但检出结构化 traceback');
+    return tb;
+  }
   return '';
+}
+
+/** R971 纯函数：只从 stdout 认 Python 结构化 traceback，返回「头 + 最后异常行」。
+ *  没有 Traceback 头、或找不到 `XxxError: ...` 异常行 → 空串（宁可漏也不误报）。
+ *  只回传这两行，别把整段 File "..." 栈帧和 stdout 文件名喂给签名抽取（R865 口径）。 */
+function extractTraceback(s) {
+  if (typeof s !== 'string' || !s.includes('Traceback (most recent call last):')) return '';
+  const lines = s.split(/\r?\n/);
+  const start = lines.findIndex(l => l.includes('Traceback (most recent call last):'));
+  let last = '';
+  for (let i = start + 1; i < lines.length; i++) {
+    if (/^\s*[A-Za-z_][\w.]*(Error|Exception)\s*:\s*\S/.test(lines[i])) last = lines[i].trim();
+  }
+  if (!last) return '';
+  const out = 'Traceback (most recent call last):\n' + last;
+  return out.length >= MIN_ERR_CHARS ? out : '';
 }
 
 function resolveRoot(ev) {
