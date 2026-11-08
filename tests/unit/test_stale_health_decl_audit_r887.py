@@ -33,12 +33,18 @@ def _seed(root, decl_text=None, tag=""):
 
 
 def test_pending_declaration_is_named_without_failing_check(hub_root):
-    """有未裁决声明：summary/detail 都要点名，但 ok 仍为 True。"""
+    """有未裁决声明：summary/detail 都要点名，但 ok 仍为 True。
+
+    R974 契约变更：摘要文案从「取代声明未裁决 N 组」改成「声明未裁决 N 组（取代x/修正y…）」，
+    因为点名范围扩到了修正/更正/纠正/推翻四类动词。断言随之改成**更严**的形状：
+    连动词分栏一起钉住，避免以后有人把分栏去掉还悄悄过。
+    """
     old = _seed(hub_root)
     r = ops._stale_health(hub_root)
     assert r["ok"] is True, "待判定是提示，不是故障：别让体检长期红"
-    assert "取代声明未裁决" in r["summary"], r
-    assert any("取代声明" in d for d in r["detail"]), r["detail"]
+    assert "声明未裁决" in r["summary"], r
+    assert "取代1" in r["summary"], r["summary"]
+    assert any("声明未裁决" in d for d in r["detail"]), r["detail"]
     assert any(f"#{old}" in d for d in r["detail"]), r["detail"]
     assert "hub_memory_supersede" in " ".join(r["detail"]), "必须给裁决入口"
 

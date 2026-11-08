@@ -1500,7 +1500,22 @@ def supersede_declaration_audit(root: str) -> dict:
     import sqlite3
     from pathlib import Path
 
-    decl_re = re.compile(r"取代(?:记忆)?\s*#?\s*(\d+)")
+    # R974：声明动词表。原来只认「取代」，真库实测 7 条「修正/更正记忆#N」全在审计
+    # 视野之外（#370→#71、#497→#495、#501→#500、#577→#279、#286→#284、#362→#360、
+    # #508→#506），其中 #71「GitHub 凭据全灭」、#495「DLSS 菜单消失=mod 与 exe 失配」
+    # 已被后条明确推翻却仍 live——「审计看不见」等于「机制不管」。三类外部一手材料
+    # （aicassindra / spacetimeagents / baylabs）都把 stale fact 列为记忆系统第一失效模式。
+    # 数字后不许紧跟 `-` / `/` / 数字：真库 #49「修正 2026-10-01 那次事故」会把年份
+    # 解析成记忆 id 2026。顺序＝动词优先级（同一对写多种时取最强）。
+    DECL_VERBS = (
+        ("取代", re.compile(r"取代(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
+        ("更正", re.compile(r"更正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
+        ("纠正", re.compile(r"纠正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
+        ("推翻", re.compile(r"推翻(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
+        ("修正", re.compile(r"修正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
+    )
+    # 「补充」是追加不是裁决：单列计数，不进 pending（真库 5 条）。
+    supplement_re = re.compile(r"补充(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")
     # 命中任一即表示「不是整条取代」，只能提示人工判定。顺序＝优先级。
     rules = (
         ("补充而非取代", ("补充而非取代", "而非取代", "补充而非")),
@@ -1534,32 +1549,46 @@ def supersede_declaration_audit(root: str) -> dict:
         con.close()
 
     declarations, skipped = [], []
+    supplement_declared = 0
     for mid, row in rows.items():
         body = str(row.get("content") or "")
-        ids = decl_re.findall(body)
-        if not ids:
+        found = []
+        for verb, rx in DECL_VERBS:
+            for raw in rx.findall(body):
+                found.append((verb, int(raw)))
+        has_supplement = bool(supplement_re.search(body))
+        if not found and not has_supplement:
             continue
         if is_selfdoc(row):
             skipped.append(mid)
             continue
-        declarations.append((mid, ids, body))
+        if has_supplement:
+            supplement_declared += 1
+        if not found:
+            continue
+        # 同一 (声明, 目标) 出现多种动词时只算一次，动词取优先级最高的
+        # （DECL_VERBS 顺序即优先级：取代 > 更正 > 纠正 > 推翻 > 修正）。
+        best = {}
+        for verb, tid in found:
+            if tid not in best:
+                best[tid] = verb
+        declarations.append((mid, best, body))
 
     pending, resolved, dangling = [], [], []
     seen = set()
     for mid, ids, body in declarations:
         cls = classify(body)
-        for raw in ids:
-            tid = int(raw)
+        for tid, verb in ids.items():
             if tid == mid or (mid, tid) in seen:
                 continue
             seen.add((mid, tid))
             target = rows.get(tid)
             if target is None:
-                dangling.append({"decl": mid, "target": tid, "class": cls})
+                dangling.append({"decl": mid, "target": tid, "class": cls, "verb": verb})
                 continue
             sup = int(target.get("superseded_by") or 0)
             live = sup == 0 and (target.get("status") or "active") not in retired
-            item = {"decl": mid, "target": tid, "class": cls,
+            item = {"decl": mid, "target": tid, "class": cls, "verb": verb,
                     "target_status": target.get("status"), "target_superseded_by": sup}
             (pending if live else resolved).append(item)
 
@@ -1573,7 +1602,10 @@ def supersede_declaration_audit(root: str) -> dict:
         "skipped_selfdoc": skipped,
         "distinct_live_targets": sorted({x["target"] for x in pending}),
         "by_class": {c: sum(1 for x in pending if x["class"] == c) for c in classes},
-        "note": "启发式分类不是裁决；pending 是「声明对」，distinct_live_targets 才是被点名的旧记忆条数。",
+        "by_verb": {v: sum(1 for x in pending if x["verb"] == v) for v, _ in DECL_VERBS},
+        "supplement_declared": supplement_declared,
+        "note": "启发式分类不是裁决；pending 是「声明对」，distinct_live_targets 才是被点名的旧记忆条数。"
+                "「补充记忆#N」不计入 pending（追加不是裁决对象），见 supplement_declared。",
     }
 
 
@@ -1657,11 +1689,14 @@ def _stale_health(root: str) -> dict:
     stale_n = dist["stale"] + dist["expired"]
     detail = [f"{st.upper()} #{r['id']}（{brain.KIND_CN.get(r['kind'], r['kind'])}，"
               f"{age:.0f} 天未复核）：{(r['content'] or '')[:50]}" for age, r, st in worst[:8]]
-    # ③ R887：正文取代声明未裁决的只读点名。R886 的量具要人主动跑脚本才看得见，
+    # ③ R887：正文声明未裁决的只读点名。R886 的量具要人主动跑脚本才看得见，
     #    等于「还得有人记得」——正是主人那句「完全不智能」的同款病。这里让它随每次
     #    体检自动送达。三条边界：① 待人工判定是提示不是故障，ok 不因它变 False；
     #    ② 泄漏硬不变量在上面已直接 return，点名不许盖住它；③ 审计挂了 fail-open
     #    但留痕可见，不许静默失明（记忆 #514 的口径）。
+    #    R974：点名范围从「取代」扩到「修正/更正/纠正/推翻」——真库实测多抓 5 条
+    #    前条仍在现行集里的旧记忆（#71/#279/#495/#500/#506），摘要按动词分栏，
+    #    让人一眼看出「其中几条只是措辞被修正、几条是整条被取代」。
     decl_note, decl_detail = "", []
     try:
         a = supersede_declaration_audit(root)
@@ -1671,9 +1706,11 @@ def _stale_health(root: str) -> dict:
             ids = "、".join(f"#{i}" for i in a["distinct_live_targets"][:8])
             if n_targets > 8:
                 ids += f" 等 {n_targets} 条"
-            decl_note = f"；取代声明未裁决 {n_pairs} 组（涉及 {n_targets} 条旧记忆）"
+            bv = {k: v for k, v in (a.get("by_verb") or {}).items() if v}
+            mix = "/".join(f"{k}{v}" for k, v in bv.items())
+            decl_note = f"；声明未裁决 {n_pairs} 组（{mix}，涉及 {n_targets} 条旧记忆）"
             decl_detail.append(
-                f"取代声明未裁决：{ids} 仍为现行（正文写了「取代记忆#N」却没调取代工具）；"
+                f"声明未裁决：{ids} 仍为现行（正文写了「取代/修正/更正记忆#N」却没标取代）；"
                 f"裁决入口 hub_memory_write(supersedes=旧id) 或 hub_memory_supersede(keep_id, drop_id)。"
                 f"分类是提示不是裁决，须逐条人工判定，勿自动回填。")
     except Exception as e:  # noqa: BLE001  体检不因一次审计异常整体挂掉
