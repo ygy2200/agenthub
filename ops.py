@@ -3210,6 +3210,11 @@ def _brief_hook_health(root: str) -> dict:
     return {"ok": True,
             "summary": f"记忆钩子：简报 {len(inplace)} 家、回忆 {len(recall_inplace)} 家"
                        f"、报错回忆 {len(error_inplace)} 家在位"
+                       # R998：事件缺口写进摘要。只在 detail 里说，一眼看摘要的人会以为
+                       # 「6 家在位」就等于「都能用」——而 R987 实锤：在位≠会被调用。
+                       + (f"（其中 {len(error_post_missing)} 家缺 PostToolUse 出口）"
+                          if error_post_missing else "")
+                       + (f"；{len(event_gaps)} 处脚本事件不齐" if event_gaps else "")
                        + (f"；{len(absent)} 家本机无配置" if absent else "")
                        + (f"；{len(unmanaged)} 家无钩子出口" if unmanaged else ""),
             "detail": detail}

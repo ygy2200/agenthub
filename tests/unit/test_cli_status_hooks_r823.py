@@ -76,7 +76,10 @@ def test_status_json_carries_hook_state(monkeypatch, capsys, tmp_path):
     cli.cmd_status(str(tmp_path), as_json=True)
     data = json.loads(capsys.readouterr().out.strip().splitlines()[-1])
     assert data["agents"][0]["hook"] == {"session": "inplace", "prompt": "inplace",
-                                         "answer": "inplace", "error": "inplace"}, data
+                                         "answer": "inplace", "error": "inplace",
+                                         # R999：多出第二事件状态——「报错钩子在位」与
+                                         # 「exit 0 的兜底会触发」是两件事，必须分开看。
+                                         "error_post": ""}, data
     assert data["healthy"] is True, data
 
 

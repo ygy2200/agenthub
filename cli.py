@@ -173,9 +173,10 @@ def _hook_mark(st: dict) -> str:
     if lacking and set(lacking) <= {"回填", "报错"} and all(
             parts[n] == "unsupported" for n in lacking):
         return "✓简报+回忆（" + "+".join(lacking) + "无出口）"
+    post_gap = " ⚠报错缺PostToolUse" if (st.get("error") or {}).get("post_missing") else ""
     if lacking:
-        return "✗缺" + "+".join(lacking)
-    return "✓" + "+".join(n for n in ("简报", "回忆", "回填", "报错") if n in parts)
+        return "✗缺" + "+".join(lacking) + post_gap
+    return "✓" + "+".join(n for n in ("简报", "回忆", "回填", "报错") if n in parts) + post_gap
 
 
 def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
@@ -196,7 +197,10 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
         r["hook"] = {"session": (st.get("session") or {}).get("state", ""),
                      "prompt": (st.get("prompt") or {}).get("state", ""),
                      "answer": (st.get("answer") or {}).get("state", ""),
-                     "error": (st.get("error") or {}).get("state", "")}
+                     "error": (st.get("error") or {}).get("state", ""),
+                     # R999：第二事件（PostToolUse）的状态——「报错钩子在位」不等于
+                     # 「exit 0 的兜底会触发」，两件事必须分开显示。
+                     "error_post": (st.get("error") or {}).get("post_status", "")}
     for r in rows:
         issues = []
         if r["mcp"] is False:
@@ -250,6 +254,17 @@ def cmd_status(root: str, agent: str = "", as_json: bool = False) -> int:
               f"钩子:{mark}  {r['instr_path']}")
     if problems:
         print(f"\n{len(problems)} 个 agent 需要处理——修好后重跑：python cli.py onboard <agent>")
+    # R999：报错钩子缺第二个事件（PostToolUse）——半挂，不算接入缺口、不改退出码，
+    # 但必须可见：只挂失败事件时，`a; b` 串联把非零退出码吃掉的两段兜底永不执行
+    # （R987 实锤：日志 27 条兜底记录 sid 全是测试、真实会话 0 条）。
+    _post_gap = [r["agent"] for r in rows
+                 if (r.get("hook") or {}).get("error_post") == "would_add"]
+    if _post_gap:
+        print()
+        print(f"⚠ 报错钩子只挂了失败事件：{('、'.join(_post_gap))}")
+        print("  exit 0 时（`a; b` 串联）Python traceback / Node 异常两段兜底不会触发。")
+        print("  补：python cli.py hook-install --events error --apply（R992 起一次挂两个事件），"
+              "然后重启该客户端。")
     # R840（B044）：钩子副本漂移要点名。它不属于「接入缺口」（退出码不变），但它是
     # 最会骗人的那种故障——源码改完、单测全绿、脚本还是旧的那一份。
     try:

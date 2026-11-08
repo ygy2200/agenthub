@@ -1799,8 +1799,14 @@ def memory_hook_status(agent: str, path: str = "") -> dict:
         answer = {"agent": key, "state": _hook_state(aprobe), "path": aprobe.get("path", ""),
                   "script": hook_script_path(HOOK_ADHERENCE_NAME).is_file()}
         eprobe = install_error_recall_hook(key, apply=False, path=path, install_script=False)
+        # R999：带出第二个事件的缺口。只报「报错钩子在位」是不够的——R987 实锤「在位 ≠
+        # 会被调用」：只挂 PostToolUseFailure 时两段兜底永不执行。四维里的 error 一格
+        # 因此要多带一个 post_status，CLI/GUI/体检测三面才能同口径点名。
+        _pe = eprobe.get("post_event") or {}
         error = {"agent": key, "state": _hook_state(eprobe), "path": eprobe.get("path", ""),
-                 "script": hook_script_path(HOOK_ERROR_RECALL_NAME).is_file()}
+                 "script": hook_script_path(HOOK_ERROR_RECALL_NAME).is_file(),
+                 "post_status": _pe.get("status", ""),
+                 "post_missing": _pe.get("status") == "would_add"}
         wprobe = install_sweep_hook(key, apply=False, path=path, install_script=False)
         sweep = {"agent": key, "state": _hook_state(wprobe), "path": wprobe.get("path", ""),
                  "script": hook_script_path(HOOK_SWEEP_NAME).is_file()}

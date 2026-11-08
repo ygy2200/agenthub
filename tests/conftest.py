@@ -82,3 +82,26 @@ def _flush_qt_deletes():
         gc.collect()
     except Exception:  # noqa: BLE001 Qt 未启动/已销毁时不该影响用例结论
         pass
+
+
+@pytest.fixture(autouse=True)
+def _reset_brain_via():
+    """R1000：清掉 brain._VIA 这个模块级全局，防用例间串味。
+
+    现象（2026-11-08 实测）：`cli.main(["status"])` 会调 `brain.set_via("cli")`，
+    而 `_journal_append` 的 via 是 `via or _VIA`——于是**后续用例**写进临时库的
+    journal 行全带上 via=cli，`ops._brief_hook_health` 把它们当「管理面自调」剔出
+    送达统计，`近 7 天简报送达：qoder 1` 那条断言随机红。单独跑绿、按文件顺序跑红，
+    是最难查的那种偶发。
+    """
+    try:
+        import brain
+        brain.set_via("")
+    except Exception:  # noqa: BLE001  没装 brain 的层不该被这条拖垮
+        pass
+    yield
+    try:
+        import brain
+        brain.set_via("")
+    except Exception:  # noqa: BLE001
+        pass
