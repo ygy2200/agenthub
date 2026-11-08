@@ -10607,7 +10607,12 @@ _ERR_URL_RE = re.compile(r"\b(https?):/+([A-Za-z0-9][A-Za-z0-9.-]*[A-Za-z0-9])"
                          r"(?::(\d{2,5}))?(?:[/?#]\S*)?")
 # 不配当身份的两种词：进程级指针地址（0x + 去掉前导 0 仍 ≥9 位十六进制；8 位的
 # NTSTATUS/HRESULT 0xC0000005、0x80070005 照旧算招牌），以及带 scheme 的 URL 碎片/整体。
-_ERR_VOLATILE_RE = re.compile(r"0x0*[0-9a-f]{9,}|https?:/", re.I)
+_ERR_VOLATILE_RE = re.compile(
+    r"0x0*[0-9a-f]{9,}|https?:/|"
+    # R1019：会话/请求 UUID——每个会话都换一串，当身份等于没有身份。
+    # 宿主钩子事件的 JSON 落进失败载荷时（session_id/transcript_path 那几枚样本），
+    # 签名会整个变成「92ec29bb-9eb4-…」，同一条错每次撞都算新错，欠账永远收编不了。
+    r"\b[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}\b", re.I)
 _ERR_NAMED_RE = re.compile(r"(?i)\b(?:no such (?:column|table|function|view|index)"
                            r"|no module named|cannot find (?:name|module)"
                            r"|unrecognized (?:option|argument)|unknown (?:option|command)"
@@ -10624,18 +10629,44 @@ _ERR_SNAKE_RE = re.compile(r"\b[a-z][a-z0-9]{2,}(?:[_-][a-z0-9]+)+\b")
 # R865：诊断成语（英语 shell/文件系统层）。它们描述「失败本身」，不是报错提到的对象，
 # 所以进签名当 w=3 锚点。`_FAIL_SHELL_IDIOM_RE` 同时喂形状分类，R859 定过「别动它」；
 # 这一支只收能当招牌的短语，别把 `fatal:`、`errno N` 这类泛前缀带进签名键。
+# R1017：按真库 153 枚失败样本补齐失败成语（不凭想象补，每条都能在样本里指出来源）。
+# 缺口最大的一类是**宿主工具层的失败口音**——它不是 shell 成语也不是 Python 异常，
+# 老词典一条都收不到，于是整条失败被判成「无签名」，大脑闭嘴，模型拿不到上次的修法：
+#   · error during web fetch          ~60 枚（153 枚里的最大类，WebFetch 抓 GitHub 原文）
+#   · error during glob search operation / search timeout / search path does not exist
+#   · string to replace not found（编辑类工具的老_string 失配）
+#   · file has not been read yet / file does not exist / file or directory not found
+#   · not a git repository / unable to access / failed to receive handshake（git 与 TLS）
+#   · exceeds maximum allowed tokens（宿主读文件超限）
+# 收词纪律同 R859/R865：**只收「失败本身」的短语**，不收泛前缀（failed to / error / exit code）。
+# 风险控制：这些短语进签名后必须同时进 `_ERR_ANCHOR_RE`（强锚点，独一份即定身份），
+# 否则 `_err_accept` 会把它们当对象词退回去——那等于白加。
+_ERR_HARNESS_IDIOM = (
+    r"error during web fetch|error during glob search operation|"
+    r"search path does not exist|search timeout|string to replace not found|"
+    r"file has not been read yet|file does not exist|file or directory not found|"
+    r"exceeds maximum allowed tokens|not a git repository|unable to access|"
+    r"failed to receive handshake|being used by another process|"
+    r"the system cannot find the path specified|no route to host|"
+    r"temporary failure in name resolution|connection reset by peer|"
+    r"too many open files|cannot allocate memory"
+)
 _ERR_IDIOM_TERM_RE = re.compile(
     r"(?i)(?:\bno such file or directory\b|\bis a directory\b|\bnot a directory\b|"
     r"\bcannot (?:open|access|find the (?:file|path))\b|\bcan'?t (?:open|read)\b|"
     r"\bno space left on device\b|\bread-only file system\b|\bdevice or resource busy\b|"
     r"\btext file busy\b|\bbroken pipe\b|\bsegmentation fault\b|\bcore dumped\b|"
     r"\bnot recognized as (?:an internal or external command|the name of a cmdlet)\b|"
-    r"\bunexpected (?:eof|token|end of file)\b)")
+    r"\bunexpected (?:eof|token|end of file)\b|"
+    r"\boperation timed out\b|"
+    r"\b(?:" + _ERR_HARNESS_IDIOM + r")\b)")
 # HTTP 状态只在「有方法/状态前缀」时才当招牌：裸 3 位数在日志里太容易是编号。
 _ERR_HTTP_CODE_RE = re.compile(
     r"(?i)\b(?:HTTP/\S+\s+|status(?:\s+code)?\s*[:=]?\s*|"
     r"(?:GET|POST|PUT|PATCH|DELETE|HEAD)\s+\S+\s+)([45]\d{2})\b")
 # 能单独认出「这是哪一类失败」的诊断词（不是被报错提到的文件名/标识符）。
+# R1017：宿主工具层的失败口音同步进锚点表——只进签名不进锚点的话，
+# `_err_accept` 会把这些词当「对象词」退回去，签名抽得出也上不了墙。
 _ERR_ANCHOR_RE = re.compile(
     r"(?i)(?:no such (?:file|column|table|function|view|index)|no module named|"
     r"cannot (?:open|access|find)|can'?t (?:open|read)|permission denied|"
@@ -10645,6 +10676,7 @@ _ERR_ANCHOR_RE = re.compile(
     r"connection (?:refused|reset)|could not (?:resolve|connect)|"
     r"unexpected (?:eof|token|end of file)|missing \d|invalid (?:value|argument|state|path)|"
     r"exceeds|corrupt|winerror \d+|errno \d+|status(?:\s+code)?[ :=]+[45]\d{2}|"
+    r"(?:" + _ERR_HARNESS_IDIOM + r")|"
     r"http/[\d.]+ [45]\d{2}|[45]\d{2} (?:not found|bad request|unauthorized|forbidden|"
     r"internal server error|bad gateway|service unavailable|gateway timeout)|not found)")
 # 只说「有问题」、不指向具体东西的弱锚点：单独命中不认，必须再有第二条独立证据。
@@ -10655,7 +10687,13 @@ _ERR_STOP = frozenset({"error", "errors", "exception", "traceback", "failed", "f
                        "warning", "unknown", "invalid", "cannot", "unable", "not",
                        "found", "true", "false", "none", "null", "exit", "code",
                        "status", "message", "stderr", "stdout", "line", "file",
-                       "the", "and", "for", "with", "is", "of", "in", "at", "to"})
+                       "the", "and", "for", "with", "is", "of", "in", "at", "to",
+                       # R1019：宿主钩子事件的元字段名——它们描述「这次调用是谁发的」，
+                       # 不是「这次错是什么」。JSON 事件落进失败载荷时，引号里的
+                       # session_id / transcript_path / hook_event_name 会被当成招牌词。
+                       "session_id", "sessionid", "transcript_path", "hook_event_name",
+                       "permission_mode", "cwd", "model", "session", "transcript",
+                       "tool_use_id", "toolname", "tool_name"})
 # traceback 脚手架对检索是纯噪声（每份栈都一样），路径只留 basename。
 _ERR_NOISE_RE = re.compile(r'File "[^"]+", line \d+, in \w+|\s*File "[^"]+", line \d+')
 # 挽具（agent 运行时）自己加的套话：每一次失败调用都带退出码，所以「exit code 1」
@@ -11198,7 +11236,8 @@ FAIL_SHAPES = ("exception_line", "transport", "exit_code", "named_phrase",
 # 「有失败口音」的形状才允许进召回：这四类是报错自己在说话。`content_only`（网页正文/
 # 引号段）、`prose_only`（一句人话）、`no_text`（没正文）不是——它们过去照样能生成 keyed
 # 签名，并把「大脑没答案」的催红推到模型眼前（B045/B066 那条假报错就是这么来的）。
-FAIL_LIVE_SHAPES = ("exception_line", "transport", "exit_code", "named_phrase")
+FAIL_LIVE_SHAPES = ("exception_line", "transport", "exit_code", "named_phrase",
+                    "harness_phrase")
 
 
 def failure_shape(text: str) -> str:
@@ -11221,6 +11260,10 @@ def failure_shape(text: str) -> str:
         return "transport"
     if _FAIL_EXIT_RE.search(t):
         return "exit_code"
+    if _fail_harness_voice(t):
+        # R1018：宿主工具层的失败口音（web fetch / glob / 编辑器类工具）——
+        # 老判据下它们带 URL 或引号，被归进 content_only 当成「一句内容」，永远上不了墙。
+        return "harness_phrase"
     if _ERR_NAMED_RE.search(t) or _FAIL_SHELL_IDIOM_RE.search(t):
         return "named_phrase"      # `permission denied` / `no such column` 这类没异常名、
                                    # 但报错成语本身就是招牌的真失败，不能被当成「一句人话」
@@ -11268,6 +11311,43 @@ _FAIL_SHELL_IDIOM_RE = re.compile(
     r"\bunexpected (?:eof|token|end of file)\b|"
     r"没有那个文件或目录|不是内部或外部命令|系统找不到指定的|磁盘空间不足|权限不够)")
 
+# R1018：宿主工具层的失败口音——它们不是 shell 成语、不是 Python 异常，也没有错误码，
+# 老判据一律看不出「这是失败」，于是被归成 content_only（因为带 URL/引号）挡在上墙之外。
+# 真库实测（153 枚失败样本）：被这条闸挡住 86 枚，是签名闸之外的**头号缺口**。
+# 收紧条件（B045/B066 的红线：内容里的 error 字样不等于这次调用失败）：
+#   ① 载荷**首行**就是这句口音（WebFetch/编辑类工具的报错正文就是整条载荷）；
+#   ② 或者载荷是宿主的结构化报告（Command/Stdout/Stderr/Exit Code），
+#      且这句口音落在 **Stderr 段**里（Bash 失败时 stdout 在前、stderr 在后，
+#      位置随 stdout 长度浮动，所以不能只看前几行）。
+# 网页正文中间出现同名词，两条都不满足 → 仍按 content_only 挡掉。
+_FAIL_HARNESS_RE = re.compile(
+    r"(?i)(?:^|\n)\s*(?:glob error\s*:\s*)?(?:"
+    r"error during (?:web fetch|glob search operation)\b"
+    r"|string to replace not found\b"
+    r"|file has not been read yet\b"
+    r"|file does not exist\b"
+    r"|file or directory not found\b"
+    r"|exceeds maximum allowed tokens\b"
+    r"|the system cannot find the path specified\b)")
+_FAIL_HOST_STDERR_RE = re.compile(
+    r"(?is)\bStderr\s*:\s*(.*?)(?:\n\s*(?:Exit Code|Signal)\s*:|\Z)")
+
+
+def _fail_harness_voice(text: str) -> bool:
+    """这条载荷是不是宿主的失败口音（R1018 的判据本体）。
+
+    两条入口：①载荷首行就是这句口音（WebFetch/编辑类工具的报错正文就是整条载荷）；
+    ②载荷是宿主结构化报告且这句口音落在 Stderr 段里（Bash 失败 stdout 在前、stderr 在后，
+    位置随 stdout 长度浮动，所以不能只看前几行）。两条都不满足 → 按 content_only 挡掉
+    （B045/B066 的红线：内容里的 error 字样不等于这次调用失败了）。"""
+    t = str(text or "")
+    if not t.strip():
+        return False
+    if _FAIL_HARNESS_RE.search(t.split("\n", 1)[0]):
+        return True
+    m = _FAIL_HOST_STDERR_RE.search(t)
+    return bool(m and _FAIL_HARNESS_RE.search(m.group(1)))
+
 
 def _diagnosis_span(text: str) -> str:
     """从混合输出里只留下「错误自己在说话」的行（R865）。
@@ -11284,6 +11364,7 @@ def _diagnosis_span(text: str) -> str:
         if (_FAIL_EXC_LINE_RE.search(ln) or _FAIL_SHELL_IDIOM_RE.search(ln)
                 or _ERR_NAMED_RE.search(ln) or _ERR_CODE_RE.search(ln)
                 or _ERR_HTTP_CODE_RE.search(ln)
+                or _FAIL_HARNESS_RE.search(ln)
                 or re.search(r"(?i)traceback \(most recent call last\)", ln)
                 or _FAIL_EXIT_RE.search(ln)):
             keep.append(ln)

@@ -21,6 +21,9 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+
+import _console  # noqa: E402,F401
 import brain  # noqa: E402
 import core  # noqa: E402
 
