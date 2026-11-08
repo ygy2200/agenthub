@@ -103,6 +103,12 @@ function errorText(ev) {
     logLine('traceback_from_stdout: isError 缺失但检出结构化 traceback');
     return tb;
   }
+  // R986：Node 形状（Python 之外唯一在本机 Bash 里会出现的运行时异常）
+  const ne = extractNodeError(out);
+  if (ne) {
+    logLine('node_error_from_stdout: isError 缺失但检出 Node 异常行');
+    return ne;
+  }
   return '';
 }
 
@@ -120,6 +126,35 @@ function extractTraceback(s) {
   if (!last) return '';
   const out = 'Traceback (most recent call last):\n' + last;
   return out.length >= MIN_ERR_CHARS ? out : '';
+}
+
+/** R986（B119）：只从 stdout 认 Node 未捕获异常，返回错误行本身。
+ *  为什么需要：`node -e "throw …" | head -3; echo done` 这类串联/管道把非零退出码吃掉，
+ *  宿主不标 isError，而 R971 只认 Python 的 traceback 头——Node 形状整段静默跳过。
+ *  真库旁证：近 14 天 24 条 exception_line 的 head 全是 python 调用，一条 Node 都没有。
+ *  双条件防误报：① `XxxError: …` 行；② 前 6 行内有只含 caret 的定位行，或后 4 行内有 at 栈帧。
+ *  只回传错误行：不带 [eval]:1 / 文件路径 / 栈（签名要稳定，R865 口径）。 */
+function extractNodeError(s) {
+  if (typeof s !== 'string' || !s) return '';
+  const lines = s.split(/\r?\n/);
+  let best = '';
+  for (let i = 0; i < lines.length; i++) {
+    const line = lines[i].trim();
+    // 前缀可选：Node 的 `new Error()` 打印的就是裸 `Error: …`（首版要求带前缀，漏了最常见那种）
+    if (!/^(?:[A-Za-z_$][A-Za-z0-9_$.]*)?(?:Error|Exception):\s*\S/.test(line)) continue;
+    let shaped = false;
+    for (let k = Math.max(0, i - 6); k < i; k++) {
+      // 整行只有 caret 才算定位行；`[^a]` 这类字符类里的 ^ 不算
+      if (/^\s*\^+\s*$/.test(lines[k])) { shaped = true; break; }
+    }
+    if (!shaped) {
+      for (let k = i + 1; k <= Math.min(lines.length - 1, i + 4); k++) {
+        if (/^\s+at\s+\S/.test(lines[k])) { shaped = true; break; }
+      }
+    }
+    if (shaped) best = line;
+  }
+  return best.length >= MIN_ERR_CHARS ? best : '';
 }
 
 function resolveRoot(ev) {
