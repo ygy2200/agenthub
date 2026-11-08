@@ -54,8 +54,8 @@ def test_patrol_runs_in_background_and_renders(qapp, hub_root, monkeypatch):
         "自检结果未渲染"
 
     txt = page.patrolView.toPlainText()
-    assert "✓ env" in txt and "✓ db_health" in txt, f"通过项缺失：{txt[:300]}"
-    assert "✗ audit_chain" in txt and "链尾截断 2 条" in txt, f"问题项缺失：{txt[:300]}"
+    assert "√ env" in txt and "√ db_health" in txt, f"通过项缺失：{txt[:300]}"
+    assert "× audit_chain" in txt and "链尾截断 2 条" in txt, f"问题项缺失：{txt[:300]}"
     assert "跑 hub_ops_run audit_chain 看断点" in txt, \
         "失败项必须带可执行修复口径（显示完整口径会淹没一行结论）"
     assert "regression" in txt and "跳过" in txt, f"跳过项缺失：{txt[:300]}"

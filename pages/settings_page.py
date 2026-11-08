@@ -429,7 +429,7 @@ class SettingsPage(QWidget):
     @staticmethod
     def _patrol_text(rep) -> str:
         lines = ["", "通过："]
-        lines += [f"  ✓ {n}" for n in rep.get("passed", [])] or ["  （无）"]
+        lines += [f"  √ {n}" for n in rep.get("passed", [])] or ["  （无）"]
         issues = rep.get("issues", [])
         lines += ["", f"问题 {len(issues)} 项："]
         if not issues:
@@ -441,7 +441,7 @@ class SettingsPage(QWidget):
             if i.get("kind") == "decide":
                 tags.append("要拍板")
             tag = f"（{' · '.join(tags)}）" if tags else ""
-            lines.append(f"  ✗ {i.get('name', '')}{tag}：{i.get('summary', '')}")
+            lines.append(f"  × {i.get('name', '')}{tag}：{i.get('summary', '')}")
             fix = i.get("fix_brief") or i.get("fix") or ""
             if fix:
                 lines.append(f"     修复：{fix}")

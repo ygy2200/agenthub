@@ -458,7 +458,7 @@ class TodayPage(QWidget):
         menu = QMenu(self)
         chosen = None
         for val, label in NewTaskDialog.PRIORITIES:
-            act = menu.addAction(("✓ " if val == cur else "   ") + f"P{val} {label}")
+            act = menu.addAction(("√ " if val == cur else "   ") + f"P{val} {label}")
             act.setData(val)
             if val == cur:
                 act.setEnabled(False)  # 当前档位不给点，避免「改了但没变」的假反馈
