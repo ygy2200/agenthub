@@ -154,3 +154,25 @@ def test_project_filter_ignores_distill_seen(root_with_blind_project):
     brain.mark_distill_shown(root_with_blind_project, [1, 2, 3])
     cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
     assert cands, "指定项目时不该过滤已展示过的记录"
+
+
+# ---- R1027：噪声词表别误杀真知识；表格行不是结论 ----
+
+def test_table_row_is_not_a_conclusion():
+    """表格行（| 项目 | 实测结果 |）是排版，不是结论。"""
+    assert brain._distill_gist("| 项目 | 实测结果 | 对计划的含义 |")[0] == ""
+
+
+def test_methodology_line_with_plan_word_is_kept():
+    """「审查计划漏洞、推测与实测分层标注」带「计划」——一排就误杀真方法论。"""
+    g, _src = brain._distill_gist(
+        "执行前多道门检查：复核关键事实（把代理转述升级为一手验证）、审查计划漏洞、"
+        "推测与实测分层标注、修订计划。")
+    assert "多道门检查" in g
+
+
+def test_request_line_still_rejected():
+    """收窄噪声词表不能把请求句放回来。"""
+    assert brain._distill_gist(
+        "1. 我的雷神开机会自启动。但是不会自动加速steam，你能不能写一个脚本呢，你看着来吧"
+    )[0] == ""
