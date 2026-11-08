@@ -13560,6 +13560,41 @@ def error_count(root: str, status: str = "") -> int:
         return int(conn.execute(q, args).fetchone()["n"] or 0)
 
 
+def error_sig_gap(root: str, limit: int = 10) -> dict:
+    """登记了但**没有签名键**的错误行（R1022）。
+
+    「登记一次下次秒命中」靠的是 errors.sig 逐字相同。签名键写不进去的行，
+    召回只能退回模糊 LIKE 命中——这本身不算坏，但**静默丢失**是坏：
+    最常见的成因是**写入方的进程跑的是旧代码**（R987 同款纪律：部署≠生效）——
+    行看起来一切正常（标题、现象、回滚都在），只有这一个字段是空的。
+    这项读数把「哪些行缺键、理论上能不能补」摆出来，别让下一次同错多跑一遍。
+
+    口径：sig 为空、且按登记时的同一把尺子（error_sig_of(detail) or (title)）
+    **能**算出键 → 算「缺键」；算不出（本来就没签名形状）→ 不算，那是正常老行。
+    """
+    out = {"total": 0, "gap": 0, "rows": []}
+    if not root or not os.path.isdir(root):
+        return out
+    try:
+        with db_conn(root) as conn:
+            conn.row_factory = sqlite3.Row
+            rows = list(conn.execute(
+                "SELECT id, ts, title, detail FROM errors "
+                "WHERE COALESCE(sig,'')='' ORDER BY id DESC LIMIT 200"))
+    except sqlite3.Error:
+        return out
+    out["total"] = len(rows)
+    for r in rows:
+        sig = error_sig_of(r["detail"] or "") or error_sig_of(r["title"] or "")
+        if not sig:
+            continue
+        out["gap"] += 1
+        if len(out["rows"]) < max(1, int(limit)):
+            out["rows"].append({"id": r["id"], "ts": r["ts"],
+                                "title": (r["title"] or "")[:60], "sig": sig})
+    return out
+
+
 def error_list(root: str, status: str = "", limit: int = 100) -> list:
     q = "SELECT * FROM errors"
     args: list = []

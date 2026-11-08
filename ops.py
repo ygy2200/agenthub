@@ -4319,11 +4319,28 @@ def _error_debt(root: str) -> dict:
         head += f" / 判不了 {debt['unjudgeable']} 条（改签名口径前写进去的旧键，出窗口自清）"
     if debt.get("miss_unshaped"):
         head += f"（另有 {debt['miss_unshaped']} 次非报错触发，不进命中率）"
+    # R1023：把「抽得出签名」的比例摆出来——它就是「大脑认不认得出自己的错」的实时体温。
+    # 客户端没重启（旧代码在跑）时这一项会明显偏低，是部署≠生效的体温计。
+    asked = int(debt.get("asked") or 0)
+    shaped_asked = int(debt.get("asked_shaped") or 0)
+    if asked:
+        head += (f"；有签名率 {shaped_asked * 100 // asked}%"
+                 f"（{shaped_asked}/{asked} 次抽得出可追签名——"
+                 "偏低多半是客户端还跑着旧代码，重启后应上升）")
     if debt["distinct"] > debt["sampled"]:
         # 判定只做了重复次数最高的那批，别把「没判」说成「没欠」
         head += f"（窗口共 {debt['distinct']} 类签名，本次判了 {debt['sampled']} 类）"
     if debt["skipped_legacy"]:
         head += f"（口径变更前 {debt['skipped_legacy']} 行不计入）"
+    # R1022：登记了但没签名键的行——「登记一次下次秒命中」靠的正是这个键。
+    # 静默丢失的常见成因是写入方进程跑旧代码（部署≠生效），行看着一切正常。
+    try:
+        gap = brain.error_sig_gap(root)
+    except Exception:  # noqa: BLE001 这段读数不该把整项检查搞挂
+        gap = {}
+    if gap.get("gap"):
+        head += (f"；另有 {gap['gap']} 条登记缺签名键"
+                 "（写入方多半是旧进程——重启该客户端后重新登记才有）")
     detail = [f"×{r['count']} [{r['status']}] "
               + (" ".join(r["terms"][:4]) or r["sig"])[:70]
               for r in rows[:8]]
