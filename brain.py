@@ -2717,9 +2717,13 @@ def usage_stats(root: str, days: int = 7, agent: str = "", tool: str = "") -> di
             zc.append("tool=?")
             za.append(tl)
         zw = (" WHERE hits=0 AND query!=''" + (" AND " + " AND ".join(zc) if zc else ""))
-        out["zero_hit_searches"] = [dict(r) for r in conn.execute(
-            f"SELECT query, agent, COUNT(*) n, MAX(ts) last FROM searches{zw} "
-            f"GROUP BY query, agent ORDER BY n DESC, last DESC LIMIT 15", za)]
+        # R1015：带上 tool 与通道——`error_recall_miss` 的「query」其实是脱敏后的失败样本键，
+        # 它不是「检索没搜到」，混在一张表里会让人去改关键词。
+        out["zero_hit_searches"] = [
+            dict(r, _channel=_search_channel(r["tool"])) for r in conn.execute(
+                f"SELECT COALESCE(NULLIF(tool,''),'?') tool, query, agent, COUNT(*) n, MAX(ts) last"
+                f" FROM searches{zw} "
+                f"GROUP BY tool, query, agent ORDER BY n DESC, last DESC LIMIT 15", za)]
         out["repeated_queries"] = [dict(r) for r in conn.execute(
             f"SELECT query, agent, COUNT(*) n FROM searches"
             + ((" WHERE query!=''" + (" AND " + " AND ".join(zc) if zc else "")) if zc else " WHERE query!=''")
@@ -5319,6 +5323,32 @@ def task_metrics(root: str, days: int = 7, project: str = "", agent: str = "") -
     }
 
 
+# R1015：searches 表混了四种语义完全不同的「检索」，混在一个数字里报会给出错建议。
+# 真库实测（2026-11-08，近 7 天）：prompt_recall 5616 / hub_search 86 / error_recall_miss 168(全零命中)
+# ——不拆账时「检索 5973（零命中 190）」读起来像 agent 搜了 5973 次、190 次白搜，
+# 实际 190 条零命中里 168 条是「失败事件抽不出报错签名」的采集面样本，与关键词无关。
+SEARCH_CHANNELS = {
+    "hub_search": "agent",        # agent 主动全文检索：零命中=关键词/索引问题
+    "hub_memory_read": "agent",
+    "hub_skill_match": "agent",
+    "prompt_recall": "auto",      # 会话/心跳自动回忆：零命中只是本项目没相关记忆
+    "recall_push": "auto",
+    "error_recall": "error",      # 报错即时回忆：真查了库，零命中=知识缺口（该登记）
+    "error_recall_miss": "miss",  # 失败事件抽不出签名：采集面问题，不是知识缺口
+}
+SEARCH_CHANNEL_LABELS = {
+    "agent": "主动检索", "auto": "自动回忆", "error": "报错回忆",
+    "miss": "报错无签名", "other": "其它",
+}
+_SEARCH_AGENT_TOOLS = tuple(t for t, c in SEARCH_CHANNELS.items() if c == "agent")
+_SEARCH_ERROR_TOOLS = tuple(t for t, c in SEARCH_CHANNELS.items() if c in ("error", "miss"))
+
+
+def _search_channel(tool: str) -> str:
+    """检索工具 → 通道。未知工具归 other（不猜、不并进任何一个已有通道）。"""
+    return SEARCH_CHANNELS.get((tool or "").strip(), "other")
+
+
 def team_digest(root: str, days: int = 1) -> dict:
     """团队日结（只读）：窗口流动 + 当前风险 + 按 agent 记分卡。
 
@@ -5428,10 +5458,30 @@ def team_digest(root: str, days: int = 1) -> dict:
             "zero_hit_searches": count(
                 "SELECT COUNT(*) FROM searches WHERE ts>=? AND COALESCE(hits,0)=0", (cutoff,)),
         }
-        zero_samples = [dict(r) for r in conn.execute(
-            "SELECT agent, query, COUNT(*) n FROM searches WHERE ts>=?"
-            " AND COALESCE(hits,0)=0 GROUP BY agent, query ORDER BY n DESC, query LIMIT 5",
-            (cutoff,))]
+        # R1015：按通道拆账（主动/自动/报错/无签名/其它），附每通道零命中。
+        _ch = {k: {"searches": 0, "zero": 0} for k in SEARCH_CHANNEL_LABELS}
+        for r in conn.execute(
+                "SELECT COALESCE(NULLIF(tool,''),'?') tool, COUNT(*) n,"
+                " SUM(CASE WHEN COALESCE(hits,0)=0 THEN 1 ELSE 0 END) z"
+                " FROM searches WHERE ts>=? GROUP BY tool", (cutoff,)):
+            c = _ch[_search_channel(r["tool"])]
+            c["searches"] += int(r["n"] or 0)
+            c["zero"] += int(r["z"] or 0)
+        flow["searches_by_channel"] = _ch
+
+        def _zero_samples(tools, limit=3):
+            """某一类通道的零命中样本（按 tool+agent+query 聚合）。"""
+            if not tools:
+                return []
+            ph = ",".join("?" * len(tools))
+            return [dict(r) for r in conn.execute(
+                "SELECT COALESCE(NULLIF(tool,''),'?') tool, agent, query, COUNT(*) n"
+                " FROM searches WHERE ts>=? AND COALESCE(hits,0)=0 AND tool IN (" + ph + ")"
+                " GROUP BY tool, agent, query ORDER BY n DESC, query LIMIT ?",
+                (cutoff, *tools, limit))]
+
+        zero_agent = _zero_samples(_SEARCH_AGENT_TOOLS)
+        zero_error = _zero_samples(_SEARCH_ERROR_TOOLS)
         done_rows = [dict(r) for r in conn.execute(
             "SELECT created, done_at FROM tasks WHERE status='done' AND done_at>=?", (cutoff,))]
         flow["tasks_created"] = count("SELECT COUNT(*) FROM tasks WHERE created>=?", (cutoff,))
@@ -5573,13 +5623,32 @@ def team_digest(root: str, days: int = 1) -> dict:
             "sample": [f"{a['agent']} 未闭 {a['errors']['open']} 条" for a in err_open[:3]],
             "hint": "修完用 hub_error_close 关闭，别留僵尸",
         })
-    if zero_samples:
+    # R1015：零命中分通道报——主动检索的白搜与「报错事件抽不出签名」是两类问题，
+    # 一条「换关键词」建议对后者完全无效（真库 190 条零命中里 168 条属于后者）。
+    if zero_agent or (flow["searches_by_channel"]["agent"]["zero"] and not zero_agent):
+        n_zero = flow["searches_by_channel"]["agent"]["zero"]
         risks.append({
-            "kind": "zero_hit_search", "count": flow["zero_hit_searches"],
-            "agents": sorted({clean(r["agent"]) for r in zero_samples if clean(r["agent"])}),
+            "kind": "zero_hit_search", "count": n_zero,
+            "agents": sorted({clean(r["agent"]) for r in zero_agent if clean(r["agent"])}),
             "sample": [f"{clean(r['agent']) or '未知'}：{str(r['query'])[:24]}×{r['n']}"
-                       for r in zero_samples[:3]],
-            "hint": "换关键词/补记录；同词反复零命中说明索引或描述要改",
+                       for r in zero_agent[:3]],
+            "hint": "主动检索白搜：换关键词/补记录；同词反复零命中说明索引或描述要改",
+        })
+    if zero_error or (flow["searches_by_channel"]["error"]["zero"]
+                      + flow["searches_by_channel"]["miss"]["zero"]):
+        n_err = (flow["searches_by_channel"]["error"]["zero"]
+                 + flow["searches_by_channel"]["miss"]["zero"])
+        n_miss = flow["searches_by_channel"]["miss"]["zero"]
+        risks.append({
+            "kind": "error_recall_gap", "count": n_err,
+            "agents": sorted({clean(r["agent"]) for r in zero_error if clean(r["agent"])}),
+            "sample": [f"{clean(r['agent']) or '未知'}：{str(r['query'])[:24]}×{r['n']}"
+                       for r in zero_error[:3]],
+            "hint": ("报错回忆没答案（与关键词无关）："
+                     + (f"其中 {n_miss} 条是失败事件里抽不出报错正文（采集面，"
+                        "hub_ops_run(name=\"failure_samples\") 看样本形状），" if n_miss else "")
+                     + "其余是这个签名库里没有修法——真修好后用 hub_report_error 登记"
+                       "（带 undo），下次同错才认得出来"),
         })
     if sec["total"]:
         risks.append({
@@ -5592,7 +5661,7 @@ def team_digest(root: str, days: int = 1) -> dict:
 
     order = ["lease_stale", "unowned", "approval_waiting", "approval_aging", "overdue",
              "offline_with_open", "dead_letter", "retry_storm", "handoff_stale",
-             "security_denied", "errors_open", "zero_hit_search"]
+             "security_denied", "errors_open", "zero_hit_search", "error_recall_gap"]
     risks.sort(key=lambda x: (order.index(x["kind"]) if x["kind"] in order else 99,
                               -x["count"]))
     suggestions = [r["hint"] for r in risks]
@@ -11226,6 +11295,35 @@ FAIL_SAMPLE_DAYS = 30
 FAIL_SAMPLE_ROWS = 3000
 _FAIL_SAMPLE_ENSURED: set = set()   # 进程内已补建过 fail_events 的 root（见 sample_failure）
 
+# R1016：失败样本要存「错误本体」，不是「命令回声」。
+# 钩子拼的载荷是三段：①「失败调用：<命令>」②宿主回显的「Command: <命令>」③真正的报错正文。
+# 旧实现直接截前 400 字——存下来的几乎全是①②（命令），③被整段切掉，
+# 于是 153 枚样本里能看出「这是什么错」的极少，「无签名触发说不清是什么」永远说不清。
+_FAIL_ECHO_LINE_RE = re.compile(r"^\s*(?:失败调用\s*[:：]|失败\s*[:：]|Command\s*:|命令\s*[:：])")
+
+
+def _fail_head(payload: str) -> str:
+    """取失败载荷里「错误自己在说话」的那部分（去掉命令回声行）。
+
+    顺序：先按诊断形状挑行（_diagnosis_span 会挑出异常行/诊断成语行），
+    挑不出就退回「去掉命令回声行」的正文；再没有就原样返回（不制造空样本）。"""
+    txt = str(payload or "")
+    for src in (_diagnosis_span(txt), txt):
+        body = [ln for ln in src.splitlines() if not _FAIL_ECHO_LINE_RE.match(ln)]
+        body = [ln for ln in body if ln.strip()]
+        if body:
+            return "\n".join(body).strip()
+    return txt.strip()
+
+
+def _fail_head_has_sig(head: str) -> bool:
+    """这段样本正文能不能抽出可追的签名（w≥3）。用于「样本可归因率」读数。"""
+    try:
+        terms = error_signature_terms(_error_voice(_diagnosis_span(head or "")))
+    except Exception:  # noqa: BLE001 归因读数不该把巡检搞挂
+        return False
+    return bool(terms) and any(w >= 3 for _, w in terms)
+
 
 def sample_failure(root: str, *, agent: str = "", tool: str = "", event: str = "",
                    shape: str = "", sig: str = "", payload: str = "",
@@ -11244,7 +11342,7 @@ def sample_failure(root: str, *, agent: str = "", tool: str = "", event: str = "
             ensure_schema(root)
         except sqlite3.Error:
             pass
-    head = _fail_redact(str(payload or ""))[:FAIL_SAMPLE_MAX_CHARS]
+    head = _fail_redact(_fail_head(payload))[:FAIL_SAMPLE_MAX_CHARS]
     sh = shape or failure_shape(payload)
     # sig 也照样要过脱敏：签名是从**原文**抽的词，凭据被抽成招牌词时（实测
     # `permission denied, open token=ghp_…` 整枚 token 进了 sig 列），洗 head 不管用。
@@ -11295,10 +11393,31 @@ def fail_summary(root: str, days: int = 7, limit: int = 12) -> dict:
                             for r in conn.execute(sql, (floor,))]
             out["examples"] = [{"ts": r["ts"], "agent": r["agent"], "tool": r["tool"],
                                 "event": r["event"], "shape": r["shape"], "sig": r["sig"],
-                                "chars": int(r["chars"] or 0), "head": r["head"]}
+                                "chars": int(r["chars"] or 0), "head": r["head"],
+                                "has_sig": _fail_head_has_sig(r["head"])}
                                for r in conn.execute(
                                    "SELECT * FROM fail_events WHERE ts>=? "
                                    "ORDER BY id DESC LIMIT ?", (floor, limit))]
+            # R1016：样本可归因率——存下来的正文能不能认出「这是哪条错」。
+            # 认不出=样本白存，采集面越厚越没信息量（这是采集面的收益指标，不是失败指标）。
+            # 查询必须在 with 块内：db_conn 退出即关连接，块外再查会抛
+            # sqlite3.ProgrammingError（被 except 吞掉 → 新字段整段消失）。
+            _all = list(conn.execute("SELECT head FROM fail_events WHERE ts>=?", (floor,)))
+            _attr = sum(1 for r in _all if _fail_head_has_sig(r["head"]))
+            out["attributable"] = _attr
+            out["sample_total"] = len(_all)
+            out["attributable_pct"] = round(100.0 * _attr / max(1, len(_all)), 1)
+            by_shape_attr: dict = {}
+            for r in conn.execute("SELECT shape, head FROM fail_events WHERE ts>=?", (floor,)):
+                k = r["shape"] or "(空)"
+                d = by_shape_attr.setdefault(k, {"n": 0, "attr": 0})
+                d["n"] += 1
+                if _fail_head_has_sig(r["head"]):
+                    d["attr"] += 1
+            out["attributable_by_shape"] = [
+                {"shape": k, "n": v["n"], "attr": v["attr"],
+                 "pct": round(100.0 * v["attr"] / max(1, v["n"]), 1)}
+                for k, v in sorted(by_shape_attr.items(), key=lambda kv: -kv[1]["n"])]
     except sqlite3.Error:
         pass
     return out

@@ -4380,7 +4380,13 @@ def _failure_samples(root: str) -> dict:
     blind = sum(d["n"] for d in s["by_shape"] if d["k"] in FAIL_BLIND_SHAPES)
     tail = (f"（其中 {blind} 枚是「宿主报了失败但正文拿不到」——正是 B045/B066 要看的那批）"
             if blind else "")
-    return {"ok": True, "summary": head + tail, "detail": detail}
+    # R1016：样本可归因率——存下来的正文能不能认出「这是哪条错」。认不出=样本白存。
+    attr = f"；可归因 {s.get('attributable', 0)}/{s.get('sample_total', 0)}" \
+           f"（{s.get('attributable_pct', 0)}%）"
+    worst = [a for a in (s.get("attributable_by_shape") or []) if a["pct"] < 50][:3]
+    if worst:
+        attr += "，最难认：" + "、".join(f"{a['shape']} {a['attr']}/{a['n']}" for a in worst)
+    return {"ok": True, "summary": head + tail + attr, "detail": detail}
 
 
 # 冷记忆压缩的事实抽取（1.2，先做窄）：四类窄正则，只抽明确可沉淀的持久事实

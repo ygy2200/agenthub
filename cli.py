@@ -1238,12 +1238,25 @@ def cmd_digest(root: str, days: int = 1) -> int:
     f, c = d["flow"], d["current"]
     print(f"团队日结（近 {d['window_days']} 天）：")
     cyc = f.get("done_cycle_p50_h")
+    ch = f.get("searches_by_channel") or {}
+    if ch:
+        srch = (f"检索 {f['searches']}（主动 {ch.get('agent', {}).get('searches', 0)}"
+                f" / 自动 {ch.get('auto', {}).get('searches', 0)}"
+                f" / 报错 {ch.get('error', {}).get('searches', 0)}"
+                f"+{ch.get('miss', {}).get('searches', 0)}）"
+                f"（零命中 {f['zero_hit_searches']}："
+                f"主动 {ch.get('agent', {}).get('zero', 0)}"
+                f" / 自动 {ch.get('auto', {}).get('zero', 0)}"
+                f" / 报错 {ch.get('error', {}).get('zero', 0)}"
+                f"+{ch.get('miss', {}).get('zero', 0)}）")
+    else:
+        srch = f"检索 {f['searches']}（零命中 {f['zero_hit_searches']}）"
     print(f"  流动：记录 {f['records']} · 记忆 {f['memories']} · 任务 新建 {f['tasks_created']}"
           f" / 完成 {f['tasks_done']}"
           + ("" if cyc is None else f"（中位周期 {cyc:g}h）")
           + f" / 取消或死信 {f['tasks_cancelled_or_dead']}"
           f" · 错误新开 {f['errors_opened']}（未闭 {f['errors_open']}）"
-          f" · 调用 {f['tool_calls']} · 检索 {f['searches']}（零命中 {f['zero_hit_searches']}）")
+          f" · 调用 {f['tool_calls']} · {srch}")
     w, fr = c["wip"], c["freeze"]
     hf = c.get("handoffs") or {"open": 0, "stale": 0}
     sec = c.get("security") or {"denied": 0}
@@ -1257,7 +1270,8 @@ def cmd_digest(root: str, days: int = 1) -> int:
               "approval_aging": "待批过久", "overdue": "逾期", "dead_letter": "死信",
               "retry_storm": "重试≥2", "offline_with_open": "无心跳但有在办",
               "handoff_stale": "交接陈旧", "security_denied": "越权拦截",
-              "errors_open": "未闭错误", "zero_hit_search": "零命中检索"}
+              "errors_open": "未闭错误", "zero_hit_search": "零命中检索",
+              "error_recall_gap": "报错回忆没答案"}
     if d["risks"]:
         print("  风险：")
         for r in d["risks"]:

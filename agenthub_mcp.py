@@ -571,6 +571,7 @@ _DIGEST_RISK_CN = {
     "retry_storm": "重试≥2", "offline_with_open": "无心跳但有在办",
     "handoff_stale": "交接陈旧", "errors_open": "未闭错误",
     "zero_hit_search": "零命中检索",
+    "error_recall_gap": "报错回忆没答案",
 }
 
 
@@ -581,12 +582,27 @@ def _render_team_digest(d: dict) -> str:
     lines = [f"团队日结（近 {d['window_days']} 天｜{since} 起）："]
     cyc = f.get("done_cycle_p50_h")
     cyc_s = "—" if cyc is None else f"{cyc:g}h"
+    ch = f.get("searches_by_channel") or {}
+    z_tot = f.get("zero_hit_searches", 0)
+    if ch:
+        parts = [f"主动 {ch.get('agent', {}).get('searches', 0)}",
+                 f"自动 {ch.get('auto', {}).get('searches', 0)}",
+                 f"报错 {ch.get('error', {}).get('searches', 0)}"
+                 f"+{ch.get('miss', {}).get('searches', 0)}"]
+        zero_parts = [f"主动 {ch.get('agent', {}).get('zero', 0)}",
+                      f"自动 {ch.get('auto', {}).get('zero', 0)}",
+                      f"报错 {ch.get('error', {}).get('zero', 0)}"
+                      f"+{ch.get('miss', {}).get('zero', 0)}"]
+        srch = (f"检索 {f['searches']}（{' / '.join(parts)}）"
+                f"（零命中 {z_tot}：{' / '.join(zero_parts)}）")
+    else:
+        srch = f"检索 {f['searches']}（零命中 {z_tot}）"
     lines.append(
         f"流动：记录 {f['records']} · 记忆 {f['memories']} · 任务 新建 {f['tasks_created']}"
         f" / 完成 {f['tasks_done']}（中位周期 {cyc_s}）"
         f" / 取消或死信 {f['tasks_cancelled_or_dead']}"
         f" · 错误新开 {f['errors_opened']}（未闭 {f['errors_open']}）"
-        f" · 工具调用 {f['tool_calls']} · 检索 {f['searches']}（零命中 {f['zero_hit_searches']}）")
+        f" · 工具调用 {f['tool_calls']} · {srch}")
     w, fr = c["wip"], c["freeze"]
     hf = c.get("handoffs") or {"open": 0, "stale": 0}
     lines.append(
@@ -1592,9 +1608,24 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
                 fresh = sorted(st["last_seen"].items(), key=lambda kv: kv[1], reverse=True)[:8]
                 lines.append("最近露面：" + "，".join(f"{k}({v[5:16].replace('T', ' ')})" for k, v in fresh))
             if st["zero_hit_searches"]:
-                lines.append("零命中检索（反复出现=索引/描述待修）：")
-                for r in st["zero_hit_searches"][:8]:
-                    lines.append(f"  ×{r['n']} 「{r['query'][:40]}」（{r['agent'] or '?'}，末次 {r['last'][5:16].replace('T', ' ')}）")
+                # R1015：按通道分组——主动检索的白搜才谈得上「索引/描述待修」，
+                # 报错通道的零命中是「这个错还没被认出来」，两者的下一步动作不同。
+                zs = st["zero_hit_searches"]
+                ag = [r for r in zs if r.get("_channel") == "agent"]
+                er = [r for r in zs if r.get("_channel") in ("error", "miss")]
+                if ag:
+                    lines.append("零命中·主动检索（反复出现=索引/描述待修）：")
+                    for r in ag[:8]:
+                        lines.append(f"  ×{r['n']} 「{r['query'][:40]}」（{r['agent'] or '?'}，末次 {r['last'][5:16].replace('T', ' ')}）")
+                if er:
+                    lines.append("零命中·报错回忆（不是关键词问题：这个错库里还没有修法）：")
+                    for r in er[:8]:
+                        lines.append(f"  ×{r['n']} 「{r['query'][:40]}」（{r['agent'] or '?'}，末次 {r['last'][5:16].replace('T', ' ')}）")
+                other = [r for r in zs if r.get("_channel") not in ("agent", "error", "miss")]
+                if other:
+                    lines.append("零命中·其它通道：")
+                    for r in other[:4]:
+                        lines.append(f"  ×{r['n']} 「{r['query'][:40]}」（{r['agent'] or '?'}）")
             if st["repeated_queries"]:
                 lines.append("重复查询（≥3 次，重试风暴代理信号）：")
                 for r in st["repeated_queries"][:8]:
