@@ -3529,7 +3529,10 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
         except (TypeError, ValueError):
             limit = 15
         proj = str(arguments.get("project", "") or "").strip()
-        cands = brain.distill_candidates(root, limit, project=proj)
+        # 只在真给了 project 时才带关键字参数——外部有把 distill_candidates
+        # 换成两参 lambda 的探针/测试（旧调用形状要继续能用）。
+        cands = (brain.distill_candidates(root, limit, project=proj) if proj
+                 else brain.distill_candidates(root, limit))
         if not cands:
             return "无蒸馏候选——近期含「目的」的记录都已沉淀或展示过（结晶良好）"
         brain.mark_distill_shown(root, [c["id"] for c in cands])
@@ -5102,7 +5105,8 @@ TOOLS = [
                      "required": ["query"]}},
     {"name": "hub_distill", "description": "记忆蒸馏候选：记录里含可沉淀结论、但同项目无记忆覆盖的记录（结晶流水线）。盲区优先——「有记录、零记忆」的项目（沉了几个月没人动过的）会排前面，并标注记录数与沉寂天数。收尾时看它，确认后用 hub_memory_write 沉淀——日记会膨胀，笔记本只留精华。例：hub_distill(limit=10)、hub_distill(project=\"课表日程App\")",
      "inputSchema": {"type": "object",
-                     "properties": {"limit": {"type": "integer", "description": "候选条数上限，默认 15（看过后会记录已展示，下次不再刷同一条）"}}}},
+                     "properties": {"limit": {"type": "integer", "description": "候选条数上限，默认 15（看过后会记录已展示，下次不再刷同一条）"},
+                                    "project": {"type": "string", "description": "只看某个项目的候选（如 project=\"课表日程App\"）——盲区项目记录多，一次一页捞不完"}}}},
     {"name": "hub_get_record", "description": "按 id 精读一条工作记录（渐进披露三级：abstract 前200字 → outline 段头骨架 → full 全文，每级成本差一个量级）。先从 hub_search/hub_list_todos 等拿到 #id 再调；不知道 id 时不要盲调。例：hub_get_record(record_id=3262, level=\"outline\")",
      "inputSchema": {"type": "object",
                      "properties": {"record_id": {"type": "integer", "description": "记录 id，如 2037"},
@@ -5378,7 +5382,7 @@ _INT_PARAMS = {
     "hub_claim": ("task_id",),
     "hub_crystallize": ("task_id",),
     "hub_decision_review": ("review_id",),
-    "hub_distill": ("limit",),
+    "hub_distill": ("limit",),        # project 是字符串参数，不进整数强校验表
     "hub_duplicates": ("min_len",),
     "hub_env_list": ("limit",),
     "hub_error_close": ("error_id",),
