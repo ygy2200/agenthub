@@ -1311,6 +1311,11 @@ HOOK_JSON_EVENTS = {
     "prompt": ("UserPromptSubmit", HOOK_RECALL_NAME, HOOK_RECALL_DESC),
     "answer": ("Stop", HOOK_ADHERENCE_NAME, HOOK_ADHERENCE_DESC),
     "error": ("PostToolUseFailure", HOOK_ERROR_RECALL_NAME, HOOK_ERROR_RECALL_DESC),
+    # R992：报错回忆的第二个事件。R971（Python traceback）与 R986（Node 异常）两段兜底
+    # 要处理的正是「宿主不判定失败」的 exit=0 场景——只挂 PostToolUseFailure 时它们永不执行
+    # （真库实测：日志里 27 条兜底记录 sid 全是测试、真实会话 0 条）。这不是可选增强，
+    # 是同一支脚本必须挂的第二个口子，所以安装器要一次挂两个。
+    "error_post": ("PostToolUse", HOOK_ERROR_RECALL_NAME, HOOK_ERROR_RECALL_DESC),
     "sweep": ("UserPromptSubmit", HOOK_SWEEP_NAME, HOOK_SWEEP_DESC),
 }
 
@@ -1522,13 +1527,29 @@ def install_adherence_hook(agent: str, apply: bool = False, path: str = "",
 
 def install_error_recall_hook(agent: str, apply: bool = False, path: str = "",
                               node: str = "", install_script: bool = True) -> dict:
-    """把 brain_error_recall.mjs 挂到 agent 的 PostToolUseFailure（R833）。
+    """把 brain_error_recall.mjs 挂到 agent 的 PostToolUseFailure **与 PostToolUse**（R833/R992）。
 
     工具失败是「大脑该开口」的确定信号：这时候给一句同签名的旧坑，比事后由用户
     提醒「你先查一下记忆」有效得多，成本也低——只在失败时跑一次检索。
+
+    R992：第二个事件不是可选增强。R971（Python traceback）与 R986（Node 异常）两段兜底
+    要处理的正是「宿主不判定失败」的 exit=0 场景（`a; b` 串联把非零退出码吃掉），
+    只挂 PostToolUseFailure 时它们永远不会被执行——真库日志里 27 条兜底记录 sid 全是测试、
+    真实会话 0 条。安装器一次挂两个，重装才不会再退回「只有一半」。
     """
-    return _install_json_hook(agent, "error", apply=apply, path=path, node=node,
+    main = _install_json_hook(agent, "error", apply=apply, path=path, node=node,
                               install_script=install_script)
+    post = _install_json_hook(agent, "error_post", apply=apply, path=path, node=node,
+                              install_script=False)
+    ms, ps = main.get("status"), post.get("status")
+    # 合并口径：主事件装成 → added；主事件早已在位但第二事件刚补上 → 也算 added
+    # （否则「补挂」在回执里看不出来，用户会以为它本来就在）。
+    if ms == "added" or (ms == "already" and ps == "added"):
+        main["status"] = "added"
+        main["event"] = f"{main.get('event')}+{post.get('event')}"
+    main["post_event"] = {"event": post.get("event"), "status": ps,
+                          "backup": post.get("backup", "")}
+    return main
 
 
 def install_sweep_hook(agent: str, apply: bool = False, path: str = "",

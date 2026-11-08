@@ -545,3 +545,27 @@ def test_bundle_lists_error_recall_files():
     files = core.bundle_files()
     assert "brain_error_recall.py" in files, files
     assert "brain_error_recall.mjs" in files, files
+
+
+def test_installer_mounts_both_events(tmp_path):
+    """R992：报错钩子必须一次挂两个事件。
+
+    兜底（R971 Python traceback / R986 Node 异常）要处理的是「宿主不判定失败」的
+    exit=0 场景——只挂 PostToolUseFailure 时它们永不执行。真库实测：日志里 27 条
+    兜底记录 sid 全是测试、真实会话 0 条；这台机器 6 家里 5 家都缺第二个口子。
+    """
+    p = tmp_path / "settings.json"
+    p.write_text(json.dumps({"hooks": {}}, ensure_ascii=False), encoding="utf-8")
+    r = core.install_error_recall_hook("claude", apply=True, path=str(p),
+                                       node="D:/node/node.exe", install_script=False)
+    assert r["status"] == "added", r
+    data = json.loads(p.read_text(encoding="utf-8"))
+    for ev in ("PostToolUseFailure", "PostToolUse"):
+        cmd = data["hooks"][ev][0]["hooks"][0]["command"]
+        assert core.HOOK_ERROR_RECALL_NAME in cmd, (ev, cmd)
+    again = core.install_error_recall_hook("claude", apply=True, path=str(p),
+                                           install_script=False)
+    assert again["status"] == "already", again
+    data2 = json.loads(p.read_text(encoding="utf-8"))
+    assert len(data2["hooks"]["PostToolUseFailure"]) == 1, "幂等：不许重复追加"
+    assert len(data2["hooks"]["PostToolUse"]) == 1, "幂等：不许重复追加"
