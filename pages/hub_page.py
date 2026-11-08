@@ -235,6 +235,13 @@ class HubPage(QWidget):
             self.preview.setHtml(
                 f"<p style='color:{tokens.C(tokens.TEXT_3)}'>记忆读取失败："
                 f"{type(e).__name__}: {str(e)[:80]}</p>")
+        # R976/R979：被后来者声明修正过的旧条——桌面是第四个出口，口径必须与注入/
+        # hub_memory_read/hub_search 一致，否则 agent 说「已被 #N 修正」而人翻列表看不到。
+        # 索引按库文件指纹缓存（首次 7ms、之后 0.1ms），失败一律当没有。
+        try:
+            amended = brain.amended_by_map(self.win.root)
+        except Exception:  # noqa: BLE001
+            amended = {}
         for m in self._mem_rows:
             if kw and kw not in m["content"].lower() and kw not in (m["tags"] or "").lower():
                 continue
@@ -243,15 +250,19 @@ class HubPage(QWidget):
             flag = "★" if m["pinned"] else "·"
             tags = f" #{m['tags']}" if m["tags"] else ""
             src = f" @{m['agent']}" if m["agent"] and m["agent"] != "migrated" else ""
+            am = amended.get(int(m["id"])) or []
+            am_badge = f"⚠已被#{'/'.join(str(i) for i in am)}修正 " if am else ""
             self.memList.addItem(
-                f"{memory_badge(fr)}{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]"
+                f"{am_badge}{memory_badge(fr)}{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]"
                 f"{tags}{src}  {m['content'][:90]}")
             it = self.memList.item(self.memList.count() - 1)
             it.setData(Qt.UserRole, f"mem:{m['id']}")
             age = fr.get("age_days")
             it.setToolTip(
                 f"新鲜度 {fr['state']}（{age if age is not None else '?'} 天，依据 {fr.get('basis') or '-'}）"
-                + (f"\n最后复核 {m.get('confirmed')}" if m.get("confirmed") else "\n从未显式复核"))
+                + (f"\n最后复核 {m.get('confirmed')}" if m.get("confirmed") else "\n从未显式复核")
+                + (f"\n已被 {'、'.join('#%d' % i for i in am)} 修正：后写的那条在正文里明确推翻了这条，"
+                   f"但没走取代工具。冲突以新条为准。" if am else ""))
         if not self._mem_rows:
             # R197：列表行只说人话，工具名进 tooltip
             self.memList.addItem("（大脑记忆为空——用下方「新建记忆」，或让 agent 记一条）")
