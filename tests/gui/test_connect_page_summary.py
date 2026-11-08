@@ -109,3 +109,30 @@ def test_connect_summary_python_missing_and_empty(qapp, hub_root, monkeypatch):
         assert page2.sumLabel.toolTip() == ""
     finally:
         win2.close()
+
+
+def test_connect_summary_names_missing_post_tool_use(qapp, hub_root, monkeypatch):
+    """R1003：报错钩子「在位」但只挂了失败事件，汇总行必须点出来。
+
+    R987 实锤：只挂 PostToolUseFailure 时，`a; b` 串联把退出码吃掉（exit 0）的两段
+    兜底（Python traceback / Node 异常）永不执行——日志 27 条兜底记录 sid 全是测试、
+    真实会话 0 条。接入页此前说「全部在位」，等于把半挂说成全挂。
+    """
+    import core
+
+    def _hooks(agent, path=""):
+        base = {"agent": agent, "state": "inplace", "path": "", "script": True}
+        return {"agent": agent,
+                "session": dict(base), "prompt": dict(base), "answer": dict(base),
+                "error": {**base, "post_status": "would_add", "post_missing": True}}
+
+    monkeypatch.setattr(core, "memory_hook_status", _hooks)
+    win, page = _page(qapp, hub_root, monkeypatch, [_adapter("a")], _state(),
+                      connected=("/fake/a.json",), booted=("/fake/a.instr",))
+    try:
+        text = page.hookLabel.text()
+        assert "全部在位" in text, text
+        assert "只挂了失败事件" in text, f"半挂被说成全挂：{text}"
+        assert "hook-install --events error" in text, "必须给补法"
+    finally:
+        win.close()

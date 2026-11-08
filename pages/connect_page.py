@@ -364,6 +364,13 @@ class ConnectPage(QWidget):
                   if "bad_schema" in (_st(s, "session"), _st(s, "prompt"),
                                       _st(s, "answer"), _st(s, "error"))]
         absent = [a for a, s in self._hookStates.items() if _st(s, "session") == "absent"]
+        # R1002：第四类缺口——报错钩子在位、但只挂了 PostToolUseFailure。
+        # 「在位」不等于「会被调用」：两段兜底（Python traceback / Node 异常）要处理的正是
+        # 「`a; b` 串联把退出码吃掉」的 exit 0 场景，那种场景不触发失败事件（R987 实锤：
+        # 日志 27 条兜底记录 sid 全是测试、真实会话 0 条）。只在文案里说，不动 gaps，
+        # 免得「点按钮补齐」把已经在位的那条再挂一遍。
+        post_gap = [a for a, s in self._hookStates.items()
+                    if (s.get("error") or {}).get("post_missing")]
         if unwired:
             text = (f"记忆钩子：{'、'.join(unwired)} 未挂——这些 agent 开新会话不会自动带团队上下文，"
                     "说话时也不会自动回忆（MCP 握手简报仍可用，但要求客户端已接入且重启过）")
@@ -379,6 +386,11 @@ class ConnectPage(QWidget):
             text = (f"记忆钩子：{len(inplace)} 家全部在位——开新会话自动收到大脑简报，"
                     "每句话自动检索相关记忆，撞上报错自动想起同签名的旧坑，"
                     "一轮结束自动回填采纳，不需要再提醒 AI 读记忆")
+            if post_gap:
+                text += (f"；但 {'、'.join(post_gap)} 的报错钩子只挂了失败事件——"
+                         "`a; b` 串联把退出码吃掉时（exit 0）Python traceback / Node 异常"
+                         "两段兜底不会触发（补：cli.py hook-install --events error --apply，"
+                         "然后重启该客户端）")
         if unwired and (fill_gap or err_gap):
             text += f"；{'、'.join(dict.fromkeys(fill_gap + err_gap))} 还缺回填/报错回忆"
         if broken:
