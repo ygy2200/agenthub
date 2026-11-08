@@ -6278,6 +6278,12 @@ def amend_note(amended: dict, mid: int) -> str:
     return "已被 " + "、".join(f"#{i}" for i in ids) + " 修正，冲突以它为准；"
 
 
+def amend_suffix(amended: dict, mid) -> str:
+    """简报行尾的紧凑形态：「（已被 #370 修正）」——简报每行只有一个括号位置。"""
+    note = amend_note(amended, mid)
+    return f"（{note.rstrip('；')}）" if note else ""
+
+
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
                project: str = "", agent: str = "", pinned: bool = False,
                supersedes: int = 0, valid_until: str = "",
@@ -12036,6 +12042,12 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
         tcounts = tasks.get("counts") or {}
 
         via = "MCP 握手" if source == "initialize" else "SessionStart 钩子"
+        # R978：简报导出的每一条记忆都可能已经被后来者推翻过（真库 18 条）。
+        # 简报是「开会话第一眼」的信息，比注入更需要这一步——否则第一眼就是旧结论。
+        try:
+            _amended = amended_by_map(root)
+        except Exception:  # noqa: BLE001 注脚失败不许拖垮简报
+            _amended = {}
         lines = [f"【AgentHub 大脑简报 · 会话启动自动生成 · {who or '未署名'} · "
                  f"{now:%Y-%m-%d %H:%M}】",
                  f"根目录 {root} ｜ {n_proj} 项目 · {n_rec} 条活跃记录 · {n_mem} 条记忆",
@@ -12077,7 +12089,8 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
                 if m["id"] in seen:
                     continue
                 seen.add(m["id"])
-                lines.append(f"  · #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 90)}")
+                lines.append(f"  · #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 90)}"
+                             f"{amend_suffix(_amended, m['id'])}")
             if proj_recs or proj_mem:
                 lines.append(f"  更多：hub_memory_read(query=\"{pname} 关键词\") / hub_search(keyword=…)")
             # R838：把「干到哪了」摆到简报里，别让每个新会话都从头翻台账
@@ -12091,7 +12104,8 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
             lines.append("▸ 最近团队踩坑（其他 agent · 7 天内，自动共享）")
             for m in lessons:
                 lines.append(f"- #{m['id']} [{m['agent'] or '其他'}] "
-                             f"{_brief_oneline(m['content'], 90)}")
+                             f"{_brief_oneline(m['content'], 90)}"
+                             f"{amend_suffix(_amended, m['id'])}")
         # R883：当前项目的「干到哪了」比团队新闻更能决定下一步；团队进展后置。
         if progress:
             lines.append("")
@@ -12107,7 +12121,8 @@ def session_brief(root: str, agent: str = "", cwd: str = "", project: str = "",
             for m in pinned:
                 if m["id"] in seen or m["id"] in rule_ids:
                     continue
-                lines.append(f"- #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 110)}")
+                lines.append(f"- #{m['id']} [{m['kind']}] {_brief_oneline(m['content'], 110)}"
+                             f"{amend_suffix(_amended, m['id'])}")
         todo = []
         if sig["fresh"]:
             todo.append(f"- 未读信号 {sig['fresh']} 条"

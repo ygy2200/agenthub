@@ -1167,6 +1167,26 @@ def _clip(text, n: int) -> str:
     return s if len(s) <= n else s[:n] + "…"
 
 
+def _amend_map(root: str) -> dict:
+    """R976：被后来者声明修正过的记忆索引（渲染用）。
+
+    为什么在出口层统一取：同一件事要看在四个面上（注入 / hub_memory_read / hub_search /
+    桌面），口径必须一致，否则 agent 读到「已被 #370 修正」而人翻桌面看不到，会以为
+    agent 在编。异常一律空表——这是注脚，不许把出口弄崩。
+    """
+    try:
+        return brain.amended_by_map(root)
+    except Exception:  # noqa: BLE001
+        return {}
+
+
+def _amend_note(amended: dict, mid) -> str:
+    try:
+        return brain.amend_note(amended, int(mid or 0))
+    except Exception:  # noqa: BLE001
+        return ""
+
+
 def _snippet(content: str, words: list, width: int = 76) -> str:
     """命中片段：取首个命中词前后的上下文（无命中给开头），单行化。
     hub_search 只给标题时判断不了价值，精读前先看片段省一次 hub_get_record。"""
@@ -2297,6 +2317,7 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
             snip = _snippet(r["content"], words)
             if snip:
                 lines.append(f"  ↳ {snip}")
+        amended = _amend_map(root)
         for mem in res["memories"]:
             src = (f"（图关联自{mem['_cross'][2:]}）" if mem.get("_cross")
                    else "（图关联）" if "graph" in (mem.get("_channels") or {}) else "")
@@ -2304,6 +2325,11 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
                 src += f" ✅现行（对面#{'/#'.join(str(i) for i in mem['_current_hint'])}为旧版）"
             elif mem.get("_superseded_hint"):
                 src += f" ⧗对面#{'/#'.join(str(i) for i in mem['_superseded_hint'])}是更新版"
+            # R976：被后来者声明修正过的旧条（R106 的 _current_hint 只管「版本对」，
+            # 管不到「后条在正文里说前条错了却没走取代工具」这一类，真库 18 条）
+            am = _amend_note(amended, mem.get("id"))
+            if am:
+                src += " ⚠" + am.rstrip("；")
             lines.append(f"[记忆#{mem['id']}] {brain.KIND_CN.get(mem['kind'], mem['kind'])}：{_clip(mem['content'], 100)}{src}")
         # 矛盾提示（2026-10-13）：业界把冲突检测定位为「取回后、进上下文前」的标准步骤——
         # 不检测就交给 LLM 自己发现，行为不确定且不可审计。这里只提示，不替用户裁决。
@@ -2417,12 +2443,18 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
         if any("_bigram" in m for m in rows):
             head += "（长串已拆词放宽召回，弱相关自行取舍）"
         lines = [head]
+        amended = _amend_map(root)
         for m in rows:
             flag = "★" if m["pinned"] else "·"
             tags = f" #{m['tags']}" if m["tags"] else ""
             # R3：同事实多版本的处置标注——旧版不藏（信息不丢），但要让读的人知道
             # 「这条是旧版，现行版在上面那条」，否则降序只是隐形重排、LLM 仍会综合
             notes = []
+            # R976：先报「这条已被谁修正」——它比新鲜度更要紧：新鲜度只说「没人复核过」，
+            # 这条是「已经有人明确推翻过」，读的人必须先看到。
+            am = _amend_note(amended, m.get("id"))
+            if am:
+                notes.append(am.rstrip("；"))
             if m.get("_older_version_of"):
                 notes.append(f"旧版，现行版为 #{m['_older_version_of']}")
             if m.get("_folded_older"):

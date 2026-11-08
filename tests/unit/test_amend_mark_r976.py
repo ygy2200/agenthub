@@ -119,3 +119,40 @@ def test_selfdoc_does_not_contaminate(hub_root):
     assert m.get(old) == [old + 1]
     for ids in m.values():
         assert all(i != old + 2 for i in ids), m
+
+
+def test_memory_read_renders_amend(hub_root):
+    """读出口与注入出口同一口径：agent 主动查也要看到「已被 #N 修正」。"""
+    import agenthub_mcp
+    root = str(hub_root)
+    brain.init_db(root)
+    old = _mem(root, "旧结论：GitHub 强 token 已失效，凭据全灭")
+    new = _mem(root, f"修正记忆#{old}：本机有效凭据是 git credential fill")
+    out = agenthub_mcp.call_tool("hub_memory_read", {"query": "GitHub token 凭据"}, root)
+    assert f"#{old}" in out
+    assert f"已被 #{new} 修正" in out, out
+
+
+def test_search_renders_amend(hub_root):
+    import agenthub_mcp
+    root = str(hub_root)
+    brain.init_db(root)
+    old = _mem(root, "旧结论：DLSS 菜单消失是 mod 与 exe 失配")
+    new = _mem(root, f"修正记忆#{old}：真主因是 NVIDIA App 的 DLSS Override")
+    out = agenthub_mcp.call_tool("hub_search", {"keyword": "DLSS 菜单消失 失配"}, root)
+    assert f"已被 #{new} 修正" in out, out
+
+
+def test_brief_carries_amend(hub_root):
+    """R978：简报是开会话第一眼，那里的旧结论更必须先标出来。"""
+    root = str(hub_root)
+    brain.init_db(root)
+    brain.add_record(root, "演示-项目", "workbuddy", "2026-11-05",
+                     "一条记录", "内容")
+    old = brain.add_memory(root, "PROJ-MEM 旧结论：端口 8080", kind="fact",
+                           project="演示-项目", agent="qoder")
+    new = brain.add_memory(root, f"修正记忆#{old}：端口已改 9090", kind="fact",
+                           project="演示-项目", agent="qoder")
+    text = brain.session_brief(root, agent="qoder", project="演示-项目")["text"]
+    assert f"#{old}" in text
+    assert f"已被 #{new} 修正" in text, text
