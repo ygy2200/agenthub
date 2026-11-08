@@ -106,3 +106,51 @@ def test_single_project_quota(root_with_blind_project):
     for c in cands:
         per[c["project"]] = per.get(c["project"], 0) + 1
     assert all(v <= brain.DISTILL_MAX_PER_PROJECT for v in per.values()), per
+
+
+# ---- R1026：指定项目视图 ----
+
+def test_project_filter_returns_only_that_project(root_with_blind_project):
+    cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
+    assert cands
+    assert all(c["project"] == "盲区项目" for c in cands)
+
+
+def test_project_filter_finds_old_records_of_now_covered_project(root_with_blind_project):
+    """项目一旦有了记忆就不再是盲区——它的老记录仍在「最近 300 条」之外，
+    所以指定项目时必须直接查该项目，不能只从盲区池/最近池里筛。"""
+    brain.add_memory(root_with_blind_project, "盲区项目已有一条记忆", kind="fact",
+                     project="盲区项目")
+    cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
+    assert cands, "指定项目时必须能捞到该项目的老记录"
+
+
+def test_project_filter_ignores_distill_seen(root_with_blind_project):
+    """显式点名要看这个项目 = 要把它捞干净，不该被「展示过」挡掉。"""
+    brain.mark_distill_shown(root_with_blind_project, [1, 2, 3])
+    cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
+    assert cands, "指定项目时不该过滤已展示过的记录"
+
+
+# ---- R1026：指定项目视图 ----
+
+def test_project_filter_returns_only_that_project(root_with_blind_project):
+    cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
+    assert cands
+    assert all(c["project"] == "盲区项目" for c in cands)
+
+
+def test_project_filter_finds_old_records_of_now_covered_project(root_with_blind_project):
+    """项目一旦有了记忆就不再是盲区——它的老记录仍在「最近 300 条」之外，
+    所以指定项目时必须直接查该项目，不能只从盲区池/最近池里筛。"""
+    brain.add_memory(root_with_blind_project, "盲区项目已有一条记忆", kind="fact",
+                     project="盲区项目")
+    cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
+    assert cands, "指定项目时必须能捞到该项目的老记录"
+
+
+def test_project_filter_ignores_distill_seen(root_with_blind_project):
+    """显式点名要看这个项目 = 要把它捞干净，不该被「展示过」挡掉。"""
+    brain.mark_distill_shown(root_with_blind_project, [1, 2, 3])
+    cands = brain.distill_candidates(root_with_blind_project, limit=10, project="盲区项目")
+    assert cands, "指定项目时不该过滤已展示过的记录"

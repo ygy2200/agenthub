@@ -16749,7 +16749,7 @@ def _distill_gist(content: str) -> tuple:
     return "", ""
 
 
-def distill_candidates(root: str, limit: int = 20) -> list:
+def distill_candidates(root: str, limit: int = 20, project: str = "") -> list:
     """记忆蒸馏候选（结晶流水线）：记录里含可沉淀结论、但同项目没有记忆覆盖、且未展示过。
 
     R1025 改了两件要紧的事：
@@ -16769,10 +16769,14 @@ def distill_candidates(root: str, limit: int = 20) -> list:
         mem_count: dict = {}
         for m in mems:
             mem_count[m["project"]] = mem_count.get(m["project"], 0) + 1
+        # 指定项目时不过滤「已展示过」——显式点名要看这个项目，
+        # 就是要把它捞干净；全局视图才遵守「展示即登记、不再重复推送」。
+        proj = (project or "").strip()
+        seen_sql = "" if proj else (
+            " AND id NOT IN (SELECT record_id FROM distill_seen)")
         recs = [dict(r) for r in conn.execute(
             "SELECT id, project, date, agent, content FROM records "
-            "WHERE status='active' AND id NOT IN "
-            "(SELECT record_id FROM distill_seen) ORDER BY id DESC LIMIT 300")]
+            "WHERE status='active'" + seen_sql + " ORDER BY id DESC LIMIT 300")]
         # 盲区项目：记录多、零记忆 → 它们的记录额外进池（否则永远轮不到）
         blind_recs: list = []
         blind_projects = [p for p, n in proj_rec.items()
@@ -16780,14 +16784,25 @@ def distill_candidates(root: str, limit: int = 20) -> list:
         for p in sorted(blind_projects, key=lambda x: -proj_rec[x])[:DISTILL_BLIND_PROJECTS]:
             blind_recs += [dict(r) for r in conn.execute(
                 "SELECT id, project, date, agent, content FROM records "
-                "WHERE status='active' AND project=? AND id NOT IN "
-                "(SELECT record_id FROM distill_seen) ORDER BY id DESC LIMIT ?",
+                "WHERE status='active' AND project=?" + seen_sql +
+                " ORDER BY id DESC LIMIT ?",
                 (p, DISTILL_BLIND_PER_PROJECT))]
     mem_toks: dict = {}
     for m in mems:
         mem_toks.setdefault(m["project"], []).append(_tokens(m["content"]))
     blind_ids = {r["id"] for r in blind_recs}
     pool = blind_recs + [r for r in recs if r["id"] not in blind_ids]
+    if proj:
+        # 指定项目时**直接查这个项目**（R1026）：盲区项目动辄几十条记录，一次一页捞不完，
+        # 「先把这个项目的知识捞干净」比全局排序更实用。
+        # 不能只从上面两个池子里筛——项目一旦有了记忆就不再是盲区，
+        # 它的老记录既不在盲区池、也不在「最近 300 条」里。
+        with db_conn(root) as conn:
+            pool = [dict(r) for r in conn.execute(
+                "SELECT id, project, date, agent, content FROM records "
+                "WHERE status='active' AND project=?" + seen_sql +
+                " ORDER BY id DESC LIMIT ?",
+                (proj, max(limit * 4, 40)))]
     today = datetime.date.today()
     out = []
     for r in pool:
