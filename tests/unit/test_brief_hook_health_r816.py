@@ -151,3 +151,22 @@ def test_error_hook_with_posttooluse_is_not_named(hub_root, tmp_path, monkeypatc
            tmp_path)
     r = ops._brief_hook_health(hub_root)
     assert not any("只挂了失败事件" in d for d in r["detail"]), r["detail"]
+
+
+def test_script_mounted_without_its_event_is_named(hub_root, tmp_path, monkeypatch):
+    """R989：脚本挂在配置里、它要的事件却没挂 → 对应分支永不触发。
+
+    R987 的通用化：不只 error_recall 有「挂了但不是那个事件」的问题。这条把
+    core.HOOK_EVENT_CONTRACT 钉住——以后客户端升级只留一半 hooks，体检会点名。
+    """
+    brain.init_db(hub_root)
+    data = _both()
+    data["hooks"].pop("SessionStart")            # 简报事件没了
+    data["hooks"]["Stop"][0]["hooks"].append(    # 但脚本名还在配置文本里
+        {"type": "command", "command": core.HOOK_BRIEF_NAME})
+    cfg = _cfg(tmp_path, "no-session.json", json.dumps(data))
+    _patch(monkeypatch, {"qoder": str(cfg)}, (("hermes-cn", str(tmp_path / "none")),),
+           tmp_path)
+    r = ops._brief_hook_health(hub_root)
+    assert any("钩子事件不齐" in d and "brain_inject.mjs" in d and "SessionStart" in d
+               for d in r["detail"]), r["detail"]

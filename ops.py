@@ -3052,6 +3052,7 @@ def _brief_hook_health(root: str) -> dict:
     answer_inplace, answer_unwired = [], []   # R828：Stop 采纳回填
     error_inplace, error_unwired = [], []     # R833：工具失败即时回忆
     error_post_missing = []                   # R987：缺 PostToolUse 出口（兜底永远不会触发）
+    event_gaps = []                           # R989：脚本挂了但契约事件没挂（其他脚本）
     for agent, cfg_s in targets.items():
         p = Path(os.path.expanduser(cfg_s))
         if not p.is_file():
@@ -3083,6 +3084,15 @@ def _brief_hook_health(root: str) -> dict:
                     error_post_missing.append(agent)
             else:
                 error_unwired.append(agent)
+        # R989：把 R987 的教训做成通用契约——任何脚本「配置里挂了、但它要的事件没挂」
+        # 都意味着对应分支在生产上永不触发。error_recall 已由上面单独点名（文案更具体），
+        # 这里只覆盖另外几支，防的是「客户端升级后只留一半 hooks」这类静默残缺。
+        for _script, _need in getattr(core, "HOOK_EVENT_CONTRACT", {}).items():
+            if _script == core.HOOK_ERROR_RECALL_NAME or _script not in text:
+                continue
+            _lack = [e for e in _need if f'"{e}"' not in text]
+            if _lack:
+                event_gaps.append((agent, _script, _lack))
     d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
     delivered: dict = {}
     recalled: dict = {}
@@ -3135,6 +3145,11 @@ def _brief_hook_health(root: str) -> dict:
                       + "（缺 PostToolUse —— `a; b` 串联把非零退出码吃掉时宿主不判失败，"
                         "R971 的 Python traceback 与 R986 的 Node 异常两段兜底就永远不会被调用；"
                         "补：在该客户端 hooks 里给 PostToolUse 加同一条命令，重启客户端生效）")
+    if event_gaps:
+        detail.append(
+            "钩子事件不齐（脚本挂在配置里、它要的事件却没挂，对应分支永不触发）："
+            + "；".join(f"{a} · {s} 缺 {'/'.join(l)}" for a, s, l in event_gaps[:4])
+            + "（按 core.HOOK_EVENT_CONTRACT 核对；补上事件后重启客户端生效）")
     if unwired or recall_unwired:
         lost = sorted(set(unwired) | set(recall_unwired))
         detail.append("钩子丢失：" + "、".join(lost)

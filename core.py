@@ -1314,6 +1314,19 @@ HOOK_JSON_EVENTS = {
     "sweep": ("UserPromptSubmit", HOOK_SWEEP_NAME, HOOK_SWEEP_DESC),
 }
 
+# R989：钩子脚本 → 运行时**必须**挂的事件。与上面那张表分工不同：
+# HOOK_JSON_EVENTS 是「安装时挂哪一个」（一个 target 一个事件），本表是「运行时靠哪些
+# 事件才不残废」。R987 的教训：error_recall 的兜底要处理 exit=0（宿主不判失败）的场景，
+# 只挂 PostToolUseFailure 等于 Python traceback 与 Node 异常两段兜底永远不执行——
+# 本机日志里 27 条兜底记录 sid 全是测试、真实会话 0 条。把那次教训变成可检查的契约，
+# 以后换机器/重装客户端，体检会直接点名「脚本在了但事件没挂」。
+HOOK_EVENT_CONTRACT = {
+    HOOK_ERROR_RECALL_NAME: ("PostToolUseFailure", "PostToolUse"),
+    HOOK_BRIEF_NAME: ("SessionStart",),
+    HOOK_RECALL_NAME: ("UserPromptSubmit",),
+    HOOK_ADHERENCE_NAME: ("Stop",),
+}
+
 
 def hook_brief_script_path() -> Path:
     return Path.home() / ".agenthub" / "hooks" / HOOK_BRIEF_NAME
