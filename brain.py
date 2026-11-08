@@ -6092,6 +6092,22 @@ def memory_trace(root: str, mid: int) -> list:
 
 MEMORY_SIG_TAG_MAX = 4   # 一条记忆最多沉淀几个签名词：tag 库是人维护的，塞满报错碎片就没人用了
 
+# R974/R975：正文里的「记忆裁决声明」。写入口（写后提示）与体检（ops 的取代声明审计）
+# 共用这一张表——两张表各写一遍必然漂，是本仓反复踩过的形态。
+# 只认「取代」时真库漏了 7 条「修正/更正记忆#N」（#370→#71、#497→#495、
+# #501→#500、#577→#279、#286→#284、#362→#360、#508→#506），其中 #71 和 #495
+# 的旧结论已被明确推翻却仍 live 照推——审计看不见等于机制不管。
+# 数字后不许紧跟 - / / 数字：真库 #49「修正 2026-10-01 那次事故」会把年份解析成 id 2026。
+DECL_VERBS = (
+    ("取代", r"取代(?:记忆)?\s*#?\s*(\d+)(?![-/\d])"),
+    ("更正", r"更正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])"),
+    ("纠正", r"纠正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])"),
+    ("推翻", r"推翻(?:记忆)?\s*#?\s*(\d+)(?![-/\d])"),
+    ("修正", r"修正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])"),
+)
+SUPPLEMENT_RE = r"补充(?:记忆)?\s*#?\s*(\d+)(?![-/\d])"   # 追加不是裁决，不进 pending
+DECL_HINT_MAX = 3        # 写后提示最多点名几条：写一次记忆不该刷屏
+
 
 def _sediment_tags(content: str, tags: str) -> str:
     """把正文里的错误签名词补进 tags（R834 B041）——`search_memories` 已给 tags 计分，
@@ -6118,6 +6134,70 @@ def _sediment_tags(content: str, tags: str) -> str:
         lower.add(t.lower())
         added += 1
     return ",".join(have)
+
+
+def declaration_refs(text) -> list:
+    """抽正文里的「记忆裁决声明」→ [(verb, target_id)]，同 id 只留优先级最高的动词。
+
+    R975：写入口（hub_memory_write 写后提示）与体检（ops.supersede_declaration_audit）
+    共用这一张动词表——R974 的教训是「两张表各写一遍必然漂」。
+    「补充记忆#N」不算裁决意图（追加不是推翻），刻意不收。
+    """
+    s = str(text or "")
+    out, seen = [], set()
+    for verb, pat in DECL_VERBS:
+        for raw in re.findall(pat, s):
+            tid = int(raw)
+            if tid in seen:
+                continue
+            seen.add(tid)
+            out.append((verb, tid))
+    return out
+
+
+def declaration_hint(root: str, new_id: int, content, supersedes: int = 0) -> str:
+    """写后提示（R975）：正文点了 #N / 说「修正 #N」，而那条仍是现行 → 给一句可执行出口。
+
+    为什么不在写入前拦：写入是事实，裁决是判断；机制只该把「你好像忘了一件事」说出来，
+    拦下来会让「先记录、稍后裁决」这种正常节奏走不通。
+    为什么必须稀缺：目标已被取代、本次已 supersedes 到它、或压根没写声明 → 返回空串。
+    每次写记忆都念一句提示，等于训练调用方忽略它（记忆 #9 的 nudge-once 口径）。
+    读库失败一律静默（fail-open）：提示是锦上添花，不许把写入回执弄崩。
+    """
+    nid = int(new_id or 0)
+    refs = [(v, t) for v, t in declaration_refs(content)
+            if t != nid and t != int(supersedes or 0)]
+    if not refs:
+        return ""
+    live, missing = [], []
+    try:
+        with db_conn(root) as conn:
+            for verb, tid in refs:
+                row = conn.execute(
+                    "SELECT superseded_by, status FROM memories WHERE id=?",
+                    (tid,)).fetchone()
+                if row is None:
+                    missing.append((verb, tid))
+                    continue
+                if int(row["superseded_by"] or 0) == 0 and \
+                        (row["status"] or "active") == "active":
+                    live.append((verb, tid))
+    except Exception:  # noqa: BLE001
+        return ""
+    if not live and not missing:
+        return ""
+    msgs = []
+    if live:
+        label = "、".join(f"{v} #{t}" for v, t in live[:DECL_HINT_MAX])
+        more = len(live) - min(len(live), DECL_HINT_MAX)
+        tail = f"（另有 {more} 条未列出）" if more > 0 else ""
+        msgs.append(f"{label}{tail} 仍是现行条目——若本条已推翻它，用 "
+                    f"hub_memory_supersede(keep_id={nid}, drop_id=…) 或 "
+                    f"hub_memory_write(supersedes=旧id) 一次裁决")
+    if missing:
+        label = "、".join(f"{v} #{t}" for v, t in missing[:DECL_HINT_MAX])
+        msgs.append(f"{label} 不存在（id 写错了？）")
+    return "\n（声明检查：" + "；".join(msgs) + "。只是补充说明可忽略）"
 
 
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",

@@ -2573,6 +2573,9 @@ def _call_tool_impl(name: str, arguments: dict, root: str, session: bool = False
         if evidence:
             extra += f"，证据链 {evidence}"
         out = f"已写入大脑记忆 #{mid}（{brain.KIND_CN.get(kind, kind)}），所有 agent 可读可检索{extra}"
+        # R975：正文点了 #N / 说「修正 #N」而那条仍现行 → 当场给一句可执行出口。
+        # 放在 _idem_store 之前：幂等重放要带同一句，不然重试一次提示就消失了。
+        out += brain.declaration_hint(root, mid, content, supersedes)
         _idem_store(root, "hub_memory_write", arguments, agent, out, mid)
         return out
 

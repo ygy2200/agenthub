@@ -1505,17 +1505,11 @@ def supersede_declaration_audit(root: str) -> dict:
     # #508→#506），其中 #71「GitHub 凭据全灭」、#495「DLSS 菜单消失=mod 与 exe 失配」
     # 已被后条明确推翻却仍 live——「审计看不见」等于「机制不管」。三类外部一手材料
     # （aicassindra / spacetimeagents / baylabs）都把 stale fact 列为记忆系统第一失效模式。
-    # 数字后不许紧跟 `-` / `/` / 数字：真库 #49「修正 2026-10-01 那次事故」会把年份
-    # 解析成记忆 id 2026。顺序＝动词优先级（同一对写多种时取最强）。
-    DECL_VERBS = (
-        ("取代", re.compile(r"取代(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
-        ("更正", re.compile(r"更正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
-        ("纠正", re.compile(r"纠正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
-        ("推翻", re.compile(r"推翻(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
-        ("修正", re.compile(r"修正(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")),
-    )
+    # R975：表挪到 brain.DECL_VERBS 单一维护，写入口的写后提示与这里共用同一张表。
+    import brain  # noqa: PLC0415  延迟导入：ops 与 brain 互有依赖
+    DECL_VERBS = tuple((v, re.compile(p)) for v, p in brain.DECL_VERBS)
     # 「补充」是追加不是裁决：单列计数，不进 pending（真库 5 条）。
-    supplement_re = re.compile(r"补充(?:记忆)?\s*#?\s*(\d+)(?![-/\d])")
+    supplement_re = re.compile(brain.SUPPLEMENT_RE)
     # 命中任一即表示「不是整条取代」，只能提示人工判定。顺序＝优先级。
     rules = (
         ("补充而非取代", ("补充而非取代", "而非取代", "补充而非")),
