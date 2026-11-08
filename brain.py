@@ -10021,6 +10021,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         cand.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
         cand = cand[:RECALL_SEM_RESCUE_MAX]
         added = []
+        # R981（B120）：replace 分支已经把「换掉谁」「差多少」算出来了，但原来没往外带——
+        # B107 等到首笔 origin=live 救援（11-08 11:58 ids=501）时，账上只有「加进来的是谁」，
+        # 判不了这次替换对不对。零行为影响，只加流水字段。
+        replaced_id, margin = 0, 0.0
         if RECALL_SEM_RESCUE_MODE == "append":
             # 只补位：一条强命中都不挤掉。picked 满 3 时这档天然零效果。
             room = RECALL_PICK_CAP - len(picked)
@@ -10034,6 +10038,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                 if sim < worst_sim:
                     worst_i, worst_sim = i, sim
             if best_sim - worst_sim >= RECALL_SEM_RESCUE_MARGIN:
+                replaced_id = int(picked[worst_i].get("id") or 0)
+                margin = best_sim - worst_sim
                 picked = picked[:worst_i] + picked[worst_i + 1:]
                 added = [cand[0][1]]
                 # 换掉的那条回到 cap 计数里，口径仍是「没进注入」
@@ -10045,12 +10051,15 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # R901：救援触发留流水，按 origin 分档（live/probe/eval）。默认档一上线，
             # 没有观测出口就没人能回答「真实会话里到底触发几次」，下一轮又得靠猜。
             # 只写 note、不碰 backup——journal_add 第 5 个位置参数是 backup（记忆 #569）。
+            # R981：replace 档额外带 replaced=/margin=（append 换人不成立，故不写）。
+            _extra = (f" replaced={replaced_id} margin={margin:.2f}"
+                      if replaced_id else "")
             try:
                 journal_add(root, who, "brain_recall_sem_rescue", "prompt",
                             note=f"n={len(added)} mode={RECALL_SEM_RESCUE_MODE} "
                                  f"sim={RECALL_SEM_RESCUE_SIM:.2f} "
                                  f"ids={','.join(str(int(r.get('id') or 0)) for r in added)} "
-                                 f"origin={origin}")
+                                 f"origin={origin}{_extra}")
             except sqlite3.Error:
                 pass
     rescue = 0
