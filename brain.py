@@ -16681,31 +16681,119 @@ def env_scan(root: str, agent: str = "") -> int:
     return n
 
 
+DISTILL_BLIND_MIN_RECORDS = 15      # 盲区门槛：项目记录数 ≥ 此值且零记忆
+DISTILL_BLIND_PROJECTS = 6           # 一轮最多带几个盲区项目
+DISTILL_BLIND_PER_PROJECT = 25       # 每个盲区项目最多取多少条记录
+DISTILL_MAX_PER_PROJECT = 4         # 候选页里单个项目最多占几条
+# R1025：结论型开头——别的 agent / 别的年代的记录不按四段式模板写，
+# 只认「目的：」等于把它们的知识全挡在候选外（真库盲区项目的记录全是这类）。
+_DISTILL_LABELS = r"根因|修复|结论|发现|原因|验证|教训|做法|方案|实测|注意|限制|坑"
+_DISTILL_GIST_RES = (
+    re.compile(r"目的[】\]:：]\s*(.+)"),
+    # 加粗标签必须是**中文结论标签**——放开成任意词会把「**Network**: Webhook
+    # signature validation」这种英文文档小标题也当成结论（真库噪声实测）。
+    re.compile(r"^\s*[*\-—\d.、)）]*\s*\*\*(?P<k>" + _DISTILL_LABELS
+               + r")\*\*\s*[：:]\s*(?P<v>.+)"),
+    re.compile(r"^\s*[*\-—\d.、)）]*\s*(?P<k>" + _DISTILL_LABELS
+               + r")\s*[：:]\s*(?P<v>.+)"),
+)
+# 「知识味」标记：首行兜底时用它判「这行是结论」还是「这行是流水」
+_DISTILL_KNOW_MARKERS = (
+    "根因", "因为", "导致", "必须", "不能", "不要", "应该", "结论", "已验证", "实测",
+    "教训", "踩坑", "规则", "发现", "原来", "改为", "原因", "方案", "禁止",
+    "而是", "才可以", "否则", "不可用", "会卡", "卡死", "会崩", "异常", "失效",
+)
+# 流水/请求/待办的行不是结论——首行兜底时排掉（真库噪声实测：
+# 「你能不能写一个脚本…」「…尚未实测到。下次弹窗：…」都是被知识词误捞的）。
+_DISTILL_NOISE_MARKERS = (
+    "能不能", "你看着", "先做一个", "未确认", "尚未", "下次", "TODO", "待办", "计划",
+    "？", "?", "[Request", "暂停一下",
+)
+_DISTILL_SKIP_LINE_RE = re.compile(
+    r"^\s*(?:失败调用|Command:|Stdout:|Stderr:|Exit Code|Signal:|已推送|git push|\$"
+    r"|\**做了什么\**|\**验证结果\**|\**如何回滚\**|做了什么|验证结果|如何回滚"
+    r"|验证[:：]|回滚[:：]|目的[:：])")
+
+
+def _distill_gist(content: str) -> tuple:
+    """从一条记录里取「值得沉淀的那句话」。
+
+    三档来源（按可信度）：
+      ① 四段式的「目的：」行（原口径，最准）；
+      ② 结论型开头（**根因**：…／结论：…）——别的 agent 的常见写法；
+      ③ 首行兜底：长度够、含知识味标记、且不像流水行。
+    返回 (gist, source)；取不到返回 ("", "")。
+    """
+    text = content or ""
+    for rx in _DISTILL_GIST_RES:
+        m = rx.search(text)
+        if not m:
+            continue
+        if rx is _DISTILL_GIST_RES[0]:
+            g = m.group(1).strip().strip("【】")
+        else:
+            g = f"{m.group('k')}：{m.group('v').strip()}"
+        if len(g) >= 6:
+            return g, "模板" if rx is _DISTILL_GIST_RES[0] else "结论行"
+    for ln in text.splitlines():
+        s = ln.strip().lstrip("-*•·").strip()
+        if len(s) < 16 or _DISTILL_SKIP_LINE_RE.match(s):
+            continue
+        if any(k in s for k in _DISTILL_NOISE_MARKERS):
+            continue
+        if s.endswith(("？", "?")) or re.match(r"^\d+[.、]\s*为什么", s):
+            continue      # 问句不是结论（真库噪声：「为什么auto-xhigh又失效了」）
+        if any(k in s for k in _DISTILL_KNOW_MARKERS):
+            return s, "首行"
+        break
+    return "", ""
+
+
 def distill_candidates(root: str, limit: int = 20) -> list:
-    """记忆蒸馏候选（结晶流水线）：content 含「目的」结论但同项目无相似记忆覆盖、
-    且往轮 hub_distill 未展示过的记录。行业头部（mem0/腾讯AgentMemory）用 LLM 蒸馏；
-    本方案零成本规则版——目的行提取 + bigram 相似度查重，候选经 agent/用户确认后
-    hub_memory_write 沉淀为记忆。只读不标记：登记在 mark_distill_shown（消费侧）。"""
+    """记忆蒸馏候选（结晶流水线）：记录里含可沉淀结论、但同项目没有记忆覆盖、且未展示过。
+
+    R1025 改了两件要紧的事：
+      ① **盲区优先**——「有记录、零记忆」的项目（真库：课表日程App 91 条、
+         explorer崩溃排查 45 条…）沉在池子外，永远轮不到候选位；
+         现在按项目记录数把它们顶上来，并标注 `blind`/项目记录数/沉寂天数，
+         让 agent 判断这条还成不成立。
+      ② **结论抽取放宽**——只认「目的：」这一种模板行，等于把别的 agent 与别的年代
+         的记录（根因式/结论式/列表式）全部挡在候选外（盲区项目的记录正是这一类）。
+    仍然只读不标记：登记在 mark_distill_shown（消费侧）。"""
+    limit = max(1, min(int(limit or 20), 50))
     with db_conn(root) as conn:
+        proj_rec = {r["project"]: r["n"] for r in conn.execute(
+            "SELECT project, COUNT(*) n FROM records WHERE status='active' GROUP BY project")}
+        mems = [dict(r) for r in conn.execute(
+            "SELECT project, content FROM memories WHERE " + _live_sql() + "")]
+        mem_count: dict = {}
+        for m in mems:
+            mem_count[m["project"]] = mem_count.get(m["project"], 0) + 1
         recs = [dict(r) for r in conn.execute(
             "SELECT id, project, date, agent, content FROM records "
             "WHERE status='active' AND id NOT IN "
             "(SELECT record_id FROM distill_seen) ORDER BY id DESC LIMIT 300")]
-        mems = [dict(r) for r in conn.execute(
-            "SELECT project, content FROM memories WHERE " + _live_sql() + "")]
+        # 盲区项目：记录多、零记忆 → 它们的记录额外进池（否则永远轮不到）
+        blind_recs: list = []
+        blind_projects = [p for p, n in proj_rec.items()
+                          if n >= DISTILL_BLIND_MIN_RECORDS and not mem_count.get(p)]
+        for p in sorted(blind_projects, key=lambda x: -proj_rec[x])[:DISTILL_BLIND_PROJECTS]:
+            blind_recs += [dict(r) for r in conn.execute(
+                "SELECT id, project, date, agent, content FROM records "
+                "WHERE status='active' AND project=? AND id NOT IN "
+                "(SELECT record_id FROM distill_seen) ORDER BY id DESC LIMIT ?",
+                (p, DISTILL_BLIND_PER_PROJECT))]
     mem_toks: dict = {}
     for m in mems:
         mem_toks.setdefault(m["project"], []).append(_tokens(m["content"]))
+    blind_ids = {r["id"] for r in blind_recs}
+    pool = blind_recs + [r for r in recs if r["id"] not in blind_ids]
+    today = datetime.date.today()
     out = []
-    for r in recs:
-        m = re.search(r"目的[】\]:：]\s*(.+)", r["content"] or "")
-        if not m:
+    for r in pool:
+        gist, src = _distill_gist(r["content"] or "")
+        if not gist:
             continue
-        gist = m.group(1).strip().strip("【】")
-        if len(gist) < 6:
-            continue
-        # 复合任务（①②③…/分号）按片段级查重：一条记录可能只蒸馏了一部分，
-        # 候选只展示「尚未被记忆覆盖」的片段（2026-10-02 蒸馏演示实测发现）
         segs = [s.strip() for s in re.split(r"[①②③④⑤⑥⑦⑧⑨⑩]|；", gist)
                 if len(s.strip()) >= 6] or [gist]
         project_mems = mem_toks.get(r["project"], [])
@@ -16724,12 +16812,38 @@ def distill_candidates(root: str, limit: int = 20) -> list:
         if uncovered:
             # 元信息标注（v2.8.5）：「用户拍板/执行/继续」开头的目的行是操作记录不是工作知识，
             # 沉淀价值低（结晶率虚高的元信息霸榜，2026-10-03 实测 5 候选全元信息），标注供取舍
-            meta = bool(re.match(r"^(用户|执行|继续|批准|复盘)", gist))
+            # 元信息判定：既像操作流水，又不含知识味。
+            # 「用户看到的『经典应用程序错误』框不是 WER 界面」开头也是「用户」，
+            # 但它是一条真结论——所以知识味标记优先（真库噪声实测）。
+            _meta_pfx = bool(re.match(r"^(用户|执行|继续|批准|复盘|承接|按用户|按主人)", gist))
+            _know = any(k in gist for k in ("根因", "实测", "澄清", "必须", "不能", "不可用",
+                                            "不是", "而是", "导致", "结论", "规则", "教训"))
+            meta = _meta_pfx and not _know
+            blind = r["project"] in blind_projects
+            try:
+                stale = (today - datetime.date.fromisoformat(str(r["date"])[:10])).days
+            except (ValueError, TypeError):
+                stale = -1
             out.append({"id": r["id"], "project": r["project"], "date": r["date"],
-                        "agent": r["agent"], "gist": "；".join(uncovered)[:80], "meta": meta})
-        if len(out) >= max(1, min(limit, 50)):
-            return out
-    return out
+                        "agent": r["agent"], "gist": "；".join(uncovered)[:80], "meta": meta,
+                        "blind": blind, "records_n": int(proj_rec.get(r["project"], 0)),
+                        "stale_days": stale, "src": src})
+    # 排序：盲区优先（项目记录多的先），同档内元信息沉底、日期新的先
+    out.sort(key=lambda c: (0 if c["blind"] else 1,
+                            1 if c["meta"] else 0,
+                            -c["records_n"],
+                            str(c["date"])[::-1]))
+    # 单项目配额：一个大项目吃掉整页＝别的盲区还是轮不到（R1025 实测课表日程App 占满）
+    picked, per_proj = [], {}
+    for c in out:
+        n = per_proj.get(c["project"], 0)
+        if n >= DISTILL_MAX_PER_PROJECT:
+            continue
+        per_proj[c["project"]] = n + 1
+        picked.append(c)
+        if len(picked) >= limit:
+            break
+    return picked
 
 
 def mark_distill_shown(root: str, record_ids: list) -> int:
