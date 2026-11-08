@@ -351,7 +351,7 @@ CREATE TABLE IF NOT EXISTS journal (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     ts TEXT, agent TEXT, action TEXT, target TEXT, backup TEXT, note TEXT,
     prev_hash TEXT DEFAULT '', hash TEXT DEFAULT '',
-    via TEXT DEFAULT ''
+    via TEXT DEFAULT '', origin TEXT DEFAULT ''
 );
 -- R91 治理查询索引：安全态势/日结按 action+ts 过滤，审计导出按 ts 切片。
 -- 只加索引不改数据；init_db 每次幂等补建，存量库同样生效。
@@ -1446,6 +1446,10 @@ def _migrate_columns(root: str) -> None:
         jcols = {r["name"] for r in conn.execute("PRAGMA table_info(journal)")}
         if jcols and "via" not in jcols:
             conn.execute("ALTER TABLE journal ADD COLUMN via TEXT DEFAULT ''")
+        # R1012：来源从 note 里的 `origin=` 升级为结构化列。历史行留空，报表仍用
+        # note 兼容解析——旧行的 unknown 保持 unknown，不从时间或会话名倒推。
+        if jcols and "origin" not in jcols:
+            conn.execute("ALTER TABLE journal ADD COLUMN origin TEXT DEFAULT ''")
         # R6（2026-10-21）接入验证快照补指纹列：旧快照默认空，读取时回落 mtime 判定
         # R23（2026-10-22）再补 base 列：记录指纹来自哪个代码树，跨树比对不判过期
         acols = {r["name"] for r in conn.execute("PRAGMA table_info(agent_onboarding)")}
@@ -8931,6 +8935,26 @@ RECALL_SEM_RESCUE_SIM = 0.62        # 高于「无意义句」噪声峰值 0.594
 RECALL_SEM_RESCUE_TOPN = 3       # 只认语义排名前 3
 RECALL_SEM_RESCUE_MAX = 1
 RECALL_SEM_RESCUE_MARGIN = 0.10  # replace 时，新候选必须比被换掉的明显更相近
+# R1010（B035 池外子类）：语义候选补池。R899 只重排已在 40 条词法池里的候选，
+# R861 只在词法一条候选都没有时整块走语义桥；两者之间还剩「池里有候选、答案被
+# 上限截在池外」这一类。这里把语义 topN 中**词法池没见过**的候选补进池，再走
+# 原有 hit/rare/immune/cap 全部闸门——语义只负责多给候选，不许绕过任何相关性判定。
+# 默认 0=off；只有 tools/semantic_pool_ab_r1010.py 同库 A/B 证明
+# 「ΔRecall@3>0 且 Δ噪声≤0 且延迟可控」后才允许改默认档。
+RECALL_SEM_POOL_LIMIT = 0       # 最多补几条；0=关闭
+RECALL_SEM_POOL_SIM = 0.62      # 与闸门救援同一条噪声峰值线（记忆 #542）
+# R1011：词法有候选、但 strong 被闸门全删空时的语义兜底。与 R861 的区别是
+# 此时池里**有**候选（不能把「闸门判弱」当作「没召回」），所以门槛必须更严：
+# 只认语义 top3 且相似度 >= 本值，最多 2 条。默认 0=off，A/B 过线才改。
+RECALL_SEM_EMPTY_MIN = 0.0      # R1011c：峰值护栏 0.05 会吃掉全部增益；三项同时满足才开，结论=暂不启用
+RECALL_SEM_EMPTY_TOPN = 3
+RECALL_SEM_EMPTY_CAP = 2
+# R1011 第二道硬条件：候选必须命中至少 4 个不同检索词。只靠语义相似度会把
+# 「近义但答非所问」的行放进上下文（R861 的旧护栏实锤），多词共现是低成本反证。
+RECALL_SEM_EMPTY_MIN_HITS = 4
+# R1011 第三道条件：语义第一名要明显高于第二名。多条近义记忆并列时相似度往往
+# 0.77–0.80 挤在一起，说明「答案不唯一/都在说同一个泛话题」，此时只该给查库提示。
+RECALL_SEM_EMPTY_MARGIN = 0.05
 RECALL_RECORD_CAP = 2        # 记录通道（过程证据）每次最多几条
 # R907（B103 归因）：**不依赖语义模型**的弱候选兜底，默认关闭，只给 A/B 量具切档。
 # 动机是 R906 全量归因的两个硬数字：51 个期望答案里 12 个死于稀有词闸门（最大
@@ -8952,6 +8976,80 @@ def _recall_distinct_hits(terms: list, row: dict) -> int:
     """
     low = (str(row.get("content") or "") + " " + str(row.get("tags") or "")).lower()
     return sum(1 for t, _ in terms if t in low)
+
+
+def _semantic_empty_rescue(mems: list, sem_map: dict, excluded: set, acct: dict,
+                           min_sim: float, topn: int, cap: int,
+                           min_hits: int = 0, terms: list | None = None,
+                           margin: float = 0.0) -> list:
+    """R1011：strong 全空时，从**已在词法池里**的高相似候选补答。
+
+    只在「词法确实召回了候选、但全部被 hit/rare 闸门判弱」且记录路也没有证据时调用。
+    语义不负责扩大候选集（R1010 已证伪），只负责在语义 topN 内、相似度足够高时
+    阻止系统对一条明确相关的记忆装聋。免疫/本会话已注入仍一票否决。
+    """
+    if min_sim <= 0 or not sem_map or not mems:
+        return []
+    ranked = sorted(sem_map.items(), key=lambda kv: (-kv[1], kv[0]))
+    if margin > 0 and len(ranked) > 1 and (float(ranked[0][1]) - float(ranked[1][1])) < margin:
+        return []   # 多条并列高相似 = 答案不唯一，别押一条
+    eligible = {int(i) for i, _ in ranked[:max(1, int(topn))]}
+    out = []
+    for row in mems:
+        try:
+            mid = int(row.get("id") or 0)
+            sim = float(sem_map.get(mid, 0.0))
+        except (TypeError, ValueError):
+            continue
+        if not mid or mid in excluded or mid not in eligible or sim < float(min_sim):
+            continue
+        if int(min_hits or 0) > 0 and _recall_distinct_hits(terms or [], row) < int(min_hits):
+            continue
+        cnt = acct.get(mid) or {}
+        if cnt:
+            row.update(inject_count=cnt.get("inject_count", 0),
+                       adopt_count=cnt.get("adopt_count", 0),
+                       last_inject=cnt.get("last_inject", ""))
+        if is_exposure_immune(row):
+            continue
+        row["_semantic_bridge"] = round(sim, 3)
+        row["_recall_hit"] = int(row.get("_recall_hit") or 0)
+        row["_recall_best"] = float(row.get("_recall_best") or 0.0)
+        out.append(row)
+    # 先按语义分排序再截上限：候选池是按词法分给的顺序，先截再排会把高相似候选
+    # 挡在低相似候选后面（单测实锤）。
+    out.sort(key=lambda r: (-float(sem_map.get(int(r.get("id") or 0), 0.0)),
+                            -int(r.get("id") or 0)))
+    return out[:max(1, int(cap))]
+
+
+def _augment_mem_pool(mems: list, sem_rows: list, cap: int, sim_min: float) -> tuple:
+    """R1010：把语义 topN 中词法池没见过的候选补进池，返回 (新池, 补入条数)。
+
+    只做「扩大候选集」这一件事：不删、不提前截断、不改任何已有行。补进来的行仍要
+    过 prompt_recall 的 hit/rare/immune/cap 闸门，语义相似度只作为后续重排信号。
+    cap<=0 时原样返回同一个列表对象（生产默认档零拷贝、零行为变化）。
+    """
+    cap = max(0, int(cap or 0))
+    if cap <= 0 or not sem_rows:
+        return mems, 0
+    rows = list(mems)
+    seen = {int(r.get("id") or 0) for r in rows}
+    added = 0
+    for eid, _rrf, row in sem_rows:
+        try:
+            mid = int(row.get("id") or eid)
+            sim = float(row.get("_semantic_sim") or 0.0)
+        except (TypeError, ValueError):
+            continue
+        if not mid or mid in seen or sim < float(sim_min):
+            continue
+        rows.append(row)
+        seen.add(mid)
+        added += 1
+        if added >= cap:
+            break
+    return rows, added
 
 # R827：fingeprint 抽取。思路照 Grimoire 的实测结论——「让 agent 写引用标签没用
 # （qwen 即使被要求也只有 14% 会写）」，所以判「这条记忆有没有被用」只能靠**内容里
@@ -9752,6 +9850,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "term_coverage": 0.0, "abstained": 0, "abstain_dropped": 0,
            # R900：闸门救援实际放进注入的条数（默认 0；-1 表示本档未启用）
            "sem_rescued": 0,
+           # R1010：语义补池实际新增的候选数（默认 0；只作诊断，不绕过闸门）
+           "sem_pool_added": 0,
+           # R1011：strong 全空时由高相似语义兜底补入的条数（默认 0=关闭）
+           "sem_empty_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
            "weak_picked": 0, "weak_picked_id": 0,
            # R918：全库稀有度救援（默认 off），A/B 量具据此计触发与精准率
@@ -9820,6 +9922,18 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                                count_hits=False, semantic=False, gate=False)
     except sqlite3.Error:
         return out
+    # R1010：语义补池（默认关）。先把语义 topN 里词法池没见过的行补进候选集，
+    # 再走下面完全相同的 idf / hit / rare / immune / cap。这里缓存 sem_rows，后面
+    # 重排与救援复用同一次语义查询，开档时也不额外编码第二次。
+    sem_rows_cached = None
+    if RECALL_SEM_POOL_LIMIT > 0:
+        try:
+            sem_rows_cached = _semantic_rank(
+                root, prompt, "memories", limit=max(40, RECALL_SEM_POOL_LIMIT))
+        except Exception:  # noqa: BLE001 可选能力，异常退回纯词法
+            sem_rows_cached = []
+        mems, out["sem_pool_added"] = _augment_mem_pool(
+            mems, sem_rows_cached, RECALL_SEM_POOL_LIMIT, RECALL_SEM_POOL_SIM)
     # R825：先算池内区分度，再打分。这一步不动召回集（谁会进候选），只动排序——
     # 把「命中了一堆泛词」和「命中了一个精确词」区分开。
     # R953（B116）：时间限窗只在这句话真带时间词时生效；默认关时连正则都不跑
@@ -9856,7 +9970,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     # fail-open：任何异常都退回纯词法，召回宁可少一项信号，不能因为可选能力炸掉。
     sem_map = {}
     try:
-        for _eid, _rrf, _row in _semantic_rank(root, prompt, "memories", limit=40):
+        sem_rows = (sem_rows_cached if sem_rows_cached is not None
+                    else _semantic_rank(root, prompt, "memories", limit=40))
+        for _eid, _rrf, _row in sem_rows:
             _sim = float(_row.get("_semantic_sim") or 0.0)
             if _sim > 0:
                 sem_map[int(_row.get("id") or _eid)] = _sim
@@ -10059,7 +10175,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                             note=f"n={len(added)} mode={RECALL_SEM_RESCUE_MODE} "
                                  f"sim={RECALL_SEM_RESCUE_SIM:.2f} "
                                  f"ids={','.join(str(int(r.get('id') or 0)) for r in added)} "
-                                 f"origin={origin}{_extra}")
+                                 f"origin={origin}{_extra}", origin=origin)
             except sqlite3.Error:
                 pass
     rescue = 0
@@ -10078,6 +10194,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         if rescue_rows:
             rescue = len(rescue_rows)
             picked = rescue_rows   # 与 _recall_pick_margin 同形态：下游只吃行，不吃 (分, 行)
+            bridge_mode = "zero_lexical"
     out["muted"] = muted      # 本轮被免疫挡掉的条数（报表/单测据此看断路器有没有在动）
     try:
         recs = search_records(root, query, limit=30)
@@ -10127,6 +10244,20 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     rec_strong = [(s, r) for s, r in rec_scored
                   if float(r.get("_recall_best") or 0.0) >= _recall_rare_threshold(len(recs))]
     rec_rows = _recall_pick_margin(rec_strong, RECALL_RECORD_CAP)
+    # R1011：词法有候选但 strong 全空、记录路也没证据时，才允许高相似语义补答。
+    # 放在记录判定之后：已有过程证据时不抢记忆通道，避免把一个可回答的问题变成
+    # 「记忆 + 记录」双份注入。R861 的零候选桥仍优先，本段只在 picked 为空时生效。
+    bridge_mode = ""
+    if not picked and not rec_rows and RECALL_SEM_EMPTY_MIN > 0:
+        rescued = _semantic_empty_rescue(
+            mems, sem_map, excluded, acct, RECALL_SEM_EMPTY_MIN,
+            RECALL_SEM_EMPTY_TOPN, RECALL_SEM_EMPTY_CAP,
+            RECALL_SEM_EMPTY_MIN_HITS, terms, RECALL_SEM_EMPTY_MARGIN)
+        if rescued:
+            picked = rescued
+            out["sem_empty_rescued"] = len(rescued)
+            out["semantic_bridge"] = len(rescued)
+            bridge_mode = "empty"
     # R946（B114）：弃答地板。覆盖率按「记忆池 + 记录池」合并算——只算记忆池会把
     # 「答案只在记录路」的样本误判成无答案（recall_eval #11 的标签就是 rec 路）。
     # 两池都是本轮已取回的候选，不额外查库；默认阈值 0 时这段只填诊断字段。
@@ -10293,12 +10424,17 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         text = text[: max(30, max_chars - 24)].rstrip() + "\n…（已截断）"
     out.update(text=text, memory_ids=[i for i in ids if i is not None],
                record_ids=[r.get("id") for r in rec_rows], terms=[t for t, _ in terms],
-               project=pname, chars=len(text), semantic_bridge=rescue)
-    if rescue:
+               project=pname, chars=len(text),
+               semantic_bridge=rescue or out["sem_empty_rescued"])
+    if rescue or out["sem_empty_rescued"]:
+        bridge_n = rescue or out["sem_empty_rescued"]
+        bridge_min = (_RECALL_SEM_MIN if bridge_mode == "zero_lexical"
+                      else RECALL_SEM_EMPTY_MIN)
         try:
             journal_add(root, who, "brain_recall_semantic_bridge", "prompt",
-                        note=f"n={rescue} ids={','.join(str(i) for i in out['memory_ids'])} "
-                             f"min={_RECALL_SEM_MIN} origin={origin}")
+                        note=f"n={bridge_n} mode={bridge_mode or 'unknown'} "
+                             f"ids={','.join(str(i) for i in out['memory_ids'])} "
+                             f"min={bridge_min} origin={origin}", origin=origin)
         except sqlite3.Error:
             pass
     if out["memory_ids"]:
@@ -12802,8 +12938,16 @@ def _journal_last_hash(conn) -> str:
     return (row["hash"] if row else "") or ""
 
 
-def _journal_insert_plain(conn, ts, agent, action, target, backup, note, via="") -> None:
-    """不接链的普通写入。旧库没有 via 列时退回六列写法（迁移前也不会丢流水）。"""
+def _journal_insert_plain(conn, ts, agent, action, target, backup, note, via="",
+                          origin="") -> None:
+    """不接链的普通写入。旧库缺 via/origin 列时逐级退回（迁移前也不会丢流水）。"""
+    try:
+        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,via,origin) "
+                     "VALUES(?,?,?,?,?,?,?,?)",
+                     (ts, agent, action, target, backup, note, via or _VIA, origin or ""))
+        return
+    except sqlite3.Error:
+        pass
     try:
         conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,via) "
                      "VALUES(?,?,?,?,?,?,?)",
@@ -12815,28 +12959,38 @@ def _journal_insert_plain(conn, ts, agent, action, target, backup, note, via="")
 
 
 def _journal_append(conn, ts: str, agent: str, action: str, target: str = "",
-                    backup: str = "", note: str = "", via: str = "") -> str:
+                    backup: str = "", note: str = "", via: str = "",
+                    origin: str = "") -> str:
     """同事务追加一条接链流水。抢不到写锁或旧库缺列时降级为普通写入（旁路 fail-open）。
 
     via 是 R845 加的传输口径（stdio/cli/hook/ops），**不进哈希**：审计链只锚
     「谁在什么时候做了什么」，从哪条路进来的属诊断信息，改它不该被判成断链。
+    origin 同理（R1012）：它是「这条流水是真实会话还是装置产生」的来源标签，
+    不进哈希，旧库缺列时逐级降级写入，绝不因观测字段拖垮主操作。
     """
+    origin = _journal_origin_value(origin)
     try:
         if not conn.in_transaction and _begin_write(conn):
-            _journal_insert_plain(conn, ts, agent, action, target, backup, note, via)
+            _journal_insert_plain(conn, ts, agent, action, target, backup, note, via, origin)
             return ""
         prev = _journal_last_hash(conn)
         h = _journal_hash(prev, ts, agent, action, target, backup, note)
     except sqlite3.Error:
-        _journal_insert_plain(conn, ts, agent, action, target, backup, note, via)
+        _journal_insert_plain(conn, ts, agent, action, target, backup, note, via, origin)
         return ""
     try:
         conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,"
-                     "prev_hash,hash,via) VALUES(?,?,?,?,?,?,?,?,?)",
-                     (ts, agent, action, target, backup, note, prev, h, via or _VIA))
+                     "prev_hash,hash,via,origin) VALUES(?,?,?,?,?,?,?,?,?,?)",
+                     (ts, agent, action, target, backup, note, prev, h, via or _VIA, origin))
     except sqlite3.Error:
-        conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,prev_hash,hash) "
-                     "VALUES(?,?,?,?,?,?,?,?)", (ts, agent, action, target, backup, note, prev, h))
+        try:
+            conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,"
+                         "prev_hash,hash,via) VALUES(?,?,?,?,?,?,?,?,?)",
+                         (ts, agent, action, target, backup, note, prev, h, via or _VIA))
+        except sqlite3.Error:
+            conn.execute("INSERT INTO journal(ts,agent,action,target,backup,note,prev_hash,hash) "
+                         "VALUES(?,?,?,?,?,?,?,?)",
+                         (ts, agent, action, target, backup, note, prev, h))
     try:
         _meta_set_conn(conn, "journal_head", h)
         conn.execute("INSERT OR IGNORE INTO meta(key,value) VALUES('journal_chain_at',?)", (ts,))
@@ -12877,11 +13031,12 @@ def _journal_row(conn, agent: str, action: str, target: str = "", note: str = ""
 
 
 def journal_add(root: str, agent: str, action: str, target: str = "",
-                backup: str = "", note: str = "", via: str = "") -> None:
+                backup: str = "", note: str = "", via: str = "",
+                origin: str = "") -> None:
     try:
         with db_conn(root) as conn:
             _journal_append(conn, _now(), _norm_agent(agent) or "", action, target,
-                            backup, note, via)
+                            backup, note, via, origin)
     except Exception:  # noqa: BLE001 流水是旁路
         pass
 
@@ -12946,6 +13101,12 @@ def journal_list(root: str, limit: int = 200) -> list:
             "SELECT * FROM journal ORDER BY id DESC LIMIT ?", (max(1, min(limit, 500)),))]
 
 
+def _journal_origin_value(origin: str) -> str:
+    """来源列的写入口白名单；未知值留空，报表按 unknown 处理，不猜。"""
+    o = str(origin or "").strip().lower()
+    return o if o in ("live", "brief", "probe", "eval") else ""
+
+
 JOURNAL_WINDOW_CAP = 5000  # 窗口口径的行数上限：显著高于展示夹子，又不至于无界扫库
 
 
@@ -12966,17 +13127,25 @@ def journal_window(root: str, actions=(), cutoff: str = "", limit: int = None) -
         cap = JOURNAL_WINDOW_CAP if not limit or int(limit) <= 0 else int(limit)
     except (TypeError, ValueError):
         cap = JOURNAL_WINDOW_CAP
-    sql = ("SELECT ts, agent, action, target, note FROM journal"
-           " WHERE substr(ts,1,10) >= ?")
+    where = " WHERE substr(ts,1,10) >= ?"
     args = [cutoff or ""]
     acts = [a for a in (actions or ()) if a]
     if acts:
-        sql += " AND action IN (" + ",".join("?" * len(acts)) + ")"
+        where += " AND action IN (" + ",".join("?" * len(acts)) + ")"
         args.extend(acts)
-    sql += " ORDER BY id LIMIT ?"
+    tail = " ORDER BY id LIMIT ?"
     args.append(cap + 1)   # 多取一行：判断是否撞上限，不用另跑 COUNT
     with db_conn(root) as conn:
-        rows = [dict(r) for r in conn.execute(sql, args)]
+        try:
+            rows = [dict(r) for r in conn.execute(
+                "SELECT ts, agent, action, target, note, origin FROM journal" + where + tail, args)]
+        except sqlite3.OperationalError:
+            # R1012：读路径可能先于迁移跑到（部署后首次调用、旧库只读挂载）。
+            # 缺 origin 列时退回旧列集，行里补空来源，行为等同迁移前。
+            rows = [dict(r) for r in conn.execute(
+                "SELECT ts, agent, action, target, note FROM journal" + where + tail, args)]
+            for r in rows:
+                r["origin"] = ""
     capped = len(rows) > cap
     return (rows[:cap], capped) if capped else (rows, False)
 

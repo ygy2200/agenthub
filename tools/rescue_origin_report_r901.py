@@ -29,11 +29,16 @@ import _console  # noqa: E402,F401
 import brain  # noqa: E402
 
 ACTIONS = ("brain_recall_semantic_bridge", "brain_recall_sem_rescue")
-ORIGINS = ("live", "probe", "eval")
+# brief 是 session_brief 的逐句回忆（origin="brief"），此前不在白名单里，被误记成
+# unknown；它确实是生产送达，但与 UserPromptSubmit 的 live 不是同一入口，单列。
+ORIGINS = ("live", "brief", "probe", "eval")
 _ORIGIN_RE = re.compile(r"\borigin=([A-Za-z_]+)")
 
 
-def _origin_of(note: str) -> str:
+def _origin_of(note: str, raw: str = "") -> str:
+    """结构化 origin 列优先；历史行回落到 note 里的 origin=；都没有=unknown。"""
+    if str(raw or "").strip().lower() in ORIGINS:
+        return str(raw).strip().lower()
     m = _ORIGIN_RE.search(str(note or ""))
     return m.group(1) if m and m.group(1) in ORIGINS else "unknown"
 
@@ -53,23 +58,27 @@ def collect(root: str, days: int = 30, limit: int = None,
     last = {a: "" for a in ACTIONS}
     all_ts = [str(r.get("ts") or "") for r in rows if r.get("ts")]
     live_ts = []
+    unknown_ts = []
     for r in rows:
         action = str(r.get("action") or "")
         if action not in counts:
             continue
         full = str(r.get("ts") or "")
         ts = full[:10]
-        o = _origin_of(r.get("note"))
+        o = _origin_of(r.get("note"), r.get("origin") or "")
         counts[action][o] += 1
         if o == "live":
             live_ts.append(full)
+        elif o == "unknown":
+            unknown_ts.append(full)
         if ts > last[action]:
             last[action] = ts
     cap = brain.JOURNAL_WINDOW_CAP if not limit or int(limit) <= 0 else int(limit)
     return {"counts": counts, "last": last, "total_rows": len(rows),
             "days": days, "cutoff": cutoff, "earliest": min(all_ts) if all_ts else "",
             "capped": bool(capped), "covered": not capped, "cap": cap,
-            "live_ts": live_ts, "switch_ts": switch_ts,
+            "live_ts": live_ts, "unknown_ts": sorted(t for t in unknown_ts if t),
+            "switch_ts": switch_ts,
             "live_after_switch": len([t for t in live_ts if switch_ts and t >= switch_ts])}
 
 
@@ -85,11 +94,20 @@ def render(data: dict, switch_ts: str = "") -> str:
     live_total = 0
     for a in ACTIONS:
         c = data["counts"][a]
-        line = (f"{a:34s} live={c['live']:4d}  probe={c['probe']:4d}  "
-                f"eval={c['eval']:4d}  unknown={c['unknown']:3d}  "
-                f"最近={data['last'][a] or '—'}")
+        line = (f"{a:34s} live={c['live']:4d}  brief={c['brief']:4d}  "
+                f"probe={c['probe']:4d}  eval={c['eval']:4d}  "
+                f"unknown={c['unknown']:3d}  最近={data['last'][a] or '—'}")
         out.append(line)
         live_total += c["live"]
+    prod_total = sum(data["counts"][a]["live"] + data["counts"][a]["brief"]
+                     for a in ACTIONS)
+    out.append("")
+    out.append(f"生产入口合计 live+brief = {prod_total}；"
+               "probe/eval/unknown 不计入线上收益判断。")
+    unknown_all = sorted(data.get("unknown_ts") or [])
+    if unknown_all:
+        out.append(f"unknown {len(unknown_all)} 笔为历史流水（写入时尚未标来源，或早于 origin 列）："
+                   f"{unknown_all[0]} → {unknown_all[-1]}；保持 unknown，不按时间倒推。")
     out.append("")
     st = switch_ts or data.get("switch_ts") or ""
     if st:
