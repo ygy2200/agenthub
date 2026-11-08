@@ -7,7 +7,8 @@
 训练成可忽略的背景（记忆 #9 的 nudge-once 口径）。
 
 修法：`nudge_peek` / `nudge_commit` 两步——先看额度、真注入了才扣。默认 prompt=8 /
-error=6，`AGENTHUB_NUDGE_BUDGET=0` 关掉。超了只写 journal（brain_nudge_skip），
+error=8（R1014 由 6 上调：error 档 47.4% 采纳率高于 strong 23.1%），
+`AGENTHUB_NUDGE_BUDGET=0` 关掉。超了只写 journal（brain_nudge_skip），
 不进上下文；主动检索完全不受限。
 
 本文件钉六件事：

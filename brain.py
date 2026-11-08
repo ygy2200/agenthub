@@ -8466,7 +8466,10 @@ def _save_recall_state(path: Path, state: dict, now: "datetime.datetime | None" 
 # 分别被塞了 16 条 / 15 条记忆，而一个会话真正能记住的「几件事」远小于这个数。
 # 这里给「主动塞」设硬上限，超了只写 journal 不进上下文——**不删知识**，主动检索
 # （hub_search / hub_memory_read）完全不受限，跟 R830 的曝光免疫断路器同一条纪律。
-NUDGE_BUDGET_DEFAULTS = {"prompt": 8, "error": 6}
+# R1014（B042/B098）：error 档 30 天攒到 39 注入 / 38 可指纹 / 18 被用 = 47.4%，
+# 高于 strong 的 23.1%，而预算反而更低（6 vs 8）。近 30 天 error 仅 5 次预算掐断，
+# 提高 2 格的风险面很小；先对齐到 8，仍保留硬闸防重试循环。回滚改回 6。
+NUDGE_BUDGET_DEFAULTS = {"prompt": 8, "error": 8}
 NUDGE_BUDGET_ENV = "AGENTHUB_NUDGE_BUDGET"
 NUDGE_STATE_TTL_H = 24
 
