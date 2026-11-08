@@ -8047,9 +8047,12 @@ def metacognition(root: str) -> dict:
     返回：coverage_blindspots（有记录零记忆的项目）/ low_confidence（低置信现行记忆）/
     dup_pairs（疑似矛盾对）/ pending_decisions（久未复核的决策记录）/ meta_ratio / governance。"""
     with db_conn(root) as conn:
+        # R1028：盲区口径排除 source='auto'（自动捕获的会话轨迹）。
+        # 那类记录是**事件流**不是工作知识——「有记录、零记忆」对它成立是假警报：
+        # 真库「ZCode会话轨迹-自动捕获」19 条全是 auto，混进来会把盲区名单撑大。
         proj_rec = {r["project"]: r["n"] for r in conn.execute(
             "SELECT project, COUNT(*) n FROM records WHERE status='active' AND project!='' "
-            "GROUP BY project")}
+            "AND COALESCE(source,'')!='auto' GROUP BY project")}
         proj_mem = {r["project"]: r["n"] for r in conn.execute(
             "SELECT project, COUNT(*) n FROM memories WHERE " + _live_sql()
             + " AND project!='' GROUP BY project")}
@@ -16766,7 +16769,8 @@ def distill_candidates(root: str, limit: int = 20, project: str = "") -> list:
     limit = max(1, min(int(limit or 20), 50))
     with db_conn(root) as conn:
         proj_rec = {r["project"]: r["n"] for r in conn.execute(
-            "SELECT project, COUNT(*) n FROM records WHERE status='active' GROUP BY project")}
+            "SELECT project, COUNT(*) n FROM records WHERE status='active' "
+            "AND COALESCE(source,'')!='auto' GROUP BY project")}
         mems = [dict(r) for r in conn.execute(
             "SELECT project, content FROM memories WHERE " + _live_sql() + "")]
         mem_count: dict = {}
@@ -16787,8 +16791,8 @@ def distill_candidates(root: str, limit: int = 20, project: str = "") -> list:
         for p in sorted(blind_projects, key=lambda x: -proj_rec[x])[:DISTILL_BLIND_PROJECTS]:
             blind_recs += [dict(r) for r in conn.execute(
                 "SELECT id, project, date, agent, content FROM records "
-                "WHERE status='active' AND project=?" + seen_sql +
-                " ORDER BY id DESC LIMIT ?",
+                "WHERE status='active' AND project=? AND COALESCE(source,'')!='auto'"
+                + seen_sql + " ORDER BY id DESC LIMIT ?",
                 (p, DISTILL_BLIND_PER_PROJECT))]
     mem_toks: dict = {}
     for m in mems:

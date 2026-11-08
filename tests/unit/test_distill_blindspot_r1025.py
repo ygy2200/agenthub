@@ -176,3 +176,29 @@ def test_request_line_still_rejected():
     assert brain._distill_gist(
         "1. 我的雷神开机会自启动。但是不会自动加速steam，你能不能写一个脚本呢，你看着来吧"
     )[0] == ""
+
+
+# ---- R1028：盲区口径排除自动捕获的会话轨迹 ----
+
+def test_auto_captured_records_are_not_blindspot(tmp_path):
+    """自动捕获的会话轨迹是事件流不是工作知识——算进盲区是假警报。"""
+    root = str(tmp_path)
+    brain.init_db(root)
+    brain.add_record(root, "自动捕获项目", "zcode", "2026-11-01", "轨迹 1", "会话片段")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET source='auto'")
+    d = brain.metacognition(root)
+    assert not [b for b in d["coverage_blindspots"] if b["project"] == "自动捕获项目"]
+
+
+# ---- R1028：盲区口径排除自动捕获的会话轨迹 ----
+
+def test_auto_captured_records_are_not_blindspot(tmp_path):
+    """自动捕获的会话轨迹是事件流不是工作知识——算进盲区是假警报。"""
+    root = str(tmp_path)
+    brain.init_db(root)
+    brain.add_record(root, "自动捕获项目", "zcode", "2026-11-01", "轨迹 1", "会话片段")
+    with brain.db_conn(root) as conn:
+        conn.execute("UPDATE records SET source='auto'")
+    d = brain.metacognition(root)
+    assert not [b for b in d["coverage_blindspots"] if b["project"] == "自动捕获项目"]
