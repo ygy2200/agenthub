@@ -109,7 +109,7 @@ CHECK_FIXES = {
     "rules_health": "按点名 agent 跑 cli.py onboard <agent> 注入「干完活记大脑」闸门；零触发且有记录的 agent 去其会话实测一次写工具调用，确认钩子加载",
     "mcp_drift": "按点名项修对应 agent 的 MCP 配置（args）：缺 --agent / 锁名不符 → cli.py onboard <agent> 重写；server 脚本不存在 → cli.py deploy 后改配置路径；--root 指向别库 → 改回 config.root 或删掉 --root（serve 会动态跟随）",
     "usage_health": "失控/循环：先用 hub_usage_timeline(agent/tool 过滤) 看是否同一调用在反复打——是循环就修触发方（agent 端脚本的 retry 上限），速率限制 AGENTHUB_RATE_* 可临时收紧；接入闲置：确认该 agent 是否还需要，不用就下线接入（防配置漂移无人发现），还用就让它的会话跑一次真实调用",
-    "brief_hook_health": "钩子丢失/文件缺失：python cli.py deploy 补 Python 入口，python cli.py hook-install <agent> --apply 重装脚本与配置（幂等、写前备份）；配置缺失的机器跳过不算故障；有钩子但零送达：开一次该 agent 的会话看日志 ~/.workbuddy/logs/brain-inject.log 与 brain-recall.log",
+    "brief_hook_health": "钩子丢失/文件缺失：python cli.py deploy 补 Python 入口，python cli.py hook-install <agent> --apply 重装脚本与配置（幂等、写前备份）；「只挂了失败事件」是半挂：补 python cli.py hook-install --events error --apply，然后必须重启该客户端（钩子配置在启动时加载，改完当场不生效）；配置缺失的机器跳过不算故障；有钩子但零送达：开一次该 agent 的会话看日志 ~/.workbuddy/logs/brain-inject.log 与 brain-recall.log",
     "link_health": "工具通道断=该客户端的 MCP 没被拉起（最常见：改过 mcp.json 之后客户端要重新授权/Trust 一次，改配置不会自动继承授权）。修法：①去客户端的连接器/自定义 MCP 页把 agenthub 重新信任并重启该会话；②确认配置里的 python 与服务脚本路径仍有效（cli.py doctor 的 mcp_drift 会点名）；③兜底不是长久之计——钩子只在开场和每句话给上下文，主动检索与写库仍要靠工具",
     "stale_health": "hub_memory_confirm(all_stale=true) 复核；旧版本用 hub_memory_supersede 裁决",
     "ghost_memory": "先 hub_memory_read / hub_get_record 核对内容：记忆用 hub_memory_supersede(keep_id, drop_id)，记录加 target=\"record\"",

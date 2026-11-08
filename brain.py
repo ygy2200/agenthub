@@ -10268,9 +10268,17 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         date_s = dates.get(int(r.get("id") or 0), "")
         date_part = f"[{date_s}] " if date_s else ""
         am_part = amend_note(amended, int(r.get("id") or 0))
+        # R1006：注入行与 hub_memory_read 同口径——过期的条也要说一句。
+        # 只标 expired（硬过期/valid_until 已过），不标 stale：stale 是「没人复核」，
+        # 数量多，每行都加会把注脚挤满（memory_freshness 的 state 语义见其 docstring）。
+        try:
+            fr_part = ("已过期，仅作历史；"
+                       if memory_freshness(r).get("state") == "expired" else "")
+        except Exception:  # noqa: BLE001 注脚算不出来就不加
+            fr_part = ""
         lines.append(f"· {mark}#{r.get('id')} [{r.get('kind') or 'note'}] "
                      f"{_brief_oneline(str(r.get('content') or ''), 150)}"
-                     f"（{am_part}{date_part}{why}；{tag}）")
+                     f"（{am_part}{fr_part}{date_part}{why}；{tag}）")
     if rec_rows:
         lines.append("相关历史：")
         for r in rec_rows:
