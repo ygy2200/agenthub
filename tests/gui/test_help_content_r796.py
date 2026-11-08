@@ -24,7 +24,8 @@ def test_help_explains_amend_badge(qapp):
     帮助页不写清「哪四个面」，agent 说出来时用户会以为是巧合。
     """
     content = HelpPage.CONTENT
-    assert "⚠已被 #N 修正" in content
+    assert "！已被 #N 修正" in content
+    assert "⚠" not in content, "⚠ 在 FORBIDDEN 里（字体无字形），别退回方框"
     assert "hub_memory_supersede" in content
     for face in ("自动注入", "检索", "搜索", "这个列表"):
         assert face in content, f"帮助页没说清标注出现在哪个出口：{face}"

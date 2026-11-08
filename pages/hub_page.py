@@ -251,7 +251,10 @@ class HubPage(QWidget):
             tags = f" #{m['tags']}" if m["tags"] else ""
             src = f" @{m['agent']}" if m["agent"] and m["agent"] != "migrated" else ""
             am = amended.get(int(m["id"])) or []
-            am_badge = f"⚠已被#{'/'.join(str(i) for i in am)}修正 " if am else ""
+            # R984：⚠ 在 tests/gui/test_glyph_coverage 的 FORBIDDEN 里（生产字体无字形，
+            # 真机会显示方框）。种子库没有「被修正」数据，那条用例扫不到这里——
+            # 这正是「测试覆盖不到但真实存在」的一类，改用字体已覆盖的 ！。
+            am_badge = f"！已被#{'/'.join(str(i) for i in am)}修正 " if am else ""
             self.memList.addItem(
                 f"{am_badge}{memory_badge(fr)}{flag} #{m['id']} [{brain.KIND_CN.get(m['kind'], m['kind'])}]"
                 f"{tags}{src}  {m['content'][:90]}")

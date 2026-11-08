@@ -62,3 +62,26 @@ def test_memory_row_clean_without_amend(qapp, hub_root):
     assert pump(qapp, lambda: _row_for(page, mid) >= 0, 10)
     text = page.memList.item(_row_for(page, mid)).text()
     assert "已被" not in text, f"无修正关系却带了标注：{text!r}"
+
+
+def test_badge_has_no_forbidden_glyph(qapp, hub_root):
+    """R984：徽标里的符号必须在生产字体里有字形。
+
+    R979 首版用了 ⚠（U+26A0）——它在 test_glyph_coverage 的 FORBIDDEN 里，真机显示方框。
+    那条字形用例扫不到这里：它跑的是种子库，而种子库没有「被修正」的记忆，徽标根本不出现。
+    这条补上：有标注时，整行文本里不许出现禁用符号。
+    """
+    import tokens
+    from test_glyph_coverage import FORBIDDEN
+
+    old, new = _seed(hub_root)
+    tokens.apply_theme("dark")
+    w = boot_window(qapp, hub_root)
+    page = w.hub_page
+    w.switchTo(page)
+    page.viewCombo.setCurrentIndex(2)
+
+    assert pump(qapp, lambda: _row_for(page, old) >= 0, 10)
+    text = page.memList.item(_row_for(page, old)).text()
+    hit = [ch for ch in text if ch in FORBIDDEN]
+    assert not hit, f"徽标用了字体没字形的符号 {hit}：{text!r}"
