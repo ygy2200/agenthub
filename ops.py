@@ -1518,14 +1518,12 @@ def supersede_declaration_audit(root: str) -> dict:
     )
     classes = ("未见限定词", "局部取代", "续写仍有效", "补充而非取代")
     # B040 自指污染：讲这套机制本身的记忆会引用「#13 取代 #12」当例句。
-    self_tags = ("机制说明",)
-    self_body = ("取代声明 ≠", "取代声明审计", "B092", "本工具只读", "外部取证", "量具")
+    # R976：判定与 brain.amended_by_map 共用一处（真库 #561 一条说明书污染 3 条标注，
+    # 两张各写一份的结果就是一处修了另一处没修）。
     retired = ("retired", "expired", "superseded")
 
     def is_selfdoc(row):
-        tags = str(row.get("tags") or "")
-        body = str(row.get("content") or "")
-        return any(t in tags for t in self_tags) or any(m in body for m in self_body)
+        return brain.is_selfdoc_row(row)
 
     def classify(text):
         for label, words in rules:

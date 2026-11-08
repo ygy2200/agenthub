@@ -6200,6 +6200,84 @@ def declaration_hint(root: str, new_id: int, content, supersedes: int = 0) -> st
     return "\n（声明检查：" + "；".join(msgs) + "。只是补充说明可忽略）"
 
 
+# ── R976：被后来者声明修正过的记忆，注入时带一句「以 #N 为准」────────────────
+# 为什么要有：R974 数出真库 18 条「正文被别人声明修正/取代却仍 live」的旧记忆，
+# 其中 #71「GitHub 凭据全灭」被 #370 推翻、#495「DLSS 菜单消失=mod 与 exe 失配」被 #497
+# 推翻。体检能点名（要人跑），但**送达侧没人告诉模型这条已经过时**——模型读到旧结论就照办。
+# 只加标注、不改任何数据：裁决是判断，机制不替人做（R887 边界）。
+# R976：机制说明书的自指污染（B040 / R860 同族）。讲这套机制本身的记忆会把
+# 「#13 取代 #12」当例句引用，任何按正文抽声明的读者都会把它当成一次真裁决——
+# 真库实测：#561 一条说明书污染了 #12、#34、#92 三条标注。判定放这里，ops 的
+# 取代声明审计与本文件的注入标注共用（两张表各写一遍必然漂）。
+# 注意这是**行级**判定：tags 带「机制说明」或正文含这套机制的自述词，都算说明书。
+SELFDOC_TAGS = ("机制说明",)
+SELFDOC_BODY = ("取代声明 ≠", "取代声明审计", "B092", "本工具只读", "外部取证", "量具")
+
+
+def is_selfdoc_row(row) -> bool:
+    """这条记忆是「在讲机制本身」还是「在执行一次真裁决」？"""
+    try:
+        tags = str(row.get("tags") or "")
+        body = str(row.get("content") or "")
+    except (AttributeError, TypeError, IndexError):
+        return False
+    return any(t in tags for t in SELFDOC_TAGS) or any(m in body for m in SELFDOC_BODY)
+
+
+_AMEND_CACHE: dict = {}      # root -> (库文件指纹, {target_id: [decl_id,...]})
+
+
+def amended_by_map(root: str) -> dict:
+    """{被修正的 id: [声明者 id, ...]}（每条目标最多留最近 2 个声明者）。
+
+    只有「新条声明修正/取代旧条」才算，三条硬约束缺一不可：
+      · 声明者 id 必须更大（老的修不了新的，写反了 id 也不许把新结论拉下水）；
+      · 声明者自身必须 live（已归档/已取代的人说的话不算数）；
+      · 目标也必须 live（已下线的条不再进注入，标它没意义）。
+    按 `_db_file_fp` 缓存：注入路径每句都跑，稳态必须 0 次查询。
+    """
+    try:
+        fp = _db_file_fp(root)
+    except Exception:  # noqa: BLE001
+        return {}
+    hit = _AMEND_CACHE.get(root)
+    if hit is not None and hit[0] == fp:
+        return hit[1]
+    out: dict = {}
+    try:
+        with db_conn(root) as conn:
+            rows = conn.execute(
+                "SELECT id, content, tags FROM memories WHERE status='active' "
+                "AND COALESCE(superseded_by,0)=0").fetchall()
+    except Exception:  # noqa: BLE001  标注是锦上添花，读库失败就当没有
+        return {}
+    live_ids = {int(r["id"]) for r in rows}
+    for r in rows:
+        row = dict(r)
+        mid = int(row["id"])
+        if is_selfdoc_row(row):
+            continue          # 说明书的例句不是裁决（#561 实测污染 3 条）
+        refs = declaration_refs(row["content"])
+        if not refs:
+            continue
+        for _verb, tid in refs:
+            if tid == mid or tid not in live_ids or mid <= tid:
+                continue
+            out.setdefault(tid, []).append(mid)
+    for k in list(out):
+        out[k] = sorted(set(out[k]))[-2:]
+    _AMEND_CACHE[root] = (fp, out)
+    return out
+
+
+def amend_note(amended: dict, mid: int) -> str:
+    """渲染用短句：「已被 #370 修正，冲突以它为准；」——没有就空串。"""
+    ids = (amended or {}).get(int(mid or 0)) or []
+    if not ids:
+        return ""
+    return "已被 " + "、".join(f"#{i}" for i in ids) + " 修正，冲突以它为准；"
+
+
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
                project: str = "", agent: str = "", pinned: bool = False,
                supersedes: int = 0, valid_until: str = "",
@@ -10158,6 +10236,12 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         dates = _memory_dates(root, [r.get("id") for r in picked])
     except sqlite3.Error:
         dates = {}   # R913 日期同样是注脚，查不到就省略，不许影响召回
+    # R976：被后来者声明修正过的条，行内标「以 #N 为准」。缓存在 amended_by_map 里，
+    # 稳态零查询；异常一律当没有——标注是注脚，不许拖垮召回。
+    try:
+        amended = amended_by_map(root) if picked else {}
+    except Exception:  # noqa: BLE001
+        amended = {}
     for r in ordered:
         pc = proof.get(int(r.get("id") or 0), {})
         adopt, used = int(pc.get("adopt_count") or 0), int(pc.get("use_count") or 0)
@@ -10168,9 +10252,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         mark = "【必须照做】" if directive_tier(r) == "required" else ""
         date_s = dates.get(int(r.get("id") or 0), "")
         date_part = f"[{date_s}] " if date_s else ""
+        am_part = amend_note(amended, int(r.get("id") or 0))
         lines.append(f"· {mark}#{r.get('id')} [{r.get('kind') or 'note'}] "
                      f"{_brief_oneline(str(r.get('content') or ''), 150)}"
-                     f"（{date_part}{why}；{tag}）")
+                     f"（{am_part}{date_part}{why}；{tag}）")
     if rec_rows:
         lines.append("相关历史：")
         for r in rec_rows:
