@@ -3051,6 +3051,7 @@ def _brief_hook_health(root: str) -> dict:
     inplace, unwired, recall_inplace, recall_unwired, absent = [], [], [], [], []
     answer_inplace, answer_unwired = [], []   # R828：Stop 采纳回填
     error_inplace, error_unwired = [], []     # R833：工具失败即时回忆
+    error_post_missing = []                   # R987：缺 PostToolUse 出口（兜底永远不会触发）
     for agent, cfg_s in targets.items():
         p = Path(os.path.expanduser(cfg_s))
         if not p.is_file():
@@ -3072,8 +3073,16 @@ def _brief_hook_health(root: str) -> dict:
         if not hermes:
             (answer_inplace if core.HOOK_ADHERENCE_NAME in text
              else answer_unwired).append(agent)
-            (error_inplace if core.HOOK_ERROR_RECALL_NAME in text
-             else error_unwired).append(agent)
+            if core.HOOK_ERROR_RECALL_NAME in text:
+                error_inplace.append(agent)
+                # R987：兜底要处理的正是「宿主不判定失败」的 exit=0 场景（R971 Python
+                # traceback / R986 Node 异常）。只挂 PostToolUseFailure 时这两段在生产上
+                # 是死代码——真库实测 brain-error-recall.log 里 27 条兜底记录全是测试 sid，
+                # 真实会话 0 条。「装了」不等于「会触发」，必须点名。
+                if '"PostToolUse"' not in text:
+                    error_post_missing.append(agent)
+            else:
+                error_unwired.append(agent)
     d7 = (datetime.datetime.now() - datetime.timedelta(days=7)).isoformat(timespec="seconds")
     delivered: dict = {}
     recalled: dict = {}
@@ -3121,6 +3130,11 @@ def _brief_hook_health(root: str) -> dict:
         detail.append("报错回忆钩子丢失：" + "、".join(error_unwired)
                       + "（AI 撞墙时不会自动想起同签名的旧坑，仍要人提醒才查大脑——"
                         "python cli.py hook-install --events error --apply 补上）")
+    if error_post_missing:
+        detail.append("报错回忆只挂了失败事件：" + "、".join(error_post_missing)
+                      + "（缺 PostToolUse —— `a; b` 串联把非零退出码吃掉时宿主不判失败，"
+                        "R971 的 Python traceback 与 R986 的 Node 异常两段兜底就永远不会被调用；"
+                        "补：在该客户端 hooks 里给 PostToolUse 加同一条命令，重启客户端生效）")
     if unwired or recall_unwired:
         lost = sorted(set(unwired) | set(recall_unwired))
         detail.append("钩子丢失：" + "、".join(lost)

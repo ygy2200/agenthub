@@ -123,3 +123,31 @@ def test_missing_recall_hook_is_named(hub_root, tmp_path, monkeypatch):
     assert r["ok"] is False, r
     assert "回忆丢失 qoder" in r["summary"], r["summary"]
     assert any("钩子丢失" in d and "qoder" in d for d in r["detail"]), r["detail"]
+
+
+def test_error_hook_without_posttooluse_is_named(hub_root, tmp_path, monkeypatch):
+    """R987：报错钩子只挂 PostToolUseFailure，成功路径的两段兜底就是死代码。
+
+    兜底（R971 Python traceback / R986 Node 异常）要处理的正是「宿主不判定失败」的
+    exit=0 场景——只挂失败事件等于它永远不会被调用。真库实测：日志里 27 条兜底记录
+    全是测试 sid，真实会话 0 条；这台机器上 6 家 agent 里 5 家都缺这个出口。
+    """
+    brain.init_db(hub_root)
+    cfg = _cfg(tmp_path, "only-failure.json", json.dumps(_both()))
+    _patch(monkeypatch, {"qoder": str(cfg)}, (("hermes-cn", str(tmp_path / "none")),),
+           tmp_path)
+    r = ops._brief_hook_health(hub_root)
+    assert any("只挂了失败事件" in d and "qoder" in d for d in r["detail"]), r["detail"]
+
+
+def test_error_hook_with_posttooluse_is_not_named(hub_root, tmp_path, monkeypatch):
+    """反证：补上 PostToolUse 后不再点名，否则这条检查会变成永远消不掉的噪音。"""
+    brain.init_db(hub_root)
+    data = _both()
+    data["hooks"]["PostToolUse"] = [
+        {"hooks": [{"type": "command", "command": core.HOOK_ERROR_RECALL_NAME}]}]
+    cfg = _cfg(tmp_path, "both-events.json", json.dumps(data))
+    _patch(monkeypatch, {"qoder": str(cfg)}, (("hermes-cn", str(tmp_path / "none")),),
+           tmp_path)
+    r = ops._brief_hook_health(hub_root)
+    assert not any("只挂了失败事件" in d for d in r["detail"]), r["detail"]
