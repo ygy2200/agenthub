@@ -11741,7 +11741,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     out = {"text": "", "memory_ids": [], "record_ids": [], "error_ids": [],
            "terms": [], "sig": "", "project": "", "chars": 0, "elapsed_ms": 0,
            "skipped": "", "counted": bool(count), "budget": {}, "self_doc_ids": [],
-           "shape": ""}
+           "shape": "", "class_ids": []}
     if not root or not os.path.isdir(root):
         return out
     diag = _diagnosis_span(error_text)
@@ -11920,7 +11920,12 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         exact, fuzzy = [], []
     err_rows = (exact + fuzzy)[:2]
 
-    if not picked and not rec_rows and not err_rows:
+    # R1020 同类经验桥：主召回全空时，才去问「同一类毛病的解法在不在库里」。
+    class_rows: list = []
+    if not picked and not rec_rows and not err_rows and ERR_CLASS_BRIDGE:
+        class_rows = _err_class_experience(root, high)
+
+    if not picked and not rec_rows and not err_rows and not class_rows:
         # 大脑被问到、答不上：这一次问答要留证据（欠账账本），并在**原来提醒的那个位置**
         # 说一句就收——不开新入口、不进简报、同签名同会话只说一次（下面的去重分支已生效）。
         # 只对有签名的 miss 开口：「命令失败了」这种没招牌的，说一句纯属噪音。
@@ -12008,6 +12013,19 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         lines.append(f"· 历史 {r.get('id')} [{_brief_oneline(str(r.get('project') or ''), 20)}] "
                      f"{_brief_oneline(head, 46)}（{r.get('agent') or '其他'} · "
                      f"{r.get('date') or '—'}）")
+    for kind, r in class_rows:
+        # R1020：同类经验单列——它是「同一类毛病」的经验，不是这条报错的现成修法。
+        out["class_ids"].append(r.get("id"))
+        if kind == "memory":
+            lines.append(f"· 同类经验（同一类毛病，不一定是同一条错）记忆 #{r.get('id')} "
+                         f"[{r.get('kind') or 'note'}] "
+                         f"{_brief_oneline(str(r.get('content') or ''), 140)}")
+        else:
+            head = _brief_title(str(r.get("title") or "")) or _brief_oneline(
+                str(r.get("content") or ""), 40)
+            lines.append(f"· 同类经验（同一类毛病，不一定是同一条错）历史 #{r.get('id')} "
+                         f"[{_brief_online(str(r.get('project') or ''), 20)}] "
+                         f"{_brief_oneline(head, 46)}")
     lines.append(f"先自查再动手：hub_search(keyword=\"{_brief_oneline(' '.join(high[:3]), 60)}\")"
                  "｜同签名≠同根因，别照抄上次的修法，对不上就当没看见。")
     text = "\n".join(lines)
@@ -12030,19 +12048,94 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     if count:
         try:
             # hits 要含记录/错误：只命中记录=大脑**答上了**，却在这里被算成 0 命中，
-            # 下游 ops 的「查时知识未入脑的欠账」提醒就会催着给已有知识再写一条记忆
+            # 下游 ops 的「查时知识未入脑的欠账」提醒就会催着给已有知识再写一条记忆。
+            # R1020：同类经验也算命中（真的递了东西出去），但它不计入 memory_ids
+            # （那是「这条报错的现成修法」的口径，混进去会虚高采纳率）。
             log_search(root, "error_recall", query[:200],
                        len(out["memory_ids"]) + len(out["record_ids"])
-                       + len(out["error_ids"]), agent=who)
+                       + len(out["error_ids"]) + len(out["class_ids"]), agent=who)
         except sqlite3.Error:
             pass
     if count and skey and update_state and (out["memory_ids"] or out["record_ids"]
-                                            or out["error_ids"]):
+                                            or out["error_ids"] or out["class_ids"]):
         _remember_error_sig(state_file, skey, sig)
     if count and out["text"]:
         nudge_commit(budget)
     out["elapsed_ms"] = int((time.time() - t0) * 1000)
     return out
+
+
+# R1020：同类经验桥——大脑里有解法，但用的是另一种说法。
+# 报错说「failed to receive handshake」，记忆写的是「国际出站 TLS 握手大面积间歇性失败」
+# （记忆 #12）；报错说「Error during web fetch」，记忆写的是「本机 curl 抓 GitHub 全失败，
+# 必须显式走本机代理」（记忆 #134/#140）。按签名逐字去捞，两边永远碰不上——
+# 于是一条有现成解法的失败被判成「大脑没有答案」。
+# 只在主召回（记忆/记录/已登记故障）全空时启用；候选必须含该类的必答词，
+# 且注入时明写「同一类毛病，不一定是同一条错」——不冒充现成修法。
+_ERR_CLASS_HINTS = {
+    "error during web fetch": {
+        "query": "webfetch 抓 github 失败 代理 出网 curl",
+        "must": ["webfetch", "web fetch", "curl", "出网", "抓 github"],
+    },
+    "unable to access": {
+        "query": "github 推送 代理 curl 拉取 超时",
+        "must": ["代理", "curl", "出网", "schannel"],
+    },
+    "failed to receive handshake": {
+        "query": "TLS 握手 失败 出网 间歇",
+        "must": ["握手", "handshake", "tls", "出网"],
+    },
+    "not a git repository": {
+        "query": "不是 git 仓库 备份 改错 无法回滚",
+        "must": ["不是 git 仓库", "不是仓库", "git 仓库"],
+    },
+    "error during glob search operation": {
+        "query": "glob 搜索 超时 文件遍历",
+        # 必答词用组合短语，不用裸 "glob"——真库里提过 glob 的记忆大半是别的意思
+        # （NVIDIA 全局设置、ReShade 全局），裸词会把不相干的经验递上来（R1020 A/B 实测）。
+        "must": ["glob search", "glob 搜索", "文件搜索", "搜索超时", "search timeout"],
+    },
+    "string to replace not found": {
+        "query": "old_string 编辑 替换 不匹配",
+        "must": ["old_string", "替换"],
+    },
+}
+ERR_CLASS_BRIDGE = int(os.environ.get("AGENTHUB_ERR_CLASS_BRIDGE", "1") or 1)
+
+
+def _err_class_experience(root: str, high: list) -> list:
+    """同类经验桥（R1020）：返回 [(kind, row)]，最多一条记忆或一条记录。
+
+    判据：签名命中某类的 class hint → 用该类的检索词找 → 候选正文必须含该类必答词。
+    找不到就是找不到，不放宽必答词（放宽就退化成「泛词乱捞」）。"""
+    for t in high:
+        hint = _ERR_CLASS_HINTS.get((t or "").strip().lower())
+        if not hint:
+            continue
+        q = hint["query"]
+        musts = hint["must"]
+        try:
+            mems = search_memories(root, q, limit=12, count_hits=False,
+                                   semantic=False, gate=False)
+        except sqlite3.Error:
+            mems = []
+        for r in mems:
+            body = (str(r.get("content") or "") + " " + str(r.get("tags") or "")).lower()
+            if not any(m in body for m in musts):
+                continue
+            if _is_self_doc(r):
+                continue          # 机制说明不是经验（讲这套机制怎么运作的）
+            return [("memory", r)]
+        try:
+            recs = search_records(root, q, limit=8)
+        except sqlite3.Error:
+            recs = []
+        for r in recs:
+            body = (str(r.get("title") or "") + " " + str(r.get("content") or "")).lower()
+            if not any(m in body for m in musts):
+                continue
+            return [("record", r)]
+    return []
 
 
 def _error_sig_seen(state_file, skey: str, sig: str, key: str = "sigs") -> bool:
