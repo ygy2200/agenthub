@@ -3047,7 +3047,11 @@ def _brief_hook_health(root: str) -> dict:
     core = _import_core()
     import brain as _brain  # noqa: PLC0415
     targets = dict(core.HOOK_BRIEF_TARGETS)
-    targets["hermes-cn"] = core.HOOK_BRIEF_HERMES_TARGETS[0][1]
+    # R1033：hermes 目标表为空时（新装环境 / 只装了别的家 / 测试桩）旧代码直接 [0] 下标爆炸，
+    # 整条体检崩掉——而它崩的姿势是「钩子体检挂了」，读的人会去修钩子。空表就跳过这一家。
+    _hermes_targets = list(getattr(core, "HOOK_BRIEF_HERMES_TARGETS", []) or [])
+    if _hermes_targets:
+        targets["hermes-cn"] = _hermes_targets[0][1]
     inplace, unwired, recall_inplace, recall_unwired, absent = [], [], [], [], []
     answer_inplace, answer_unwired = [], []   # R828：Stop 采纳回填
     error_inplace, error_unwired = [], []     # R833：工具失败即时回忆
