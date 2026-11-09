@@ -404,6 +404,7 @@ try {
     '--session', session, '--max-chars', String(MAX_CHARS), '--event', event,
     '--error', payload];
   if (rootArg) args.push('--root', rootArg);
+  if (src === 'transcript') args.push('--lag', '1');   // R1031：文案说准「哪一次失败」
   if (process.env.AGENTHUB_ERROR_STATE) args.push('--state', process.env.AGENTHUB_ERROR_STATE);
   if (process.env.AGENTHUB_ERROR_NO_JOURNAL === '1') args.push('--no-journal');
 

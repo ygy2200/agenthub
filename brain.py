@@ -11741,7 +11741,7 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
                  cwd: str = "", project: str = "", max_chars: int = ERROR_RECALL_MAX_CHARS,
                  session: str = "", state_path: str = "", update_state: bool = True,
                  count: bool = True, budget_path: str = "", origin: str = "live",
-                 event: str = "") -> dict:
+                 event: str = "", lag: int = 0) -> dict:
     """工具失败那一刻的自动回忆（PostToolUseFailure 钩子入口，R833）。
 
     为什么需要它：简报解决开局、按句回忆解决「用户说到某件事」，但模型真正需要
@@ -12027,7 +12027,8 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     except Exception:  # noqa: BLE001
         amended = {}
     lines = ["【AgentHub 报错即时回忆 · 自动匹配，没人提醒你查大脑】",
-             f"这次失败：{shown}"]
+             (("上一条工具调用失败（宿主事件里没带正文，从会话记录补的）："
+               if lag else "这次失败：") + shown)]
     ids = []
     for r in err_rows:
         out["error_ids"].append(r.get("id"))

@@ -46,6 +46,8 @@ def main(argv=None) -> int:
                     help="只看不记账：不涨 inject_count、不写采纳账本（冒烟/调参用，"
                          "钩子真送达时不要用——曝光账本是假的，R830 断路器会据此冷却真记忆）")
     ap.add_argument("--event", default="", help="钩子事件名（采集面按事件分账，B067）")
+    ap.add_argument("--lag", type=int, default=0,
+                    help="正文是从会话记录补的、比失败晚了几次工具调用（R1031：文案要说准对象）")
     ap.add_argument("--sample-only", action="store_true",
                     help="不落召回、只落一枚失败样本（B067：钩子拿到了失败事件"
                          "却抽不出报错正文时走这条，否则那 16 次无签名触发永远说不清是什么）")
@@ -79,7 +81,7 @@ def main(argv=None) -> int:
             root, err, tool=args.tool, agent=agent, cwd=cwd, project=args.project,
             session=args.session, state_path=args.state,
             update_state=not args.no_state, count=not args.no_count,
-            event=args.event, **kw)
+            event=args.event, lag=max(0, int(args.lag or 0)), **kw)
         if not res["text"]:
             return 0
         if root and not args.no_journal:
