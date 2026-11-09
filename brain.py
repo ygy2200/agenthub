@@ -8948,12 +8948,23 @@ RECALL_SEM_RERANK_W = 10.0
 RECALL_USE_W = 0.04            # 每次唤起（封顶 10 次）
 RECALL_ADOPT_W = 0.12          # 每次被采纳（封顶 5 次）
 RECALL_PINNED_W = 0.8          # 置顶加成
-RECALL_RRF_K = 0               # 0=off；>0 启用 RRF 名次融合的 k 值
+RECALL_RRF_K = 60              # 0=off；>0 启用 RRF 名次融合的 k 值（R1074 定档）
 # R1073b：RRF 名次融合下的相对强度线。RRF 分数随名次缓慢衰减（1/(k+rank)），把词法
 # 那套 0.62 直接套上来会把第 2 名以后全砍掉（实测比值约 0.49），而完全不设线又会
 # 一律灌满 cap、噪声 +17 格。所以这里单独给一个可扫的系数，默认 0 = 不设线（与
 # R1073 首版一致，便于回放对比）。
-RECALL_RRF_MARGIN = 0.0
+RECALL_RRF_MARGIN = 0.6        # RRF 下的相对强度线（R1074 定档）
+# R1074：RRF 的条件启用门槛——**只有词法头名的语义分低于本值时才启用**。
+# 依据（真库逐例）：#10 词法头名 mem#563 语义 0.00、#23 头名 mem#489 语义 0.59，这两例
+# RRF 能把答案捞进 top3；#13 头名 mem#132 语义 0.75（语义也认它），此时 RRF 反而把
+# 语义第 1 的 mem#518 挤出去。所以「词法头名明明语义上也说得过去」= 不该动排序。
+# 0 = 不设门槛（只要 K>0 就启用，等同 R1073 首版）。
+# R1074 同库 A/B（53 条、分母 52、快照隔离）：K=60/M=0.6 下——
+#   gate 0.00（无条件）→ +1.9pp / 噪声 +1（#13 翻负）
+#   gate 0.65 → +3.9pp / 噪声 −1；**gate 0.70 → +3.9pp / 噪声 −3（取此档）**
+#   gate 0.80 → +1.9pp / 噪声 +1（#13 的头名语义正好 0.75，0.80 就放它过去了）
+# 所以 0.70 是「护住 #13 且吃到 #10/#23」之间的平台，离边界还有 0.05 余量。
+RECALL_RRF_GATE_SIM = 0.70     # 词法头名语义分低于此值才启用 RRF（R1074 定档）
 # R1073：钩子侧最终排序改用 RRF（名次融合），默认关。
 # 动机：工具路径 80.5% vs 钩子 67.3%，两边的差别之一是**融合形态**——工具路径用 RRF
 # （_memories_search_fused，名次取倒数再相加），钩子用加性分数（词法 wid*2.2 … +
@@ -10030,6 +10041,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "sem_weak_picked": 0,
            # R1068b：语义分挤成一团（领先不足护栏）而放弃补位的轮次（诊断用）
            "sem_weak_flat": 0,
+           # R1074：本轮是否真的走了 RRF 名次融合（0/1，诊断用）
+           "rrf_used": 0,
            # R1011：strong 全空时由高相似语义兜底补入的条数（默认 0=关闭）
            "sem_empty_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
@@ -10283,7 +10296,13 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # 这批候选里到处都是。分开计数才能回答「答案是被删了还是没排上」。
             out["dropped"]["rare"] += 1
             weak.append(pair)   # R900：留作闸门救援的候选集，默认不启用
-    if RECALL_RRF_K > 0 and strong and sem_map:
+    _rrf_on = RECALL_RRF_K > 0 and bool(strong) and bool(sem_map)
+    if _rrf_on and RECALL_RRF_GATE_SIM > 0:
+        # R1074：词法头名的语义分够高 → 两条路一致，不动排序（见常量注释）
+        _top_id = int(strong[0][1].get("id") or 0)
+        if sem_map.get(_top_id, 0.0) >= RECALL_RRF_GATE_SIM:
+            _rrf_on = False
+    if _rrf_on:
         # R1073：名次融合。词法名次来自 strong 现有顺序（spec 降序），语义名次来自 sem_map。
         # RRF 分数与量纲无关，所以这里同时替代「相对强度 margin」——两者尺度不同，
         # 混用会把 top*0.62 这种绝对线套到 1/(k+rank) 上，只剩 1 条能过。开档时按
@@ -10303,6 +10322,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         strong = sorted((( _rrf(p), p[1]) for p in strong),
                         key=lambda x: (-x[0], -(x[1].get("id") or 0)))
         picked = _recall_pick_margin(strong, RECALL_PICK_CAP, RECALL_RRF_MARGIN)
+        out["rrf_used"] = 1
     else:
         picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     out["dropped"]["cap"] = max(0, len(strong) - len(picked))
