@@ -6357,6 +6357,28 @@ def amend_suffix(amended: dict, mid) -> str:
     return f"（{note.rstrip('；')}）" if note else ""
 
 
+def _error_mem_note(amended: dict, row: dict) -> str:
+    """R1030：报错通道记忆行的行尾注脚——「（已被 #501 修正；已过期，仅作历史）」。
+
+    为什么单列一个小函数：报错通道每行只有一个括号位置，而 amend_note 自带「冲突以它
+    为准；」这种给正文用的长尾；这里压成短句，并顺带把硬过期说清楚（R1006 的口径）。
+    两件都是锦上添花——算不出来就不加，绝不让注脚把注入搞崩。
+    """
+    bits = []
+    try:
+        note = amend_note(amended, int(row.get("id") or 0))
+        if note:
+            bits.append(note.rstrip("；，"))
+    except Exception:  # noqa: BLE001
+        pass
+    try:
+        if memory_freshness(row).get("state") == "expired":
+            bits.append("已过期，仅作历史")
+    except Exception:  # noqa: BLE001
+        pass
+    return f"（{'；'.join(bits)}）" if bits else ""
+
+
 def add_memory(root: str, content: str, kind: str = "note", tags: str = "",
                project: str = "", agent: str = "", pinned: bool = False,
                supersedes: int = 0, valid_until: str = "",
@@ -11996,6 +12018,14 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         out["budget"] = {"used": budget["used"], "limit": budget["limit"],
                          "channel": "error", "bypass": "error_row"}
     shown = _error_headline(_error_voice(diag), high)
+    # R1030：报错通道也要说「这条结论后来被修正/已过期」。此前只有逐句回忆与简报带
+    # amend 注脚，报错通道照旧把旧修法原样递出去——「上次这么修」正是最容易被照抄的
+    # 那句，过时了却不说，比不注更坏。读库失败一律静默（注脚是锦上添花）。
+    try:
+        amended = (amended_by_map(root)
+                   if (picked or any(k == "memory" for k, _ in class_rows)) else {})
+    except Exception:  # noqa: BLE001
+        amended = {}
     lines = ["【AgentHub 报错即时回忆 · 自动匹配，没人提醒你查大脑】",
              f"这次失败：{shown}"]
     ids = []
@@ -12008,7 +12038,8 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
     for r in picked:
         ids.append(r.get("id"))
         lines.append(f"· 记忆 #{r.get('id')} [{r.get('kind') or 'note'}] "
-                     f"{_brief_oneline(str(r.get('content') or ''), 140)}")
+                     f"{_brief_oneline(str(r.get('content') or ''), 140)}"
+                     f"{_error_mem_note(amended, r)}")
     for r in rec_rows:
         out["record_ids"].append(r.get("id"))
         head = _brief_title(str(r.get("title") or "")) or _brief_oneline(
@@ -12022,7 +12053,8 @@ def error_recall(root: str, error_text: str, tool: str = "", agent: str = "",
         if kind == "memory":
             lines.append(f"· 同类经验（同一类毛病，不一定是同一条错）记忆 #{r.get('id')} "
                          f"[{r.get('kind') or 'note'}] "
-                         f"{_brief_oneline(str(r.get('content') or ''), 140)}")
+                         f"{_brief_oneline(str(r.get('content') or ''), 140)}"
+                         f"{_error_mem_note(amended, r)}")
         else:
             head = _brief_title(str(r.get("title") or "")) or _brief_oneline(
                 str(r.get("content") or ""), 40)
