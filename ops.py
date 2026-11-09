@@ -301,8 +301,10 @@ def _run_patrol(root: str, checks=None, progress=None) -> dict:
                 issue["scope"] = "machine"
             # R178：检查项若能按失败类别给出更短口径，就随问题一起带上；
             # doctor 默认显示它，--full 才回退到上面的完整口径。
-            if r.get("fix"):
-                issue["fix_brief"] = r["fix"]
+            # R1037：检查项可以显式给「首屏动作」（fix_brief），优先于按失败类别给的短口径；
+            # 之前这里无条件用 r["fix"] 覆盖，等于把 fix_brief 这一层架空了。
+            if r.get("fix_brief") or r.get("fix"):
+                issue["fix_brief"] = r.get("fix_brief") or r["fix"]
             if cause:
                 issue["cause"] = cause
                 primary_by_cause[cause] = issue
@@ -3629,7 +3631,12 @@ def _adherence_health(root: str = "") -> dict:
         return {"ok": False,
                 "summary": f"采纳账：{len(idle)} 个会话有注入却从没被判定（最久 {worst[2]}h，"
                            f"{worst[0]}）——这些注入进不了 adopt_count，排序拿不到反馈",
-                "fix": CHECK_FIXES["adherence"], "detail": detail + _closure_note()}
+                "fix": CHECK_FIXES["adherence"],
+                # R1037：doctor 首屏要能直接照做。这条 fix 全文两屏（三类成因 + 补扫钩子），
+                # 默认屏只给一句动作，全文留给 --full。
+                "fix_brief": "先 `python cli.py adherence-backfill` 预演、`--apply` 写账；"
+                             "仍判不了再加 --full 看三类成因",
+                "detail": detail + _closure_note()}
     # 三、定罪只看观测口径（R852）。R850 那版拿账面 rate 定罪，分母是可指纹的全部行——
     # 里面混着「判定从没跑到」的行，而那些行 used 恒为 0，等于用采集缺陷给记忆质量定罪。
     # 判过的笔数不足 ADHERENCE_MIN_JUDGED 时既不判红也不报好：样本太薄的百分比没有意义。
