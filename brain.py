@@ -9114,6 +9114,12 @@ RECALL_SEM_WEAK_CAP = 2         # 最多补几条
 # 个规则在档位扫描里非单调，这种旋钮没人能调。改成唯一性判定后行为单调，也更好解释：
 # 多条都够格 = 答案不唯一 = 该给检索提示，不该猜一条。
 RECALL_SEM_WEAK_UNIQUE = True   # 关掉即退回「只要过线就补」（A/B 对照用）
+# R1077：低分带 + 多词共现 = 第二条证据。R1076 归因实测：7 条 gap 里 6 条的答案都在池里、
+# 词面命中 2–5 个词、语义 0.60–0.69——正好卡在 0.75 门槛下方。单看相似度不敢放（噪声），
+# 但「命中 ≥N 个不同检索词」是独立于语义的第二证据（R1011 同款护栏）。
+# WEAK_HITS=0 关闭本带（默认关，A/B 定档后才开）。
+RECALL_SEM_WEAK_HITS = 0        # >0 = 低分带要求的最少不同命中词数
+RECALL_SEM_WEAK_LOW_SIM = 0.60  # 低分带的语义下限
 # R1034：被显式声明「修正/取代」的旧记忆降权档（默认 0 = 关，A/B 用环境变量开）。
 # 依据：真库 amended_by_map 已有 18 对关系（#500←#501、#49←#445…），这些旧条与新结论
 # 同时进候选时，排序里没有任何信号说明「它过时了」——只能靠正文里的注脚提醒读者。
@@ -10346,11 +10352,18 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     # R1068：picked 全空、scored 非空、weak 非空 = 无人接手的死角（见常量注释）。
     # 用语义分从 weak 里补位，只在真空时动手，绝不与任何已有 picked 竞争。
     if RECALL_SEM_WEAK_MIN > 0 and not picked and weak:
-        _cand = []
+        # R1077b：两条**独立**的带——高分带（只看相似度）与低分带（相似度 0.60+ 且多词共现）。
+        # 唯一性判定必须在各自带内做：混在一起时，低分带的候选会把高分带唯一性打破，
+        # 于是本来该补的那条也补不进来（R1077 首版实测：#26 因此从 hit 掉回 gap）。
+        _hi, _lo = [], []
         for s0, r0 in weak:
             _sim0 = sem_map.get(int(r0.get("id") or 0), 0.0) or                 float(r0.get("_semantic_sim") or 0.0)
             if _sim0 >= RECALL_SEM_WEAK_MIN:
-                _cand.append((_sim0, float(s0), int(r0.get("id") or 0), r0))
+                _hi.append((_sim0, float(s0), int(r0.get("id") or 0), r0))
+            elif (RECALL_SEM_WEAK_HITS > 0 and _sim0 >= RECALL_SEM_WEAK_LOW_SIM
+                  and _recall_distinct_hits(terms, r0) >= RECALL_SEM_WEAK_HITS):
+                _lo.append((_sim0, float(s0), int(r0.get("id") or 0), r0))
+        _cand = _hi if _hi else _lo
         if _cand:
             _cand.sort(key=lambda x: (-x[0], -x[1], -x[2]))
             # R1068b：多条够格 = 答案不唯一，不猜（见常量注释）
