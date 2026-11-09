@@ -932,6 +932,35 @@ def cmd_backup_prune(root: str, keep_zip: int, keep_snapshot: int, keep_legacy: 
     return 0 if r["ok"] else 1
 
 
+def cmd_adherence_backfill(root: str, apply: bool, days: int, min_idle_h: float,
+                          sessions: list | None = None) -> int:
+    """R1035：把「离线补扫」变成一条命令。
+
+    为什么需要入口：R876 的工具一直在，但没人会记得去 tools/ 下敲它——于是
+    「会话关了、注入没判」的账永远挂着，adherence 巡检天天报红，adopt_count 拿不到
+    反馈。巡检的 fix 文案里点名这条命令，用户照着敲一次就能清账。
+    """
+    import importlib.util
+    from pathlib import Path as _P
+    tool = _P(__file__).resolve().parent / "tools" / "adherence_backfill.py"
+    if not tool.is_file():
+        print("找不到补扫工具 tools/adherence_backfill.py")
+        return 2
+    spec = importlib.util.spec_from_file_location("adherence_backfill", tool)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    rows = mod.unobserved_sessions(root, days, sessions or None)
+    res = mod.run(root, rows, mod.default_project_roots(), apply, days, min_idle_h)
+    total_n = total_m = 0
+    for it in res.get("sessions", []):
+        total_n += int(it.get("checked") or 0)
+        total_m += int(it.get("matched") or 0)
+        print(f"  {it.get('agent') or '?'}/{str(it.get('session'))[:16]} · {it.get('status')}"
+              f" · 轮 {it.get('turns')} · 判 {it.get('checked')} · 用上 {it.get('matched')}")
+    print(f"{'已写账' if apply else '预演（加 --apply 才写）'}：判 {total_n} 笔 · 用上 {total_m} 笔")
+    return 0
+
+
 def cmd_backup_drill(root: str, path: str) -> int:
     """R61 恢复演练：不写现场数据（R75 起仅审计流水留痕）。"""
     import brain  # noqa: PLC0415
@@ -2044,6 +2073,13 @@ def main(argv=None) -> int:
                       help=f"每份原文件保留几个备份（默认 {core.BACKUP_KEEP}）")
     p_bd = _cmd("backup-drill", help="恢复演练（校验+试恢复，不写现场数据，仅审计流水留痕）")
     p_bd.add_argument("path", nargs="?", default="", help="备份文件路径，留空=最新整包")
+    p_ab = _cmd("adherence-backfill",
+                help="离线补扫采纳账：给已关闭会话的注入补判定（默认预演，--apply 才写）")
+    p_ab.add_argument("--apply", action="store_true", help="真正写账（默认只预演）")
+    p_ab.add_argument("--days", type=int, default=30, help="回看天数（默认 30）")
+    p_ab.add_argument("--min-idle-h", dest="min_idle_h", type=float, default=2.0,
+                      help="最后注入距今不足这么多小时的会话跳过（默认 2，防抢跑）")
+    p_ab.add_argument("--session", action="append", default=[], help="只处理指定会话（可多次）")
     p_doc = _cmd("doctor", help="一键自检：巡检聚合 + 可执行修复建议")
     p_doc.add_argument("--full", action="store_true",
                        help="展开完整修复口径与全部明细（默认只列失败项相关口径与前 3 条）")
@@ -2234,6 +2270,9 @@ def main(argv=None) -> int:
                                     args.apply, args.verify_first)
         if args.cmd == "backup-drill":
             return cmd_backup_drill(_root(args.root), args.path)
+        if args.cmd == "adherence-backfill":
+            return cmd_adherence_backfill(_root(args.root), args.apply, args.days,
+                                          args.min_idle_h, args.session)
         if args.cmd == "doctor":
             return cmd_doctor(_root(args.root), full=args.full, as_json=args.as_json,
                               only=args.only, skip=args.skip, no_machine=args.no_machine,

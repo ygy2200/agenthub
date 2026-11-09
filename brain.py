@@ -9030,6 +9030,13 @@ RECALL_CORPUS_RARE_RATIO = 0.02  # 全库活跃行出现率 <=2% 视为稀有（
 RECALL_SEM_RESCUE_MODE = "replace"  # off | append(只补位) | replace(换掉语义最弱的一条)
 RECALL_SEM_RESCUE_SIM = 0.62        # 高于「无意义句」噪声峰值 0.5942（记忆 #542）
 RECALL_SEM_RESCUE_TOPN = 3       # 只认语义排名前 3
+# R1034：被显式声明「修正/取代」的旧记忆降权档（默认 0 = 关，A/B 用环境变量开）。
+# 依据：真库 amended_by_map 已有 18 对关系（#500←#501、#49←#445…），这些旧条与新结论
+# 同时进候选时，排序里没有任何信号说明「它过时了」——只能靠正文里的注脚提醒读者。
+# 降权是更靠前的一道：既然作者写了「修正 #N」，N 就不该在与新结论竞争时排前面。
+# 默认关的理由同 R943/R946：先同库 A/B 量收益（Recall@3 不降、误注入不增）再改默认档。
+# 一键回滚：本行置 0（行为逐位恢复 R1033）。
+RECALL_AMEND_PENALTY = float(os.environ.get("AGENTHUB_RECALL_AMEND_PENALTY") or 0)
 RECALL_SEM_RESCUE_MAX = 1
 RECALL_SEM_RESCUE_MARGIN = 0.10  # replace 时，新候选必须比被换掉的明显更相近
 # R1010（B035 池外子类）：语义候选补池。R899 只重排已在 40 条词法池里的候选，
@@ -10093,6 +10100,13 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             conf_map = {}
     muted = 0
     scored = []
+    # R1034：A/B 档才读修正映射（默认 0 时完全不碰库，保证关闭档与 R1033 逐位相同）。
+    _amended_ids: set = set()
+    if RECALL_AMEND_PENALTY > 0:
+        try:
+            _amended_ids = set(amended_by_map(root))
+        except Exception:  # noqa: BLE001 降权是锦上添花，读不到就不降
+            _amended_ids = set()
     for r in mems:
         if r.get("id") in excluded:
             continue
@@ -10142,6 +10156,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         # 真正低于 1.0 的那些行，量具据此判断「分档到底动没动任何一条结论」。
         if RECALL_CONF_W > 0:
             spec += RECALL_CONF_W * (conf - 1.0)
+        if RECALL_AMEND_PENALTY > 0 and int(r.get("id") or 0) in _amended_ids:
+            spec -= RECALL_AMEND_PENALTY
         if pname and (r.get("project") or "") == pname:
             spec += 1.0
         elif not r.get("project"):
