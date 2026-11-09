@@ -9045,8 +9045,28 @@ RECALL_SEM_RESCUE_TOPN = 3       # 只认语义排名前 3
 # 待确认：增益来自单条样本翻转（#21「游戏一启动就卡住不动」），40 条分母上 1 条 = 2.5pp，
 # 样本仍薄；后续扩样若翻负，直接置 0 回滚。
 # 一键回滚：把 RECALL_SEM_ADMIT_MIN 置 0（行为逐位恢复 R1062）。
+# R1065（B035 池构建子类）：钩子取池一直是 `semantic=False`——语义只在下游重排
+# （R899 权重 10）与救援（R900）里用，候选**进池**这一步仍是纯词法。R1062 池层实测：
+# 同一批 41 条提问，纯词法池 hit@3 65.9%，开语义融合池 75.6%（+9.7pp），单次耗时
+# 中位 59.6→63.0ms。差在「答案不含检索词时根本进不了池」，下游再怎么重排都救不回。
+# 默认关：钩子路径的固定成本必须靠 A/B 换，不能靠推理换。
+# 一键回滚：置 False（行为逐位恢复 R1064）。
+RECALL_POOL_SEMANTIC = False
 RECALL_SEM_ADMIT_MIN = 0.68     # 0=off；>0 为语义相似度准入线（R1063 A/B 定的档）
 RECALL_SEM_ADMIT_CAP = 1        # 每次最多补几条（还受 RECALL_PICK_CAP 剩余空位限制）
+# R1068（B035 死区子类）：`picked` 空、`scored` 非空、`weak` 非空时，**没有任何一档会
+# 接手**——R900 replace 要求 picked 非空（没得换就不动），R861 零词法桥要求 scored 也空，
+# R907 弱候选兜底按词数而非语义。R1067 逐条归因实测：recall_eval 的 5 条 gap 样本**全部**
+# 落在这个死角，且答案都在池里（命中 2–5 个词、语义分 0.62–0.75），只是命中的全是本库
+# 高频词，被稀有词线判弱。
+# 本档：只在 picked 全空时，按语义分从 weak 里补位。护栏同 R1063——只补空位、默认 off、
+# 免疫/排除/时间窗照旧、A/B 过线才改默认。
+# R1068 同库 A/B（41 条、分母 40）：0.62/0.68 档 +5.0pp 但噪声 +2 格（按判据不采纳，
+# 待扩样复评）；**0.72 档 +2.5pp、Δ噪声 0、Δ耗时 +0.2ms（过线，取此档）**；0.75 同分。
+# 待确认：增益同样来自单条样本（#26「红色沙漠想开帧生成到底该装哪个」），样本仍薄。
+# 一键回滚：置 0（行为逐位恢复 R1067）。
+RECALL_SEM_WEAK_MIN = 0.72      # 0=off；>0 为 weak 补位的语义准入线（R1068 A/B 定的档）
+RECALL_SEM_WEAK_CAP = 2         # 最多补几条
 # R1034：被显式声明「修正/取代」的旧记忆降权档（默认 0 = 关，A/B 用环境变量开）。
 # 依据：真库 amended_by_map 已有 18 对关系（#500←#501、#49←#445…），这些旧条与新结论
 # 同时进候选时，排序里没有任何信号说明「它过时了」——只能靠正文里的注脚提醒读者。
@@ -9975,6 +9995,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "sem_pool_added": 0,
            # R1063：零词面命中、靠语义准入补进注入的条数（默认 0 = 关闭）
            "sem_admitted": 0,
+           # R1068：picked 全空时按语义从 weak 补位的条数（默认 0 = 关闭）
+           "sem_weak_picked": 0,
            # R1011：strong 全空时由高相似语义兜底补入的条数（默认 0=关闭）
            "sem_empty_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
@@ -10041,8 +10063,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         # gate=False：覆盖度闸门按「查询词命中比例」删候选，对一句自然语言太严——
         # 真实库实测会把 #487（批处理括号教训，命中 8 分）直接删掉，只留 3 条泛化记忆。
         # 召回层有自己的命中阈值与重排，宽召回 + 严重排比窄召回更可靠。
+        # R1065：池层是否走语义融合（默认关，A/B 用）。关档与 R1064 逐位相同：纯词法池。
         mems = search_memories(root, query, limit=RECALL_POOL_LIMIT,
-                               count_hits=False, semantic=False, gate=False)
+                               count_hits=False,
+                               semantic=bool(RECALL_POOL_SEMANTIC), gate=False)
     except sqlite3.Error:
         return out
     # R1010：语义补池（默认关）。先把语义 topN 里词法池没见过的行补进候选集，
@@ -10236,6 +10260,21 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             add = sem_admit_rows[:take]
             picked = list(picked) + add
             out["sem_admitted"] = len(add)
+    # R1068：picked 全空、scored 非空、weak 非空 = 无人接手的死角（见常量注释）。
+    # 用语义分从 weak 里补位，只在真空时动手，绝不与任何已有 picked 竞争。
+    if RECALL_SEM_WEAK_MIN > 0 and not picked and weak:
+        _cand = []
+        for s0, r0 in weak:
+            _sim0 = sem_map.get(int(r0.get("id") or 0), 0.0) or                 float(r0.get("_semantic_sim") or 0.0)
+            if _sim0 >= RECALL_SEM_WEAK_MIN:
+                _cand.append((_sim0, float(s0), int(r0.get("id") or 0), r0))
+        if _cand:
+            _cand.sort(key=lambda x: (-x[0], -x[1], -x[2]))
+            add = [r0 for _sim0, _s0, _i0, r0 in
+                   _cand[:max(1, int(RECALL_SEM_WEAK_CAP))]]
+            picked = add
+            out["sem_weak_picked"] = len(add)
+            out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - len(add))
     # R907：稀有词闸门把答案全删光、语义路又没预热时的窄兜底（默认 off）。
     # 只在「一条强命中都没有」时补，且最多 1 条——R826 的实测结论仍然成立：有候选
     # 却每条都只命中泛词时该克制，这里只处理两个极端同时出现的场景，且必须靠 A/B

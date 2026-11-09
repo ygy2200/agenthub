@@ -18,8 +18,10 @@
   hook_raw  : search_memories(raw,   limit=40, semantic=False, gate=False)  ← 只换查询串
   hook_sem  : search_memories(terms, limit=40, semantic=True,  gate=False)  ← 只开语义路
   hook_sem_raw: search_memories(raw, limit=40, semantic=True,  gate=False)  ← 语义+原句
+  hook_live : prompt_recall(raw) 的最终 memory_ids                          ← 线上真实形态
   （hook vs hook_raw = 抽词的影响；tool vs tool_terms = 抽词的影响；
-    hook_sem vs hook = 语义路的净增益；tool_terms vs hook_sem = 闸门的净代价）
+    hook_sem vs hook = 语义路的净增益；tool_terms vs hook_sem = 闸门的净代价；
+    hook_sem_raw vs hook_live = 钩子下游闸门/重排的净代价）
 
 口径：只读。全部调用 `count_hits=False`，不污染 use_count / last_hit；不写 journal、
 不改 state。命中判定沿用 recall_eval 的「可接受集合」：任一标注 id 进 top3 即命中。
@@ -31,6 +33,7 @@ import argparse
 import json
 import os
 import sys
+import tempfile
 import time
 from pathlib import Path
 
@@ -75,7 +78,8 @@ def run(root: str, verbose: bool = False) -> int:
     cases = recall_eval.CASES
     agg = {name: {"hit3": 0, "pool": 0, "n": 0, "gap": 0}
            for name in ("hook", "tool", "tool_terms", "hook_raw",
-                        "hook_sem", "hook_sem_raw")}
+                        "hook_sem", "hook_sem_raw", "hook_live")}
+    state = Path(tempfile.mkdtemp(prefix="path_div_")) / "state.json"
     lat = {name: [] for name in agg}
     jac = []
     rows = []
@@ -111,6 +115,18 @@ def run(root: str, verbose: bool = False) -> int:
         except Exception as e:  # noqa: BLE001 量具不因单条炸掉中断
             print(f"[{i:02d}] ERROR {prompt!r}: {e}")
             continue
+        live = {}
+        try:
+            t0 = time.perf_counter()
+            live = brain.prompt_recall(
+                root, prompt, agent="workbuddy", cwd=str(ROOT_DIR),
+                session=f"div-{i}", state_path=str(state),
+                update_state=False, origin="eval")
+            lat["hook_live"].append((time.perf_counter() - t0) * 1000.0)
+            variants["hook_live"] = [int(x) for x in (live.get("memory_ids") or [])]
+        except Exception as e:  # noqa: BLE001 可选：量具不因单条炸掉中断
+            print(f"[{i:02d}] LIVE-ERROR {prompt!r}: {e}")
+            continue
         marks = {}
         for name, ids in variants.items():
             cell = agg[name]
@@ -123,17 +139,21 @@ def run(root: str, verbose: bool = False) -> int:
             marks[name] = ("✓" if h3 else ("∅" if not ids else "✗"))
         j = _jaccard(variants["hook"], variants["tool"])
         jac.append(j)
-        rows.append((i, prompt, accepts, marks, j))
+        rows.append((i, prompt, accepts, marks, j,
+                     dict(live.get("dropped") or {}), list(live.get("terms") or [])))
         if verbose:
             want_s = "|".join(f"{k}#{v}" for k, v in accepts)
             line = " ".join(f"{k}={marks[k]}" for k in
                             ("hook", "tool", "tool_terms", "hook_raw",
-                             "hook_sem", "hook_sem_raw"))
+                             "hook_sem", "hook_sem_raw", "hook_live"))
             print(f"[{i:02d}] {line} J@5={j:.2f} want={want_s} terms={q_terms}")
             print(f"      hook={variants['hook'][:5]}")
             print(f"      tool={variants['tool'][:5]}")
+            print(f"      live={variants['hook_live'][:5]} "
+                  f"dropped={live.get('dropped')} sem_admitted={live.get('sem_admitted')}")
     print("\n== 汇总（hit@3 / 池内覆盖 / 零候选 / 单次耗时中位） ==")
-    for name in ("hook", "tool", "tool_terms", "hook_raw", "hook_sem", "hook_sem_raw"):
+    for name in ("hook", "tool", "tool_terms", "hook_raw", "hook_sem",
+                 "hook_sem_raw", "hook_live"):
         c = agg[name]
         n = max(1, c["n"])
         ls = sorted(lat[name]) or [0.0]
@@ -147,9 +167,18 @@ def run(root: str, verbose: bool = False) -> int:
     # 分歧明细：只列 hook 与 tool 的命中结论不一致的样本
     diff = [r for r in rows if r[3]["hook"] != r[3]["tool"]]
     print(f"\n== 结论不一致的样本（hook≠tool）：{len(diff)}/{len(rows)} ==")
-    for i, prompt, accepts, marks, j in diff:
+    for i, prompt, accepts, marks, j, _drop, _terms in diff:
         print(f"  [{i:02d}] hook={marks['hook']} tool={marks['tool']} "
               f"J@5={j:.2f} {prompt!r}")
+    # R1064：把「工具搜得到、线上钩子没推」的样本单独列出，并附钩子的淘汰账——
+    # 只看 hit@3 差额无法判断该修闸门、修重排还是修记录路，必须看 dropped 分项。
+    lost = [r for r in rows if r[3]["tool"] == "✓" and r[3]["hook_live"] != "✓"]
+    print(f"\n== 工具命中但线上钩子没推：{len(lost)}/{len(rows)} ==")
+    for i, prompt, accepts, marks, j, drop, terms in lost:
+        want_s = "|".join(f"{k}#{v}" for k, v in accepts)
+        print(f"  [{i:02d}] {prompt!r}")
+        print(f"       want={want_s} live={marks['hook_live']} terms={terms}")
+        print(f"       dropped={drop}")
     return 0
 
 
