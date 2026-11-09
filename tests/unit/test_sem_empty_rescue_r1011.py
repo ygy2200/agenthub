@@ -64,6 +64,10 @@ def test_端到端_词法全弱且记录为空时才补答(monkeypatch, tmp_path
     monkeypatch.setattr(brain, "_semantic_rank",
                         lambda *a, **k: [(99, 0.1, sem_row)])
 
+    # R1068 起另有「weak 语义补位」独立档（默认 0.72、只在 picked 全空时补位），它同样
+    # 会在这条真空里动手。本用例测的是 R1011 自己的开关，故把它关掉——否则两条通道
+    # 混在一起，off 档到底关掉了谁就说不清。补位档自身的边界见 test_sem_weak_r1068.py。
+    monkeypatch.setattr(brain, "RECALL_SEM_WEAK_MIN", 0.0)
     monkeypatch.setattr(brain, "RECALL_SEM_EMPTY_MIN", 0.0)
     off = brain.prompt_recall(
         str(tmp_path), prompt, agent="workbuddy", session="s-off",

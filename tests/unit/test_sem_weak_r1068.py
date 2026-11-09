@@ -52,7 +52,7 @@ def _recall(tmp_path, tag):
 
 
 def test_默认档为_0_72_且置零即关(monkeypatch, tmp_path):
-    assert brain.RECALL_SEM_WEAK_MIN == 0.72
+    assert brain.RECALL_SEM_WEAK_MIN == 0.75
     weak = _row(26, "模组 管理器 结论", sim=0.75)
     _patch(monkeypatch, [weak], [(26, 0.05, weak)])
     on = _recall(tmp_path, "on")
@@ -66,23 +66,28 @@ def test_默认档为_0_72_且置零即关(monkeypatch, tmp_path):
 
 
 def test_语义分低于线不补(monkeypatch, tmp_path):
-    weak = _row(26, "模组 管理器 结论", sim=0.71)
+    weak = _row(26, "模组 管理器 结论", sim=0.74)
     _patch(monkeypatch, [weak], [(26, 0.05, weak)])
     res = _recall(tmp_path, "low")
     assert res["memory_ids"] == [], res
     assert res["sem_weak_picked"] == 0
 
 
-def test_补位按语义分排序且不超过上限(monkeypatch, tmp_path):
-    a = _row(31, "模组 管理器 结论甲", sim=0.74)
-    b = _row(32, "模组 管理器 结论乙", sim=0.90)
-    c = _row(33, "模组 管理器 结论丙", sim=0.80)
-    _patch(monkeypatch, [a, b, c],
-           [(31, 0.05, a), (32, 0.02, b), (33, 0.03, c)])
+def test_多条够格时不补_答案不唯一只给提示(monkeypatch, tmp_path):
+    """R1068b：两条都过线 → 不猜；关掉 UNIQUE 才按分数补（A/B 对照档）。"""
+    a = _row(31, "模组 管理器 结论甲", sim=0.90)
+    b = _row(32, "模组 管理器 结论乙", sim=0.80)
+    _patch(monkeypatch, [a, b], [(31, 0.05, a), (32, 0.02, b)])
+    res = _recall(tmp_path, "two")
+    assert res["memory_ids"] == [], res
+    assert res["sem_weak_picked"] == 0
+    assert res["sem_weak_flat"] == 1
+
+    monkeypatch.setattr(brain, "RECALL_SEM_WEAK_UNIQUE", False)
     monkeypatch.setattr(brain, "RECALL_SEM_WEAK_CAP", 2)
-    res = _recall(tmp_path, "order")
-    assert res["memory_ids"] == [32, 33], res
-    assert res["sem_weak_picked"] == 2
+    loose = _recall(tmp_path, "two-loose")
+    assert loose["memory_ids"] == [31, 32], loose
+    assert loose["sem_weak_picked"] == 2
 
 
 def test_词法有强命中时不补位_不许挤占(monkeypatch, tmp_path):
@@ -99,3 +104,17 @@ def test_词法有强命中时不补位_不许挤占(monkeypatch, tmp_path):
     # 具体挑中谁属词法+语义重排的职责（不归本档管），这里只钉「本档没动」。
     assert res["memory_ids"], res
     assert res["sem_weak_picked"] == 0
+
+
+def test_语义分挤成一团时不补位_保持泛词只给提示(monkeypatch, tmp_path):
+    """R1068b：6 条近重复记忆分数都在 0.99 一带 → 不许挑一条当结论注入。
+
+    这条护栏是 R825/R826 的「泛词命中宁可只给检索提示」在本档上的落地——
+    全量 unit 实测：没有它时，同模板只改序号的 6 条记忆会被补进注入。
+    """
+    rows = [_row(40 + i, "模组 管理器 泛化结论 %d" % i, sim=0.99) for i in range(6)]
+    _patch(monkeypatch, rows, [(r["id"], 0.05, r) for r in rows])
+    res = _recall(tmp_path, "flat")
+    assert res["memory_ids"] == [], res
+    assert res["sem_weak_picked"] == 0
+    assert res["sem_weak_flat"] == 1

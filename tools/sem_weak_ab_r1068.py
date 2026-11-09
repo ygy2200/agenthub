@@ -32,6 +32,7 @@ sys.path.insert(0, str(ROOT_DIR))
 sys.path.insert(0, str(Path(__file__).resolve().parent))
 
 import _console  # noqa: E402,F401
+import _abroot  # noqa: E402
 import brain  # noqa: E402
 import recall_eval as ev  # noqa: E402
 
@@ -98,11 +99,20 @@ def main() -> int:
     buf.write(f"准入线档位：{configs}\n\n")
 
     probe_state = Path(tempfile.mkdtemp(prefix="sem_admit_probe_")) / "state.json"
-    probe = _one(0.0, root, cases, probe_state)
+    _snap0 = _abroot.snapshot_root(root)
+    try:
+        probe = _one(0.0, _snap0, cases, probe_state)
+    finally:
+        _abroot.drop_root(_snap0)
     leak_ids = frozenset(i for i, cls, _ in probe["per_case"] if cls == "leak")
     results = []
     for th in configs:
-        r = _one(th, root, cases, state, leak_ids, args.cap)
+        # R1069：每档一份真库快照，避免上一档的 use_count/inject_count 影响下一档
+        snap = _abroot.snapshot_root(root)
+        try:
+            r = _one(th, snap, cases, state, leak_ids, args.cap)
+        finally:
+            _abroot.drop_root(snap)
         results.append(r)
         buf.write(f"min={r['min']:<5.2f}  Recall@3={r['hit']}/{r['scored']}={r['rate']:5.1f}%  "
                   f"噪声格={r['noise']:3d}  补入={r['admitted']:3d}  均耗时={r['avg_ms']:6.1f}ms  "

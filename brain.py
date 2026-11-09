@@ -9061,12 +9061,22 @@ RECALL_SEM_ADMIT_CAP = 1        # 每次最多补几条（还受 RECALL_PICK_CAP
 # 高频词，被稀有词线判弱。
 # 本档：只在 picked 全空时，按语义分从 weak 里补位。护栏同 R1063——只补空位、默认 off、
 # 免疫/排除/时间窗照旧、A/B 过线才改默认。
-# R1068 同库 A/B（41 条、分母 40）：0.62/0.68 档 +5.0pp 但噪声 +2 格（按判据不采纳，
-# 待扩样复评）；**0.72 档 +2.5pp、Δ噪声 0、Δ耗时 +0.2ms（过线，取此档）**；0.75 同分。
+# R1068 同库 A/B（41 条、分母 40）：0.62/0.68 档 +5.0pp 但噪声 +2 格（按判据不采纳）；
+# **0.75 档 +2.5pp、Δ噪声 0（取此档）**。0.70/0.72 档 0.0pp——R1069 发现首版 A/B 各档
+# 共用同一个库、注入计数器在档间互相污染（上一档的 use_count 进了下一档的排序分），
+# 用 `VACUUM INTO` 快照隔离后复评才定到这个档，见 tools/_abroot.py。
 # 待确认：增益同样来自单条样本（#26「红色沙漠想开帧生成到底该装哪个」），样本仍薄。
 # 一键回滚：置 0（行为逐位恢复 R1067）。
-RECALL_SEM_WEAK_MIN = 0.72      # 0=off；>0 为 weak 补位的语义准入线（R1068 A/B 定的档）
+RECALL_SEM_WEAK_MIN = 0.75      # 0=off；>0 为 weak 补位的语义准入线（R1069 隔离复评定档）
 RECALL_SEM_WEAK_CAP = 2         # 最多补几条
+# R1068b：**只有一条候选过线时才补**。R1068 首版只卡绝对相似度，全量 unit 立刻抓到反例：
+# 6 条近重复记忆（自测里同模板只改序号）语义分挤在 0.99 一带，补位把两条几乎一样的泛化
+# 摘要塞进上下文——正是 R825/R826 明令要避免的「泛词灌水」。
+# 判据写成「唯一够格」而不是「领先第二名 X 分」：R1068b 首版用 0.05 领先线，实测 #26 的
+# 第一名 0.752 与第二名 0.733 只差 0.019，于是**阈值越低越不补、阈值越高反而补**——同一
+# 个规则在档位扫描里非单调，这种旋钮没人能调。改成唯一性判定后行为单调，也更好解释：
+# 多条都够格 = 答案不唯一 = 该给检索提示，不该猜一条。
+RECALL_SEM_WEAK_UNIQUE = True   # 关掉即退回「只要过线就补」（A/B 对照用）
 # R1034：被显式声明「修正/取代」的旧记忆降权档（默认 0 = 关，A/B 用环境变量开）。
 # 依据：真库 amended_by_map 已有 18 对关系（#500←#501、#49←#445…），这些旧条与新结论
 # 同时进候选时，排序里没有任何信号说明「它过时了」——只能靠正文里的注脚提醒读者。
@@ -9997,6 +10007,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "sem_admitted": 0,
            # R1068：picked 全空时按语义从 weak 补位的条数（默认 0 = 关闭）
            "sem_weak_picked": 0,
+           # R1068b：语义分挤成一团（领先不足护栏）而放弃补位的轮次（诊断用）
+           "sem_weak_flat": 0,
            # R1011：strong 全空时由高相似语义兜底补入的条数（默认 0=关闭）
            "sem_empty_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
@@ -10270,11 +10282,15 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
                 _cand.append((_sim0, float(s0), int(r0.get("id") or 0), r0))
         if _cand:
             _cand.sort(key=lambda x: (-x[0], -x[1], -x[2]))
-            add = [r0 for _sim0, _s0, _i0, r0 in
-                   _cand[:max(1, int(RECALL_SEM_WEAK_CAP))]]
-            picked = add
-            out["sem_weak_picked"] = len(add)
-            out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - len(add))
+            # R1068b：多条够格 = 答案不唯一，不猜（见常量注释）
+            if (not RECALL_SEM_WEAK_UNIQUE) or len(_cand) == 1:
+                add = [r0 for _sim0, _s0, _i0, r0 in
+                       _cand[:max(1, int(RECALL_SEM_WEAK_CAP))]]
+                picked = add
+                out["sem_weak_picked"] = len(add)
+                out["dropped"]["rare"] = max(0, out["dropped"]["rare"] - len(add))
+            else:
+                out["sem_weak_flat"] = 1
     # R907：稀有词闸门把答案全删光、语义路又没预热时的窄兜底（默认 off）。
     # 只在「一条强命中都没有」时补，且最多 1 条——R826 的实测结论仍然成立：有候选
     # 却每条都只命中泛词时该克制，这里只处理两个极端同时出现的场景，且必须靠 A/B
