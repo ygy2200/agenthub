@@ -761,7 +761,12 @@ def cmd_check(name: str = "", target: str = "", root: str = "",
             print(f"{n:16s} {'需要 --target' if needs else '免 target  '} {desc[:70]}")
         return 0
     if name not in ops.CHECKS:
-        print(f"✗ 未注册的检查项：{name or '(空)'}"
+        # R1040：拼错一个字母就只回「未注册」等于让人自己比对 40+ 项——主命令 R708 早就
+        # 给了最近匹配，这里补齐同一口径（巡检名比命令名更长、更容易打错）。
+        import difflib  # noqa: PLC0415
+        near = difflib.get_close_matches(name or "", list(ops.CHECKS), n=3, cutoff=0.6)
+        hint = f"；你是不是想跑：{'、'.join(near)}" if near else ""
+        print(f"✗ 未注册的检查项：{name or '(空)'}{hint}"
               f"（python cli.py check --list 看全部 {len(ops.CHECKS)} 项）", file=sys.stderr)
         return 2
     needs_target = ops.CHECKS[name][1]
