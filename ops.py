@@ -104,6 +104,7 @@ FIX_BRIEFS = {
     "usage_health": "不需要的接入：`python cli.py offboard <agent> --apply`（预演默认）；"
                     "还需要就让该会话跑一次真实调用",
     "ghost_memory": "先 `hub_memory_read` 核对内容；确是重复再用 `hub_memory_supersede(keep_id, drop_id)`",
+    "runtime_health": "先 `python cli.py deploy` 刷副本，再重启对应客户端（MCP 进程只在启动时加载）",
 }
 
 CHECK_FIXES = {

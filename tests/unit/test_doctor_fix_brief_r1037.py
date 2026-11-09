@@ -30,7 +30,7 @@ def test_adherence_declares_brief():
 
 def test_fix_briefs_table_covers_all_current_reds(tmp_path, monkeypatch):
     """R1039：当前会红的五项都要有首屏动作（表格驱动，防止新增检查项时忘了给）。"""
-    for name in ("backup_health", "usage_health", "ghost_memory"):
+    for name in ("backup_health", "usage_health", "ghost_memory", "runtime_health"):
         assert name in ops.FIX_BRIEFS, f"{name} 没有首屏动作"
         assert len(ops.FIX_BRIEFS[name]) <= 90, f"{name} 的首屏动作太长：>90 字"
 
