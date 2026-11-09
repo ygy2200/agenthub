@@ -8965,6 +8965,11 @@ RECALL_RRF_MARGIN = 0.6        # RRF 下的相对强度线（R1074 定档）
 #   gate 0.80 → +1.9pp / 噪声 +1（#13 的头名语义正好 0.75，0.80 就放它过去了）
 # 所以 0.70 是「护住 #13 且吃到 #10/#23」之间的平台，离边界还有 0.05 余量。
 RECALL_RRF_GATE_SIM = 0.70     # 词法头名语义分低于此值才启用 RRF（R1074 定档）
+# R1074b：**语义分地板**。RRF 只看名次不看强度，于是 0.30 的弱相似也能凭「语义第 1」
+# 拿到与 0.90 一样的加分——R899 的用例当场撞红（「弱语义不许翻词法顺序」）。
+# 所以名次项只对「语义上确实像」的候选计入：低于本值的候选在 RRF 里只有词法名次。
+# 0 = 不设地板（回到只看名次）。
+RECALL_RRF_SIM_FLOOR = 0.5
 # R1073：钩子侧最终排序改用 RRF（名次融合），默认关。
 # 动机：工具路径 80.5% vs 钩子 67.3%，两边的差别之一是**融合形态**——工具路径用 RRF
 # （_memories_search_fused，名次取倒数再相加），钩子用加性分数（词法 wid*2.2 … +
@@ -10316,7 +10321,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             _rid = int(pair[1].get("id") or 0)
             _sc = 1.0 / (_k + _lex_rank.get(_rid, len(strong) + 1))
             _sr = _sem_rank.get(_rid)
-            if _sr:
+            if _sr and sem_map.get(_rid, 0.0) >= RECALL_RRF_SIM_FLOOR:
                 _sc += 1.0 / (_k + _sr)
             return _sc
         strong = sorted((( _rrf(p), p[1]) for p in strong),
