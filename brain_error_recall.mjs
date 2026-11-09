@@ -17,7 +17,8 @@
  * 纪律：永远 exit 0；5 秒超时；不写任何用户配置。
  */
 import { spawnSync } from 'node:child_process';
-import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
+import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, openSync,
+  readSync, fstatSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
 
@@ -28,6 +29,11 @@ const SCRIPT = process.env.AGENTHUB_ERROR_SCRIPT
   || path.join(HOME, '.agenthub', 'mcp_server', 'brain_error_recall.py');
 const MAX_CHARS = Math.max(200, Number(process.env.AGENTHUB_ERROR_MAX_CHARS) || 700);
 const MIN_ERR_CHARS = 12;
+// R1029：WorkBuddy 的 PostToolUse 只给 {exitCode, signal, …}，没有 stdout/stderr 文本，
+// 正文只在会话 transcript 的 function_call_result.output.text 里。水位线按会话记，
+// 保证同一条工具结果只被扫一次（宿主落盘恒落后 1–2 次调用，所以要跨调用续扫）。
+const WM = process.env.AGENTHUB_ERROR_WM
+  || path.join(HOME, '.workbuddy', 'state', 'brain-error-recall-wm.json');
 
 function logLine(msg) {
   try {
@@ -157,6 +163,134 @@ function extractNodeError(s) {
   return best.length >= MIN_ERR_CHARS ? best : '';
 }
 
+/** R1029（B121 真因）：只读文件尾部若干 KB，避免整份 transcript（可能几十 MB）读进内存。 */
+function tailText(p, maxBytes = 262144) {
+  let fd;
+  try {
+    fd = openSync(p, 'r');
+    const size = fstatSync(fd).size;
+    const len = Math.min(size, maxBytes);
+    const buf = Buffer.alloc(len);
+    readSync(fd, buf, 0, len, Math.max(0, size - len));
+    let s = buf.toString('utf8');
+    if (size > len) {
+      const i = s.indexOf('\n');       // 首行可能被截断，丢掉
+      if (i >= 0) s = s.slice(i + 1);
+    }
+    return s;
+  } catch { return ''; }
+}
+
+function readWm() {
+  try { return JSON.parse(readFileSync(WM, 'utf8')) || {}; } catch { return {}; }
+}
+
+function saveWm(obj) {
+  try {
+    mkdirSync(path.dirname(WM), { recursive: true });
+    // 只保留最近 40 个会话，防止状态文件无限膨胀
+    const keys = Object.keys(obj);
+    if (keys.length > 40) {
+      keys.sort((a, b) => Number(obj[a] || 0) - Number(obj[b] || 0))
+        .slice(0, keys.length - 40).forEach(k => { delete obj[k]; });
+    }
+    writeFileSync(WM, JSON.stringify(obj), 'utf8');
+  } catch { /* ignore */ }
+}
+
+/** 把工具结果正文拆成 命令 / stdout / stderr / 退出码 四段（WorkBuddy 的渲染格式）。 */
+function splitToolText(text) {
+  const out = { command: [], stdout: [], stderr: [], exit: null };
+  let mode = 'head';
+  for (const ln of String(text || '').split(/\r?\n/)) {
+    // 宿主把正文写在同一行：`Stderr: <第一行>`；空的时候写 `Stderr: (empty)`。
+    const mOut = ln.match(/^Stdout:\s?(.*)$/);
+    if (mOut) {
+      mode = 'stdout';
+      if (mOut[1].trim() && mOut[1].trim() !== '(empty)') out.stdout.push(mOut[1]);
+      continue;
+    }
+    const mErr = ln.match(/^Stderr:\s?(.*)$/);
+    if (mErr) {
+      mode = 'stderr';
+      if (mErr[1].trim() && mErr[1].trim() !== '(empty)') out.stderr.push(mErr[1]);
+      continue;
+    }
+    const m = ln.match(/^Exit Code:\s*(-?\d+)/);
+    if (m) { out.exit = Number(m[1]); mode = 'tail'; continue; }
+    if (/^Signal:\s*/.test(ln)) { mode = 'tail'; continue; }
+    if (mode === 'head') {
+      out.command.push(ln.replace(/^Command:\s*/, ''));
+    } else if (mode === 'stdout') out.stdout.push(ln);
+    else if (mode === 'stderr') out.stderr.push(ln);
+  }
+  return out;
+}
+
+/** 一段工具结果里「真正算报错」的正文；没有就空串（宁可漏，不可误报）。
+ *  只认三种：非空 stderr / Python 结构化 traceback / Node 未捕获异常。
+ *  光有非零退出码不算——`grep` 没命中、`test -f` 为假都返回 1，那是正常结果。 */
+function errorFromToolText(text) {
+  const sec = splitToolText(text);
+  const stderr = sec.stderr.join('\n').trim();
+  if (stderr && stderr !== '(empty)' && stderr.length >= MIN_ERR_CHARS) {
+    return stderr.slice(0, 2000);
+  }
+  const stdout = sec.stdout.join('\n');
+  const tb = extractTraceback(stdout);
+  if (tb) return tb;
+  const ne = extractNodeError(stdout);
+  if (ne) return ne;
+  return '';
+}
+
+/** 扫会话 transcript 里「水位线之后、还没处理过」的工具结果，取最新一条真报错。
+ *  返回 {err, cmd, callId, exit} 或 null。 */
+function scanTranscript(ev, session) {
+  const p = String(ev.transcript_path || ev.transcriptPath || '');
+  if (!p || !existsSync(p)) return null;
+  const wm = readWm();
+  const last = Number(wm[session] || 0);
+  const cutoff = Date.now() - 15 * 60 * 1000;   // 首次运行不回放旧历史
+  const lines = tailText(p).split('\n');
+  const calls = {};
+  const results = [];
+  for (const ln of lines) {
+    if (!ln.trim()) continue;
+    let d; try { d = JSON.parse(ln); } catch { continue; }
+    if (d.type === 'function_call') {
+      let args = {};
+      try { args = JSON.parse(d.arguments || '{}'); } catch { /* ignore */ }
+      calls[d.callId] = args;
+    } else if (d.type === 'function_call_result') {
+      results.push(d);
+    }
+  }
+  let newest = 0;
+  let hit = null;
+  for (const d of results) {
+    const ts = Number(d.timestamp || 0);
+    if (!ts || ts <= last || ts < cutoff) continue;
+    if (ts > newest) newest = ts;
+    const text = d.output && (d.output.text || d.output.content) || '';
+    if (typeof text !== 'string' || !text) continue;
+    const err = errorFromToolText(text);
+    if (!err) continue;
+    const args = calls[d.callId] || {};
+    const cmd = [args.command, args.cmd, args.file_path, args.path]
+      .filter(x => typeof x === 'string' && x).join(' ');
+    const sec = splitToolText(text);
+    hit = {
+      err,
+      cmd: cmd || sec.command.join(' ').replace(/\s+/g, ' ').trim(),
+      callId: d.callId,
+      exit: sec.exit,
+    };
+  }
+  if (newest) { wm[session] = newest; saveWm(wm); }
+  return hit;
+}
+
 function resolveRoot(ev) {
   const cwd = ev.cwd || ev.workingDirectory || ev.cwdPath || process.cwd();
   let rootArg = process.env.AGENTHUB_ROOT || '';
@@ -217,7 +351,22 @@ try {
   }
 
   const tool = String(ev.tool_name || ev.toolName || '');
-  const err = errorText(ev);
+  const session0 = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
+  let err = errorText(ev);
+  let src = err ? 'payload' : '';
+  let trCmd = '';
+  if (!err && isPost) {
+    // WorkBuddy 形状：事件里只有 exitCode 元数据，正文要去 transcript 找。
+    // 宿主在钩子返回后才把结果落盘，所以这里捞到的通常是「上一次调用」的失败——
+    // 一次调用的延迟换一条真实旧坑，比永久闭嘴值。
+    const hit = scanTranscript(ev, session0);
+    if (hit) {
+      err = hit.err;
+      src = 'transcript';
+      trCmd = hit.cmd || '';
+      logLine(`transcript_fallback: exit=${hit.exit} call=${String(hit.callId || '').slice(0, 10)}`);
+    }
+  }
   if (!err) {
     if (isFailure) {
       // B067：宿主确实报了「这次工具失败」，可我们抽不出正文——这正是那 16 次无签名触发
@@ -235,14 +384,15 @@ try {
   }
 
   const agent = agentName(ev);
-  const session = String(ev.session_id || ev.sessionId || ev.conversation_id || '');
+  const session = session0;
   const { cwd, rootArg } = resolveRoot(ev);
   if (!existsSync(SCRIPT)) { logLine(`skip: ${SCRIPT} 不存在`); process.exit(0); }
 
   // 命令/入参一起给：报错正文常常只说「exit code 1」，失败的那条命令才是检索线索。
   const input = ev.tool_input || ev.toolInput || {};
-  const cmdHint = [input.command, input.cmd, input.prompt, input.file_path, input.path,
-    input.url].map(x => (typeof x === 'string' ? x : '')).filter(Boolean).join(' ').slice(0, 400);
+  const cmdHint = ([input.command, input.cmd, input.prompt, input.file_path, input.path,
+    input.url].map(x => (typeof x === 'string' ? x : '')).filter(Boolean).join(' ')
+    || trCmd).slice(0, 400);
   // 必须压成一行再拼：大脑按「失败调用：」这一整行把命令摘掉（brain.py `_error_voice`），
   // 命令自带换行（heredoc、多行脚本）时只有首行被摘，剩下的脚本正文会抢走签名词。
   // 2026-11-02 线上实测：一条 UnicodeEncodeError 的 6 个签名词里 5 个来自我自己正在跑的脚本
@@ -267,7 +417,7 @@ try {
     process.exit(0);
   }
   const capped = text.length > MAX_CHARS ? text.slice(0, MAX_CHARS - 16) + '\n…（已截断）' : text;
-  logLine(`error_recall ${capped.length} chars agent=${agent} tool=${tool.slice(0, 24)} sid=${session.slice(0, 24)}`);
+  logLine(`error_recall ${capped.length} chars agent=${agent} tool=${tool.slice(0, 24)} sid=${session.slice(0, 24)} src=${src || 'payload'}`);
   process.stdout.write(JSON.stringify({
     hookSpecificOutput: {
       hookEventName: isFailure ? 'PostToolUseFailure' : 'PostToolUse',
