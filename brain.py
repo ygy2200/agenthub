@@ -8942,6 +8942,27 @@ RECALL_REL_MARGIN = 0.62
 # 权重 10 是「0.66 × 10 ≈ 6.6 分」的量级——够翻 2–3 分的排序差，又不足以让一条
 # 语义相似但词法零命中的候选越级（那种要靠 B071 后半段的闸门救援，另立一轮）。
 RECALL_SEM_RERANK_W = 10.0
+# R1072：排序里的三个人气项提成常量（默认值 = 提成前硬编码值，逐位相同）。
+# 用途只有一个：让「pin/使用次数/采纳次数到底该占多少分」可以被同库 A/B 量，
+# 而不是每次靠拍脑袋调字面量。
+RECALL_USE_W = 0.04            # 每次唤起（封顶 10 次）
+RECALL_ADOPT_W = 0.12          # 每次被采纳（封顶 5 次）
+RECALL_PINNED_W = 0.8          # 置顶加成
+RECALL_RRF_K = 0               # 0=off；>0 启用 RRF 名次融合的 k 值
+# R1073b：RRF 名次融合下的相对强度线。RRF 分数随名次缓慢衰减（1/(k+rank)），把词法
+# 那套 0.62 直接套上来会把第 2 名以后全砍掉（实测比值约 0.49），而完全不设线又会
+# 一律灌满 cap、噪声 +17 格。所以这里单独给一个可扫的系数，默认 0 = 不设线（与
+# R1073 首版一致，便于回放对比）。
+RECALL_RRF_MARGIN = 0.0
+# R1073：钩子侧最终排序改用 RRF（名次融合），默认关。
+# 动机：工具路径 80.5% vs 钩子 67.3%，两边的差别之一是**融合形态**——工具路径用 RRF
+# （_memories_search_fused，名次取倒数再相加），钩子用加性分数（词法 wid*2.2 … +
+# 语义 sim*10）。加性分数对量纲敏感：R1066 扫过权重 15/20/30 全是负收益，说明「调大
+# 语义项」这条路已到头；RRF 只看名次，不受分数尺度影响，是**另一种形状**而不是同一个
+# 旋钮再拧一圈。
+# 实现只动 strong 内部的先后（谁被 pick），不动谁能进 strong（稀有词线口径不变）。
+# 0=off；>0 为 RRF 的 k 常数（越大越平滑，业界常用 60；小样本可试 10）。
+# 一键回滚：置 0（行为逐位恢复 R1072）。
 # R943（B112）：confidence 分档实验的两个旋钮——**默认全关，只为可复跑的只读 A/B 保留**。
 # 现状（R939 量化 + R943 复核）：confidence 列 591 条里 526 条恒 1.0，全库唯一的读取点是
 # 记忆去重的 `_MEM_QUALS` 质量裁决，检索路径一次都没读过它——所以「按置信度分档」在
@@ -10215,7 +10236,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         r["_recall_w"] = wid
         r["_recall_best"] = best_raw
         kind = r.get("kind") or "note"
-        spec = wid * 2.2 + kind_weights.get(kind, 0.4) + (0.8 if r.get("pinned") else 0)
+        spec = wid * 2.2 + kind_weights.get(kind, 0.4) +             (RECALL_PINNED_W if r.get("pinned") else 0)
         # R943：置信度降权档（默认 0=off）。写成 (conf-1) 而不是乘性系数：conf=1.0 时
         # 严格加 0.0，保证默认全 1.0 的真库上 A/B 的两档**逐位相同**——差异只可能来自
         # 真正低于 1.0 的那些行，量具据此判断「分档到底动没动任何一条结论」。
@@ -10227,10 +10248,14 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             spec += 1.0
         elif not r.get("project"):
             spec += 0.2
-        spec += min(int(r.get("use_count") or 0), 10) * 0.04
+        # R1072：人气项提成常量（默认值与提成前逐位相同：0.04/0.12/0.8）。
+        # 复评背景：R1070 扩样后 #42 这类「答案在池却不进 top3」的样本里，top3 常是
+        # pinned 老事实（#19 use=77、#9 use=94）——pin+使用次数把具体答案挤掉了。
+        # 这里只把数字提出来，不改语义；改不改默认由同库 A/B 决定。
+        spec += min(int(r.get("use_count") or 0), 10) * RECALL_USE_W
         # R830 采纳回流：被证实用上过，是比「被检索到」强得多的相关性证据（权重 3 倍）。
         # 封顶 5 次，防一条老记忆靠历史采纳量永久霸榜——那也是另一种马太。
-        spec += min(int(r.get("adopt_count") or 0), 5) * 0.12
+        spec += min(int(r.get("adopt_count") or 0), 5) * RECALL_ADOPT_W
         try:
             spec += {"fresh": 0.6, "stale": 0.0, "expired": -1.0}.get(
                 memory_freshness(r).get("state"), 0.0)
@@ -10258,7 +10283,28 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # 这批候选里到处都是。分开计数才能回答「答案是被删了还是没排上」。
             out["dropped"]["rare"] += 1
             weak.append(pair)   # R900：留作闸门救援的候选集，默认不启用
-    picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
+    if RECALL_RRF_K > 0 and strong and sem_map:
+        # R1073：名次融合。词法名次来自 strong 现有顺序（spec 降序），语义名次来自 sem_map。
+        # RRF 分数与量纲无关，所以这里同时替代「相对强度 margin」——两者尺度不同，
+        # 混用会把 top*0.62 这种绝对线套到 1/(k+rank) 上，只剩 1 条能过。开档时按
+        # cap 取前 N；关档行为逐位不变（走 _recall_pick_margin）。
+        _k = float(RECALL_RRF_K)
+        _lex_rank = {int(r.get("id") or 0): i + 1
+                     for i, (_s0, r) in enumerate(strong)}
+        _sem_rank = {int(_i0): i + 1 for i, (_i0, _v0) in
+                     enumerate(sorted(sem_map.items(), key=lambda kv: -kv[1]))}
+        def _rrf(pair):
+            _rid = int(pair[1].get("id") or 0)
+            _sc = 1.0 / (_k + _lex_rank.get(_rid, len(strong) + 1))
+            _sr = _sem_rank.get(_rid)
+            if _sr:
+                _sc += 1.0 / (_k + _sr)
+            return _sc
+        strong = sorted((( _rrf(p), p[1]) for p in strong),
+                        key=lambda x: (-x[0], -(x[1].get("id") or 0)))
+        picked = _recall_pick_margin(strong, RECALL_PICK_CAP, RECALL_RRF_MARGIN)
+    else:
+        picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     out["dropped"]["cap"] = max(0, len(strong) - len(picked))
     # R1063：语义准入候选**只补空位**——词法挑出来的任何一条都不许被挤掉（这是本档与
     # R900 replace 的根本区别：replace 会换人，这里只填空）。补进来的行已经过了排除集、
