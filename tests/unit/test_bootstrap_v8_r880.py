@@ -24,8 +24,13 @@ OLD_BLOCK = (
 
 
 def test_bootstrap_version_bumped_to_v8():
-    """引导内容变了版本必须 +1，否则 boot_stale 与 refresh 看不见这次改动。"""
-    assert core.BOOTSTRAP_VERSION == "8"
+    """引导内容变了版本必须 +1，否则 boot_stale 与 refresh 看不见这次改动。
+
+    R1062 复跑全量 unit 时发现本文件从 R1057（引导块 v9：把长跑授权写进规则）起
+    就是红的——那轮只跑了本轮的 3 条用例，没跑整层，于是「版本号没同步」的债留了
+    三轮。版本号仍要求逐次手改（不许自动跟随），否则这道守卫等于没有。
+    """
+    assert core.BOOTSTRAP_VERSION == "9"
 
 
 def test_bootstrap_teaches_directive_tag_with_payoff():
@@ -58,7 +63,7 @@ def test_stale_v7_block_replaced_and_user_text_survives(tmp_path):
     assert core.inject_bootstrap(str(p), "D:\\demo") == ""
     text = p.read_text(encoding="utf-8")
     assert "别动这一段。" in text, "注入把主人自己的内容冲掉了"
-    assert core.bootstrap_version(str(p)) == "8"
+    assert core.bootstrap_version(str(p)) == "9"   # R1057 起引导块为 v9
     assert "必做" in text
     assert text.count(core.BOOTSTRAP_BEGIN) == 1, "旧块没被摘掉，注入了两块"
     assert "<!-- agenthub:version:7 -->" not in text

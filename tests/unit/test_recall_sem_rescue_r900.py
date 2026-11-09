@@ -184,6 +184,10 @@ def test_rescue_never_restores_hit_or_immune_drops(hub_root, tmp_path, monkeypat
           extra=extra)
     monkeypatch.setattr(brain, "RECALL_SEM_RESCUE_MODE", "replace")
     monkeypatch.setattr(brain, "RECALL_SEM_RESCUE_SIM", 0.65)
+    # R1063 起另有「语义准入」独立档（只补空位、默认 0.68），它**有意**放行 hit<need
+    # 的语义近邻——那是另一条通道，不是 R900 救援。本用例测的是救援，故把准入档关掉；
+    # 准入档自身的边界（含「免疫条永不补入」）见 tests/unit/test_sem_admit_r1063.py。
+    monkeypatch.setattr(brain, "RECALL_SEM_ADMIT_MIN", 0.0)
     out = _recall(hub_root, tmp_path)
     assert 9 not in out["memory_ids"], out["memory_ids"]
     assert 10 not in out["memory_ids"], out["memory_ids"]

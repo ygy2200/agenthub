@@ -9030,6 +9030,23 @@ RECALL_CORPUS_RARE_RATIO = 0.02  # 全库活跃行出现率 <=2% 视为稀有（
 RECALL_SEM_RESCUE_MODE = "replace"  # off | append(只补位) | replace(换掉语义最弱的一条)
 RECALL_SEM_RESCUE_SIM = 0.62        # 高于「无意义句」噪声峰值 0.5942（记忆 #542）
 RECALL_SEM_RESCUE_TOPN = 3       # 只认语义排名前 3
+# R1063（B035 词法闸门子类）：**词法闸门是硬闸**，候选必须在正文里命中 ≥need 个检索词，
+# 否则连打分都进不去（下面是 `if hit < eff_need: dropped.hit += 1; continue`）。语义补池
+# （R1010）因此结构性空转：同库 A/B 实测 cap=20 补进 183 条候选，Recall@3 一条不涨、噪声
+# +5 格——补进来的行按定义就不含这几个词，全在 hit 闸门被删。R900 的语义救援也救不到它：
+# 那一档只处理「过了 hit 闸门、被稀有词线判弱」的候选（weak），对零词面命中的行不可见。
+# 本档给这类候选一条独立准入：语义相似度够近就算「召回得到」，不再要求词面命中。
+# 护栏（与 R907/R918 同一套克制口径）：① 只补空位，绝不挤掉任何一条词法命中；
+# ② 每次最多 1 条；③ 默认 0=off，同库 A/B 证明 ΔRecall@3>0 且 Δ噪声≤0 才允许改默认；
+# ④ 仍然过免疫/排除/时间窗——语义只替代「词面命中」这一道，不是绕过全部闸门。
+# R1063 同库 A/B（41 条样本，分母 40）结果：0.62 → +5.0pp 但噪声 +9 格（否决）；
+# 0.68 → +2.5pp、噪声 +0 格、耗时 +1.1ms（过线，取此档）；0.70 同分但只补入 1 条；
+# 0.72/0.78 → 补入 0 条（零效果）。cap=1 与 cap=2 结论相同，取更保守的 1。
+# 待确认：增益来自单条样本翻转（#21「游戏一启动就卡住不动」），40 条分母上 1 条 = 2.5pp，
+# 样本仍薄；后续扩样若翻负，直接置 0 回滚。
+# 一键回滚：把 RECALL_SEM_ADMIT_MIN 置 0（行为逐位恢复 R1062）。
+RECALL_SEM_ADMIT_MIN = 0.68     # 0=off；>0 为语义相似度准入线（R1063 A/B 定的档）
+RECALL_SEM_ADMIT_CAP = 1        # 每次最多补几条（还受 RECALL_PICK_CAP 剩余空位限制）
 # R1034：被显式声明「修正/取代」的旧记忆降权档（默认 0 = 关，A/B 用环境变量开）。
 # 依据：真库 amended_by_map 已有 18 对关系（#500←#501、#49←#445…），这些旧条与新结论
 # 同时进候选时，排序里没有任何信号说明「它过时了」——只能靠正文里的注脚提醒读者。
@@ -9956,6 +9973,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
            "sem_rescued": 0,
            # R1010：语义补池实际新增的候选数（默认 0；只作诊断，不绕过闸门）
            "sem_pool_added": 0,
+           # R1063：零词面命中、靠语义准入补进注入的条数（默认 0 = 关闭）
+           "sem_admitted": 0,
            # R1011：strong 全空时由高相似语义兜底补入的条数（默认 0=关闭）
            "sem_empty_rescued": 0,
            # R907：不依赖语义路的弱候选补位（默认 0 = 关闭）；A/B 量具据此计精准率
@@ -10100,6 +10119,7 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             conf_map = {}
     muted = 0
     scored = []
+    sem_admit_rows: list = []   # R1063：零词面命中、但语义够近的候选（默认档恒为空）
     # R1034：A/B 档才读修正映射（默认 0 时完全不碰库，保证关闭档与 R1033 逐位相同）。
     _amended_ids: set = set()
     if RECALL_AMEND_PENALTY > 0:
@@ -10128,7 +10148,16 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         eff_need = (1 if (RECALL_TIME_HIT_RELAX > 0 and r.get("_tw_inside"))
                     else need)
         if hit < eff_need:
-            out["dropped"]["hit"] += 1
+            # R1063：词法闸门是硬闸，但语义路能提供一条独立的「够近」证据。两条件同时
+            # 成立才放行——档开着、且这条的语义相似度过线。放行的行不进打分池（它没有
+            # 词面命中，参与词法打分只会拿 0 分占位），单独排队等空位补入。
+            _as = sem_map.get(int(r.get("id") or 0), 0.0) or \
+                float(r.get("_semantic_sim") or 0.0)
+            if RECALL_SEM_ADMIT_MIN > 0 and _as >= RECALL_SEM_ADMIT_MIN:
+                r["_sem_admit"] = round(_as, 3)
+                sem_admit_rows.append(r)
+            else:
+                out["dropped"]["hit"] += 1
             continue
         # 只数「旧门槛下本会被删、因放宽才进打分池」的；本就能过的强候选不算。
         if eff_need < need and hit < need:
@@ -10195,6 +10224,18 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             weak.append(pair)   # R900：留作闸门救援的候选集，默认不启用
     picked = _recall_pick_margin(strong, RECALL_PICK_CAP)
     out["dropped"]["cap"] = max(0, len(strong) - len(picked))
+    # R1063：语义准入候选**只补空位**——词法挑出来的任何一条都不许被挤掉（这是本档与
+    # R900 replace 的根本区别：replace 会换人，这里只填空）。补进来的行已经过了排除集、
+    # 免疫与时间窗；没过的语义相似度线由常量把关，不在这里二次放宽。
+    if RECALL_SEM_ADMIT_MIN > 0 and sem_admit_rows:
+        room = max(0, RECALL_PICK_CAP - len(picked))
+        take = min(room, max(0, int(RECALL_SEM_ADMIT_CAP)))
+        if take:
+            sem_admit_rows.sort(key=lambda r: (-float(r.get("_sem_admit") or 0.0),
+                                               -int(r.get("id") or 0)))
+            add = sem_admit_rows[:take]
+            picked = list(picked) + add
+            out["sem_admitted"] = len(add)
     # R907：稀有词闸门把答案全删光、语义路又没预热时的窄兜底（默认 off）。
     # 只在「一条强命中都没有」时补，且最多 1 条——R826 的实测结论仍然成立：有候选
     # 却每条都只命中泛词时该克制，这里只处理两个极端同时出现的场景，且必须靠 A/B
