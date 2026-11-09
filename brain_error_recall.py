@@ -46,6 +46,8 @@ def main(argv=None) -> int:
                     help="只看不记账：不涨 inject_count、不写采纳账本（冒烟/调参用，"
                          "钩子真送达时不要用——曝光账本是假的，R830 断路器会据此冷却真记忆）")
     ap.add_argument("--event", default="", help="钩子事件名（采集面按事件分账，B067）")
+    ap.add_argument("--src", default="",
+                    help="正文来源：payload（事件自带）/ transcript（R1029 从会话记录补）")
     ap.add_argument("--lag", type=int, default=0,
                     help="正文是从会话记录补的、比失败晚了几次工具调用（R1031：文案要说准对象）")
     ap.add_argument("--sample-only", action="store_true",
@@ -90,7 +92,7 @@ def main(argv=None) -> int:
             # 而这两个数恰恰是相反的结论。
             debt_hint = res.get("skipped") == "debt_hint"
             note = (f"{len(res['text'])} chars · tool={args.tool or '?'} "
-                    f"· sig={res['sig'][:80]}")
+                    f"· sig={res['sig'][:80]} · src={args.src or 'payload'}")
             if debt_hint:
                 note = (f"欠账提示 · {note} · open={res.get('debt_open')}")
             else:

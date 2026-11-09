@@ -3121,6 +3121,20 @@ def _brief_hook_health(root: str) -> dict:
                 bucket[key] = bucket.get(key, 0) + int(r["n"])
     except Exception:  # noqa: BLE001 送达统计失败不影响配置核对
         delivered, recalled, errored, self_calls = {}, {}, {}, {}
+    # R1032：报错通道的正文来源分账（payload=事件自带 / transcript=从会话记录补的）。
+    # 为什么要单报：R1029 之前 WorkBuddy 的事件只有 exitCode 元数据，通道 100% 空转；
+    # 修完后 transcript 是主路还是备胎，只能靠这个数说清——不看数就改参数等于猜。
+    src_mix: dict = {}
+    try:
+        with _brain.db_conn(root) as conn:
+            for r in conn.execute(
+                    "SELECT CASE WHEN note LIKE '%src=transcript%' THEN 'transcript' "
+                    "WHEN note LIKE '%src=payload%' THEN 'payload' ELSE 'unknown' END k, "
+                    "COUNT(*) n FROM journal WHERE action='brain_error_recall' AND ts>=? "
+                    "GROUP BY k", (d7,)):
+                src_mix[r["k"]] = int(r["n"])
+    except Exception:  # noqa: BLE001
+        src_mix = {}
     detail = []
     # 配置里写着脚本名 ≠ 脚本还在盘上：删了脚本钩子会静默失败，比配置丢失更隐蔽。
     scripts_missing = []
@@ -3189,6 +3203,11 @@ def _brief_hook_health(root: str) -> dict:
     if errored:
         detail.append("近 7 天报错回忆送达：" + " / ".join(
             f"{a} {n}" for a, n in sorted(errored.items())))
+        if src_mix.get("transcript"):
+            detail.append(
+                f"其中正文来源：payload {src_mix.get('payload', 0)} / transcript "
+                f"{src_mix['transcript']}（transcript=宿主事件不带 stdout/stderr，"
+                "从会话记录补的；R1029）")
     else:
         detail.append("近 7 天无报错回忆送达（新装、这几家没遇到过工具失败，或都没命中）")
     if self_calls:
