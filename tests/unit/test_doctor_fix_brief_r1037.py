@@ -26,3 +26,17 @@ def test_fix_brief_wins_over_fix(tmp_path, monkeypatch):
 def test_adherence_declares_brief():
     src = (pathlib.Path(__file__).resolve().parents[2] / "ops.py").read_text(encoding="utf-8")
     assert '"fix_brief": "先 `python cli.py adherence-backfill`' in src
+
+
+def test_fix_briefs_table_covers_all_current_reds(tmp_path, monkeypatch):
+    """R1039：当前会红的五项都要有首屏动作（表格驱动，防止新增检查项时忘了给）。"""
+    for name in ("backup_health", "usage_health", "ghost_memory"):
+        assert name in ops.FIX_BRIEFS, f"{name} 没有首屏动作"
+        assert len(ops.FIX_BRIEFS[name]) <= 90, f"{name} 的首屏动作太长：>90 字"
+
+
+def test_fix_briefs_table_covers_all_current_reds(tmp_path, monkeypatch):
+    """R1039：当前会红的五项都要有首屏动作（表格驱动，防止新增检查项时忘了给）。"""
+    for name in ("backup_health", "usage_health", "ghost_memory"):
+        assert name in ops.FIX_BRIEFS, f"{name} 没有首屏动作"
+        assert len(ops.FIX_BRIEFS[name]) <= 90, f"{name} 的首屏动作太长：>90 字"

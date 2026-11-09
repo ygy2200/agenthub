@@ -97,6 +97,15 @@ PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_ch
                  "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
                  "failure_samples",
                  "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
+# R1039：首屏动作表——doctor 默认屏只该给「现在敲哪条」，完整口径留给 --full。
+# 这里是数据表而不是散在各检查里：改一句话不用进业务函数，也不会和 r["fix"] 抢优先级。
+FIX_BRIEFS = {
+    "backup_health": "先 `hub_export action=backup` 备整包；清理用 `action=prune`（确认后 apply=true）",
+    "usage_health": "不需要的接入：`python cli.py offboard <agent> --apply`（预演默认）；"
+                    "还需要就让该会话跑一次真实调用",
+    "ghost_memory": "先 `hub_memory_read` 核对内容；确是重复再用 `hub_memory_supersede(keep_id, drop_id)`",
+}
+
 CHECK_FIXES = {
     "adherence": "分三种红各修各的：① 口径未覆盖又装不了新副本 → 先 `python cli.py deploy`（顺带刷新 ~/.agenthub/hooks 副本），让流水带上 src=；② 判官饿着（transcript 占比低 / 单轮证据字数中位数只有几十字）→ 采集侧问题，查 brain_adherence.mjs 是否仍优先用事件自带文本，修法见 R849（本轮工具调用才是证据）；③ 口径正常、采集在跑而采纳率低 → 才是注入精度问题：跑 tools/recall_adherence_report.py 看 by_strength，压掉「只曝光不采纳」的那批（R830 断路器），不是加大注入量。某家有注入账却窗口内零次采集：`python cli.py status` 核对回填钩子，再看 ~/.agenthub/logs/brain-adherence.log 的 skip 原因（hermes 无 Stop 出口不算故障）。④ 会话没闭环（有注入的会话隔了几小时从没被判定，R851）→ 先跑 `python cli.py adherence-backfill` 预演、`--apply` 写账（R1035：把离线补扫做成一条命令）；仍判不了再分清是「宿主压根不发 Stop」还是「钩子没跑」：Qoder Desktop 实测 3 次发言 0 次 Stop，这种家要给补扫通道 `python cli.py hook-install <agent> --events sweep --apply`（挂在 UserPromptSubmit，判的是上一轮），装完再跑一轮本项就会换成真实闭环数",
     "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
@@ -303,8 +312,9 @@ def _run_patrol(root: str, checks=None, progress=None) -> dict:
             # doctor 默认显示它，--full 才回退到上面的完整口径。
             # R1037：检查项可以显式给「首屏动作」（fix_brief），优先于按失败类别给的短口径；
             # 之前这里无条件用 r["fix"] 覆盖，等于把 fix_brief 这一层架空了。
-            if r.get("fix_brief") or r.get("fix"):
-                issue["fix_brief"] = r.get("fix_brief") or r["fix"]
+            if r.get("fix_brief") or FIX_BRIEFS.get(name) or r.get("fix"):
+                issue["fix_brief"] = (r.get("fix_brief") or FIX_BRIEFS.get(name)
+                                      or r["fix"])
             if cause:
                 issue["cause"] = cause
                 primary_by_cause[cause] = issue
