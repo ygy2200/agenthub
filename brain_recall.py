@@ -36,6 +36,34 @@ _TRANSCRIPT_GLOBS = (
     ".codex/sessions/**/*{sid}*.jsonl",
 )
 
+# R1102：可选地把「用户原句」截短脱敏后写进 brain_recall 流水。
+# 动机（R1100 实锤）：现有流水 note 只有 terms/origin/session，没有原句，
+# 于是「真实提问里有多少带时间词」「问法分布」这类问题根本量不出来；
+# searches.query 存的是 agent 主动检索词，不能冒充用户原句。
+# 默认关：AGENTHUB_RECALL_LOG_PROMPT 未设时连脱敏函数都不调用，
+# note 逐位不变、哈希链只影响新行（历史行一字不动）。
+RECALL_LOG_PROMPT = (os.environ.get("AGENTHUB_RECALL_LOG_PROMPT", "")
+                     .strip().lower() in ("1", "true", "yes", "on"))
+RECALL_LOG_PROMPT_CHARS = 120
+_REDACTORS = (
+    (re.compile(r"[A-Za-z0-9._%+-]+@[A-Za-z0-9.-]+\.[A-Za-z]{2,}"), "<email>"),
+    (re.compile(r"\b(?:gh[pousr]_[A-Za-z0-9]{16,}|sk-[A-Za-z0-9]{16,}|"
+                r"[A-Za-z0-9_-]{32,})\b"), "<token>"),
+    (re.compile(r"[A-Za-z]:[\\/][^\s,;，；]{2,}"), "<path>"),
+    (re.compile(r"/(?:Users|home|root|tmp)/[^\s,;，；]{2,}"), "<path>"),
+)
+
+
+def redact_prompt(text: str, limit: int = RECALL_LOG_PROMPT_CHARS) -> str:
+    """截短 + 脱敏用户原句，供流水记录；失败一律返回空串（fail-open）。"""
+    try:
+        s = " ".join(str(text or "").split())
+        for pat, repl in _REDACTORS:
+            s = pat.sub(repl, s)
+        return s[:max(1, int(limit))]
+    except Exception:  # noqa: BLE001 采集是可选能力，绝不影响召回
+        return ""
+
 
 def find_transcript(session: str, home: str = "") -> str:
     """按 session_id 在已知宿主目录里找 transcript；多个候选取最新。"""
@@ -106,13 +134,18 @@ def main(argv=None) -> int:
             # 「单日 + agent」近似（R902 的精度边界），且分不清装置流量与真实会话。
             # 不回填历史行：流水是哈希链，改历史会断链；旧行由探针单列 legacy。
             try:
-                core.journal(
-                    root, agent or "unknown", "brain_recall", "prompt",
-                    note=(f"{len(res['text'])} chars · mem={res['memory_ids']} "
-                          f"· ctx={1 if res.get('context_used') else 0} "
-                          f"· terms={' '.join(res['terms'])[:120]}"
-                          f" · origin={args.origin}"
-                          f" · session={(args.session or 'none')[:40]}"))
+                note = (f"{len(res['text'])} chars · mem={res['memory_ids']} "
+                        f"· ctx={1 if res.get('context_used') else 0} "
+                        f"· terms={' '.join(res['terms'])[:120]}"
+                        f" · origin={args.origin}"
+                        f" · session={(args.session or 'none')[:40]}")
+                # R1102：默认关时下面这段完全不执行，note 与 R1101 之前逐位相同。
+                if RECALL_LOG_PROMPT:
+                    q = redact_prompt(args.prompt)
+                    if q:
+                        note += f" · q={q}"
+                core.journal(root, agent or "unknown", "brain_recall", "prompt",
+                             note=note)
             except Exception:  # noqa: BLE001 流水失败不影响召回
                 pass
         if args.json:
