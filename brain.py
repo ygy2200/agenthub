@@ -8709,6 +8709,26 @@ def extract_prompt_terms(prompt: str, max_terms: int = RECALL_TERM_CAP) -> list:
     return out[:max(1, min(int(max_terms), 12))]
 
 
+def _recall_record_query(prompt: str, query: str) -> str:
+    """R1084：记录路喂给 search_records 的查询串形态。
+
+    off 档**直接返回原 query**，不读 RECALL_REC_QUERY_MODE 之外的任何状态、
+    不调 extract_prompt_terms，保证与 R1083 之前逐位相同（钩子路径零成本）。
+    其余三档只给 A/B 量具切，默认不许合入。
+    """
+    mode = RECALL_REC_QUERY_MODE
+    if mode == "off":
+        return query
+    if mode == "raw":
+        return (prompt or "").strip() or query
+    if mode == "mix":
+        return ((prompt or "").strip() + " " + query).strip()[:200]
+    if mode == "whole":
+        whole = " ".join(t for t, w in extract_prompt_terms(prompt) if w >= 2)
+        return whole or query
+    return query
+
+
 def _recall_hit_score(terms: list, text: str) -> int:
     low = (text or "").lower()
     return sum(w for term, w in terms if term in low)
@@ -9150,6 +9170,21 @@ RECALL_SEM_EMPTY_MIN_HITS = 4
 # 0.77–0.80 挤在一起，说明「答案不唯一/都在说同一个泛话题」，此时只该给查库提示。
 RECALL_SEM_EMPTY_MARGIN = 0.05
 RECALL_RECORD_CAP = 2        # 记录通道（过程证据）每次最多几条
+# R1084：记录路送进 search_records 的查询串形态，默认 off = 逐位等于 R1083 之前。
+# 动机（R1082/R1083 实测）：记录路 Recall@2 只有 11/22=50.0%，11 条失败里
+# 5 条 NOT_IN_POOL、3 条 HIT_GATE、2 条 RARE_GATE，SEM_KILLED 0 —— 瓶颈不是
+# 排序权重，而是 `query = " ".join(extract_prompt_terms(prompt))` 抽出的题面碎片
+# （「手机上不走线」「次现场」「恢复干净」）在记录正文里根本不出现，LIKE/BM25
+# 两路连候选都取不回来。search_records 池层本身已有 LIKE+BM25+语义+图四路
+# 融合（brain.py:2480），但喂给它的查询串是碎的，四路一起瞎。
+# 关档必须零行为差异：off 直接返回原 query，连 extract_prompt_terms 都不再调。
+# 一键回滚：把本行改回 "off"。
+RECALL_REC_QUERY_MODE = "off"   # off | raw | mix | whole
+# R1086：记录路专属的「后位相对强度线」。0 = 沿用全局 RECALL_REL_MARGIN(0.62)，
+# 与改动前逐位相同。R1085 复评钉死 raw 档「+18.2pp 但 Δ噪声 +6」——增益来自多
+# 召回，噪声来自第 2 条无关记录一起被注入。_recall_pick_margin 首位无条件保留，
+# 后位要够得上首位的 margin 才跟上，正好是给第 2 条装闸门，不必动召回。
+RECALL_REC_MARGIN = 0.0         # 0=沿用全局；>0 时记录路单独收紧
 # R907（B103 归因）：**不依赖语义模型**的弱候选兜底，默认关闭，只给 A/B 量具切档。
 # 动机是 R906 全量归因的两个硬数字：51 个期望答案里 12 个死于稀有词闸门（最大
 # 淘汰原因），而 32 条样本 sem_scored 全为 0 —— R901 的 replace/0.62 语义救援在
@@ -10489,8 +10524,11 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             picked = rescue_rows   # 与 _recall_pick_margin 同形态：下游只吃行，不吃 (分, 行)
             bridge_mode = "zero_lexical"
     out["muted"] = muted      # 本轮被免疫挡掉的条数（报表/单测据此看断路器有没有在动）
+    # R1084：记录路查询串形态。off 档 _recall_record_query 原样返回 query，
+    # 与改动前逐位相同；开档只由 A/B 量具切，默认不许合入。
+    _rec_q = _recall_record_query(prompt, query)
     try:
-        recs = search_records(root, query, limit=30)
+        recs = search_records(root, _rec_q, limit=30)
     except sqlite3.Error:
         recs = []
     # R953：记录路同样受窗口约束，口径与记忆路一致。
@@ -10536,7 +10574,10 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     rec_scored.sort(key=lambda x: (-x[0], -int(x[1].get("id") or 0)))
     rec_strong = [(s, r) for s, r in rec_scored
                   if float(r.get("_recall_best") or 0.0) >= _recall_rare_threshold(len(recs))]
-    rec_rows = _recall_pick_margin(rec_strong, RECALL_RECORD_CAP)
+    # R1086：默认 0 时显式传回全局值，与改动前逐位相同。
+    rec_rows = _recall_pick_margin(
+        rec_strong, RECALL_RECORD_CAP,
+        RECALL_REC_MARGIN if RECALL_REC_MARGIN > 0 else RECALL_REL_MARGIN)
     # R1011：词法有候选但 strong 全空、记录路也没证据时，才允许高相似语义补答。
     # 放在记录判定之后：已有过程证据时不抢记忆通道，避免把一个可回答的问题变成
     # 「记忆 + 记录」双份注入。R861 的零候选桥仍优先，本段只在 picked 为空时生效。
