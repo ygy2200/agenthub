@@ -92,15 +92,16 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="")
     ap.add_argument("--out", default="")
+    ap.add_argument("--label", default="R1087 记录路 margin 平台扫描（Recall@2）")
     args = ap.parse_args()
     buf = io.StringIO()
-    buf.write("R1087 稳健性检验 | margin 平台 + 分半 | 基准固定生产现状 off/cap2/m.62\n")
+    buf.write(f"{args.label} | margin 平台 + 分半 | 基准固定生产现状 off/cap2/m.62\n")
     buf.write("平台判据：0.85–0.95 须连续满足 Δrate>0 且 Δ噪声≤0 且 Δ耗时≤50ms；"
               "只单点过线判过拟合。\n\n")
     header = ("预注册：Δrate>0 且 Δ噪声≤0 且 Δ耗时≤50ms 相对 off；"
               "本轮目的是看平台宽度，不是再挑一个更好的点。\n")
     try:
-        results = ab.run_ab(label="R1087 记录路 margin 平台扫描（Recall@2）",
+        results = ab.run_ab(label=args.label,
                             configs=CONFIGS, apply=apply, restore=restore,
                             root=args.root, out=args.out, cases=rce.CASES_REC,
                             judge=ab.records_judge, metric="Recall@2",

@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import io
 import json
+import statistics
 import sys
 import tempfile
 import time
@@ -90,17 +91,27 @@ def _one(root, cases, state, leak_ids, label, judge):
         except Exception as exc:  # noqa: BLE001 单条异常不中断量具
             per_case.append((i, "ERROR", [str(exc)[:120]]))
             continue
-        elapsed.append((time.perf_counter() - t0) * 1000)
+        elapsed.append((i, (time.perf_counter() - t0) * 1000))
         cls, n_noise, got = judge(root, case, res)
         counts[cls] += 1
         noise += n_noise
         per_case.append((i, cls, [f"{k}#{v}" for k, v in got]))
     scored = sum(counts.values()) - counts["leak"]
     rate = (counts["hit"] / scored * 100) if scored else 0.0
+    ms = [v for _i, v in elapsed]
+    srt = sorted(ms)
+    p50 = statistics.median(ms) if ms else 0.0
+    p90 = srt[min(len(srt) - 1, int(len(srt) * 0.9))] if srt else 0.0
+    slowest = [(i, round(v, 1)) for i, v in
+               sorted(elapsed, key=lambda t: -t[1])[:3]]
     return {"label": label, "hit": counts["hit"], "scored": scored,
             "rate": round(rate, 1), "counts": dict(counts), "noise": noise,
-            "avg_ms": round(sum(elapsed) / len(elapsed) if elapsed else 0.0, 1),
-            "per_case": per_case}
+            "avg_ms": round(sum(ms) / len(ms) if ms else 0.0, 1),
+            # R1090：判据改用 p50。均值会被进程预热 / GC / 首次语义编码的
+            # 离群点拉偏（R1089 同批十档 Δ均值在 +4.6~+89.1ms 之间乱跳，
+            # 而各档命中/噪声完全一致，说明跳的是测量不是代码）。
+            "p50_ms": round(p50, 1), "p90_ms": round(p90, 1),
+            "slowest": slowest, "per_case": per_case}
 
 
 def run_ab(*, label: str, configs: list, apply, restore,
@@ -143,7 +154,9 @@ def run_ab(*, label: str, configs: list, apply, restore,
             results.append(r)
             buf.write(f"{str(tag):<16} {metric}={r['hit']}/{r['scored']}="
                       f"{r['rate']:5.1f}%  噪声格={r['noise']:3d}  "
-                      f"均耗时={r['avg_ms']:6.1f}ms  四类={r['counts']}\n")
+                      f"p50={r['p50_ms']:6.1f}ms p90={r['p90_ms']:6.1f}ms "
+                      f"均值={r['avg_ms']:6.1f}ms  四类={r['counts']}\n"
+                      f"{'':<16} 最慢三例={r['slowest']}\n")
         base = results[0]
         buf.write(f"\n分母锁定：剔除题面泄漏样本 {sorted(leak_ids)}，"
                   f"各档分母恒为 {base['scored']}。\n")
@@ -155,16 +168,20 @@ def run_ab(*, label: str, configs: list, apply, restore,
             lost = [f for f in flips if f[1] == "hit" and f[2] != "hit"]
             dr = round(r["rate"] - base["rate"], 1)
             dn = r["noise"] - base["noise"]
-            dt = round(r["avg_ms"] - base["avg_ms"], 1)
+            dt = round(r["p50_ms"] - base["p50_ms"], 1)
+            dt_avg = round(r["avg_ms"] - base["avg_ms"], 1)
             ok = dr > 0 and dn <= 0 and dt <= 50
             r["verdict"] = {"delta_rate": dr, "delta_noise": dn,
-                            "delta_ms": dt, "gained": gained, "lost": lost,
-                            "pass": ok}
+                            "delta_ms": dt, "delta_avg_ms": dt_avg,
+                            "gained": gained, "lost": lost, "pass": ok}
             buf.write(f"  {str(r['label']):<16} Δrate={dr:+5.1f}pp  "
-                      f"Δ噪声={dn:+3d}  Δ耗时={dt:+6.1f}ms  "
+                      f"Δ噪声={dn:+3d}  Δp50={dt:+6.1f}ms (Δ均值={dt_avg:+6.1f}ms)  "
                       f"{'PASS' if ok else 'KEEP-OFF'}  "
                       f"转命中={gained}  转丢失={lost}\n")
-        buf.write("\n判据（写在前）：Δrate>0 且 Δ噪声<=0 且 Δ耗时<=50ms 才考虑改默认档。\n")
+        buf.write("\n判据（R1090 明确口径）：Δrate>0 且 Δ噪声<=0 且 **Δp50<=50ms**"
+                  " 才考虑改默认档；均值与 p90 只作诊断，不参与判定。\n"
+                  "口径变更说明：R1074–R1087 的「Δ耗时」用的是均值；本轮起改为中位数，"
+                  "是把它写清楚而非放宽——历史数字不可与新口径直接比。\n")
     finally:
         restore()
 
