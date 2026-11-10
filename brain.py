@@ -7316,6 +7316,21 @@ def _parse_time_range(q: str) -> tuple[str, str] | None:
         return None
     today = datetime.date.today()
     td = datetime.timedelta
+    # R1098（B129 定向验证发现）：ISO 绝对日期 YYYY-MM-DD / YYYY.MM.DD / YYYY/MM/DD。
+    # R1097 实测「2026-10-25 那次调研结论是什么」旧实现返回 None —— 时间限窗完全
+    # 不触发，而中文「10月25号」反而能解析成整月。用户引用历史记录时写标准日期
+    # 很常见，最明确的时间信号被丢掉属于真缺陷。放在最前面是因为它最具体；
+    # 非法日期（13 月 / 2 月 30 日）一律返回 None 交后续分支/fail-open，
+    # 绝不返回错误区间污染排序。前后加 (?!\d)/(?<!\d) 防止命中时间戳里的片段。
+    m_iso = re.search(r"(?<!\d)(\d{4})\s*[-/.]\s*(\d{1,2})\s*[-/.]\s*(\d{1,2})(?!\d)", q)
+    if m_iso:
+        try:
+            d_iso = datetime.date(int(m_iso.group(1)), int(m_iso.group(2)),
+                                  int(m_iso.group(3)))
+        except ValueError:
+            d_iso = None
+        if d_iso:
+            return (d_iso.isoformat(), d_iso.isoformat())
     # R949：最近/近 + 数量（阿拉伯**或中文**数字）+ 时间单位。
     # 旧正则 (\d{1,3})? 只认阿拉伯数字：「最近三天」的「三」匹配不到 group(2)，
     # 单位又是可选的，整句静默回落成「最近 → 默认 30 天」，给一个看似合理的
