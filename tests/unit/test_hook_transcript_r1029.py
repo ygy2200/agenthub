@@ -22,9 +22,12 @@ import pathlib
 import subprocess
 import time
 
-import brain
+import pytest
 
-NODE = r"D:/node/node.exe"
+import brain
+from _node_exe import node_exe
+
+NODE = node_exe()  # R1119：改走统一解析器，不再写死 D 盘（CI runner 没这个盘符）
 HOOK = (pathlib.Path(__file__).resolve().parents[2] / "brain_error_recall.mjs")
 
 WB_RESPONSE = {"exitCode": 1, "signal": None, "interrupted": False,
@@ -72,6 +75,8 @@ def _entry(call_id, text, ts_offset_ms=-800):
 
 
 def _run(tmp_path, transcript, session="r1029-test"):
+    if not NODE:
+        pytest.skip("node 不可用：CI 需 setup-node，或设 AGENTHUB_NODE 指向 node.exe")
     root = tmp_path / "hub"
     root.mkdir(exist_ok=True)
     brain.init_db(str(root))
