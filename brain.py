@@ -9106,6 +9106,16 @@ RECALL_TIME_WINDOW = 1
 # 于是既有机会救回被误杀的答案，又不放宽候选集。默认 0.0=关，逐位零回归。
 # 一键回滚：本行改回 0.0。
 RECALL_TIME_SOFT = 0.0
+# R1112（B132 第三条路）：窗内候选的**乘法**权重，默认 0.0=关（逐位零回归）。
+# 为什么不是再调 RECALL_TIME_SOFT：R1107 实测 soft0.5/1.0/2.0 三档与 off 逐位
+# 完全相同——`wid*2.2` 的量级把 ±0.5~2.0 的加性项完全吞掉，加多少都不改排序
+# （与 R1080 的 kind 权重同族）。乘法不同：它按比例放大，跨越名次只需要
+# 「分差 < 倍数」，不依赖候选分数的绝对量级。
+# 与 SOFT 的分工：SOFT/MULT 任一 >0 时**都不删任何候选**（把硬过滤换成排序信号），
+# 于是既不会像硬过滤那样在「时间错位」时误杀（R1111 实测错位必杀 8/16），
+# 又能让时间信号真能改排序。R1111 的对齐子集证明过滤器确实有收益
+# （on 8/8 噪声 3 vs off 6/8 噪声 11），所以不能简单关掉了事。
+RECALL_TIME_MULT = 0.0
 # R1110（B132 转向）：**时间窗选择率护栏**，默认 0.0=关（逐位零回归）。
 # R1109 实测把误杀机制量化了：窗口覆盖语料越窄，误杀越狠——单日相对词
 # 只覆盖 2.9% 的 active 记忆（612 条剩 18 条）、ISO 单日 5.5%、最近N天
@@ -10298,7 +10308,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             outside = bool(d) and not inside
             # R1105：软加权档不删任何候选，只打标；关闭档维持 R953 原样。
             # R1110：护栏判定窗口覆盖不足时同样不删（skip_tw_filter）。
-            if outside and RECALL_TIME_SOFT <= 0 and not skip_tw_filter:
+            if (outside and RECALL_TIME_SOFT <= 0
+                    and RECALL_TIME_MULT <= 0 and not skip_tw_filter):
                 out["time_window_dropped"] += 1
                 continue
             # R960：只有「确认窗内」的候选才够格享受放宽；取不到日期的
@@ -10403,6 +10414,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         # R1105：软加权只给确认窗内的候选加分，窗外候选照常竞争（不删、不罚）。
         if RECALL_TIME_SOFT > 0 and r.get("_tw_inside"):
             spec += RECALL_TIME_SOFT
+        # R1112：乘法加权——按比例放大才能真正跨越名次（加性项被 wid*2.2 吞掉）。
+        if RECALL_TIME_MULT > 0 and r.get("_tw_inside"):
+            spec *= (1.0 + RECALL_TIME_MULT)
         # R943：置信度降权档（默认 0=off）。写成 (conf-1) 而不是乘性系数：conf=1.0 时
         # 严格加 0.0，保证默认全 1.0 的真库上 A/B 的两档**逐位相同**——差异只可能来自
         # 真正低于 1.0 的那些行，量具据此判断「分档到底动没动任何一条结论」。
@@ -10651,7 +10665,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             outside = bool(d) and not inside
             # R1105：软加权档与记忆路同口径，不删候选只打标。
             # R1110：护栏 skip_tw_filter 同样生效（两路共用一次覆盖率计算）。
-            if outside and RECALL_TIME_SOFT <= 0 and not skip_tw_filter:
+            if (outside and RECALL_TIME_SOFT <= 0
+                    and RECALL_TIME_MULT <= 0 and not skip_tw_filter):
                 out["time_window_dropped"] += 1
                 continue
             if inside:
@@ -10677,6 +10692,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         # R1105：记录路同口径，软加权档只给确认窗内的记录加分。
         if RECALL_TIME_SOFT > 0 and r.get("_tw_inside"):
             spec += RECALL_TIME_SOFT
+        # R1112：乘法加权——按比例放大才能真正跨越名次（加性项被 wid*2.2 吞掉）。
+        if RECALL_TIME_MULT > 0 and r.get("_tw_inside"):
+            spec *= (1.0 + RECALL_TIME_MULT)
         if pname and (r.get("project") or "") == pname:
             spec += 1.5
         try:

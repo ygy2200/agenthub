@@ -33,7 +33,16 @@ _ORIG = brain.RECALL_TIME_WINDOW
 CONFIGS = [("on(生产)", 1), ("off", 0)]
 PAIR_IDS = tuple(i for i, (_p, _w, _why) in enumerate(ev.CASES, 1)
                    if str(_why).startswith("时间词配对"))  # R1108：按标注前缀推导，扩样不再漏算
-PAIR_N = len(PAIR_IDS)   # R1108：扩到 16 条后仍按标注前缀自动算，不再写死 8
+PAIR_N = len(PAIR_IDS)
+# R1111：时间**对齐**子集（时间词与答案真实日期一致，且带近义老记忆干扰项）。
+ALIGN_IDS = tuple(i for i, (_p, _w, _why) in enumerate(ev.CASES, 1)
+                  if str(_why).startswith("时间词对齐"))
+ALIGN_N = len(ALIGN_IDS)
+
+
+def _acc(i):
+    """该样本的合格答案集合（含多答案/记录路 target 形态）。"""
+    return set(ev._accepts(ev.CASES[i - 1][1]))
 
 
 def apply(v):
@@ -48,13 +57,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="")
     ap.add_argument("--out", default="")
+    ap.add_argument("--label", default="R1104",
+                    help="报表标签（复评时改轮次号）")
     args = ap.parse_args()
     header = (f"生产默认 RECALL_TIME_WINDOW={_ORIG}；评测集 {len(ev.CASES)} 条，"
               f"其中 {len(PAIR_IDS)} 条为 R1103 时间词配对样本（编号 {PAIR_IDS[0]}–{PAIR_IDS[-1]}）。\n"
               "判据：off 相对 on 需 Δrate>0、Δ噪声≤0、Δp50≤50ms 且 bootstrap 下界>0"
               " 才判「硬过滤有害、证据充分」。本轮只出证据不改默认。\n")
     try:
-        results = ab.run_ab(label="R1104 时间限窗 on/off A/B（Recall@3, 81条）",
+        results = ab.run_ab(label=f"{args.label} 时间限窗 on/off A/B（Recall@3, {len(ev.CASES)}条）",
                             configs=CONFIGS, apply=apply, restore=restore,
                             root=args.root, out=args.out, cases=ev.CASES,
                             header=header, verbose=False)
@@ -62,7 +73,7 @@ def main() -> int:
         restore()
     on, off = results
     buf = io.StringIO()
-    buf.write("R1104 时间词配对子集专项（8 条）\n")
+    buf.write(f"{args.label} 时间词配对子集（{PAIR_N} 条，时间词贴老记忆）\n")
     on_map = {i: cls for i, cls, _ in on["per_case"]}
     off_map = {i: cls for i, cls, _ in off["per_case"]}
     for i in PAIR_IDS:
@@ -71,6 +82,27 @@ def main() -> int:
     pair_on = sum(1 for i in PAIR_IDS if on_map.get(i) == "hit")
     pair_off = sum(1 for i in PAIR_IDS if off_map.get(i) == "hit")
     buf.write(f"  配对子集：on {pair_on}/{PAIR_N} → off {pair_off}/{PAIR_N}\n")
+    if ALIGN_N:
+        buf.write(f"\n时间词对齐子集（{ALIGN_N} 条，时间词与答案日期一致）\n")
+        for i in ALIGN_IDS:
+            tag = "误杀" if on_map.get(i) == "hit" and off_map.get(i) != "hit" else ""
+            buf.write(f"  [{i:02d}] on={on_map.get(i):<5} → off={off_map.get(i):<5}{tag}\n")
+        a_on = sum(1 for i in ALIGN_IDS if on_map.get(i) == "hit")
+        a_off = sum(1 for i in ALIGN_IDS if off_map.get(i) == "hit")
+
+        def _noise_of(res, ids):
+            acc = {i: set(ev._accepts(ev.CASES[i - 1][1])) for i in ids}
+            return sum(1 for i, _c, got in res["per_case"] if i in ids
+                       for g in got
+                       if (g.split("#")[0], int(g.split("#")[1])) not in acc[i])
+        n_on = _noise_of(on, ALIGN_IDS)
+        n_off = _noise_of(off, ALIGN_IDS)
+        buf.write(f"  对齐子集：on {a_on}/{ALIGN_N} 命中 噪声{n_on} → "
+                  f"off {a_off}/{ALIGN_N} 命中 噪声{n_off}\n")
+        verdict = ("过滤器在对齐场景有收益（on 命中不低于 off、噪声不多于 off）"
+                   if a_on >= a_off and n_on <= n_off
+                   else "过滤器在对齐场景也无收益 → B132 应讨论关默认")
+        buf.write(f"  判据：{verdict}\n")
     buf.write(f"  全量：on {on['hit']}/{on['scored']}={on['rate']}% "
               f"噪声={on['noise']} → off {off['hit']}/{off['scored']}={off['rate']}% "
               f"噪声={off['noise']}\n")
