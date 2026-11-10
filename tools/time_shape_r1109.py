@@ -28,6 +28,7 @@ import sys
 from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent))
+import _console  # noqa: E402,F401  UTF-8 控制台守卫（全量门禁 test_console_guard 强制）
 import recall_eval as ev  # noqa: E402
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
