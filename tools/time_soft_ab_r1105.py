@@ -34,7 +34,9 @@ CONFIGS = [
     ("soft2.0", (1, 2.0)),
     ("off(参照)", (0, 0.0)),
 ]
-PAIR_IDS = tuple(range(74, 82))
+PAIR_IDS = tuple(i for i, (_p, _w, _why) in enumerate(ev.CASES, 1)
+                   if str(_why).startswith("时间词配对"))  # R1108：按标注前缀推导，扩样不再漏算
+PAIR_N = len(PAIR_IDS)
 
 
 def apply(cfg):
@@ -49,13 +51,15 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("--root", default="")
     ap.add_argument("--out", default="")
+    ap.add_argument("--label", default="R1105",
+                    help="报表标签（复评时改轮次号，避免历史证据混名）")
     args = ap.parse_args()
     header = (f"生产默认 TW={_ORIG[0]} SOFT={_ORIG[1]}；评测集 {len(ev.CASES)} 条，"
               f"其中 8 条时间词配对样本（{PAIR_IDS[0]}–{PAIR_IDS[-1]}）。\n"
               "判据：Δrate>0 且 Δ噪声≤0 且 Δp50≤50ms 且 bootstrap 下界>0；"
               "本轮只出证据不改默认。\n")
     try:
-        results = ab.run_ab(label="R1105 时间限窗软加权 A/B（Recall@3, 81条）",
+        results = ab.run_ab(label=f"{args.label} 时间限窗软加权 A/B（Recall@3, 81条）",
                             configs=CONFIGS, apply=apply, restore=restore,
                             root=args.root, out=args.out, cases=ev.CASES,
                             header=header, verbose=False)
@@ -63,13 +67,13 @@ def main() -> int:
         restore()
     on = results[0]
     buf = io.StringIO()
-    buf.write("R1105 时间词配对子集专项（8 条，on → 各档）\n")
+    buf.write(f"{args.label} 时间词配对子集专项（8 条，on → 各档）\n")
     maps = {r["label"]: {i: cls for i, cls, _ in r["per_case"]} for r in results}
     for i in PAIR_IDS:
         buf.write(f"  [{i:02d}] " + " ".join(
             f"{r['label']}={maps[r['label']].get(i)}" for r in results) + "\n")
     buf.write("  配对命中数：" + " ".join(
-        f"{r['label']}={sum(1 for i in PAIR_IDS if maps[r['label']].get(i) == 'hit')}/8"
+        f"{r['label']}={sum(1 for i in PAIR_IDS if maps[r['label']].get(i) == 'hit')}/{PAIR_N}"
         for r in results) + "\n")
     passed = [r["label"] for r in results[1:]
               if r["verdict"]["pass"] and r["label"] != "off(参照)"]

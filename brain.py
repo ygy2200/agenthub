@@ -7396,6 +7396,58 @@ def _row_date(r: dict) -> str:
     return (r.get("date") or r.get("created") or "")[:10]
 
 
+def _time_window_cover(root: str, trange: tuple[str, str] | None) -> float:
+    """R1110：时间窗对语料的覆盖率（0~1）= 窗内 active 条数 ÷ 总 active 条数。
+
+    取记忆路与记录路两者的**较小值**（最坏路径）：两路候选混在同一个池里，
+    任何一路被窗口删到近乎为零，都会把答案整批带走。
+
+    为什么需要它（R1109 实测）：窗口宽度决定误杀强度——单日相对词覆盖
+    2.9% 记忆（库里 612 条只剩 18 条）、ISO 单日 5.5%、最近N天 8.5%、
+    周 18.3%、本月 23%；而覆盖率 49%/76% 的两个形态（月中日、上月）
+    在 R1108 的 16 对配对样本里**一条都没恢复**（本来就没东西可误杀）。
+    也就是说「越窄越害」，与词面形态无关——所以护栏必须按覆盖率而不是
+    按形态黑名单，才能自动覆盖没见过的新表达。
+
+    fail-open 方向一致：任何异常返回 1.0（=覆盖充分），让过滤照旧执行，
+    绝不因为护栏查询失败而改变行为。
+    """
+    if not trange:
+        return 1.0
+    lo, hi = trange
+    try:
+        conn = sqlite3.connect(str(db_path(root)))
+        try:
+            covers = []
+            row = conn.execute(
+                "SELECT COUNT(*) FROM memories WHERE status='active'"
+                " AND (superseded_by IS NULL OR superseded_by=0)").fetchone()
+            total_m = int(row[0] or 0) if row else 0
+            if total_m > 0:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM memories WHERE status='active'"
+                    " AND (superseded_by IS NULL OR superseded_by=0)"
+                    " AND substr(created,1,10) BETWEEN ? AND ?",
+                    (lo, hi)).fetchone()
+                covers.append(int(row[0] or 0) / total_m)
+            cols = [r[1] for r in conn.execute("PRAGMA table_info(records)")]
+            if "date" in cols:
+                row = conn.execute(
+                    "SELECT COUNT(*) FROM records WHERE status='active'").fetchone()
+                total_r = int(row[0] or 0) if row else 0
+                if total_r > 0:
+                    row = conn.execute(
+                        "SELECT COUNT(*) FROM records WHERE status='active'"
+                        " AND substr(date,1,10) BETWEEN ? AND ?",
+                        (lo, hi)).fetchone()
+                    covers.append(int(row[0] or 0) / total_r)
+        finally:
+            conn.close()
+        return min(covers) if covers else 1.0
+    except (sqlite3.Error, ValueError, OSError):
+        return 1.0
+
+
 def _time_boost(r: dict, trange: tuple[str, str] | None) -> float:
     """P0-2 时间语义加法 boost：仅当查询解析出时间区间、且候选日期落在区间内时加分。
     只重排、不引入新候选；无区间或日期为空/越界 → 0（fail-open）。"""
@@ -9054,6 +9106,15 @@ RECALL_TIME_WINDOW = 1
 # 于是既有机会救回被误杀的答案，又不放宽候选集。默认 0.0=关，逐位零回归。
 # 一键回滚：本行改回 0.0。
 RECALL_TIME_SOFT = 0.0
+# R1110（B132 转向）：**时间窗选择率护栏**，默认 0.0=关（逐位零回归）。
+# R1109 实测把误杀机制量化了：窗口覆盖语料越窄，误杀越狠——单日相对词
+# 只覆盖 2.9% 的 active 记忆（612 条剩 18 条）、ISO 单日 5.5%、最近N天
+# 8.5%、周 18.3%、本月 23%；覆盖率 49%/76% 的两个形态完全无害。
+# 因此护栏按「窗口覆盖率 < 阈值 → 放弃硬过滤」而不是按词面形态做黑名单：
+# 新表达自动被覆盖，不必维护词表。R1108 的 16 对配对样本给出现象
+# （on 4/16 → off 12/16、p=0.0078 显著），R1110 用同库 A/B 定阈值。
+# 一键回滚：本行保持 0.0，或改回 0.0。
+RECALL_TIME_MIN_COVER = 0.0
 # R960（B118）：窗内候选的命中门槛放宽，默认 0=off。R955/R956 只读取证：
 # 开窗后「上周的踩坑经验有哪些」窗内确有 15 条候选，却全被 hit 闸门删光
 # （need=2，只命中 1 个词就出局）。时间窗已把窗外噪声挡掉，窗内再守 need=2
@@ -10203,6 +10264,16 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
     trange = _parse_time_range(prompt) if RECALL_TIME_WINDOW > 0 else None
     if trange:
         out["time_window"] = [trange[0], trange[1]]
+    # R1110：选择率护栏。窗口覆盖语料太窄时（R1109 实测 <10% 必然误杀）
+    # 放弃硬过滤——保留候选、只打标，靠 R960 的窗内放宽继续吃时间信号。
+    # 覆盖率每查询只算一次（两条 COUNT，规模 10^3），两路过滤共用。
+    skip_tw_filter = False
+    if trange and RECALL_TIME_MIN_COVER > 0:
+        cover = _time_window_cover(root, trange)
+        out["time_window_cover"] = round(float(cover), 4)
+        if cover < RECALL_TIME_MIN_COVER:
+            skip_tw_filter = True
+            out["time_window_skipped"] = 1
     # 打分用的 idf 一律按**过滤前的完整池**算：删一条越窗旧候选若顺带改了 idf，
     # 剩下候选的分数和顺序都会变——那是重排不是约束（R946 实锤代价）。
     mem_texts = [str(r.get("content") or "") + " " + str(r.get("tags") or "")
@@ -10226,7 +10297,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # （夹具期待注入 [1,3]，实际 [1]）。这里显式区分三种状态。
             outside = bool(d) and not inside
             # R1105：软加权档不删任何候选，只打标；关闭档维持 R953 原样。
-            if outside and RECALL_TIME_SOFT <= 0:
+            # R1110：护栏判定窗口覆盖不足时同样不删（skip_tw_filter）。
+            if outside and RECALL_TIME_SOFT <= 0 and not skip_tw_filter:
                 out["time_window_dropped"] += 1
                 continue
             # R960：只有「确认窗内」的候选才够格享受放宽；取不到日期的
@@ -10578,7 +10650,8 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             # R1106：与记忆路同一处修复——无日期必须 fail-open 保留。
             outside = bool(d) and not inside
             # R1105：软加权档与记忆路同口径，不删候选只打标。
-            if outside and RECALL_TIME_SOFT <= 0:
+            # R1110：护栏 skip_tw_filter 同样生效（两路共用一次覆盖率计算）。
+            if outside and RECALL_TIME_SOFT <= 0 and not skip_tw_filter:
                 out["time_window_dropped"] += 1
                 continue
             if inside:

@@ -31,7 +31,9 @@ import recall_eval as ev  # noqa: E402
 
 _ORIG = brain.RECALL_TIME_WINDOW
 CONFIGS = [("on(生产)", 1), ("off", 0)]
-PAIR_IDS = tuple(range(74, 82))   # R1103 追加的 8 条时间词配对样本
+PAIR_IDS = tuple(i for i, (_p, _w, _why) in enumerate(ev.CASES, 1)
+                   if str(_why).startswith("时间词配对"))  # R1108：按标注前缀推导，扩样不再漏算
+PAIR_N = len(PAIR_IDS)   # R1108：扩到 16 条后仍按标注前缀自动算，不再写死 8
 
 
 def apply(v):
@@ -68,7 +70,7 @@ def main() -> int:
                   f"{'转命中' if on_map.get(i) != 'hit' and off_map.get(i) == 'hit' else ''}\n")
     pair_on = sum(1 for i in PAIR_IDS if on_map.get(i) == "hit")
     pair_off = sum(1 for i in PAIR_IDS if off_map.get(i) == "hit")
-    buf.write(f"  配对子集：on {pair_on}/8 → off {pair_off}/8\n")
+    buf.write(f"  配对子集：on {pair_on}/{PAIR_N} → off {pair_off}/{PAIR_N}\n")
     buf.write(f"  全量：on {on['hit']}/{on['scored']}={on['rate']}% "
               f"噪声={on['noise']} → off {off['hit']}/{off['scored']}={off['rate']}% "
               f"噪声={off['noise']}\n")
