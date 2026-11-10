@@ -3392,6 +3392,7 @@ def _link_health(root: str = "") -> dict:
 ADHERENCE_BAD_RATE = 20.0
 ADHERENCE_OK_RATE = 40.0
 ADHERENCE_MIN_JUDGED = 5      # 判过的笔数不足此数就不定罪：分母太薄的百分比没有意义
+ADHERENCE_MIN_CONFIDENT = 50  # R1116：判过不足此数只报观测值，不判红也不报好（见下方注释）
 ADHERENCE_TRANSCRIPT_SHARE = 0.5    # 口径内的采集次数里，证据来自 transcript 的最低占比
 ADHERENCE_MIN_MEDIAN_CHARS = 120    # 单轮证据字数中位数低于此 = 判官只捞到收尾一句话
 # 会话注入后隔多久还没被判定就算「没闭环」（R851）。6 小时是刻意留的宽量：一个会话
@@ -3656,6 +3657,20 @@ def _adherence_health(root: str = "") -> dict:
                 "summary": f"采纳账：只判过 {judged_n} 笔（少于 {ADHERENCE_MIN_JUDGED} 笔），"
                            f"另有 {unobserved_n} 笔注入从没被判定——样本太薄，"
                            f"账面 {rate:.1f}% 不用于下结论",
+                "detail": detail + _closure_note()}
+    # R1116 样本下限（先尺子后结论的第三层）：判过 5~49 笔时口径是干净的，但小样本
+    # 的百分比半宽远大于观察线本身——8 笔 0 用上就下「记忆真没被用上」这种硬结论，
+    # 红一次就够让人去改注入策略。这里只报观测值，既不定罪也不报好。
+    # 外部依据：Applied Compute 只统计 >15 次 retrieve 的 bucket；CSDN 采纳率每题双跑、
+    # 只上线前跑；lmversity「how many items a claim needs」；bigyan.dev「小样本制造的是
+    # 虚假置信」。50 是比引用口径更保守的本库自设线，不是外部标准。
+    if judged_n < ADHERENCE_MIN_CONFIDENT:
+        detail.append(f"样本下限：判过 {judged_n} 笔 < {ADHERENCE_MIN_CONFIDENT} 笔"
+                      f"——观测口径 {observed_rate:.1f}% 仅供观察，"
+                      f"不判红也不报好（本库自设，非外部标准）")
+        return {"ok": True,
+                "summary": f"采纳账：判过 {judged_n} 笔 < 样本下限 {ADHERENCE_MIN_CONFIDENT} 笔"
+                           f" · 观测口径 {observed_rate:.1f}% 仅供观察，不判红也不报好（待确认）",
                 "detail": detail + _closure_note()}
     if observed_rate < ADHERENCE_BAD_RATE:
         return {"ok": False,

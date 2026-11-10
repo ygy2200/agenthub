@@ -803,8 +803,38 @@ def main() -> int:
     ap = argparse.ArgumentParser()
     ap.add_argument("-v", "--verbose", action="store_true")
     ap.add_argument("--root", default="")
+    ap.add_argument("--snapshot", default="",
+                    help="用冻结基线快照跑（快照名或 .manifest.json 路径）；真库一行不写")
+    ap.add_argument("--freeze", default="",
+                    help="冻结一份基线快照后退出（给名字，落 output/eval_snapshots/）")
     args = ap.parse_args()
-    return run(args.verbose, args.root)
+    import eval_snapshot as _snap  # noqa: PLC0415  tools/ 已在 sys.path（见文件头）
+    if args.freeze:
+        m = _snap.freeze(args.root or str(_brain_root()), args.freeze)
+        print(json.dumps({k: m[k] for k in
+                          ("name", "sha256", "memory_count", "record_count",
+                           "db_bytes", "gz_bytes", "created_at", "manifest_path")},
+                         ensure_ascii=False, indent=2))
+        return 0
+    root = args.root
+    tmp = ""
+    if args.snapshot:
+        mf = _snap.resolve_manifest(args.snapshot)
+        ok, why = _snap.verify(mf)
+        if not ok:
+            print(f"快照校验失败：{why}")
+            return 2
+        m = json.loads(Path(mf).read_text(encoding="utf-8"))
+        print(f"基线快照：{m['name']} · 冻结于 {m['created_at']} · sha256 {m['sha256'][:16]}…"
+              f" · memories {m['memory_count']} / records {m['record_count']}"
+              f"（评测只读此副本，真库不写）")
+        tmp = _snap.materialize(mf)
+        root = tmp
+    try:
+        return run(args.verbose, root)
+    finally:
+        if tmp:
+            _snap.drop(tmp)
 
 
 if __name__ == "__main__":

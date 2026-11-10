@@ -22,10 +22,22 @@ R849 把「判官只看到收尾一句话」这个采集缺陷修掉了，但修
 """
 import datetime
 
+import pytest
+
 import brain
 import ops
 
 PROJECT = "采纳账-测试-对象问题"
+
+
+@pytest.fixture(autouse=True)
+def _legacy_sample_floor(monkeypatch):
+    """R1116：本组钉的是 R850 的采集口径与判红顺序，不测样本下限。
+
+    把下限降到 5 保持原断言语义（判过 8~10 笔照样走定罪/报好分支）；
+    50 这条线由 test_adherence_sample_floor_r1116.py 专测，避免把口径测试改厚成数据工程。
+    """
+    monkeypatch.setattr(ops, "ADHERENCE_MIN_CONFIDENT", 5)
 
 
 def _now(offset_min: int = 0) -> str:

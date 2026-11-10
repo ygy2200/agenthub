@@ -30,6 +30,17 @@ import pytest
 
 REPO = Path(__file__).resolve().parents[2]
 MJS = REPO / "brain_adherence_sweep.mjs"
+
+
+@pytest.fixture(autouse=True)
+def _legacy_sample_floor(monkeypatch):
+    """R1116：本组钉的是 R851 的补扫闭环账与两条红路，不测样本下限。
+
+    把下限降到 5 保持原断言语义（判过 10 笔照样定罪）；
+    50 这条线由 test_adherence_sample_floor_r1116.py 专测。
+    """
+    import ops
+    monkeypatch.setattr(ops, "ADHERENCE_MIN_CONFIDENT", 5)
 PY_ENTRY = REPO / "brain_adherence.py"
 SIG = "zebra_probe_r851.py"
 # 提问与记忆共有的词，负责把这条记忆捞出来。刻意用两段都 ≥5 字符的标识符：

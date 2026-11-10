@@ -121,14 +121,18 @@ def test_bulk_unobserved_does_not_convict(hub_root):
 
 
 def test_conviction_uses_observed_denominator(hub_root):
-    """账面压到观察线以下而观测口径正常：旧口径会误判红，新口径报绿——分母换成判过的。"""
+    """账面压到观察线以下而观测口径正常：旧口径会误判红，新口径报绿——分母换成判过的。
+
+    R1116：夹具加厚到判过 60 笔（原 10 笔）。本例钉的是「分母换成判过的」，
+    不是「10 笔就够下结论」；样本下限 50 上线后必须够样本才能走报绿分支。
+    """
     mid = _hub(hub_root)
-    for _ in range(4):
+    for _ in range(24):
         _row(hub_root, "qoder", mid, "s1", used=1, decided=True)
-    for _ in range(6):
+    for _ in range(36):
         _row(hub_root, "qoder", mid, "s1", decided=True)
-    for _ in range(40):
-        _row(hub_root, "qoder", mid, "s1")            # 未观测：把账面压到 8%
+    for _ in range(80):  # R1116：判过 60 笔时账面 24/100=24% 已高于观察线，需更多未观测行压回线下方
+        _row(hub_root, "qoder", mid, "s1")
     _capture(hub_root, "qoder", ["s1"])
     st = brain.recall_adherence_stats(hub_root, days=7)
     assert st["rate"] < ops.ADHERENCE_BAD_RATE, st     # 旧口径会在这里定罪
@@ -136,7 +140,7 @@ def test_conviction_uses_observed_denominator(hub_root):
     r = ops._adherence_health(hub_root)
     assert r["ok"] is True, r
     assert "正常区间" in r["summary"], r["summary"]
-    assert "观测口径 4/10 = 40.0%" in _find(r, "三态账"), r["detail"]
+    assert "观测口径 24/60 = 40.0%" in _find(r, "三态账"), r["detail"]
     assert "本库自设" in _find(r, "判据线"), r["detail"]
 
 
@@ -163,25 +167,25 @@ def test_manual_report_prints_tri_state_too(hub_root):
 
 
 def test_observed_zero_with_judged_rows_is_the_real_rejection(hub_root):
-    """判过 8 笔一笔没认出来：这才叫「注入的记忆真没被用上」，摘要要带判过的笔数。"""
+    """判过 60 笔一笔没认出来：够样本，这才叫「注入的记忆真没被用上」（R1116 加厚夹具）。"""
     mid = _hub(hub_root)
-    for _ in range(8):
+    for _ in range(60):
         _row(hub_root, "qoder", mid, "s1", decided=True)
     for _ in range(12):
         _row(hub_root, "qoder", mid, "s1")
     _capture(hub_root, "qoder", ["s1"])
     r = ops._adherence_health(hub_root)
     assert r["ok"] is False and "真没被用上" in r["summary"], r
-    assert "判过的 8 笔里只有 0 笔用上" in r["summary"], r["summary"]
+    assert "判过的 60 笔里只有 0 笔用上" in r["summary"], r["summary"]
     assert "加大注入量" in r["fix"], r["fix"]
 
 
 def test_mid_band_reports_green_with_self_set_lines(hub_root):
-    """观察线与正常线之间报绿但写偏低，并明说两线是本库自设。"""
+    """观察线与正常线之间报绿但写偏低，并明说两线是本库自设（R1116：判过 60 笔够样本）。"""
     mid = _hub(hub_root)
-    for _ in range(3):
+    for _ in range(18):
         _row(hub_root, "qoder", mid, "s1", used=1, decided=True)
-    for _ in range(5):
+    for _ in range(42):
         _row(hub_root, "qoder", mid, "s1", decided=True)
     _capture(hub_root, "qoder", ["s1"])
     r = ops._adherence_health(hub_root)
@@ -195,13 +199,14 @@ def test_no_unsourced_band_in_any_output(hub_root):
     banned = ("行业区间", "sheratonhq", "健康区间")
     mid = _hub(hub_root, agents=("qoder", "workbuddy"))
     # 三条路都走一遍：绿（观测正常）→ 红（判无用）→ 绿（全未观测，样本薄）
-    for _ in range(8):
+    # R1116：判过 60 笔才够样本下限，否则第 1/2 条会落进「不判红也不报好」分支。
+    for _ in range(60):
         _row(hub_root, "qoder", mid, "s1", used=1, decided=True)
     _capture(hub_root, "qoder", ["s1"])
     cases = [ops._adherence_health(hub_root)]
     with brain.db_conn(hub_root) as conn:
         conn.execute("UPDATE recall_adherence SET used=0")
-    cases.append(ops._adherence_health(hub_root))                     # 判过 8 笔零采纳 → 定罪红
+    cases.append(ops._adherence_health(hub_root))                     # 判过 60 笔零采纳 → 定罪红
     with brain.db_conn(hub_root) as conn:
         conn.execute("UPDATE recall_adherence SET decided_at=''")
     cases.append(ops._adherence_health(hub_root))                     # 全未观测 → 样本太薄
