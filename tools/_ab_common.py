@@ -21,6 +21,8 @@ from __future__ import annotations
 
 import io
 import json
+import math
+import random
 import statistics
 import sys
 import tempfile
@@ -73,6 +75,55 @@ def records_judge(root, case, res):
     if worst >= ev.leak_floor(prompt):
         return "leak", len(ids), got
     return ("gap" if not ids else "miss"), len(ids), got
+
+
+def mcnemar_exact(gain: int, loss: int) -> float:
+    """R1092：二元 hit@k 的配对显著性（不一致对的精确二项双尾检验）。
+
+    外部依据：同一批 query 上两系统相关，「14 比 6 听着能说服人，其实不显著」
+    https://iotdigitaltwinplm.com/rag-retrieval-evaluation-recall-at-k-ndcg-mrr-ragas-golden-sets-synthetic-queries-pipeline-2026
+    精确二项比卡方近似保守（g=14,l=6 → 精确 0.115 / 卡方≈0.07），小样本更该用精确。
+    """
+    n = gain + loss
+    if n == 0:
+        return 1.0
+    k = min(gain, loss)
+    tail = sum(math.comb(n, i) for i in range(k + 1)) / (2 ** n)
+    return round(min(1.0, 2 * tail), 6)
+
+
+def paired_bootstrap(deltas, n_boot: int = 10000, seed: int = 0) -> tuple:
+    """逐例差 d_i∈{−1,0,+1} 的有放回 bootstrap，返回 95% 区间 (lo, hi)。
+
+    固定 seed 保证可复跑；纯标准库实现，量具不依赖 numpy。
+    """
+    if not deltas:
+        return (0.0, 0.0)
+    rnd = random.Random(seed)
+    n = len(deltas)
+    means = []
+    for _ in range(n_boot):
+        means.append(sum(deltas[rnd.randrange(n)] for _ in range(n)) / n)
+    means.sort()
+    return (round(means[int(n_boot * 0.025)], 4),
+            round(means[min(n_boot - 1, int(n_boot * 0.975))], 4))
+
+
+def paired_verdict(base_per_case, cand_per_case) -> dict:
+    """把两档的逐例类别压成配对显著性证据。"""
+    b = {i: cls for i, cls, _ in base_per_case}
+    deltas, gain, loss = [], 0, 0
+    for i, cls, _ in cand_per_case:
+        if i not in b:
+            continue
+        d = (1 if cls == "hit" else 0) - (1 if b[i] == "hit" else 0)
+        deltas.append(d)
+        gain += int(d > 0)
+        loss += int(d < 0)
+    lo, hi = paired_bootstrap(deltas)
+    return {"gain_n": gain, "loss_n": loss,
+            "mcnemar_p": mcnemar_exact(gain, loss),
+            "boot_lo": lo, "boot_hi": hi, "n_pairs": len(deltas)}
 
 
 def _one(root, cases, state, leak_ids, label, judge):
@@ -170,18 +221,26 @@ def run_ab(*, label: str, configs: list, apply, restore,
             dn = r["noise"] - base["noise"]
             dt = round(r["p50_ms"] - base["p50_ms"], 1)
             dt_avg = round(r["avg_ms"] - base["avg_ms"], 1)
-            ok = dr > 0 and dn <= 0 and dt <= 50
+            pv = paired_verdict(base["per_case"], r["per_case"])
+            # R1092 主判据：点估计为正 + 噪声不增 + p50 不超线 + 配对 bootstrap 下界 > 0。
+            # McNemar p 只作诊断（小样本功效有限，不当唯一闸门）。
+            ok = dr > 0 and dn <= 0 and dt <= 50 and pv["boot_lo"] > 0
             r["verdict"] = {"delta_rate": dr, "delta_noise": dn,
                             "delta_ms": dt, "delta_avg_ms": dt_avg,
-                            "gained": gained, "lost": lost, "pass": ok}
+                            "gained": gained, "lost": lost, "pass": ok, **pv}
             buf.write(f"  {str(r['label']):<16} Δrate={dr:+5.1f}pp  "
                       f"Δ噪声={dn:+3d}  Δp50={dt:+6.1f}ms (Δ均值={dt_avg:+6.1f}ms)  "
                       f"{'PASS' if ok else 'KEEP-OFF'}  "
-                      f"转命中={gained}  转丢失={lost}\n")
-        buf.write("\n判据（R1090 明确口径）：Δrate>0 且 Δ噪声<=0 且 **Δp50<=50ms**"
-                  " 才考虑改默认档；均值与 p90 只作诊断，不参与判定。\n"
-                  "口径变更说明：R1074–R1087 的「Δ耗时」用的是均值；本轮起改为中位数，"
-                  "是把它写清楚而非放宽——历史数字不可与新口径直接比。\n")
+                      f"转命中={gained}  转丢失={lost}\n"
+                      f"{'':<18} 配对：g={pv['gain_n']} l={pv['loss_n']} "
+                      f"McNemar p={pv['mcnemar_p']:.4f} · "
+                      f"bootstrap95%=[{pv['boot_lo']:+.4f},{pv['boot_hi']:+.4f}] "
+                      f"(n={pv['n_pairs']}, seed=0)\n")
+        buf.write("\n判据（R1092 升级）：Δrate>0 且 Δ噪声<=0 且 **Δp50<=50ms** 且 "
+                  "**配对 bootstrap 95% 区间下界 > 0** 才考虑改默认档。\n"
+                  "McNemar p 与均值/p90 只作诊断；不显著 ≠ 无效，只等于「证据不足，不改默认」。\n"
+                  "口径沿革：R1074–R1087 用 Δ均值且无配对检验；R1090 起改 Δp50；"
+                  "R1092 起加配对检验。**历史结论不可与新口径直接比，也不追溯改写。**\n")
     finally:
         restore()
 
