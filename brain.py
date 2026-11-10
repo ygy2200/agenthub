@@ -10220,15 +10220,20 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         for r in mems:
             d = mdates.get(int(r.get("id") or 0), "") or _row_date(r)
             inside = bool(d and trange[0] <= d <= trange[1])
+            # R1106 修 R1105 的真回归：**取不到日期 ≠ 窗外**。R1105 把
+            # `not inside` 当成越窗，于是「无日期」候选被硬过滤删掉，违反
+            # R953 的 fail-open 契约——全量门禁 test_time_window_r953 抓住
+            # （夹具期待注入 [1,3]，实际 [1]）。这里显式区分三种状态。
+            outside = bool(d) and not inside
             # R1105：软加权档不删任何候选，只打标；关闭档维持 R953 原样。
-            if not inside and RECALL_TIME_SOFT <= 0:
+            if outside and RECALL_TIME_SOFT <= 0:
                 out["time_window_dropped"] += 1
                 continue
             # R960：只有「确认窗内」的候选才够格享受放宽；取不到日期的
             # fail-open 候选不打标，保持原门槛，不许把噪声一起放进来。
             if inside:
                 r["_tw_inside"] = 1
-            else:
+            elif outside:
                 r["_tw_outside"] = 1
             kept.append(r)   # 取不到日期一律 fail-open 保留：宁可少滤也不误杀
         mems = kept
@@ -10570,13 +10575,15 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         for r in recs:
             d = _row_date(r)          # 记录行带 date 列；取不到日期 fail-open 保留
             inside = bool(d and trange[0] <= d <= trange[1])
+            # R1106：与记忆路同一处修复——无日期必须 fail-open 保留。
+            outside = bool(d) and not inside
             # R1105：软加权档与记忆路同口径，不删候选只打标。
-            if not inside and RECALL_TIME_SOFT <= 0:
+            if outside and RECALL_TIME_SOFT <= 0:
                 out["time_window_dropped"] += 1
                 continue
             if inside:
                 r["_tw_inside"] = 1   # R960：同记忆路，只放宽确认窗内的记录
-            else:
+            elif outside:
                 r["_tw_outside"] = 1
             kept.append(r)
         recs = kept

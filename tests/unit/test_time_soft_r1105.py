@@ -68,3 +68,36 @@ def test_off_window_equals_legacy():
     b = _run(TIME_Q, 0, 1.0)
     assert a.get("memory_ids") == b.get("memory_ids")
     assert a.get("time_window") in ([], None)
+
+
+def test_soft_keeps_undated_and_outside(hub_root, tmp_path, monkeypatch):
+    """R1106：软加权档既不许删窗外候选，也不许删无日期候选。
+
+    R1105 首版把「无日期」算进 `not inside`，硬过滤档直接删掉，违反 R953
+    的 fail-open 契约；全量门禁 test_time_window_r953 抓住（期待 [1,3] 实际 [1]）。
+    这条用例从软加权档侧再钉一次：窗内 1、窗外 2、缺日期 3 条都必须在注入里。
+    """
+    import datetime as dt
+    import brain
+    brain.init_db(str(hub_root))
+    today = dt.date.today()
+    yesterday = (today - dt.timedelta(days=1)).isoformat()
+    old = (today - dt.timedelta(days=20)).isoformat()
+    filler = [{"id": 100 + i, "content": "无关填充内容", "tags": "", "kind": "lesson"}
+              for i in range(37)]
+    mems = [{"id": i, "content": "门禁结果怎么查", "tags": "", "kind": "lesson"}
+            for i in (1, 2, 3)] + filler
+    monkeypatch.setattr(brain, "search_memories", lambda *a, **k: [dict(r) for r in mems])
+    monkeypatch.setattr(brain, "search_records", lambda *a, **k: [])
+    monkeypatch.setattr(brain, "_semantic_rank", lambda *a, **k: [])
+    monkeypatch.setattr(brain, "_memory_dates",
+                        lambda *a, **k: {1: yesterday, 2: old})
+    brain.RECALL_TIME_WINDOW, brain.RECALL_TIME_SOFT = 1, 1.0
+    out = brain.prompt_recall(str(hub_root), "昨天的门禁结果", agent="workbuddy",
+                              session="soft1", state_path=str(tmp_path / "s.json"),
+                              update_state=False, origin="probe")
+    assert out["time_window"] == [yesterday, yesterday], out
+    assert out["time_window_dropped"] == 0, "软加权档不许删候选：" + str(out)
+    assert 1 in out["memory_ids"], out["memory_ids"]
+    assert 2 in out["memory_ids"], "窗外候选只打标、不进硬过滤：" + str(out["memory_ids"])
+    assert 3 in out["memory_ids"], "取不到日期必须 fail-open 保留"
