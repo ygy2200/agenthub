@@ -9046,6 +9046,14 @@ RECALL_ABSTAIN_MIN_COV = 0.0
 # 越窗错答案、3 组保留窗内答案，没有一组「窗内有用答案被误删」。
 # 回滚：本行改回 0 即恢复 R952 及以前的旧行为。
 RECALL_TIME_WINDOW = 1
+# R1105（B132）：时间限窗的形态开关。0=沿用 R953 的**硬过滤**（越窗候选直接删）。
+# R1103/R1104 实锤：8 条时间词配对样本只 2/8 命中，因为「上周那次 X」「最近三天…
+# 还记得吗」里的口语时间词被当成检索时间范围，按记忆写入日期把答案整批删掉；
+# 直接关掉限窗能救到 7/8 但噪声 +8，判据不达标。软加权档**不删任何候选**，
+# 只给确认窗内的候选在 spec 上加一个可标量级的分；窗外候选照常参与竞争，
+# 于是既有机会救回被误杀的答案，又不放宽候选集。默认 0.0=关，逐位零回归。
+# 一键回滚：本行改回 0.0。
+RECALL_TIME_SOFT = 0.0
 # R960（B118）：窗内候选的命中门槛放宽，默认 0=off。R955/R956 只读取证：
 # 开窗后「上周的踩坑经验有哪些」窗内确有 15 条候选，却全被 hit 闸门删光
 # （need=2，只命中 1 个词就出局）。时间窗已把窗外噪声挡掉，窗内再守 need=2
@@ -10211,13 +10219,17 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         kept = []
         for r in mems:
             d = mdates.get(int(r.get("id") or 0), "") or _row_date(r)
-            if d and not (trange[0] <= d <= trange[1]):
+            inside = bool(d and trange[0] <= d <= trange[1])
+            # R1105：软加权档不删任何候选，只打标；关闭档维持 R953 原样。
+            if not inside and RECALL_TIME_SOFT <= 0:
                 out["time_window_dropped"] += 1
                 continue
             # R960：只有「确认窗内」的候选才够格享受放宽；取不到日期的
             # fail-open 候选不打标，保持原门槛，不许把噪声一起放进来。
-            if d:
+            if inside:
                 r["_tw_inside"] = 1
+            else:
+                r["_tw_outside"] = 1
             kept.append(r)   # 取不到日期一律 fail-open 保留：宁可少滤也不误杀
         mems = kept
     # R899：只在语义路已预热时取分（模型没加载就返回空表，钩子路径不会被拖慢）。
@@ -10311,6 +10323,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         r["_recall_best"] = best_raw
         kind = r.get("kind") or "note"
         spec = wid * 2.2 + kind_weights.get(kind, 0.4) +             (RECALL_PINNED_W if r.get("pinned") else 0)
+        # R1105：软加权只给确认窗内的候选加分，窗外候选照常竞争（不删、不罚）。
+        if RECALL_TIME_SOFT > 0 and r.get("_tw_inside"):
+            spec += RECALL_TIME_SOFT
         # R943：置信度降权档（默认 0=off）。写成 (conf-1) 而不是乘性系数：conf=1.0 时
         # 严格加 0.0，保证默认全 1.0 的真库上 A/B 的两档**逐位相同**——差异只可能来自
         # 真正低于 1.0 的那些行，量具据此判断「分档到底动没动任何一条结论」。
@@ -10554,11 +10569,15 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
         kept = []
         for r in recs:
             d = _row_date(r)          # 记录行带 date 列；取不到日期 fail-open 保留
-            if d and not (trange[0] <= d <= trange[1]):
+            inside = bool(d and trange[0] <= d <= trange[1])
+            # R1105：软加权档与记忆路同口径，不删候选只打标。
+            if not inside and RECALL_TIME_SOFT <= 0:
                 out["time_window_dropped"] += 1
                 continue
-            if d:
+            if inside:
                 r["_tw_inside"] = 1   # R960：同记忆路，只放宽确认窗内的记录
+            else:
+                r["_tw_outside"] = 1
             kept.append(r)
         recs = kept
     rec_scored = []
@@ -10575,6 +10594,9 @@ def prompt_recall(root: str, prompt: str, agent: str = "", cwd: str = "",
             out["time_hit_relaxed"] += 1
         spec = _recall_weighted_hit(terms, rec_idf, body) * 2.2 \
             + _recall_hit_score(terms, title)
+        # R1105：记录路同口径，软加权档只给确认窗内的记录加分。
+        if RECALL_TIME_SOFT > 0 and r.get("_tw_inside"):
+            spec += RECALL_TIME_SOFT
         if pname and (r.get("project") or "") == pname:
             spec += 1.5
         try:
