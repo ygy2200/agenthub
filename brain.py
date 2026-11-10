@@ -9564,6 +9564,49 @@ def _record_adherence(root: str, session: str, agent: str, picked: list,
     return len(rows)
 
 
+def prune_adherence_device_rows(root: str, days: int = 7, apply: bool = False) -> dict:
+    """R1114：把评测/探针写的采纳账装置行清出真库（默认预演，apply=True 才删）。
+
+    为什么需要独立入口：建表注释就写了「表要有界」，_record_adherence 里也确实在
+    每次写入后 DELETE 掉 ADHERENCE_KEEP_DAYS 天前的行——但清理只在**写入那一刻**
+    触发，装置在保留窗口内高频写出来的行照样堆着（R1113 真库实测 18385 笔，
+    是生产 510 笔的 36 倍）。这些行永远不会被判定（装置没有对应产出），统计侧
+    已按 R853 排除在分母外，留在库里只拖慢每次 stats 的捞取。
+
+    删除边界刻意窄：只认 origin 归一化后精确为 eval/probe **且**早于 days 天的行；
+    NULL/未知来历/生产来历一律不碰——猜错来历就是把生产账删了，不可逆。
+    保留窗口内的装置行也不删：正在跑的评测还要拿它们核对本轮结果。
+
+    外部依据：n4n.ai《How to evaluate AI agent memory systems》「Never test against
+    production data」；bigyan.dev《Eval Set Contamination》「hard train/eval firewall
+    with provenance tags … enforced in code at the seams of the pipeline」。
+    """
+    keep = max(1, int(days))
+    cutoff = _days_ago(keep)
+    marks = ",".join("?" * len(DEVICE_ORIGINS))
+    cond = f"LOWER(COALESCE(origin,'live')) IN ({marks})"
+    out = {"days": keep, "cutoff": cutoff, "apply": bool(apply),
+           "device_total": 0, "eligible": 0, "fresh": 0,
+           "production_total": 0, "deleted": 0}
+    with db_conn(root) as conn:
+        out["device_total"] = int(conn.execute(
+            f"SELECT COUNT(*) FROM recall_adherence WHERE {cond}",
+            DEVICE_ORIGINS).fetchone()[0])
+        out["production_total"] = int(conn.execute(
+            f"SELECT COUNT(*) FROM recall_adherence WHERE NOT ({cond})",
+            DEVICE_ORIGINS).fetchone()[0])
+        out["eligible"] = int(conn.execute(
+            f"SELECT COUNT(*) FROM recall_adherence WHERE {cond} AND ts < ?",
+            (*DEVICE_ORIGINS, cutoff)).fetchone()[0])
+        if apply and out["eligible"]:
+            cur = conn.execute(
+                f"DELETE FROM recall_adherence WHERE {cond} AND ts < ?",
+                (*DEVICE_ORIGINS, cutoff))
+            out["deleted"] = int(cur.rowcount or 0)
+    out["fresh"] = out["device_total"] - out["eligible"]
+    return out
+
+
 def brief_rules_adherence(root: str, session: str, agent: str = "", project: str = "",
                           rule_ids: list = None) -> int:
     """R923：SessionStart 简报送的「必做规则」记一笔采纳账（`origin=brief`）。
@@ -9791,13 +9834,25 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
            "unobserved_gap_old": 0, "capture_start": "",
            "judged_unused": 0, "judged_used": 0,
            "judged": 0, "observed_rate": 0.0, "device_rows": 0,
+           "scanned_rows": 0,   # R1114：SQL 实际捞进 Python 的行数（应恒等于 injected）
            "by_directive": {}}     # R881：required/supportive/unknown 三档，合计必须等于顶层
+    prod_marks = ",".join("?" * len(PRODUCTION_ORIGINS))
+    prod_cond = f"LOWER(COALESCE(origin,'live')) IN ({prod_marks})"
     with db_conn(root) as conn:
+        # R1114 下推：装置行在 SQL 层就排除，不再把上万行捞进内存再逐条过滤。
+        # device_rows 单独 COUNT，保证「排除了多少」这件事本身仍可核查（R853 口径不变）。
+        # LOWER 是顺带修正：写入口一律 lower，历史大写来历此前被误算成装置。
         rows = [dict(r) for r in conn.execute(
             "SELECT strength, fp, used, decided_at, memory_id, ts, agent, session,"
             " COALESCE(origin,'live') AS origin, COALESCE(directive,'') AS directive"
-            " FROM recall_adherence WHERE ts>=?",
-            (since,))]
+            f" FROM recall_adherence WHERE ts>=? AND {prod_cond}",
+            (since, *PRODUCTION_ORIGINS))]
+        try:
+            out["device_rows"] = int(conn.execute(
+                f"SELECT COUNT(*) FROM recall_adherence WHERE ts>=? AND NOT ({prod_cond})",
+                (since, *PRODUCTION_ORIGINS)).fetchone()[0])
+        except sqlite3.Error:
+            pass
         try:
             cap = conn.execute(
                 "SELECT MIN(ts) FROM journal WHERE action='brain_adherence'"
@@ -9805,11 +9860,7 @@ def recall_adherence_stats(root: str, days: int = ADHERENCE_KEEP_DAYS) -> dict:
             out["capture_start"] = (cap[0] if cap else "") or ""
         except sqlite3.Error:
             pass
-    if not rows:
-        return out
-    device_rows = sum(1 for r in rows if (r.get("origin") or "live") not in PRODUCTION_ORIGINS)
-    rows = [r for r in rows if (r.get("origin") or "live") in PRODUCTION_ORIGINS]
-    out["device_rows"] = device_rows
+    out["scanned_rows"] = len(rows)
     if not rows:
         return out
     out["injected"] = len(rows)

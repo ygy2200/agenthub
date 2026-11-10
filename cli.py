@@ -966,6 +966,30 @@ def cmd_adherence_backfill(root: str, apply: bool, days: int, min_idle_h: float,
     return 0
 
 
+def cmd_adherence_prune(root: str, apply: bool, days: int) -> int:
+    """R1114：清掉超龄的 eval/probe 装置行（默认预演，--apply 才删）。
+
+    R1113 只读诊断报出真库装置行 18385 笔（生产 510 的 36 倍），但没有任何
+    可执行的出口——「看得见」不等于「清得掉」。这条命令把 brain 层的清理
+    暴露成一条可预演、可回滚的动作，生产行一笔不动。
+    """
+    import brain  # noqa: PLC0415
+    try:
+        r = brain.prune_adherence_device_rows(root, days=days, apply=apply)
+    except Exception as e:  # noqa: BLE001 库读不动时别把账说成「已清」
+        print(f"读取采纳账失败：{str(e)[:120]}")
+        return 1
+    print(f"采纳账装置行：合计 {r['device_total']} 笔 · 超 {r['days']} 天可删"
+          f" {r['eligible']} 笔 · 保留窗口内 {r['fresh']} 笔")
+    print(f"生产行 {r['production_total']} 笔（live/brief/NULL/未知来历一律不动）"
+          f" · 截止 {r['cutoff']}")
+    if apply:
+        print(f"已删 {r['deleted']} 笔装置行")
+    else:
+        print("以上仅为预演；确认后加 --apply 执行。")
+    return 0
+
+
 def cmd_backup_drill(root: str, path: str) -> int:
     """R61 恢复演练：不写现场数据（R75 起仅审计流水留痕）。"""
     import brain  # noqa: PLC0415
@@ -2085,6 +2109,11 @@ def main(argv=None) -> int:
     p_ab.add_argument("--min-idle-h", dest="min_idle_h", type=float, default=2.0,
                       help="最后注入距今不足这么多小时的会话跳过（默认 2，防抢跑）")
     p_ab.add_argument("--session", action="append", default=[], help="只处理指定会话（可多次）")
+    p_ap = _cmd("adherence-prune",
+                help="清理评测/探针写的采纳账装置行（默认预演，--apply 才删；生产行一律不动）")
+    p_ap.add_argument("--apply", action="store_true", help="真正删除（默认只预演）")
+    p_ap.add_argument("--days", type=int, default=7,
+                      help="只删早于这么多天的装置行（默认 7，保留窗口内的不动）")
     p_doc = _cmd("doctor", help="一键自检：巡检聚合 + 可执行修复建议")
     p_doc.add_argument("--full", action="store_true",
                        help="展开完整修复口径与全部明细（默认只列失败项相关口径与前 3 条）")
@@ -2278,6 +2307,8 @@ def main(argv=None) -> int:
         if args.cmd == "adherence-backfill":
             return cmd_adherence_backfill(_root(args.root), args.apply, args.days,
                                           args.min_idle_h, args.session)
+        if args.cmd == "adherence-prune":
+            return cmd_adherence_prune(_root(args.root), args.apply, args.days)
         if args.cmd == "doctor":
             return cmd_doctor(_root(args.root), full=args.full, as_json=args.as_json,
                               only=args.only, skip=args.skip, no_machine=args.no_machine,
