@@ -780,11 +780,20 @@ def cmd_check(name: str = "", target: str = "", root: str = "",
         print(f"✗ target 不是目录：{target}", file=sys.stderr)
         return 2
     r = ops.run_check(name, target, root)
+    # R1132：ok=True 只表示「这项不拖垮巡检」，不等于「被检对象健康」。
+    # R1131 真实输出曾是 `✓ ci_health：CI 状态未判定（PENDING）`——绿色对勾与
+    # 「没判绿」同屏，会被一眼读成 CI 健康。显示层用中性 `?`，脚本侧在 JSON 补
+    # verdict=undetermined（正常结果不加字段，保持向后兼容）。
+    undetermined = bool(r.get("ok")) and "未判定" in str(r.get("summary", ""))
     if as_json:
+        payload = dict(r)
+        if undetermined:
+            payload["verdict"] = "undetermined"
         print(json.dumps({"schema": 1, "name": name, "target": target, "root": root,
-                          "result": r}, ensure_ascii=False))
+                          "result": payload}, ensure_ascii=False))
         return 0 if r.get("ok") else 1
-    print(("✓ " if r.get("ok") else "✗ ") + f"{name}：{r.get('summary', '')}")
+    mark = "? " if undetermined else ("✓ " if r.get("ok") else "✗ ")
+    print(mark + f"{name}：{r.get('summary', '')}")
     for line in r.get("detail") or []:
         print("   · " + line)
     return 0 if r.get("ok") else 1
