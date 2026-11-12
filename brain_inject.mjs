@@ -16,12 +16,18 @@ import { spawnSync } from 'node:child_process';
 import { appendFileSync, existsSync, mkdirSync, readFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOG = path.join(HOME, '.workbuddy', 'logs', 'brain-inject.log');
 const CONFIG = path.join(HOME, '.agenthub', 'config.json');
+const HOME_SCRIPT = path.join(HOME, '.agenthub', 'mcp_server', 'brain_brief.py');
+// R1122：未部署环境（CI / 源码树）没有 HOME 副本，从钩子自身目录取仓库副本。
+const REPO_SCRIPT = path.join(HERE, 'brain_brief.py');
 const SCRIPT = process.env.AGENTHUB_BRIEF_SCRIPT
-  || path.join(HOME, '.agenthub', 'mcp_server', 'brain_brief.py');
+  || (existsSync(HOME_SCRIPT) ? HOME_SCRIPT
+      : (existsSync(REPO_SCRIPT) ? REPO_SCRIPT : HOME_SCRIPT));
 const MAX_CHARS = Math.max(400, Number(process.env.AGENTHUB_BRIEF_MAX_CHARS) || 3000);
 
 function logLine(msg) {

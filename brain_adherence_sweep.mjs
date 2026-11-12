@@ -33,13 +33,19 @@ import {
 } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOG = path.join(HOME, '.agenthub', 'logs', 'brain-adherence.log');
 const CONFIG = path.join(HOME, '.agenthub', 'config.json');
 const STATE = path.join(HOME, '.agenthub', 'state');
+const HOME_SCRIPT = path.join(HOME, '.agenthub', 'mcp_server', 'brain_adherence.py');
+// R1122：未部署环境（CI / 源码树）没有 HOME 副本，从钩子自身目录取仓库副本。
+const REPO_SCRIPT = path.join(HERE, 'brain_adherence.py');
 const SCRIPT = process.env.AGENTHUB_ADHERENCE_SCRIPT
-  || path.join(HOME, '.agenthub', 'mcp_server', 'brain_adherence.py');
+  || (existsSync(HOME_SCRIPT) ? HOME_SCRIPT
+      : (existsSync(REPO_SCRIPT) ? REPO_SCRIPT : HOME_SCRIPT));
 // 一次补扫最多读 1.2MB、喂 120K 字符：长会话里两轮之间能塞下整篇文档，
 // 上限只在「窗口尾部」取值——越新的动作越能代表这一轮干了什么。
 const MAX_BYTES = 1200000;

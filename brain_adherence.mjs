@@ -25,12 +25,18 @@ import { spawnSync } from 'node:child_process';
 import { closeSync, fstatSync, openSync, readSync, readFileSync, existsSync, mkdirSync, appendFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOG = path.join(HOME, '.agenthub', 'logs', 'brain-adherence.log');
 const CONFIG = path.join(HOME, '.agenthub', 'config.json');
+const HOME_SCRIPT = path.join(HOME, '.agenthub', 'mcp_server', 'brain_adherence.py');
+// R1122：未部署环境（CI / 源码树）没有 HOME 副本，从钩子自身目录取仓库副本。
+const REPO_SCRIPT = path.join(HERE, 'brain_adherence.py');
 const SCRIPT = process.env.AGENTHUB_ADHERENCE_SCRIPT
-  || path.join(HOME, '.agenthub', 'mcp_server', 'brain_adherence.py');
+  || (existsSync(HOME_SCRIPT) ? HOME_SCRIPT
+      : (existsSync(REPO_SCRIPT) ? REPO_SCRIPT : HOME_SCRIPT));
 // 尾部窗口。一轮重型工作（几十次 Edit/Write）的 JSONL 能写到上百万字，400KB 会把本轮
 // 开头切掉；读到 1.2MB 仍然只是一次小 IO，比整读 10MB 的会话文件便宜两个数量级。
 const MAX_BYTES = 1200000;

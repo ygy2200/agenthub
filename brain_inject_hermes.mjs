@@ -19,17 +19,26 @@ import { createHash } from 'node:crypto';
 import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
+const HERE = path.dirname(fileURLToPath(import.meta.url));
 const LOG = process.env.AGENTHUB_HERMES_LOG
   || path.join(HOME, '.workbuddy', 'logs', 'brain-inject.log');
 const CONFIG = path.join(HOME, '.agenthub', 'config.json');
 const STATE = process.env.AGENTHUB_HERMES_STATE
   || path.join(HOME, '.agenthub', 'state', 'brief-hermes.json');
+const HOME_BRIEF = path.join(HOME, '.agenthub', 'mcp_server', 'brain_brief.py');
+// R1122：未部署环境（CI / 源码树）没有 HOME 副本，从钩子自身目录取仓库副本。
+const REPO_BRIEF = path.join(HERE, 'brain_brief.py');
+const HOME_RECALL = path.join(HOME, '.agenthub', 'mcp_server', 'brain_recall.py');
+const REPO_RECALL = path.join(HERE, 'brain_recall.py');
 const BRIEF = process.env.AGENTHUB_BRIEF_SCRIPT
-  || path.join(HOME, '.agenthub', 'mcp_server', 'brain_brief.py');
+  || (existsSync(HOME_BRIEF) ? HOME_BRIEF
+      : (existsSync(REPO_BRIEF) ? REPO_BRIEF : HOME_BRIEF));
 const RECALL = process.env.AGENTHUB_RECALL_SCRIPT
-  || path.join(HOME, '.agenthub', 'mcp_server', 'brain_recall.py');
+  || (existsSync(HOME_RECALL) ? HOME_RECALL
+      : (existsSync(REPO_RECALL) ? REPO_RECALL : HOME_RECALL));
 const MAX_CHARS = Math.max(400, Number(process.env.AGENTHUB_BRIEF_MAX_CHARS) || 3000);
 const RECALL_MAX_CHARS = Math.max(300, Number(process.env.AGENTHUB_RECALL_MAX_CHARS) || 900);
 const TTL_MS = 7 * 24 * 3600 * 1000;
