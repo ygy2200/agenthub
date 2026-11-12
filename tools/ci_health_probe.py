@@ -20,6 +20,7 @@ from __future__ import annotations
 import argparse
 import json
 import sys
+import time
 import urllib.request
 from pathlib import Path
 
@@ -38,6 +39,16 @@ import _console  # noqa: E402,F401
 REPO = "ygy2200/agenthub"
 ALERT_THRESHOLD = 3
 API = "https://api.github.com/repos/%s/actions/runs?per_page=%d"
+
+# R1142：巡检项访问外部 API 的短 TTL 缓存。外部依据见
+# output/迭代依据-R1140-ci-health-cache外部取证-2026-11-12.md
+# （Spring Boot 健康检查 10–30s TTL / Actuator background-refresh / API 限流实践）。
+CACHE_PATH = Path.home() / ".agenthub" / "state" / "ci-health-cache.json"
+CACHE_TTL = 120
+# R1143：只缓存 HEALTHY。实测抓到 ALERT 缓存让「CI 已恢复」继续报红；
+# 反向更危险——HEALTHY 未过期时 CI 刚变红会漏报最多 120s，正是 25 连红无人发现的病根。
+# 告警 / 单次失败一律实时回源，宁可多花 2 秒也不拿旧结论下判定。
+CACHEABLE = ("HEALTHY",)
 
 
 def fetch_runs(limit: int = 10, fetcher=None, timeout: int = 30):
@@ -101,32 +112,105 @@ def summarize(runs, threshold: int = ALERT_THRESHOLD) -> dict:
             "threshold": threshold, "runs_seen": len(runs), "action": action}
 
 
+
+def _cache_read(path, now, ttl):
+    """坏缓存 / 过期 / 缺字段 / 不确定结论一律回源（fail-open）。"""
+    try:
+        data = json.loads(Path(path).read_text(encoding="utf-8"))
+    except Exception:  # noqa: BLE001
+        return None
+    if not isinstance(data, dict):
+        return None
+    if not {"ts", "status", "consecutive_failures"} <= set(data):
+        return None
+    if data.get("status") not in CACHEABLE:
+        return None
+    try:
+        age = now - float(data["ts"])
+    except (TypeError, ValueError):
+        return None
+    if age < 0 or age > ttl:
+        return None
+    return data
+
+
+def _cache_write(path, out, now):
+    """只缓存确定结论；不写 token / 日志正文，写失败不影响巡检。"""
+    if out.get("status") not in CACHEABLE:
+        return
+    payload = {"ts": now, "status": out["status"],
+               "consecutive_failures": out.get("consecutive_failures", 0),
+               "threshold": out.get("threshold", ALERT_THRESHOLD),
+               "runs_seen": out.get("runs_seen", 0),
+               "action": out.get("action", ""),
+               "latest": _brief(out.get("latest") or {})}
+    try:
+        q = Path(path)
+        q.parent.mkdir(parents=True, exist_ok=True)
+        q.write_text(json.dumps(payload, ensure_ascii=False), encoding="utf-8")
+    except OSError:
+        pass
+
+
+def get_status(limit=10, fetcher=None, timeout=30, cache_path=None, ttl=None,
+               use_cache=True, now=None):
+    """先读短 TTL 缓存，未命中才回源。返回 summarize 结果 + cached/cache_age。
+
+    纪律：UNKNOWN / PENDING 绝不落缓存——把「没判绿」固化成历史结论比没有缓存更坏。
+    """
+    now = time.time() if now is None else now
+    ttl = CACHE_TTL if ttl is None else ttl
+    path = Path(cache_path) if cache_path else CACHE_PATH
+    if use_cache:
+        hit = _cache_read(path, now, ttl)
+        if hit is not None:
+            return {"status": hit["status"],
+                    "consecutive_failures": hit["consecutive_failures"],
+                    "latest": hit.get("latest") or {},
+                    "threshold": hit.get("threshold", ALERT_THRESHOLD),
+                    "runs_seen": hit.get("runs_seen", 0),
+                    "action": hit.get("action", ""),
+                    "cached": True, "cache_age": int(now - float(hit["ts"]))}
+    try:
+        runs = fetch_runs(limit=limit, fetcher=fetcher, timeout=timeout)
+        out = summarize(runs)
+    except Exception as e:  # noqa: BLE001  断网/凭据/限流一律 UNKNOWN
+        out = _unknown("API 取不到（%s）：不许判断 CI 已绿；核对代理与凭据后重跑"
+                       % type(e).__name__)
+        out["error_type"] = type(e).__name__
+    _cache_write(path, out, now)
+    out["cached"] = False
+    out["cache_age"] = 0
+    return out
+
+
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(description="AgentHub CI 连红巡检（只读）")
     ap.add_argument("--limit", type=int, default=10, help="查最近几个 run")
     ap.add_argument("--threshold", type=int, default=ALERT_THRESHOLD,
-                    help="连败几次才按模式报警（默认 3）")
+                    help="连败几次才按模式报警（默认 3；自定义时自动跳过缓存）")
     ap.add_argument("--json", action="store_true", help="只输出 JSON")
+    ap.add_argument("--no-cache", action="store_true", help="跳过本地缓存，强制回源")
+    ap.add_argument("--ttl", type=int, default=CACHE_TTL, help="缓存有效期秒数（默认 120）")
+    ap.add_argument("--cache-path", default="", help="缓存文件路径（测试/隔离用）")
     args = ap.parse_args(argv)
 
-    try:
-        runs = fetch_runs(limit=args.limit)
-    except Exception as e:  # noqa: BLE001  网络/凭据异常一律 UNKNOWN，不假装绿
-        out = _unknown("API 取不到（%s）：不许判断 CI 已绿；核对代理与凭据后重跑"
-                       % type(e).__name__, args.threshold)
-        out["error_type"] = type(e).__name__
-        print(json.dumps(out, ensure_ascii=False))
-        return 2
-
-    out = summarize(runs, args.threshold)
+    out = get_status(limit=args.limit, timeout=30, ttl=args.ttl,
+                     cache_path=args.cache_path or None,
+                     use_cache=(not args.no_cache and args.threshold == ALERT_THRESHOLD))
     print(json.dumps(out, ensure_ascii=False))
     if not args.json:
         latest = out.get("latest") or {}
-        print("CI %s｜连败 %d｜最新 run %s %s｜%s" % (
+        cache_tag = ("｜缓存 %ds 前" % out["cache_age"]) if out.get("cached") else ""
+        print("CI %s｜连败 %d｜最新 run %s %s%s｜%s" % (
             out["status"], out["consecutive_failures"],
-            latest.get("id", "-"), latest.get("head_sha", "-")[:8],
-            out["action"]))
-    return 1 if out["status"] == "ALERT" else 0
+            latest.get("id", "-"), str(latest.get("head_sha", "-"))[:8],
+            cache_tag, out["action"]))
+    if out["status"] == "ALERT":
+        return 1
+    if out["status"] == "UNKNOWN":
+        return 2
+    return 0
 
 
 if __name__ == "__main__":

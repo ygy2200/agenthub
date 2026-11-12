@@ -455,19 +455,19 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
 
 
 def _ci_health(root: str) -> dict:
-    """R1131：CI 连红巡检（只读，短超时，拿不到数据绝不判绿）。
+    """R1131 + R1142：CI 连红巡检（只读、短 TTL 缓存、拿不到数据绝不判绿）。
 
-    与 tools/ci_health_probe.py 同一套状态口径；这里只负责把它压成 ops 的
-    ok / summary / detail≤8 三件套。网络不通不判红（不拖垮 doctor 的 23 项），
-    但摘要必须明说「未判定」，绝不把 in_progress 或无凭据读成转绿。
+    缓存只存确定结论，UNKNOWN / PENDING 不落盘；命中缓存时摘要必须标
+    「缓存 Ns 前」，不把 120 秒前的结论读成实时（外部取证见
+    output/迭代依据-R1140-ci-health-cache外部取证-2026-11-12.md）。
     """
     tools_dir = Path(__file__).resolve().parent / "tools"
     if str(tools_dir) not in sys.path:
         sys.path.insert(0, str(tools_dir))
     try:
         import ci_health_probe as probe
-        runs = probe.fetch_runs(limit=5, timeout=6)
-        out = probe.summarize(runs)
+        cache_path = os.environ.get("AGENTHUB_CI_CACHE") or None
+        out = probe.get_status(limit=5, timeout=6, cache_path=cache_path)
     except Exception as e:  # noqa: BLE001  断网/凭据/限流一律「无从判定」
         return {"ok": True,
                 "summary": "CI 状态未判定（UNKNOWN：网络/凭据不可达）",
@@ -482,29 +482,34 @@ def _ci_health(root: str) -> dict:
     n = out["consecutive_failures"]
     rid = latest.get("id", "-")
     sha = str(latest.get("head_sha") or "")[:8]
+    tag = ("（缓存 %ds 前）" % out["cache_age"]) if out.get("cached") else ""
 
     if status == "ALERT":
-        return {"ok": False,
-                "summary": f"CI 连败 {n} 次（ALERT，≥{out['threshold']} 触发模式报警）",
-                "detail": [f"最新 run {rid} {sha} conclusion=failure",
-                           out["action"], url,
-                           "复核：python tools/ci_health_probe.py --limit 8 --json",
-                           "分族：下载该 run 日志，按 本机耦合/钩子静默/doctor/真库耦合 归因"]}
-    if status in ("UNKNOWN", "PENDING"):
-        return {"ok": True,
-                "summary": f"CI 状态未判定（{status}）",
-                "detail": [out["action"], "没判绿：拿不到结论 ≠ 已转绿",
-                           "复核：python tools/ci_health_probe.py --json",
-                           f"最近已完成连败 {n} 次"]}
-    if status == "FAILING":
-        return {"ok": True,
-                "summary": f"CI 单次失败（{n} 次），未达模式报警线",
-                "detail": [out["action"], url,
-                           "连败 ≥3 才报红，防告警疲劳",
-                           "复核：python tools/ci_health_probe.py --json"]}
-    return {"ok": True,
-            "summary": f"CI HEALTHY：最近 {out['runs_seen']} 个 run 无连败",
-            "detail": [out["action"], f"最新 run {rid} {sha} conclusion=success", url]}
+        ok = False
+        summary = f"CI 连败 {n} 次（ALERT，≥{out['threshold']} 触发模式报警）{tag}"
+        detail = [f"最新 run {rid} {sha} conclusion=failure", out["action"], url,
+                  "复核：python tools/ci_health_probe.py --limit 8 --json",
+                  "分族：下载该 run 日志，按 本机耦合/钩子静默/doctor/真库耦合 归因"]
+    elif status in ("UNKNOWN", "PENDING"):
+        ok = True
+        summary = f"CI 状态未判定（{status}）{tag}"
+        detail = [out["action"], "没判绿：拿不到结论 ≠ 已转绿",
+                  "复核：python tools/ci_health_probe.py --json",
+                  f"最近已完成连败 {n} 次"]
+    elif status == "FAILING":
+        ok = True
+        summary = f"CI 单次失败（{n} 次），未达模式报警线{tag}"
+        detail = [out["action"], url, "连败 ≥3 才报红，防告警疲劳",
+                  "复核：python tools/ci_health_probe.py --json"]
+    else:
+        ok = True
+        summary = f"CI HEALTHY：最近 {out['runs_seen']} 个 run 无连败{tag}"
+        detail = [out["action"], f"最新 run {rid} {sha} conclusion=success", url]
+
+    if out.get("cached"):
+        detail.append(f"本次命中本地缓存（{out['cache_age']}s 前，TTL {probe.CACHE_TTL}s）；"
+                      "未请求 GitHub API，--no-cache 可强制回源")
+    return {"ok": ok, "summary": summary, "detail": detail[:8]}
 
 
 def _safe_dir(target: str) -> Path | None:

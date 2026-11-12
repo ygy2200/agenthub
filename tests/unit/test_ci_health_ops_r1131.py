@@ -26,7 +26,22 @@ import ci_health_probe as probe  # noqa: E402
 
 
 def _patch(monkeypatch, fn):
-    monkeypatch.setattr(probe, "fetch_runs", fn)
+    """R1142 后 ops 走 probe.get_status（内含短 TTL 缓存）。
+
+    这里注入 get_status 本身，让本文件继续只测「ops 显示逻辑」这一层；
+    缓存的命中/过期/不落盘等行为由 test_ci_health_cache_r1142.py 单独覆盖，
+    避免旧契约被真实机器上的缓存文件串味。
+    """
+    def fake_get_status(**kwargs):
+        try:
+            out = probe.summarize(fn())
+        except Exception:
+            raise
+        out["cached"] = False
+        out["cache_age"] = 0
+        return out
+
+    monkeypatch.setattr(probe, "get_status", fake_get_status)
 
 
 def _runs(n_fail, n_ok=0, pending=False):
