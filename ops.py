@@ -1476,7 +1476,26 @@ def _profile_surface() -> dict:
     detail = [f"{n}: {c} 工具 / {ch:,} 字符 / ~{tk:,} tok" for n, c, ch, tk in rows]
     detail.append(f"预算 {budget:,} tok（{admin_n} 工具×{PROFILE_TOK_PER_TOOL}；"
                   "R8 基线 69 工具 19.3K +25% 余量）")
-    verdict = "✓ 预算内" if ok else "⚠ 超预算——工具描述可能在膨胀，检查新增工具的描述篇幅"
+    if ok:
+        verdict = "✓ 预算内"
+    else:
+        # R1133 / B138：旧告警只说「可能在膨胀」，没说超多少、没说查哪几个——
+        # 把活推回给人。这里补成带证据的归因；**不擅自砍描述**（80 条描述是
+        # 对外契约，示例/时机/必填参数砍掉会掉调用准确率），压缩与否交拍板。
+        over = admin_tok - budget
+        per_actual = admin_tok / max(admin_n, 1)
+        per_budget = budget / max(admin_n, 1)
+        offenders = sorted(
+            ((len(t.get("description", "")), t.get("name", "?")) for t in m.TOOLS),
+            reverse=True)[:3]
+        detail.append(
+            f"超出 {over:,} tok；实际每工具 {per_actual:.0f} tok vs 预算单价 "
+            f"{per_budget:.0f} tok（工具数增长时固定开销也要一起看）")
+        detail.append(
+            "描述最长 3 个工具：" + "、".join(f"{n}({c}字)" for c, n in offenders)
+            + "；别砍示例 / 使用时机 / 必填参数（R17 实测缺了准确率掉约 18 点），"
+              "优先压缩历史版本说明与重复限制语")
+        verdict = "⚠ 超预算——工具描述可能在膨胀，检查新增工具的描述篇幅"
     return {"ok": ok,
             "summary": f"被动上下文预算：admin ~{admin_tok:,} tok（{admin_n} 工具）{verdict}",
             "detail": detail[:8]}
