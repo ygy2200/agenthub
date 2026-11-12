@@ -25,7 +25,8 @@ def test_empty_root_collapses_to_single_db_issue(hub_root):
     # 21→22、13→14 = R834 +error_debt（报错欠账账本，依赖大脑库 → 同因折叠也少跑一次 LIKE 扫描）
     # 23→24、14→15 = R850 +adherence（采纳账读 recall_adherence 与 journal，坏库上同样归因到 db_integrity）
     # 24→25、15→16 = R859 +failure_samples（读 fail_events 与 searches，坏库上同样归因到 db_integrity）
-    assert rep["total"] == len(ops.PATROL_CHECKS) == 25
+    # 25→26 = R1131 +ci_health（网络检查，不读大脑库，故 DB_BACKED_CHECKS 与 16 不变）
+    assert rep["total"] == len(ops.PATROL_CHECKS) == 26
     assert rep["same_cause_skipped"] == len(ops.DB_BACKED_CHECKS) - 1 == 16
 
     db_issues = [i["name"] for i in rep["issues"] if i["name"] in ops.DB_BACKED_CHECKS]
@@ -98,8 +99,11 @@ def test_db_backed_registry_covers_patrol_db_checks():
     non_db = set(ops.PATROL_CHECKS) - ops.DB_BACKED_CHECKS
     # link_health 读 journal，但它对「库不可用」自带早退（与 brief_hook_health 同口径），
     # 所以不算 DB_BACKED——空库时不会多摊一条「需要有效根目录」。
+    # R1131 ci_health 查的是 GitHub Actions API，不是大脑库；空库时它返回
+    # UNKNOWN（不判绿也不判红），不应被算进「依赖库、需要同因折叠」的那一批。
     assert non_db == {"env", "runtime_health", "backup_health", "rules_health",
-                      "mcp_drift", "inbox", "brief_hook_health", "link_health"}, non_db
+                      "mcp_drift", "inbox", "brief_hook_health", "link_health",
+                      "ci_health"}, non_db
     assert ops.DB_BACKED_CHECKS <= set(ops.CHECKS)
 
 
