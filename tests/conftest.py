@@ -105,3 +105,33 @@ def _reset_brain_via():
         brain.set_via("")
     except Exception:  # noqa: BLE001
         pass
+
+
+# R1120：CI 与开发机不同构的第二层。「探测开发机上各家 agent 真实配置/进程」的用例
+# 在干净 runner 上根本没有被测对象（R1119 日志：zcode state=absent、script=False、
+# link_health 读到 runneradmin 的真实 HOME 与 MCP 进程）。按 pytest 官方 skipping 口径，
+# 这类用例要么跑、要么明确跳过并报数；不能靠「本机碰巧装了」绿着，也不能在 CI 假装失败。
+# 清单是**用例级**而非文件级——同文件里不依赖本机状态的用例照跑。
+LOCAL_ONLY_NODEIDS = (
+    "test_adherence_sweep_r851.py::test_install_dry_run_lists_sweep",
+    "test_zcode_hooks_r824.py::test_zcode_real_config_probe",
+    "test_memory_hooks_deploy_r821.py::test_memory_hook_status_reports_both_events",
+    "test_link_health_stale_proc_r848.py::test_旧进程不报断而是报待重启",
+    "test_link_health_stale_proc_r848.py::test_旧进程不掩盖另一家的真断",
+)
+
+
+def _running_on_ci() -> bool:
+    return bool(os.environ.get("GITHUB_ACTIONS") or os.environ.get("CI"))
+
+
+def pytest_collection_modifyitems(config, items):
+    """CI 上给本机耦合用例打 skip；本机一个都不跳（由 R1120 契约用例钉住）。"""
+    if not _running_on_ci():
+        return
+    mark = pytest.mark.skip(
+        reason="R1120：探测开发机真实 agent 配置/进程，CI runner 上无被测对象；本机仍全跑")
+    for it in items:
+        nid = str(it.nodeid).replace("\\", "/")
+        if any(nid.endswith(n) for n in LOCAL_ONLY_NODEIDS):
+            it.add_marker(mark)
