@@ -21,12 +21,20 @@ import { appendFileSync, existsSync, mkdirSync, readFileSync, writeFileSync, ope
   readSync, fstatSync, closeSync } from 'node:fs';
 import { homedir } from 'node:os';
 import path from 'node:path';
+import { fileURLToPath } from 'node:url';
 
 const HOME = homedir();
 const LOG = path.join(HOME, '.workbuddy', 'logs', 'brain-error-recall.log');
 const CONFIG = path.join(HOME, '.agenthub', 'config.json');
+const HERE = path.dirname(fileURLToPath(import.meta.url));
+const HOME_SCRIPT = path.join(HOME, '.agenthub', 'mcp_server', 'brain_error_recall.py');
+// R1121：CI runner / 未部署的源码树没有 HOME 下的部署副本，旧版直接 spawn 一个
+// 不存在的脚本 → stdout 恒空 → 11 条「必须触发报错召回」全红（本机靠部署副本蒙混过关）。
+// 从钩子自身位置取仓库副本；优先级不倒挂：显式环境变量 > 已部署副本 > 仓库副本。
+const REPO_SCRIPT = path.join(HERE, 'brain_error_recall.py');
 const SCRIPT = process.env.AGENTHUB_ERROR_SCRIPT
-  || path.join(HOME, '.agenthub', 'mcp_server', 'brain_error_recall.py');
+  || (existsSync(HOME_SCRIPT) ? HOME_SCRIPT
+      : (existsSync(REPO_SCRIPT) ? REPO_SCRIPT : HOME_SCRIPT));
 const MAX_CHARS = Math.max(200, Number(process.env.AGENTHUB_ERROR_MAX_CHARS) || 700);
 const MIN_ERR_CHARS = 12;
 // R1029：WorkBuddy 的 PostToolUse 只给 {exitCode, signal, …}，没有 stdout/stderr 文本，
