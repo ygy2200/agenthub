@@ -126,6 +126,9 @@ LOCAL_ONLY_NODEIDS = (
     "test_init_path_display_r737.py::test_root_hint_is_actually_usable",
     "test_time_iso_r1098.py::test_prompt_recall_time_window_lit",
     "test_time_soft_r1105.py::test_hard_filter_drops_candidates",
+    # R1129：run 43155809224 唯一失败——用例读开发机 D 盘真库，runner 上
+    # sqlite3.OperationalError: unable to open database file；本机全量复跑该用例绿。
+    "test_journal_window_r935.py::test_real_db_window_is_complete",
 )
 
 
