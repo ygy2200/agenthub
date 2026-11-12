@@ -87,6 +87,7 @@ CHECKS = {
     "tasks_health": ("任务治理巡检（R5 2026-10-21，R30/R34/R35/R43 扩展）：在办任务的过期租约/无主/持有者心跳已停/截止日已过/待办饥饿，近 7 天 done 任务的交付物证据核对，「记录称已完成、任务却没关」的闭环漂移，以及重试耗尽的死信任务——认领了没人续、人走了任务还挂着、声明过的产物缺失、完成只停在记录里、失败多次后无声退出队列，都会让「谁在干什么」失真；只报不动手（接管 hub_claim，关单/改派 hub_task_update，死信 hub_task_retry）", False),
     "governance_health": ("治理面巡检（R93 2026-10-24）：把「等人拍板」的积压收成一张单子——待批超过 TASK_APPROVAL_AGING_H(24h) 的任务、超过 HANDOFF_STALE_DAYS(3天) 仍无人认领的交接、近 7 天越权拦截中的未锁身份（配置漂移，归属不可信）与角色越权≥3 次（反复试探）。与 tasks_health 分工：那边看任务/租约是否健康，这边看管理动作是否积压；只报不动手（hub_task_approve / hub_handoff claim/close / 核对各 agent 的 --agent 启动参数）", False),
     "lease_health": ("文件租约巡检（R12 2026-10-21）：活跃租约互相冲突/任务绑定漂移/持有者未登记一次点名；过期未释放只报数供清理，不算失败——租约不拦写盘，但冲突看不见就会让两个 agent 同时改同一文件；只报不动手（list 看台账、release 释放、先 signal 协调）", False),
+    "ci_health": ("CI 连红巡检（R1131）：只读查 GitHub Actions 最近 5 个 run，连败≥3 才按模式报警；拿不到数据 / 最新 run 未结束一律「未判定」**绝不判绿**，单次失败只报数不扰民。防的是 R1118 那类「25 连红、本机全绿、无人发现」——让状态进 doctor 日常自检面，不再等人想起来跑独立 CLI", False),
 }
 
 # R8 一键自检：巡哪些项 + 每项失败时「下一步怎么做」（修复建议必须可执行，
@@ -96,7 +97,7 @@ PATROL_CHECKS = ("db_integrity", "env", "runtime_health", "db_health", "audit_ch
                  "mcp_drift", "usage_health",
                  "stale_health", "ghost_memory", "dup_mem", "error_debt", "record_quality",
                  "failure_samples",
-                 "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled")
+                 "date_health", "tasks_health", "governance_health", "lease_health", "inbox", "stalled", "ci_health")
 # R1039：首屏动作表——doctor 默认屏只该给「现在敲哪条」，完整口径留给 --full。
 # 这里是数据表而不是散在各检查里：改一句话不用进业务函数，也不会和 r["fix"] 抢优先级。
 FIX_BRIEFS = {
@@ -108,6 +109,7 @@ FIX_BRIEFS = {
 }
 
 CHECK_FIXES = {
+    "ci_health": "连败报红：先跑 python tools/ci_health_probe.py --limit 8 --json 看连败数与最新 run；下载该 run 的 logs 分族（本机耦合 / 钩子静默 / doctor / 真库耦合），按根因修，别把失败用例一律 skip。UNKNOWN / PENDING 不是转绿：核对代理（flclash-proxy 技能，7890）与 token（release_token 查找链）后重跑；单次失败不报警是设计，别急着改阈值",
     "adherence": "分三种红各修各的：① 口径未覆盖又装不了新副本 → 先 `python cli.py deploy`（顺带刷新 ~/.agenthub/hooks 副本），让流水带上 src=；② 判官饿着（transcript 占比低 / 单轮证据字数中位数只有几十字）→ 采集侧问题，查 brain_adherence.mjs 是否仍优先用事件自带文本，修法见 R849（本轮工具调用才是证据）；③ 口径正常、采集在跑而采纳率低 → 才是注入精度问题：跑 tools/recall_adherence_report.py 看 by_strength，压掉「只曝光不采纳」的那批（R830 断路器），不是加大注入量。某家有注入账却窗口内零次采集：`python cli.py status` 核对回填钩子，再看 ~/.agenthub/logs/brain-adherence.log 的 skip 原因（hermes 无 Stop 出口不算故障）。④ 会话没闭环（有注入的会话隔了几小时从没被判定，R851）→ 先跑 `python cli.py adherence-backfill` 预演、`--apply` 写账（R1035：把离线补扫做成一条命令）；仍判不了再分清是「宿主压根不发 Stop」还是「钩子没跑」：Qoder Desktop 实测 3 次发言 0 次 Stop，这种家要给补扫通道 `python cli.py hook-install <agent> --events sweep --apply`（挂在 UserPromptSubmit，判的是上一轮），装完再跑一轮本项就会换成真实闭环数",
     "db_integrity": "库文件损坏：停止所有写入并关闭 MCP 进程；把 brain.db/-wal/-shm 一起留证（-wal 可能有未落盘数据），用 hub_export action=backups 选最近整包、action=verify 校验，再按《运维手册》§3.4 手工恢复；不要删库重建（会清空全部记录）",
     "env": "按 detail 点名项修环境（Python/代理/磁盘/库路径）；装依赖用 pip install -e .",
@@ -444,10 +446,65 @@ def run_check(name: str, target: str = "", root: str = "") -> dict:
         r = _tasks_health(root)
     elif name == "governance_health":
         r = _governance_health(root)
+    elif name == "ci_health":
+        r = _ci_health(root)
     else:
         r = _brain(root)
     _journal(root, name, r.get("summary", ""), t.name if t else (Path(root).name if root else ""), ok=r.get("ok"))
     return r
+
+
+def _ci_health(root: str) -> dict:
+    """R1131：CI 连红巡检（只读，短超时，拿不到数据绝不判绿）。
+
+    与 tools/ci_health_probe.py 同一套状态口径；这里只负责把它压成 ops 的
+    ok / summary / detail≤8 三件套。网络不通不判红（不拖垮 doctor 的 23 项），
+    但摘要必须明说「未判定」，绝不把 in_progress 或无凭据读成转绿。
+    """
+    tools_dir = Path(__file__).resolve().parent / "tools"
+    if str(tools_dir) not in sys.path:
+        sys.path.insert(0, str(tools_dir))
+    try:
+        import ci_health_probe as probe
+        runs = probe.fetch_runs(limit=5, timeout=6)
+        out = probe.summarize(runs)
+    except Exception as e:  # noqa: BLE001  断网/凭据/限流一律「无从判定」
+        return {"ok": True,
+                "summary": "CI 状态未判定（UNKNOWN：网络/凭据不可达）",
+                "detail": [f"取不到 Actions 数据：{type(e).__name__}",
+                           "没判绿：断网 / 缺凭据 / run 未完成都不等于转绿",
+                           "复核：python tools/ci_health_probe.py --limit 8 --json",
+                           "修代理：按 flclash-proxy 技能启动 7890；token 走 release_token 查找链"]}
+
+    status = out["status"]
+    latest = out.get("latest") or {}
+    url = str(latest.get("html_url") or "")
+    n = out["consecutive_failures"]
+    rid = latest.get("id", "-")
+    sha = str(latest.get("head_sha") or "")[:8]
+
+    if status == "ALERT":
+        return {"ok": False,
+                "summary": f"CI 连败 {n} 次（ALERT，≥{out['threshold']} 触发模式报警）",
+                "detail": [f"最新 run {rid} {sha} conclusion=failure",
+                           out["action"], url,
+                           "复核：python tools/ci_health_probe.py --limit 8 --json",
+                           "分族：下载该 run 日志，按 本机耦合/钩子静默/doctor/真库耦合 归因"]}
+    if status in ("UNKNOWN", "PENDING"):
+        return {"ok": True,
+                "summary": f"CI 状态未判定（{status}）",
+                "detail": [out["action"], "没判绿：拿不到结论 ≠ 已转绿",
+                           "复核：python tools/ci_health_probe.py --json",
+                           f"最近已完成连败 {n} 次"]}
+    if status == "FAILING":
+        return {"ok": True,
+                "summary": f"CI 单次失败（{n} 次），未达模式报警线",
+                "detail": [out["action"], url,
+                           "连败 ≥3 才报红，防告警疲劳",
+                           "复核：python tools/ci_health_probe.py --json"]}
+    return {"ok": True,
+            "summary": f"CI HEALTHY：最近 {out['runs_seen']} 个 run 无连败",
+            "detail": [out["action"], f"最新 run {rid} {sha} conclusion=success", url]}
 
 
 def _safe_dir(target: str) -> Path | None:

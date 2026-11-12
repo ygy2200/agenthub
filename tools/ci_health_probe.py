@@ -40,7 +40,7 @@ ALERT_THRESHOLD = 3
 API = "https://api.github.com/repos/%s/actions/runs?per_page=%d"
 
 
-def fetch_runs(limit: int = 10, fetcher=None):
+def fetch_runs(limit: int = 10, fetcher=None, timeout: int = 30):
     """取最近 N 个 run（API 默认按创建时间倒序）。fetcher 供测试注入。"""
     if fetcher is not None:
         return fetcher(limit)
@@ -50,7 +50,7 @@ def fetch_runs(limit: int = 10, fetcher=None):
         headers={"Authorization": "Bearer " + token,
                  "Accept": "application/vnd.github+json",
                  "User-Agent": "agenthub-ci-health-probe"})
-    with urllib.request.urlopen(req, timeout=30) as resp:
+    with urllib.request.urlopen(req, timeout=timeout) as resp:
         return json.load(resp).get("workflow_runs", [])
 
 

@@ -182,7 +182,8 @@ def test_check_list_covers_every_registered_check(capsys):
     # 21→22 = R834 +error_debt（报错欠账账本：撞过却没答案的签名要在收尾自检里看得见）
     # 23→24 = R850 +adoption 采纳账（注入到底有没有被用上，且先分清「记忆没人用」与「采集饿着」）
     # 24→25 = R859 +failure_samples（B067 采集面：无签名触发到底长什么样，收尾自检要看得见）
-    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 25
+    # 25→26 = R1131 +ci_health（CI 连红巡检：25 连红无人发现的病根是没进日常自检面）
+    assert len(ops.CHECKS) > 30 and len(ops.PATROL_CHECKS) == 26
     assert all(n in out for n in ops.CHECKS)
     assert "需要 --target" in out and "免 target" in out
 
