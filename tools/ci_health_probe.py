@@ -29,6 +29,12 @@ if str(ROOT) not in sys.path:
 
 from release_token import resolve_token  # noqa: E402
 
+# R1126：tools/ 下会 print 的独立脚本必须装 UTF-8 控制台守卫（R222 契约，
+# run 43154389309 的 1 failed 就是漏了它）；GBK 管道下打印中文不崩。
+if str(ROOT / "tools") not in sys.path:
+    sys.path.insert(0, str(ROOT / "tools"))
+import _console  # noqa: E402,F401
+
 REPO = "ygy2200/agenthub"
 ALERT_THRESHOLD = 3
 API = "https://api.github.com/repos/%s/actions/runs?per_page=%d"
